@@ -1,0 +1,20 @@
+{
+  "name": "@canvas/core",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "Reactive serializable core store for the canvas notes app. A signia (@tldraw/state) substrate behind a swappable handle interface, with three output channels: reactive handles, a record-diff stream, and an append-one-per-gesture intent log.",
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tldraw/state": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.20",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,24 @@
+# The session card type (agent-sessions-on-canvas.md §3/§4, §12). An agent session as a card.
+# FIELDS + CODEC, like the file card — fields.title carries the session id, fields.text the raw
+# `.jsonl` transcript (a cached projection; the file on disk is the source of truth). The jsonl →
+# turns[] codec lives in render.js as real JS, per the rule that refuses a declarative layer.
+#
+# GRANT (the full duplex, agent-sessions §3):
+#   • `session` — a per-card live feed of the transcript, keyed by this card's session id. With a
+#     registry-spawned process (slice 2) it streams the live PROCESS output token-level; for an
+#     out-of-band Claude session (slice 1) it tails the .jsonl turn-level; with no feed it shows the
+#     static field (a plain historical transcript). Derived/channel-1 only — the live tail never
+#     touches the canvas log (the clock rule, §9.1; session-timelines.md §1/§5).
+#   • `sessionInput` — the INPUT half: a bound fn that POSTs a prompt into this card's live session.
+#     SESSION-INTERNAL (session-timelines.md §4): never editor.commit, never a canvas-log entry — a
+#     prompt is a session act the canvas points at, not one it absorbs. Functional only when the feed
+#     value carries a `status` (a registry-backed live process); a historical/file-tail card has none,
+#     so the template shows no input row.
+#   • `sessionResume` — the unify-on-resume handoff (slice 3): a bound fn that POSTs to recommence
+#     this card's historical session as a live process, IN PLACE. The registry seeds the live feed
+#     from the on-disk .jsonl so history survives, then `claude --resume`s; the card flips from static
+#     transcript to live duplex with no new card. Also session-internal — resuming is a session act,
+#     not a board act; the only canvas-log entry was the card's original addNode.
+name: session
+contract: 1
+capabilities: [session, sessionInput, sessionResume]

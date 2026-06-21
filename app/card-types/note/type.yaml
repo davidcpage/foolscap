@@ -1,0 +1,6 @@
+# The plain note card type (card-types-as-data.md §7, second card). Pure FIELDS: the whole
+# interior renders off the node record through card.fields, so the capability grant is EMPTY —
+# the narrowest contract a type can hold: read your own fields, commit nothing.
+name: note
+contract: 1
+capabilities: []

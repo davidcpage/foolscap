@@ -1,0 +1,17 @@
+{
+  "name": "@canvas/interaction",
+  "private": true,
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "description": "The interaction layer for the canvas notes app. Framework- and DOM-agnostic: camera (screen↔page), spatial index / hit-test, selection, drag mechanics, and a tool state machine — all driving gestures/commands into @canvas/core's Editor. The only DOM-touching file is input.ts's bindDom adapter; everything else is unit-testable in Node. Borrows OSS only at the primitive level behind swappable interfaces (SpatialIndex → rbush is the documented drop-in).",
+  "scripts": {
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.20",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

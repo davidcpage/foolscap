@@ -1,0 +1,12 @@
+# The weather card type, as data in the folder (card-types-as-data.md §3). Its location is its TITLE —
+# a free-text place ("London", "Tokyo", "Paris, France") you type into the card's header — so it holds:
+#   • `weather` — a PER-CARD off-log read keyed by that title. The host polls Open-Meteo SERVER-SIDE
+#     (vite-fs-plugin.ts → /api/weather) and the interior only ever reads the granted signal; nothing
+#     here touches the public internet or the canvas log (the clock rule — channel-1, never channel-3).
+#   • `setTitle` — the one WRITE capability, so the header input commits the new location to this card's
+#     own record (actor "user" → undoable, persisted), exactly like the sticky card's title.
+# An empty title shows a "type a city" hint; fill it in and the current conditions appear and refresh
+# every ~10 min. See render.js for the WMO weather-code → icon/label codec and the not-found/offline states.
+name: weather
+contract: 1
+capabilities: [weather, setTitle]

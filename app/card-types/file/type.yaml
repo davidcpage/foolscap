@@ -1,0 +1,14 @@
+# The file card type (card-types-as-data.md §7, second card). FIELDS + CODEC: title carries the
+# file's path relative to its dataset root. The path → basename/dir/kind mapping — the v1 codec —
+# lives in render.js as real JS, per the rule that refuses the first conditional in any declarative
+# layer.
+#
+# GRANT:
+#   • `fileContent` — the file's content as an OFF-LOG signal projected from disk (content.ts),
+#     keyed by this card's path. The body reads it, not node.text, so a file card's liveness comes
+#     from the watcher refreshing this signal (channel-1, derived from the one source) — never a
+#     setText on the durable log. The log keeps only the card's arrangement + its path reference.
+#     This is the clock rule (§9.1) applied to the file cards' own bodies.
+name: file
+contract: 1
+capabilities: [fileContent]

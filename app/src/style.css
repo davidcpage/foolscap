@@ -1,0 +1,1255 @@
+/* Base canvas/grid/panel styles are lifted from app/src/style.css (engine-agnostic chrome); the
+   file-card rules at the bottom are the spike's own. */
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
+  background: #fafafa;
+  color: #18181b;
+}
+
+.app {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* ── canvas (screen space) ───────────────────────────────── */
+.canvas {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  outline: none;
+  touch-action: none;
+  background: #fafafa;
+}
+.canvas.tool-hand {
+  cursor: grab;
+}
+.canvas.tool-hand:active {
+  cursor: grabbing;
+}
+
+.grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: radial-gradient(circle, #d4d4d8 1px, transparent 1.4px);
+  background-repeat: repeat;
+}
+
+/* ── page (camera-transformed) ───────────────────────────── */
+.page {
+  position: absolute;
+  top: 0;
+  left: 0;
+  transform-origin: 0 0;
+}
+.page.zooming {
+  will-change: transform;
+}
+
+/* ── file card ───────────────────────────────────────────── */
+/* A node with type "file": same record pair and the same `c-<color>` swatch as a note. The body shows
+   the file's content — markdown as rendered prose, every other kind as a raw monospace preview — and
+   scrolls when taller than the box via the interior-interaction seam (.file-body below). The card still
+   drags from anywhere: the seam captures only the wheel over a scrollable body, never the pointerdown. */
+.node {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px solid #e4e4e7;
+  border-radius: 8px;
+  background: #fff;
+  overflow: hidden;
+  box-shadow: 0 1px 2px #0000000d, 0 4px 12px #0000000a;
+  user-select: none;
+  display: flex;
+  flex-direction: column;
+}
+.node.file {
+  /* a thin coloured rail on the left keys the card to its file kind without flooding the whole card */
+  border-left-width: 4px;
+}
+.node.clock {
+  /* same rail as a file card; its body is a live time read from the off-log nowSignal, not from the store */
+  border-left-width: 4px;
+}
+.clock-face {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  padding: 8px 10px 12px;
+  box-sizing: border-box;
+}
+.clock-rim { fill: #fff; stroke: #e4d6ff; stroke-width: 2; }
+.clock-tick { stroke: #b9a3e3; stroke-width: 1.5; stroke-linecap: round; }
+.clock-hand { stroke-linecap: round; transform-box: view-box; }
+.clock-hand.hour { stroke: #3f3f46; stroke-width: 3.4; }
+.clock-hand.minute { stroke: #3f3f46; stroke-width: 2.4; }
+.clock-hand.second { stroke: #c49bff; stroke-width: 1.4; }
+.clock-pin { fill: #3f3f46; }
+
+/* Swatches by file kind (set in fileTypes.ts). Tinted lightly on the background + a saturated left rail. */
+:is(.node).c-yellow { background: #fffdf2; border-left-color: #ffd84d; }
+:is(.node).c-pink   { background: #fff5f8; border-left-color: #ff8fab; }
+:is(.node).c-blue   { background: #f3faff; border-left-color: #7cc4ff; }
+:is(.node).c-green  { background: #f3fdf3; border-left-color: #6fd86a; }
+:is(.node).c-orange { background: #fff8f0; border-left-color: #ffb45c; }
+:is(.node).c-purple { background: #faf6ff; border-left-color: #c49bff; }
+
+.node.selected {
+  border-color: #6366f1;
+  border-left-color: #6366f1;
+  box-shadow: 0 0 0 1px #6366f1, 0 2px 6px #6366f133;
+}
+
+/* chrome: bare (file-trees-on-canvas.md §7) — a card type opts out of the resting frame: no border,
+   background, or shadow, so it paints onto transparent ground (the clock face; later the treemap). The
+   AABB box is unchanged — the spatial index, hit-testing, and edge anchoring still see a rectangle —
+   it's only the paint that's gone. Placed AFTER the per-colour `.c-*` tints so it overrides their
+   background + left rail at equal specificity, and (being later) it also suppresses `.node.selected`'s
+   rectangular ring: a bare card's selection reads from the corner resize handles alone (SelectionOverlay
+   draws them for any lone selection), so a heavy frame never snaps back around a frameless widget. */
+.node.bare {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+/* Read-only card text ([data-text]: file/session/note bodies) overrides the .node `user-select:none`
+   default, but ONLY once the card is selected — paired with the pointerdown the seam contains there
+   when selected (NodeView). The rule is "select the card, then select its text": an unselected card
+   stays one draggable object, a selected one lets you drag-select and ⌘C its visible content. */
+.node.selected [data-text] {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+.file-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px 0;
+}
+.file-name {
+  font-weight: 600;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-ext {
+  flex: none;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #71717a;
+  background: #00000008;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+.file-dir {
+  padding: 1px 10px 0;
+  font-size: 10px;
+  color: #a1a1aa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-body {
+  margin: 6px 0 0;
+  padding: 6px 10px 8px;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* a real scroll container (the interior-interaction seam, like .ses-body): when the content is
+     taller than the box, wheel-over and arrow keys scroll it and overscroll-behavior keeps the
+     scroll-to-end from chaining out to the canvas; when it fits, the wheel bubbles to pan/zoom.
+     pointerdown still bubbles, so the card drags from anywhere — only the wheel is captured. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #52525b;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-top: 1px solid #00000008;
+  background: #00000003;
+}
+.file-body::-webkit-scrollbar {
+  width: 8px;
+}
+.file-body::-webkit-scrollbar-thumb {
+  background: #00000022;
+  border-radius: 4px;
+}
+/* a .md file card renders PROSE (the shared markdown codec), so override the raw-preview monospace/
+   pre-wrap with a proportional body — the .md-prose block rules supply the per-block spacing. */
+.file-md {
+  font: 11px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: #3f3f46;
+  white-space: normal;
+}
+
+/* ── directory card (file-trees-on-canvas.md §3) ─────────── */
+/* A first-class folder node: same left rail as a file card, body lists the immediate children off the
+   off-log `dirListing` projection. Each row is draggable onto the canvas (drag-out promotion, §9). */
+.node.directory {
+  border-left-width: 4px;
+}
+.dir-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 6px 0 0;
+  padding: 4px 6px 6px;
+  /* a scroll container like .file-body: wheel-over scrolls it (interior-interaction seam), contained
+     from chaining out to the canvas; pointerdown on a row is contained by [data-interactive] so a grab
+     drags the row out (HTML5 DnD), not the whole card. */
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  border-top: 1px solid #00000008;
+  background: #00000003;
+}
+.dir-body::-webkit-scrollbar {
+  width: 8px;
+}
+.dir-body::-webkit-scrollbar-thumb {
+  background: #00000022;
+  border-radius: 4px;
+}
+.dir-empty {
+  padding: 8px 6px;
+  font-size: 11px;
+  color: #a1a1aa;
+}
+.dir-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: #3f3f46;
+  cursor: grab;
+}
+.dir-row:hover {
+  background: #6366f10f;
+}
+.dir-row:active {
+  cursor: grabbing;
+}
+.dir-sub .dir-rowname {
+  font-weight: 600;
+}
+/* The expand/collapse twisty on a folder row (empty spacer on a file row, so names align). Clicking it
+   toggles the level; dragging anywhere on the row still promotes it. A fixed width keeps depths aligned. */
+.dir-tw {
+  flex: none;
+  width: 12px;
+  text-align: center;
+  font-size: 9px;
+  color: #a1a1aa;
+  cursor: pointer;
+  user-select: none;
+}
+.dir-glyph {
+  flex: none;
+  font-size: 12px;
+  line-height: 1;
+}
+.dir-rowname {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.dir-ext {
+  flex: none;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #71717a;
+  background: #00000008;
+  border-radius: 4px;
+  padding: 1px 5px;
+}
+
+/* ── sessions browser card (Phase C) ─────────────────────── */
+/* A persistent on-canvas list of historical agent sessions; each row drags out to OPEN that session as a
+   card (the directory card's drag-out, applied to sessions). Reuses .dir-body for the scroll container. */
+.node.sessions {
+  border-left-width: 4px;
+}
+/* The header's refresh control — re-pulls the off-log list (no disk watch on the sessions dir). A bare
+   glyph button; the host's seam contains its pointerdown (it's a <button>) so a click never grabs the card. */
+.ses-refresh {
+  flex: none;
+  margin-left: auto;
+  padding: 0 4px;
+  font-size: 12px;
+  line-height: 1;
+  color: #a1a1aa;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ses-refresh:hover {
+  color: #52525b;
+  background: #00000008;
+}
+.ses-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  cursor: grab;
+}
+.ses-row:hover {
+  background: #6366f10f;
+}
+.ses-row:active {
+  cursor: grabbing;
+}
+.ses-row-title {
+  font-size: 12px;
+  color: #3f3f46;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ses-row-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ses-row-meta {
+  font-size: 10px;
+  color: #a1a1aa;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── feed cards (off-log bodies: git HEAD, HN) ───────────── */
+.node.feed {
+  border-left-width: 4px;
+}
+.feed-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 8px 10px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow: hidden;
+}
+.feed-big {
+  font-size: 22px;
+  font-weight: 700;
+  color: #27272a;
+}
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.feed-line {
+  font-size: 12px;
+  color: #3f3f46;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+.feed-title {
+  font-size: 14px;
+  font-weight: 600;
+  -webkit-line-clamp: 4;
+}
+.feed-meta {
+  margin-top: auto;
+  font-size: 11px;
+  color: #a1a1aa;
+}
+.feed-waiting {
+  color: #a1a1aa;
+  font-size: 11px;
+  justify-content: center;
+  align-items: center;
+}
+
+/* ── plain note (what an agent's addNode lands as) ───────── */
+.node.note {
+  border-left-width: 4px;
+}
+.note-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  padding: 6px 10px 8px;
+  overflow: hidden;
+  font-size: 12px;
+  color: #3f3f46;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── sticky note (card-types/sticky) — an editable memo / todo pad ──────────────
+   The first card you type INTO: an unadorned title input over a fill-the-card textarea, both styled
+   to read as paper rather than form controls (no borders, transparent — the card IS the field). Edits
+   commit to the record on blur through the granted setTitle/setText capabilities. user-select:text
+   overrides the .node default so the body is freely selectable/editable. */
+.node.sticky {
+  border-left-width: 4px;
+}
+/* Same "select the card, then touch its text" rule as the read-only cards, run the other way: until
+   the sticky is selected its inputs are transparent to the pointer, so a click selects the CARD (the
+   seam sees the host, not an input, and lets it reach the canvas) instead of dropping a cursor. Once
+   selected the inputs take pointer events again, so a second click focuses them to edit. Fixes the
+   "a click goes straight to the cursor and I can't grab the card" frustration without a modal mode. */
+.node.sticky:not(.selected) .sticky-title,
+.node.sticky:not(.selected) .sticky-body {
+  pointer-events: none;
+}
+/* The swatch row is secondary chrome: keep the resting memo clean and only reveal it once the card is
+   selected — which is also exactly when it becomes clickable (the title/body take pointer events on the
+   same beat). Revealing on plain hover would show swatches that a first click can't apply (the click
+   selects the card instead), so the reveal is tied to selection, not hover. */
+.node.sticky:not(.selected) .sticky-swatch-row {
+  display: none;
+}
+/* When the swatch cluster is showing (selected), keep the title text from running under it. */
+.node.sticky.selected .sticky-title {
+  padding-right: 92px;
+}
+.sticky-head {
+  padding: 7px 10px 0;
+}
+.sticky-title {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-weight: 600;
+  font-size: 12px;
+  color: #27272a;
+  border: none;
+  background: transparent;
+  padding: 0;
+  user-select: text;
+}
+.sticky-title::placeholder {
+  color: #a1a1aa;
+  font-weight: 500;
+}
+.sticky-title:focus {
+  outline: none;
+}
+.sticky-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  margin-top: 4px;
+  padding: 4px 10px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #3f3f46;
+  border: none;
+  background: transparent;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  user-select: text;
+}
+.sticky-body::placeholder {
+  color: #b4b4bb;
+}
+.sticky-body:focus {
+  outline: none;
+}
+/* Colour swatches: one button per NOTE_COLORS, committed through the setColor grant. The fill is the
+   saturated rail colour of each c-<color> (the box theme reads those on .node; a button isn't a .node,
+   so the swatches carry their own fills here). The current colour gets a ring.
+   Positioned as card chrome, not content: floated into the top-right corner of the box (.node is the
+   positioned ancestor), out of the head's flow so the body starts higher. A faint backdrop pill reads
+   the cluster as one control over the tinted note; the title reserves room for it only when selected
+   (the one time it's shown — see the reveal rule above). */
+.sticky-swatch-row {
+  position: absolute;
+  top: 6px;
+  right: 7px;
+  z-index: 1;
+  display: flex;
+  gap: 4px;
+  padding: 3px 4px;
+  border-radius: 8px;
+  background: #ffffffd9;
+  box-shadow: 0 1px 2px #0000000f;
+}
+.sticky-swatch {
+  width: 11px;
+  height: 11px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  cursor: pointer;
+  background: #d4d4d8;
+}
+.sticky-swatch.c-yellow { background: #ffd84d; }
+.sticky-swatch.c-pink   { background: #ff8fab; }
+.sticky-swatch.c-blue   { background: #7cc4ff; }
+.sticky-swatch.c-green  { background: #6fd86a; }
+.sticky-swatch.c-orange { background: #ffb45c; }
+.sticky-swatch.c-purple { background: #c49bff; }
+.sticky-swatch.selected {
+  border-color: #3f3f46;
+  box-shadow: 0 0 0 2px #fff, 0 0 0 3px #3f3f46;
+}
+.sticky-swatch:focus-visible {
+  outline: 2px solid #3f3f46;
+  outline-offset: 2px;
+}
+
+/* ── provenance card (the intent log, live) ──────────────── */
+.prov-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin-top: 6px;
+  padding: 5px 10px;
+  overflow: hidden;
+  font: 9.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-top: 1px solid #00000008;
+  background: #00000003;
+}
+.prov-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.prov-time {
+  color: #a1a1aa;
+  flex: none;
+}
+.prov-type {
+  color: #27272a;
+  font-weight: 600;
+  flex: none;
+}
+.prov-diff {
+  color: #71717a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prov-meta {
+  flex: none;
+  padding: 4px 10px 6px;
+  font-size: 10px;
+  color: #a1a1aa;
+  border-top: 1px solid #00000008;
+}
+/* ── weather card (current local weather for a typed location) ───────────────────────────────────
+   The interior is fully inline-styled (the usage card's additive pattern); the only thing the app
+   stylesheet owns is the box accent and the same "select the card, then touch its input" rule the
+   sticky uses — until the card is selected its location field is pointer-transparent, so a first click
+   grabs the CARD (reaching the canvas through the interaction seam) instead of dropping a text cursor,
+   and a second click on the selected card focuses it to retype the place. */
+.node.weather {
+  border-left-width: 4px;
+}
+.node.weather:not(.selected) .weather-loc {
+  pointer-events: none;
+}
+.node.weather .weather-loc {
+  user-select: text;
+}
+.node.weather .weather-loc::placeholder {
+  color: #a1a1aa;
+  font-weight: 500;
+}
+
+/* ── session card (a historical agent session, file-backed) ─────────────────────────────────────
+   Renders the jsonl transcript as a clipped column of turns. Like the file card it is static and
+   clipped (no in-interior scroll/click yet — the interaction layer owns the wheel and hit-tests
+   geometrically), so tool calls + thinking are compact always-visible summaries, and a bottom fade
+   signals there is more than the box shows. */
+.node.session {
+  border-left-width: 4px;
+}
+.ses-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 7px 10px 5px;
+  flex: none;
+}
+/* The session id, click-to-copy (render.js): a button reset to read as the bare hash it replaced, with
+   a hover hint that it's actionable and a green ✓ flashed on a successful copy. */
+.ses-name {
+  font-weight: 600;
+  font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #27272a;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+}
+.ses-name:hover {
+  color: #6366f1;
+  text-decoration: underline dotted;
+}
+.ses-name.copied {
+  color: #16a34a;
+  text-decoration: none;
+}
+.ses-name.copied::after {
+  content: " ✓";
+}
+.ses-live {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #16a34a;
+  animation: ses-pulse 1.6s ease-in-out infinite;
+}
+@keyframes ses-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+.ses-meta {
+  margin-left: auto;
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.ses-trunc {
+  color: #d97706;
+}
+/* Live per-turn token counts (↑ context in · ↓ output): steady, monospace, muted — sits beside the
+   pulsing verb pill without competing with it. */
+.ses-usage {
+  font-size: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a1a1aa;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+/* Interactive question widget (the ```ask convention — render.js). The headless replacement for
+   AskUserQuestion: clickable options that answer back through the input duplex. */
+.ses-ask {
+  margin: 6px 0;
+  padding: 8px 10px;
+  border: 1px solid #c7d2fe;
+  border-left: 3px solid #6366f1;
+  border-radius: 6px;
+  background: #f5f6ff;
+}
+.ses-ask-static {
+  border-color: #e4e4e7;
+  border-left-color: #a1a1aa;
+  background: #00000003;
+  opacity: 0.8;
+}
+.ses-ask-q + .ses-ask-q {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #00000010;
+}
+.ses-ask-head {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #6366f1;
+}
+.ses-ask-text {
+  font-size: 12px;
+  font-weight: 600;
+  color: #27272a;
+  margin: 2px 0 6px;
+}
+.ses-ask-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.ses-ask-opt {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 2px 7px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ses-ask-opt:hover {
+  background: #6366f10f;
+}
+.ses-ask-opt input {
+  grid-row: 1;
+  cursor: pointer;
+}
+.ses-ask-label {
+  font-size: 12px;
+  color: #27272a;
+}
+.ses-ask-desc {
+  grid-column: 2;
+  font-size: 10px;
+  color: #71717a;
+  line-height: 1.35;
+}
+.ses-ask-otherrow .ses-ask-other {
+  grid-column: 2;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 5px;
+  border: 1px solid #d4d4d8;
+  border-radius: 4px;
+  background: #fff;
+}
+.ses-ask-submit {
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: #6366f1;
+  border: none;
+  border-radius: 5px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.ses-ask-submit:hover {
+  background: #4f46e5;
+}
+.ses-ask-warn {
+  border-left-color: #d97706;
+}
+.ses-ask-warn .ses-ask-submit {
+  background: #d97706;
+}
+/* Registry-backed status (slice 2): only a working turn pulses; idle/exited are steady. */
+.ses-idle {
+  color: #a1a1aa;
+  animation: none;
+}
+.ses-exited {
+  color: #dc2626;
+  animation: none;
+}
+/* The input half of the duplex — a session-internal prompt box, pinned below the scrolling body. */
+.ses-input-row {
+  position: relative; /* anchors the slash-completion menu, which pops ABOVE the row */
+  flex: none;
+  display: flex;
+  gap: 6px;
+  padding: 7px 10px;
+  border-top: 1px solid #0000000f;
+  background: #fafafa;
+}
+/* Slash-completion menu over the session's advertised skills. Pops above the input (the row is pinned
+   to the card's bottom edge). Owned imperatively by render.js; hidden until it has options (.open). */
+.ses-complete {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: calc(100% - 1px);
+  max-height: 160px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: none;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid #d4d4d8;
+  border-radius: 6px 6px 0 0;
+  box-shadow: 0 -4px 12px #00000018;
+  z-index: 2;
+}
+.ses-complete.open {
+  display: flex;
+}
+.ses-opt {
+  font-size: 11px;
+  padding: 4px 9px;
+  color: #3f3f46;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ses-opt.sel {
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+.ses-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 11px;
+  padding: 4px 7px;
+  border: 1px solid #d4d4d8;
+  border-radius: 5px;
+  background: #fff;
+  color: #27272a;
+}
+.ses-input:focus {
+  outline: none;
+  border-color: #2563eb;
+}
+.ses-input-row button {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border: 1px solid #d4d4d8;
+  border-radius: 5px;
+  background: #fff;
+  color: #3f3f46;
+  cursor: pointer;
+}
+.ses-input-row button:disabled,
+.ses-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+/* Resume control — shown on a historical/exited session card in place of the input row; recommences
+   the session live in the same card (slice 3, the unify-on-resume handoff). */
+.ses-resume {
+  flex: 1 1 auto;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 9px;
+  border: 1px solid #c7d2fe;
+  border-radius: 5px;
+  background: #eef2ff;
+  color: #4338ca;
+  cursor: pointer;
+}
+.ses-resume:hover {
+  background: #e0e7ff;
+}
+.ses-resume:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.ses-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* a real scroll container (the interior-interaction seam): wheel-over and arrow keys scroll it,
+     overscroll-behavior keeps a scroll-to-the-end from chaining out to the canvas */
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  padding: 4px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  font-size: 11px;
+  line-height: 1.45;
+  border-top: 1px solid #00000008;
+}
+.ses-body::-webkit-scrollbar {
+  width: 8px;
+}
+.ses-body::-webkit-scrollbar-thumb {
+  background: #00000022;
+  border-radius: 4px;
+}
+.ses-turn {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.ses-role {
+  font-size: 8.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 700;
+  color: #a1a1aa;
+}
+.ses-you .ses-role {
+  color: #6366f1;
+}
+.ses-claude .ses-role {
+  color: #16a34a;
+}
+.ses-text {
+  word-break: break-word;
+  color: #27272a;
+}
+/* markdown blocks (the shared prose codec in vendor/markdown.js, used by session turns + .md file
+   cards). Collapse the outer margins so the prose never has dead space top/bottom, and keep every
+   block tight — these live inside a small card. Scoped to .md-prose so any card that renders markdown
+   opts in by wearing that class on its container. */
+.md-prose > :first-child {
+  margin-top: 0;
+}
+.md-prose > :last-child {
+  margin-bottom: 0;
+}
+.md-p {
+  margin: 0 0 6px;
+}
+.md-h {
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 8px 0 4px;
+}
+.md-h1 {
+  font-size: 15px;
+}
+.md-h2 {
+  font-size: 13.5px;
+}
+.md-h3 {
+  font-size: 12.5px;
+}
+.md-h4,
+.md-h5,
+.md-h6 {
+  font-size: 11.5px;
+  color: #52525b;
+}
+.md-list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+}
+.md-list .md-list {
+  margin-bottom: 0;
+}
+.md-prose li {
+  margin: 1px 0;
+}
+.md-task {
+  list-style: none;
+  margin-left: -14px;
+}
+.md-box {
+  margin-right: 4px;
+}
+.md-icode {
+  font: 0.92em ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #00000008;
+  border: 1px solid #0000000f;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+.md-pre {
+  margin: 4px 0 6px;
+  padding: 6px 8px;
+  background: #00000008;
+  border-radius: 4px;
+  font: 10.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #27272a;
+}
+.md-pre code {
+  font: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.md-quote {
+  margin: 4px 0 6px;
+  padding: 0 0 0 9px;
+  border-left: 2px solid #d4d4d8;
+  color: #52525b;
+}
+.md-link {
+  color: #6366f1;
+  text-decoration: underline;
+}
+.md-hr {
+  border: none;
+  border-top: 1px solid #e4e4e7;
+  margin: 8px 0;
+}
+.md-table {
+  margin: 4px 0 6px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+.md-table th,
+.md-table td {
+  padding: 3px 7px;
+  border: 1px solid #e4e4e7;
+  text-align: left;
+  vertical-align: top;
+}
+.md-table th {
+  background: #00000006;
+  font-weight: 600;
+}
+/* thinking + tool calls are <details> disclosures — collapsed to a scannable summary, click the
+   ▸ to expand (the host's pointerdown-on-summary keeps the canvas from stealing the click). */
+.ses-body details > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+}
+.ses-body details > summary::-webkit-details-marker {
+  display: none;
+}
+.ses-body details > summary::before {
+  content: "▸";
+  flex: none;
+  color: #a1a1aa;
+  font-size: 9px;
+}
+.ses-body details[open] > summary::before {
+  content: "▾";
+}
+
+.ses-think > summary {
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.ses-think-body {
+  margin: 3px 0 0 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-style: italic;
+  color: #a1a1aa;
+}
+
+.ses-tool {
+  border-left: 2px solid #e4e4e7;
+  padding-left: 7px;
+}
+.ses-tool.err {
+  border-left-color: #ef4444;
+}
+.ses-tool > summary,
+.ses-tool-static {
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #52525b;
+}
+.ses-tool-static {
+  display: flex;
+  gap: 5px;
+  align-items: baseline;
+}
+.ses-tool-name {
+  font-weight: 700;
+  flex: none;
+}
+.ses-tool-hint {
+  color: #71717a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ses-tool-glyph {
+  margin-left: auto;
+  flex: none;
+}
+.ses-tool.err .ses-tool-glyph {
+  color: #ef4444;
+}
+.ses-tool-out {
+  margin: 4px 0 0 12px;
+  padding: 4px 6px;
+  background: #00000008;
+  border-radius: 4px;
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #52525b;
+}
+.ses-empty {
+  color: #a1a1aa;
+  font-style: italic;
+}
+
+/* ── template host (runtime-loaded card types) ───────────── */
+/* lit renders the template into .tpl-interior; display:contents keeps the template's children
+   direct flex items of the .node box, so templated and hardcoded cards share one layout model. */
+.tpl-interior {
+  display: contents;
+}
+
+/* The actor badge — now used ONLY inside the intent-log card to tag each event's actor (the
+   who-touched-this badge that used to float on every card was removed). */
+.actor-badge {
+  flex: none;
+  font-size: 8.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-radius: 4px;
+  padding: 0 4px;
+  color: #fff;
+  background: #a1a1aa;
+}
+.actor-badge.actor-human { background: #22c55e; }
+.actor-badge.actor-remote { background: #f59e0b; }
+.actor-badge.actor-claude { background: #8b5cf6; }
+.actor-badge.actor-system { background: #a1a1aa; }
+
+/* ── edge layer (authored wiring) ────────────────────────── */
+.edge-layer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.edge-layer line {
+  stroke: #c4b5fd;
+  stroke-width: 1.6;
+  stroke-dasharray: 5 4;
+}
+
+/* ── overlays ────────────────────────────────────────────── */
+.selection-box {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px solid #6366f1;
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 2147483647;
+}
+.marquee {
+  position: absolute;
+  top: 0;
+  left: 0;
+  border: 1px solid #6366f1;
+  background: #6366f11a;
+  pointer-events: none;
+  z-index: 2147483647;
+}
+/* Corner resize grab dots on a lone selection. Sized/positioned inline (screen-constant ÷ zoom); this
+   only carries the look. pointer-events:none — the interaction layer hit-tests the corner by geometry,
+   so the dot never needs to be the event target (matches the .selection-box / .marquee discipline). */
+.resize-handle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  background: #fff;
+  border-style: solid;
+  border-color: #6366f1;
+  border-radius: 2px;
+  pointer-events: none;
+  z-index: 2147483647;
+}
+
+/* ── floating chrome ─────────────────────────────────────── */
+.panel {
+  position: absolute;
+  z-index: 10;
+  background: #ffffffd9;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000010;
+  border-radius: 10px;
+  box-shadow: 0 1px 2px #0000000d, 0 6px 20px #0000001a;
+}
+
+/* The right-click add menu — a floating popover anchored at the cursor (left/top set inline). It hosts
+   the same .menu-list rows the old toolbar dropdowns used; only the framing differs. */
+.canvas-menu {
+  position: fixed;
+  min-width: 200px;
+  max-width: 320px;
+  padding: 4px;
+  background: #fff;
+  border: 1px solid #00000014;
+  border-radius: 8px;
+  box-shadow: 0 4px 18px #00000026;
+  z-index: 30;
+}
+.menu-divider {
+  height: 1px;
+  margin: 4px 2px;
+  background: #00000010;
+}
+.menu-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.menu-list button {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  width: 100%;
+  padding: 5px 8px;
+  font: inherit;
+  text-align: left;
+  white-space: nowrap;
+  color: #27272a;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.menu-list button:hover {
+  background: #00000008;
+}
+/* Group labels inside the unified Add menu (Session / Files / Notes & widgets). */
+.menu-section {
+  padding: 7px 8px 2px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.menu-section:first-child {
+  padding-top: 2px;
+}
+
+/* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left, shown only while an
+   event is fresh (the component unmounts it otherwise). The last survivor of the removed status bar. */
+.event-chip {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  z-index: 10;
+  padding: 4px 10px;
+  background: #ffffffd9;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000010;
+  border-radius: 8px;
+  color: #6366f1;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.event-chip b {
+  color: #6366f1;
+  font-weight: 600;
+}
+
+/* The empty-board cue — the one piece of standing chrome, since right-click is otherwise undiscoverable.
+   Centred, faint, and pointer-transparent so it never intercepts the very right-click it advertises. */
+.empty-hint {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 5;
+  pointer-events: none;
+  color: #a1a1aa;
+  font-size: 13px;
+  letter-spacing: 0.01em;
+}

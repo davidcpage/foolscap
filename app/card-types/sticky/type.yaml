@@ -1,0 +1,11 @@
+# The sticky-note card type — a brief memo / todo pad. The FIRST card to hold WRITE capabilities:
+# its interior takes typed input and commits it back as the node's own title/text on the intent log
+# (actor "user" → undoable, provenance-tagged). The grant names exactly the two commands it may
+# emit — setTitle (the one-line header) and setText (the body) — and nothing else: it can edit its
+# OWN node, never reach the editor. Storage today is the intent log (the record's text field,
+# persisted to IndexedDB like every other card); a markdown-file backing would be a later codec, the
+# file card's disk-projection pattern applied to an editable body. setColor recolours the memo via a
+# swatch row in the head — the host applies the c-<color> theme class, so committing recolours the box.
+name: sticky
+contract: 1
+capabilities: [setTitle, setText, setColor]

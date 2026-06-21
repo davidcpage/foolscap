@@ -1,0 +1,12 @@
+# The clock card type, as data in the folder (card-types-as-data.md §3). The yaml half is the
+# schema/codec side; `capabilities` is the whole capability grant — the host passes the template
+# ONLY the off-log signals named here, never the store, never the editor.
+name: clock
+contract: 1
+capabilities: [now]
+# chrome: bare — the clock paints a clock face on transparent ground (file-trees-on-canvas.md §7); the
+# host skips the frame while the AABB box stays for selection + edges. Remove this line to re-frame it.
+chrome: bare
+# aspect: 1 — a clock face is round, so resizing keeps it square (w/h = 1); a corner drag scales it
+# uniformly instead of stretching it to an oval-in-a-rectangle. Drop this line for free resize.
+aspect: 1

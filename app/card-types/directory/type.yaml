@@ -1,0 +1,19 @@
+# The directory card type (file-trees-on-canvas.md §3) — the first-class folder node. FIELDS + CODEC:
+# title carries the directory's path relative to the dataset root (the same path codec the file card
+# uses; basename/glyph mapping lives in render.js as real JS).
+#
+# GRANT:
+#   • `dirListing` — a CALLABLE (path → immediate children) over the OFF-LOG listing projection
+#     (content.ts, /api/ls). The card is an in-card TREE: it calls dirListing(path) for its root and for
+#     each EXPANDED sub-folder, drilling down without leaving the card. Each call is a channel-1
+#     projection from disk — never a commit, never the durable log (the "derived by default" rule, §9).
+#     The log keeps only the card's arrangement + its path reference. DRAG any row onto the canvas to
+#     pin that file/sub-folder as its own card — that promotion is the one authored addNode (§9).
+#   • `treeState` — per-card EPHEMERAL view state: which sub-folders are expanded. Read-tracked + settable
+#     so a local expand/collapse re-renders the card, but never logged and gone on reload (browsing is
+#     view state, not authored state, §9).
+#
+# No `chrome` flag: a directory is a container and wants its frame (unlike the bare clock).
+name: directory
+contract: 1
+capabilities: [dirListing, treeState]
