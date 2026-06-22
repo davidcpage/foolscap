@@ -3,9 +3,12 @@
 // root's immediate children and lets you DRILL DOWN by expanding sub-folders in place, each level's
 // children read off the OFF-LOG `dirListing(path)` capability (content.ts, /api/ls), not node.text, so
 // browsing the tree is a channel-1 projection that never touches the durable log ("derived by default",
-// §9). Which folders are open is `treeState` — per-card view state, also off-log. Every row is DRAGGABLE:
-// drop it on the canvas and the host promotes that one path to an authored node (a file card, or a fresh
-// directory card for a sub-folder — loader.materializeAt). So you navigate INSIDE the card and drag out
+// §9). Which folders are open is `treeState` — per-card view state, also off-log. Every row is DRAGGABLE
+// from anywhere: drop a path on the canvas and the host promotes it to an authored node (a file card, or
+// a fresh directory card for a sub-folder — loader.materializeAt). A FOLDER row additionally CLICKS
+// anywhere to expand/collapse in place; click and drag coexist on the same row because a drag needs
+// pointer movement and a click doesn't. Both gestures get a persistent affordance (the twisty for expand,
+// the ⠿ grip for drag), so neither hides behind the other. So you navigate INSIDE the card and drag out
 // only the specific level you want to pin — the deliberate §9 promotion gesture.
 import { html } from "/vendor/lit-html.js";
 
@@ -47,8 +50,12 @@ export default {
       ts.set(next);
     };
 
-    // One level → an array of rows, recursing into expanded sub-folders. Indent grows with depth; each
-    // dir row carries a twisty (expand/collapse) and is draggable; each file row is draggable.
+    // One level → an array of rows, recursing into expanded sub-folders. Indent grows with depth.
+    // Both gestures work from the WHOLE folder row and don't collide — HTML5 drag needs pointer movement,
+    // a click doesn't, so a real drag suppresses the click and a plain click never starts a drag. So a
+    // FOLDER row is draggable-from-anywhere (the §9 promotion) AND click-anywhere expands; a FILE row only
+    // drags. The visible ⠿ grip + the twisty are the two affordances — neither gesture is hidden behind a
+    // tiny target. (data-interactive contains the pointer seam so a grab drags the row OUT, not the card.)
     const rowsFor = (dir, depth) => {
       const listing = ls(dir); // { dirs, files } | undefined while loading
       const pad = 8 + depth * 14;
@@ -61,13 +68,15 @@ export default {
             class="dir-row dir-sub"
             draggable="true"
             data-interactive="1"
-            title="drag onto the canvas to pin as its own card"
+            title="click to ${isOpen ? "collapse" : "expand"} · drag onto the canvas to pin as its own card"
             style="padding-left:${pad}px"
+            @click=${() => toggle(d)}
             @dragstart=${(e) => dragStart(e, d, "dir")}
           >
-            <span class="dir-tw" @click=${(e) => { e.stopPropagation(); toggle(d); }}>${isOpen ? "▾" : "▸"}</span>
+            <span class="dir-tw">${isOpen ? "▾" : "▸"}</span>
             <span class="dir-glyph">${isOpen ? "📂" : "📁"}</span>
-            <span class="dir-rowname" @click=${(e) => { e.stopPropagation(); toggle(d); }}>${baseName(d)}</span>
+            <span class="dir-rowname">${baseName(d)}</span>
+            <span class="dir-grip" aria-hidden="true">⠿</span>
           </div>
         `);
         if (isOpen) out.push(...rowsFor(d, depth + 1));
@@ -86,6 +95,7 @@ export default {
             <span class="dir-glyph">📄</span>
             <span class="dir-rowname">${baseName(f)}</span>
             ${ext(f) ? html`<span class="dir-ext">${ext(f)}</span>` : ""}
+            <span class="dir-grip" aria-hidden="true">⠿</span>
           </div>
         `);
       }

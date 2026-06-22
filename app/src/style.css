@@ -236,10 +236,13 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 6px;
+  padding: 4px 6px;
   border-radius: 5px;
   font-size: 12px;
   color: #3f3f46;
+  /* A file row's only act is drag-out, so its whole body is the grab handle. A folder row is ALSO
+     draggable-from-anywhere but its primary act is expand, so it overrides to `pointer` below — the
+     always-visible .dir-grip is what advertises that it drags too. */
   cursor: grab;
 }
 .dir-row:hover {
@@ -248,19 +251,48 @@ body {
 .dir-row:active {
   cursor: grabbing;
 }
+/* A folder row clicks-anywhere to expand (the light, frequent act) — pointer advertises that. It still
+   drags from anywhere; the persistent grip carries the drag cue so neither gesture hides behind the other. */
+.dir-sub {
+  cursor: pointer;
+}
+.dir-sub:active {
+  cursor: pointer;
+}
 .dir-sub .dir-rowname {
   font-weight: 600;
 }
-/* The expand/collapse twisty on a folder row (empty spacer on a file row, so names align). Clicking it
-   toggles the level; dragging anywhere on the row still promotes it. A fixed width keeps depths aligned. */
+/* The expand/collapse twisty on a folder row (empty spacer on a file row, so names align). The whole
+   folder row toggles, so this is purely a visual cue. A fixed width keeps depths aligned. */
 .dir-tw {
   flex: none;
   width: 12px;
   text-align: center;
-  font-size: 9px;
+  font-size: 10px;
   color: #a1a1aa;
-  cursor: pointer;
   user-select: none;
+}
+/* The drag-out handle — a persistent, unmistakable "grab me onto the canvas" cue on every row, so a
+   folder row's drag affordance isn't lost under its expand affordance. Faint at rest, full on row hover. */
+.dir-grip {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 3px;
+  font-size: 12px;
+  line-height: 1;
+  color: #c4c4cc;
+  cursor: grab;
+  opacity: 0.4;
+  transition: opacity 0.1s, color 0.1s;
+}
+.dir-grip:active {
+  cursor: grabbing;
+}
+.dir-row:hover .dir-grip {
+  opacity: 1;
+}
+.dir-grip:hover {
+  color: #6366f1;
 }
 .dir-glyph {
   flex: none;

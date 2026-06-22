@@ -171,7 +171,7 @@ test("file template renders a .md card as PROSE (shared markdown codec), other k
   assert.ok(ts.includes("## not a heading") && !ts.includes("md-h"), "no markdown parsing for a .ts file");
 });
 
-test("directory template is an in-card tree: dirListing(path) per level, treeState expands, each row draggable", async () => {
+test("directory template is an in-card tree: dirListing(path) per level, treeState expands, every row drags / folders also expand", async () => {
   const mod = await loadTemplate("directory");
   assert.equal(mod.contract, 1);
 
@@ -199,11 +199,14 @@ test("directory template is an in-card tree: dirListing(path) per level, treeSta
   assert.ok(out.includes('dir-ext">ts<'), "file kind from extension");
   assert.ok(!out.includes(">select.ts<"), "a collapsed sub-folder hides its children");
 
-  // Every row is draggable (the drag-out promotion gesture, §9) and contained from the canvas drag
-  // (data-interactive, so grabbing a row drags it OUT, not the whole card).
-  assert.ok(out.includes('draggable="true"'), "rows are draggable");
+  // Promotion is the drag-out gesture (§9): every row is draggable from anywhere, contained from the
+  // canvas drag (data-interactive, so the grab drags the path OUT, not the whole card). A FOLDER row
+  // ALSO clicks-to-expand — the two coexist — and every row shows a persistent .dir-grip drag cue so
+  // the drag affordance isn't lost under the expand affordance.
+  assert.ok(out.includes('draggable="true"'), "rows are draggable for drag-out promotion");
   assert.ok(out.includes('data-interactive="1"'), "rows are contained from the canvas pointer seam");
   assert.ok(out.includes("dir-sub"), "a sub-dir row is marked distinct from a file row");
+  assert.ok(out.includes("dir-grip"), "every row carries a persistent drag-out grip cue");
 
   // Expand the sub-folder (treeState carries the open path) → its children drill IN, in place, rather
   // than spawning a separate card. This is the §B in-card tree behaviour.

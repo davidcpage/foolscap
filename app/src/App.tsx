@@ -110,6 +110,10 @@ function Board({ m, undo, persistence }: Engine) {
   const [menu, setMenu] = useState<{ screen: Pos; at: Pos } | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
+  // Where a drag-out gesture began (screen point + the card it left), captured on dragstart. Dropping
+  // back ON that card, or within a small radius of the grab point, ABORTS the promotion instead of
+  // spawning a card — the bail-out for an accidental grab. Null when no drag-out is in flight.
+  const dragOriginRef = useRef<{ x: number; y: number; nodeId: string | null } | null>(null);
 
   // Reactive node count — drives the empty-board hint (the only visible "how do I add things?" cue now
   // that the header is gone).
@@ -215,17 +219,55 @@ function Board({ m, undo, persistence }: Engine) {
   // preventDefault for the drop to fire, and only for our own mimes so a stray file/text drag is ignored.
   const FS_MIME = "application/x-canvas-fsnode";
   const SESSION_MIME = "application/x-canvas-session";
-  const onDragOver = useCallback((e: React.DragEvent) => {
+  // Screen-px radius around the grab point that counts as "dropped back where it started" → cancel.
+  const DRAG_CANCEL_RADIUS = 48;
+  const isOurDrag = (e: React.DragEvent) => {
     const t = e.dataTransfer.types;
-    if (t.includes(FS_MIME) || t.includes(SESSION_MIME)) {
-      e.preventDefault();
-      e.dataTransfer.dropEffect = "copy";
+    return t.includes(FS_MIME) || t.includes(SESSION_MIME);
+  };
+  // A drop is a CANCEL when it lands back on the source card, or within DRAG_CANCEL_RADIUS of the grab
+  // point. dragstart bubbles up from the row's handler (which has already set the mime) to here, so we
+  // read the grab point + originating card off the event itself — the templates stay untouched.
+  const inCancelZone = (e: React.DragEvent) => {
+    const o = dragOriginRef.current;
+    if (!o) return false;
+    if (o.nodeId) {
+      const over = (e.target as HTMLElement)?.closest?.("[data-node-id]");
+      if (over?.getAttribute("data-node-id") === o.nodeId) return true;
     }
+    return Math.hypot(e.clientX - o.x, e.clientY - o.y) < DRAG_CANCEL_RADIUS;
+  };
+  const onDragStart = useCallback((e: React.DragEvent) => {
+    if (!isOurDrag(e)) return;
+    const src = (e.target as HTMLElement)?.closest?.("[data-node-id]");
+    dragOriginRef.current = { x: e.clientX, y: e.clientY, nodeId: src?.getAttribute("data-node-id") ?? null };
+  }, []);
+  const onDragEnd = useCallback(() => {
+    dragOriginRef.current = null;
+  }, []);
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    if (!isOurDrag(e)) return;
+    // In the cancel zone, leave the default (no-drop): the browser shows the universal no-drop cursor —
+    // the clearest "release here to abort" cue — and never fires `drop`, so the release just cancels.
+    // (The native snap-back-to-origin animation on release has a fixed duration JS can't tune, so we
+    // accept it.) Outside the zone, accept the drop as a copy.
+    if (inCancelZone(e)) {
+      e.dataTransfer.dropEffect = "none";
+      return;
+    }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
   }, []);
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       const el = canvasRef.current;
       if (!el) return;
+      // Belt-and-suspenders: a release on the cancel-zone boundary can still fire here — abort it.
+      if (inCancelZone(e)) {
+        dragOriginRef.current = null;
+        return;
+      }
+      dragOriginRef.current = null;
       const rect = el.getBoundingClientRect();
       const toPage = () => m.camera.screenToPage(vec(e.clientX - rect.left, e.clientY - rect.top));
 
@@ -292,8 +334,10 @@ function Board({ m, undo, persistence }: Engine) {
         tabIndex={0}
         onKeyDown={onKeyDown}
         onPointerDown={() => canvasRef.current?.focus()}
+        onDragStart={onDragStart}
         onDragOver={onDragOver}
         onDrop={onDrop}
+        onDragEnd={onDragEnd}
         onContextMenu={onContextMenu}
       >
         <CanvasView m={m} />
