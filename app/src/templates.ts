@@ -2,8 +2,8 @@ import { nothing, render as litRender } from "../vendor/lit-html.js";
 import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal } from "./feeds";
-import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
+import { openSession, openChannel, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
 import { cellOutputsSignal, runCell, syncCells, type CellSpec } from "./notebook-runtime";
 import { weatherSignal, type WeatherData } from "./weather";
 import { activeBoardId } from "./board";
@@ -85,6 +85,7 @@ const CAPABILITY_SIGNALS: Record<string, Subscribable<unknown>> = {
   hn: feedSignal("hn"),
   usage: feedSignal("usage"), // account-level plan windows, polled server-side (vite-fs-plugin.ts)
   sessionList: sessionListSignal, // the historical-transcript list (GET /api/sessions), the sessions card's body
+  channelList: channelListSignal, // the persisted-channel list (GET /api/channels), the channels card's body
   roots: rootsSignal, // the board's roots (canonical + git worktrees), each with a colour — worktree-activity slice B/C
 };
 
@@ -423,6 +424,24 @@ export function buildCard(
       if (host) {
         const { m, id } = host;
         signals.sessionOpen = (sid: string): void => void openSession(m, sid, cascadeFrom(m, id, 520, 400));
+      }
+      continue;
+    }
+    // `channelRefresh` is the channels browser card's re-pull ACTION (the sessions card's `sessionRefresh`
+    // twin): re-fetch the off-log channel list (content.ts) and notify. Board-global, never the canvas log.
+    if (name === "channelRefresh") {
+      signals.channelRefresh = (): void => refreshChannelList();
+      continue;
+    }
+    // `channelOpen` is the channels browser's DOUBLE-CLICK open — the keyboard-free twin of the drag-out
+    // (App.tsx's drop → openChannel). Same authored addNode (or fly-to if the card already exists), placed by
+    // cascadeFrom off THIS browser card since a double-click carries no drop point. Per-card: needs the host id
+    // to anchor the cascade. A no-op without a host (the headless mock has none).
+    if (name === "channelOpen") {
+      if (host) {
+        const { m, id } = host;
+        signals.channelOpen = (chanId: string, title: string, text: string): void =>
+          openChannel(m, chanId, title, text, cascadeFrom(m, id, 300, 240));
       }
       continue;
     }

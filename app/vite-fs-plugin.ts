@@ -9,6 +9,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
+import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, upsertChannelMeta } from "./channel-ledger.js";
 import { resolveTags } from "./channel-tags.js";
 import chokidar from "chokidar";
 
@@ -683,6 +684,39 @@ function startSessionsFeed(boardId: string, dir: string): void {
   chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("sessions:" + boardId, { ts: Date.now() }), 200);
+  });
+}
+
+// GET /api/channels → every channel this board has on disk (newest activity first), for the channels-list
+// rail (the channels browser card, the sessions card's twin). Mirrors handleSessions: a cheap readdir of the
+// `.canvas/channels/` markers, NOT the message logs — the rail wants title/description/activity, not the
+// conversation (the card reads that off the channel:<id> feed once opened). `messages` is the last seq, the
+// monotonic count of everything posted; a channel deleted from the canvas still lists here, so "reopen it
+// later" needs no canvas persistence — the marker is the source of truth (the sessions list's .jsonl rationale).
+function handleChannels(res: ServerResponse, repoPath: string): void {
+  const channels = listChannels(repoPath).map((m) => ({
+    chanId: m.chanId as string,
+    title: typeof m.title === "string" ? m.title : "",
+    text: typeof m.text === "string" ? m.text : "",
+    messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
+    mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
+  }));
+  sendJson(res, 200, { channels });
+}
+
+// ── channels-list feed (the channels browser card's live push) ──────────────────────────────────
+// The channels-list mirror of startSessionsFeed: watch `.canvas/channels/` and PING the `channels:<boardId>`
+// feed on any marker add/change (a channel gaining its first message, or a title/activity update); the client
+// re-pulls /api/channels once per ping (content.ts). A bare ping, not the list — handleChannels stays the one
+// place the list is built. mkdir first so chokidar has a directory to watch even before any channel has been
+// persisted (a fresh board). Not pinned on fsState — boardFeedsStarted stops a reload from stacking a second.
+function startChannelsFeed(boardId: string, repoPath: string): void {
+  const dir = canvasChannelsDir(repoPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
+  let t: ReturnType<typeof setTimeout> | null = null;
+  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("channels:" + boardId, { ts: Date.now() }), 200);
   });
 }
 
@@ -1373,8 +1407,12 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
 // ≤ one wake per idle/result boundary, and an ignored nudge isn't re-fired until NEW traffic arrives.
 const MAX_CHANNEL_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
 
-// Append to a channel's log, trim to the tail, and republish its feed (the card's conversation view).
-function appendChannelMsg(chanId: string, from: string, text: string, kind?: "ask"): ChannelMsg {
+// Append to a channel's log, trim to the tail, republish its feed (the card's conversation view), and
+// PERSIST the message to the board's `.canvas/channels/` ledger so it survives a cold restart (the in-memory
+// `channelLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
+// every caller already has it. The marker upsert also makes the channel appear in the channels-list rail and
+// keeps its title/description fresh from the live snapshot. Both disk writes are best-effort (channel-ledger).
+function appendChannelMsg(boardId: string, chanId: string, from: string, text: string, kind?: "ask"): ChannelMsg {
   let log = channelLogs.get(chanId);
   if (!log) channelLogs.set(chanId, (log = []));
   const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
@@ -1383,7 +1421,36 @@ function appendChannelMsg(chanId: string, from: string, text: string, kind?: "as
   let truncated = false;
   if (log.length > MAX_CHANNEL_MSGS) { log.splice(0, log.length - MAX_CHANNEL_MSGS); truncated = true; } // keep recent
   publishFeed("channel:" + chanId, { messages: log, truncated });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (repoPath) {
+    appendChannelLine(repoPath, chanId, msg);
+    // Refresh the marker. Title/description ride along only when the snapshot can resolve the channel node
+    // (so a momentary no-snapshot post bumps activity without clobbering a good title with a blank one).
+    const records = boardSnapshotRecords(boardId);
+    const chan = records ? channelNode(records, chanId) : null;
+    const meta: Record<string, unknown> = { lastSeq: msg.seq, lastTs: msg.ts };
+    if (chan) { meta.title = chan.title ?? ""; meta.text = typeof chan.text === "string" ? chan.text : ""; }
+    upsertChannelMeta(repoPath, chanId, meta);
+  }
   return msg;
+}
+
+// Restore a board's channel logs from `.canvas/channels/*.jsonl` into the in-memory map at boot (once per
+// board, gated by startBoardFeeds). This is the cold-restart fix: without it, a process restart emptied every
+// channel card's conversation. Republishing each restored log to its `channel:<id>` feed seeds feedValues, so
+// a tab that connects to /api/feeds AFTER the restart gets the history replayed (handleFeeds) — the channel
+// card renders its backlog with no message having to arrive first. Channel ids are globally unique, so the
+// shared (cross-board) channelLogs map is safe to seed per board; a log already in memory (a hot re-eval kept
+// it pinned) is left alone — disk and memory agree, and we don't want to clobber a live tail with a stale read.
+function seedChannelLogs(repoPath: string): void {
+  for (const meta of listChannels(repoPath)) {
+    const chanId = meta.chanId as string;
+    if (channelLogs.has(chanId)) continue; // pinned from before a hot re-eval — keep the live one
+    let log = readChannelLog(repoPath, chanId);
+    if (log.length > MAX_CHANNEL_MSGS) log = log.slice(log.length - MAX_CHANNEL_MSGS); // keep the recent tail
+    channelLogs.set(chanId, log);
+    if (log.length) publishFeed("channel:" + chanId, { messages: log, truncated: false });
+  }
 }
 
 // The channel ids a session is an OPEN member of (the reverse of channelMemberSids), for nudge/read.
@@ -1905,6 +1972,8 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   startGitHeadFeed(boardId, repoPath);
   startSessionsFeed(boardId, sessionsDir(repoPath));
   startWorktreesFeed(boardId, repoPath);
+  seedChannelLogs(repoPath); // restore channel conversations from `.canvas/channels/` (cold-restart fix)
+  startChannelsFeed(boardId, repoPath); // live-push the channels-list rail as channels gain activity
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
 }
 
@@ -2335,7 +2404,7 @@ function maybeAnnounceMembership(
         `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
     );
     if (others.length) {
-      appendChannelMsg(chan.id, "system", `${sid} joined the channel. members now: ${roster}.`);
+      appendChannelMsg(boardId, chan.id, "system", `${sid} joined the channel. members now: ${roster}.`);
       wakeChannelMembers(boardId, chan.id, sid, null); // a join is a room event — broadcast it to all members
     }
     const js = liveSessions.get(sid);
@@ -2370,7 +2439,7 @@ async function handleChannelMessage(
 
   // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
   // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
-  const msg = appendChannelMsg(chanId, from, body.text);
+  const msg = appendChannelMsg(boardId, chanId, from, body.text);
   // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
   // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
   const { wakeAll, human, members: tagged } = resolveTags(body.text, members);
@@ -2594,7 +2663,7 @@ async function handleChannelReply(
 
   settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
   // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  appendChannelMsg(chanId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, "ask");
+  appendChannelMsg(boardId, chanId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, "ask");
   sendJson(res, 200, { ok: true, askId: ask.askId, channel: chanId, delivered: true });
 }
 
@@ -2695,6 +2764,11 @@ export function fsApi(): Plugin {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
           return handleSessions(res, sessionsDir(b.repoPath), b.repoPath);
+        }
+        if (url.pathname === "/api/channels") {
+          const b = reqBoard(url);
+          if (!b) return sendJson(res, 400, { error: "unknown board" });
+          return handleChannels(res, b.repoPath);
         }
         if (url.pathname === "/api/card-types") return handleCardTypesList(res);
         if (url.pathname === "/api/boards" && req.method === "POST")

@@ -8,13 +8,14 @@
 export type SessionStatus = "working" | "waiting" | "waiting-agent" | "done" | "crashed" | "ended";
 
 // Hex matched to the card band (.ses-frame-*): a calm green `working`, the loud amber `waiting`, a steady
-// blue `waiting-agent` (idle but blocked on a PEER, not you), a lighter steady `done`, a loud red
-// `crashed`, and muted grey `ended`.
+// blue `waiting-agent` (idle but blocked on a PEER, not you), a loud red `crashed`, and muted grey
+// `ended`. `done` shares the grey `ended` colour — a wound-down session makes no demand on you either
+// way; the "done" vs "ended" distinction survives only in the LABEL, not the colour.
 export const STATUS_COLOR: Record<SessionStatus, string> = {
   working: "#16a34a",
   waiting: "#f59e0b",
   "waiting-agent": "#2563eb",
-  done: "#86efac",
+  done: "#d4d4d8",
   crashed: "#ef4444",
   ended: "#d4d4d8",
 };

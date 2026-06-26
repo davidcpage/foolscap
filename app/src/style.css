@@ -1396,15 +1396,11 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-frame-waiting-agent {
   background: #2563eb;
 }
-/* ended: muted grey — the process has exited (a clean /terminate, or a status-less historical tail);
-   nothing here wants your attention. */
+/* ended: muted grey — the process has wound down (a /done, a clean /terminate, or a status-less historical
+   tail); nothing here wants your attention. `done` shares this band — the "✓ done" pill carries the only
+   positive-end distinction, the colour does not. */
 .ses-frame-ended {
   background: #d4d4d8;
-}
-/* done (Phase 2): a calm green band — work declared finished via /done. Distinct from the vivid, busy
-   "working" green by being lighter and steady (no pulse, no demand): a settled, positive end. */
-.ses-frame-done {
-  background: #86efac;
 }
 /* crashed (Phase 2): a loud red band — the process died on its own (not a /done, /terminate, or clean
    server shutdown). Steady, not pulsing (the amber "waiting" pulse owns "act now"); red says "look here". */
@@ -1427,9 +1423,6 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 }
 .ses-head[data-ses-state="ended"] {
   background: #fafafa;
-}
-.ses-head[data-ses-state="done"] {
-  background: #f0fdf4;
 }
 .ses-head[data-ses-state="crashed"] {
   background: #fef2f2;
@@ -2422,6 +2415,17 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .waiting-chip:hover {
   border-color: #f59e0b66;
   box-shadow: 0 2px 12px #f59e0b33;
+}
+/* The 8-char session hash, leading the chip — matches the card head's clipped id so you can eyeball which
+   card a waiting chip belongs to. Monospace + muted so it reads as an id, not as the title. */
+.waiting-hash {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #71717a;
+}
+.waiting-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
 }
 .waiting-more {
   pointer-events: none;

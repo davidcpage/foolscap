@@ -550,16 +550,23 @@ export default {
     // on its own). A status `exited` or file-tail with no recorded reason keeps the old generic wording.
     const endReason = live && live.endReason;
     const ended = status === "exited" || inactive;
-    const endFrame = endReason === "done" ? "done" : endReason === "crashed" ? "crashed" : "ended";
+    // `done` folds into the grey "ended" band: a wound-down session makes no demand on you whether it was
+    // explicitly /done or cleanly torn down. The positive "work wrapped up" distinction survives only in
+    // the pill text ("✓ done" vs "✕ ended"), not the band/header colour.
+    const endFrame = endReason === "crashed" ? "crashed" : "ended";
     // An idle session that named a peer in a channel @-tag is waiting on an AGENT, not you — the server
     // carries that as `waitingOn` (the tagged sids). It reads blue, a quieter "still in flight elsewhere"
     // rather than the loud amber "your turn". Cleared server-side the moment the session next runs.
     const waitingOnAgent = status === "idle" && !!(live && Array.isArray(live.waitingOn) && live.waitingOn.length);
+    // A just-spawned process is idle before its first turn — but it's handed nothing back to you yet, so
+    // the loud amber "your turn" band is wrong. An idle session with an empty feed has never run a turn →
+    // it stays bandless (neutral) until it produces output and goes idle again, which IS your turn.
+    const neverRun = status === "idle" && raw.trim() === "";
     const frameState =
       status === "running"
         ? "working"
         : status === "idle"
-          ? waitingOnAgent ? "waiting-agent" : "waiting"
+          ? neverRun ? null : waitingOnAgent ? "waiting-agent" : "waiting"
           : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
@@ -578,9 +585,11 @@ export default {
       status === "running"
         ? html`<span class="ses-live ses-running">● ${verb}…</span>`
         : status === "idle"
-          ? waitingOnAgent
-            ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
-            : html`<span class="ses-live ses-idle">○ waiting</span>`
+          ? neverRun
+            ? html`<span class="ses-live">● live</span>`
+            : waitingOnAgent
+              ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
+              : html`<span class="ses-live ses-idle">○ waiting</span>`
           : status === "exited"
             ? endPill("✕ exited", "ses-exited")
             : inactive

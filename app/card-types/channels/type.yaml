@@ -1,0 +1,20 @@
+# The channels browser card type — a persistent on-canvas list of this board's channels, the sessions card's
+# twin (and the directory card's move): instead of a menu chooser, put a browser on the board and DRAG a row
+# out to REOPEN that channel. A single board-global card (one node:channels), so it carries no per-card key;
+# FIELDS title/text/color are unused chrome (the body is the list).
+#
+# GRANT:
+#   • `channelList` — the OFF-LOG list of persisted channels (content.ts, GET /api/channels): chanId + title +
+#     description + message-count + last-activity, newest-first. Channel-1 / derived — listing the
+#     `.canvas/channels/` markers touches no diff, no intent event, no persistence. DRAG any row onto the
+#     canvas to REOPEN that channel as its own card (loader.openChannel) — that promotion is the one act.
+#   • `channelRefresh` — a board-global ACTION (a bound fn, not a signal) that re-pulls the list. A live push
+#     covers the common case (the channels feed pings on a marker change); this ⟳ button is the manual force.
+#   • `channelOpen` — a per-card ACTION (a bound fn taking chanId/title/text) that REOPENS that channel as a
+#     card on double-click: the keyboard-free twin of the drag-out (loader.openChannel), placed offset
+#     down-right from this browser card (loader.cascadeFrom) since a double-click carries no drop point.
+#
+# No `chrome` flag: a browser is a container and wants its frame (like the directory / sessions card).
+name: channels
+contract: 1
+capabilities: [channelList, channelRefresh, channelOpen]

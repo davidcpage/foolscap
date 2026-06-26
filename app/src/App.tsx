@@ -32,6 +32,7 @@ import {
   addNotebookCard,
   addProvenanceCard,
   addSessionsCard,
+  addChannelsCard,
   addStickyNote,
   addUsageCard,
   addWeatherCard,
@@ -42,6 +43,7 @@ import {
   materializeAt,
   materializeImageAt,
   openSession,
+  openChannel,
   registerFileCommands,
   reprojectContent,
   spawnLiveSession,
@@ -445,11 +447,12 @@ function Board({ m, undo, persistence }: Engine) {
   // preventDefault for the drop to fire, and only for our own mimes so a stray file/text drag is ignored.
   const FS_MIME = "application/x-canvas-fsnode";
   const SESSION_MIME = "application/x-canvas-session";
+  const CHANNEL_MIME = "application/x-canvas-channel";
   // Screen-px radius around the grab point that counts as "dropped back where it started" → cancel.
   const DRAG_CANCEL_RADIUS = 48;
   const isOurDrag = (e: React.DragEvent) => {
     const t = e.dataTransfer.types;
-    return t.includes(FS_MIME) || t.includes(SESSION_MIME);
+    return t.includes(FS_MIME) || t.includes(SESSION_MIME) || t.includes(CHANNEL_MIME);
   };
   // An OS file drag (a screenshot/image dragged in from Finder) advertises the "Files" type. We accept it
   // in dragover so the browser fires `drop`, then filter to images in onDrop (the type isn't readable until
@@ -553,6 +556,21 @@ function Board({ m, undo, persistence }: Engine) {
         if (!payload.id) return;
         const p = toPage();
         void openSession(m, payload.id, { x: Math.round(p.x), y: Math.round(p.y) });
+        return;
+      }
+
+      const chanRaw = e.dataTransfer.getData(CHANNEL_MIME);
+      if (chanRaw) {
+        e.preventDefault();
+        let payload: { chanId: string; title?: string; text?: string };
+        try {
+          payload = JSON.parse(chanRaw);
+        } catch {
+          return;
+        }
+        if (!payload.chanId) return;
+        const p = toPage();
+        openChannel(m, payload.chanId, payload.title ?? "", payload.text ?? "", { x: Math.round(p.x), y: Math.round(p.y) });
       }
     },
     [m],
@@ -638,7 +656,8 @@ function Board({ m, undo, persistence }: Engine) {
               onClick={() => jumpToSession(s.id)}
             >
               <span className="session-headsup-dot" />
-              {s.title || s.id.slice(0, 8)}
+              <span className="waiting-hash">{s.id.slice(0, 8)}</span>
+              {s.title && <span className="waiting-title">{s.title}</span>}
             </button>
           ))}
           {waiting.length > 4 && <div className="waiting-more">+{waiting.length - 4} more waiting</div>}
@@ -715,6 +734,7 @@ function CanvasMenu({
         <button onClick={() => run(() => void spawnLiveSession(m, at))}>New session</button>
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
         <button onClick={() => run(() => void createChannel(m.editor, at))}>New channel</button>
+        <button onClick={() => run(() => addChannelsCard(m, at))}>Channels</button>
         <div className="menu-section">Files</div>
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>

@@ -569,6 +569,23 @@ export function addSessionsCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
+// The channels browser card (card-types/channels) — the sessions card's twin: a persistent on-canvas list of
+// this board's channels; drag a row out (or double-click) to REOPEN that channel as a card (openChannel). Its
+// body reads the off-log `channelList` projection (content.ts, /api/channels), so this addNode is the only
+// thing it ever logs — the list churns off-log like the sessions card. A stable singleton id (node:channels) →
+// idempotent: re-adding is a no-op rather than littering the board. actor "user" + selected, like addSessionsCard.
+export function addChannelsCard(m: InteractionManager, at?: Pos): void {
+  const w = 280;
+  const h = 360;
+  const id = "node:channels" as Id<"node">;
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "channels", title: "", text: "", color: "purple", ...(at ?? spawnAt(m, w, h)), w, h },
+  });
+  m.selection.set([id]);
+}
+
 // A NOTEBOOK card (docs/notebook-card.md). A notebook is a file-backed card like any file
 // card: write a starter `.html` (Observable Notebooks 2.0 format) to a path under the canonical root, then
 // add the node via the file-card path so the card VIEWS that file — source on disk, body off the off-log
@@ -680,6 +697,39 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       h: SESSION_CARD_H,
     },
   });
+}
+
+// Reopen a channel as a card from the channels browser (the sessions card's twin, card-types/channels). Unlike
+// openSession there's NO server round-trip: a channel's node id IS the channel id (`node:chan:<short>`), and its
+// message log already lives server-side (seeded from `.canvas/channels/` at boot, streamed on channel:<id>), so
+// reopening is purely a canvas act — re-add the node with the SAME id and the card's NodeView re-subscribes to
+// the feed and shows the restored backlog. If a card for this channel is already on the board, FLY to it (select
+// + fitSelection) instead of littering a duplicate; otherwise add it (at the drop point, else viewport-centred)
+// and select it. actor "user" (like createChannel / addSessionsCard) so a reopen is an undoable, attributed act.
+const CHANNEL_CARD_W = 300;
+const CHANNEL_CARD_H = 240;
+export function openChannel(m: InteractionManager, chanId: string, title: string, text: string, at?: Pos): void {
+  const id = chanId as Id<"node">;
+  if (m.editor.store.get<"node">(id)) {
+    m.selection.set([id]);
+    m.fitSelection();
+    return;
+  }
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: {
+      id,
+      type: "channel",
+      title: title || "channel",
+      text: text ?? "",
+      color: "purple",
+      ...(at ?? spawnAt(m, CHANNEL_CARD_W, CHANNEL_CARD_H)),
+      w: CHANNEL_CARD_W,
+      h: CHANNEL_CARD_H,
+    },
+  });
+  m.selection.set([id]);
 }
 
 // Spawn a NEW live Claude Code session (agent-sessions §8 / slice 2) and drop a card showing it. The
