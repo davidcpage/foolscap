@@ -38,7 +38,11 @@ export interface EdgeRecord extends BaseRecord {
   id: Id<"edge">;
   from: Id<"node">;
   to: Id<"node">;
-  type: string; // "links" | "contains" | ...
+  type: string; // "links" | "contains" | "member:open" | "member:pending" | "watch:open" | ...
+  // A "member:*" edge is a session card's membership in a channel node (from: session, to: channel) — the
+  // join relationship the agent-coordination layer rides (see app/src/channels.ts). The description lives on
+  // the channel NODE's text, not here, so it stays editable like any card. The engine is blind to all of
+  // this: it only sees a typed edge between two nodes.
 }
 
 export interface LayoutRecord extends BaseRecord {
@@ -51,6 +55,11 @@ export interface LayoutRecord extends BaseRecord {
   h: number;
   z: number; // stacking order — higher paints on top + wins hit-testing. Explicit (not insertion
   // order) so it's serializable + agent-legible: an agent can read/reason about "what's on top".
+  anchor?: "screen" | "world"; // where x/y/w/h live. Absent ≡ "world" (the default): page-space, pans
+  // and zooms with the canvas like every card. "screen" makes the card FLOATING chrome — x/y/w/h are
+  // SCREEN pixels and it stays put under pan/zoom (a pinned minimap, legend, scratch note). A floating
+  // card is renderer chrome: excluded from the spatial index / hit-test / marquee / zoom-to-fit bounds,
+  // and moved by its own drag, not the engine's. Flip back to "world" to drop it onto the canvas.
 }
 
 export type AnyRecord = NodeRecord | EdgeRecord | LayoutRecord;

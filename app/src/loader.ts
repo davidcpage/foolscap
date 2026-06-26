@@ -1,5 +1,7 @@
 import {
   nodeId,
+  layoutId,
+  type Editor,
   type Id,
   type InteractionManager,
   type NodeRecord,
@@ -8,7 +10,8 @@ import {
   type AnyRecord,
 } from "./lib";
 import { fileKind } from "./fileTypes";
-import { filePreview, setFileContent } from "./content";
+import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce } from "./content";
+import { activeBoardId } from "./board";
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
@@ -19,7 +22,9 @@ import { filePreview, setFileContent } from "./content";
 // log (the clock rule applied to file bodies). addFolder/watchDataset push content into that signal
 // instead of committing setText.
 
-export type RootId = "repo";
+// A root is the canonical checkout ("repo") OR a git worktree (its dir-basename slug). The id is part
+// of every file/dir card's node id (`node:<root>:<path>`), so the roots never collide on the board.
+export type RootId = string;
 
 export interface TreeFile {
   path: string;
@@ -36,6 +41,35 @@ export interface WatchEvent {
 // headless fallback origin (spawnAt has no viewport to centre in).
 const CARD_W = 250;
 const CARD_H = 180;
+// Markdown opens as PROSE (card-types/file/render.js renders kind "md" through the markdown codec, every
+// other kind as a raw <pre>), so it wants real reading room — the bare-preview footprint above is far too
+// cramped for a rendered document. A wide, tall default that gives prose a comfortable measure out of the
+// box; you still resize from there.
+const PROSE_CARD_W = 560;
+const PROSE_CARD_H = 620;
+// A session card streams a transcript (often wide turn text / tables / code) plus its input row, and a
+// live working session is something you settle into — so it opens GENEROUS by default rather than at a
+// cramped footprint you have to resize every time. The shape is a landscape ~3:2 (wider than tall): width
+// is what stops long lines wrapping to ribbons, and that aspect matches a comfortably-sized working card
+// on a wide screen. Shared by opening a historical session and spawning a live one, so both land at the
+// same footprint; resize from there for the rest.
+const SESSION_CARD_W = 800;
+const SESSION_CARD_H = 520;
+// An image card opens at the image's OWN aspect ratio (measured at drop, fitImageBox below), so there's
+// no letterbox gap to begin with, and resizing stays aspect-locked (type.yaml `aspect: auto`) so the gap
+// never reappears. The fallback footprint is only used when the bytes can't be decoded. Dropped images
+// land under `.canvas/images/` — the canvas's own filesystem (docs/canvas-home.md): human-gitignored,
+// shadow-versioned, served by /api/asset (which excludes only the shadow git-dirs under `.canvas/roots/`,
+// so this content path is reachable).
+const IMAGE_CARD_W = 320;
+const IMAGE_CARD_H = 260;
+// The bounding box a dropped image's card is fitted into: the longer side caps here, the shorter scales to
+// keep aspect, and MIN_SIZE (80×60, the resize floor) is the lower clamp. Generous per the size-cap norm —
+// a one-time card footprint, not a memory bound.
+const IMAGE_MAX = 420;
+const IMAGE_MIN_W = 80;
+const IMAGE_MIN_H = 60;
+const IMAGE_DIR = ".canvas/images";
 const COL_GAP = 36;
 const ORIGIN_X = 48;
 const ORIGIN_Y = 48;
@@ -44,6 +78,86 @@ const ORIGIN_Y = 48;
 // the same card without any path→id bookkeeping, and the two datasets never collide.
 function fileNodeId(root: RootId, p: string): Id<"node"> {
   return `node:${root}:${p}` as Id<"node">;
+}
+
+// The PARENT folder of a root-relative path ("a/b/c" → "a/b", "a" → "" = the root listing). Paths are
+// POSIX-style — the server emits path.relative joined with "/", and the root directory is keyed by "".
+function parentDir(p: string): string {
+  const i = p.lastIndexOf("/");
+  return i < 0 ? "" : p.slice(0, i);
+}
+
+// Register the file-card commands the loader commits through `editor.commit` (kept here, next to the
+// (root, path) id scheme they depend on, rather than in core/ which is path-blind). Called once at engine
+// construction (App.createEngine). Today that's just `remapFileNodes` — the atomic re-key behind an in-app
+// rename/move (see renameFileNodes). The payload is a fully-resolved put/remove pair computed browser-side,
+// so the handler stays dumb: remove the old (node, layout, edge) records, put the new ones, in ONE
+// transaction → one diff → one IntentEvent.
+export function registerFileCommands(editor: Editor): void {
+  editor.register(
+    "remapFileNodes",
+    (store, p: { put?: AnyRecord[]; remove?: Id<string>[] }) => {
+      if (p.remove?.length) store.remove(p.remove);
+      if (p.put?.length) store.put(p.put);
+    },
+  );
+}
+
+// Referential integrity for an in-app rename/move: the fs endpoint has already moved the bytes from→to on
+// disk; this re-keys any PINNED card backing that path so it survives in place instead of tombstoning. A
+// file/dir/notebook card's node id ENCODES its (root, path) (fileNodeId), so a rename would otherwise strand
+// the card at the old id — the watch's unlink(from) marks it `gone` and a card for `to` never appears. So we
+// find the card at `from` AND (for a folder rename) every descendant under it, and re-commit them at the new
+// (root, path): same geometry/type/colour, new id + retargeted title, edges carried across to the new
+// endpoints. ONE transaction, attributed actor "system" — like the loader's own adds and UNLIKE a hand
+// gesture, it is NOT user-undoable: ⌘Z can't reverse the disk move, so a card-only undo would just desync the
+// card onto a path that no longer exists. If nothing is pinned, it's a no-op — the directory card's in-card
+// view self-heals from the watch's listing refresh regardless.
+export function renameFileNodes(editor: Editor, root: RootId, from: string, to: string): void {
+  const records = editor.store.getSnapshot().records;
+  const oldId = fileNodeId(root, from);
+  const descPrefix = oldId + "/"; // "node:root:from/…" — descendants of a renamed FOLDER
+  const idMap = new Map<Id<"node">, Id<"node">>();
+  const put: AnyRecord[] = [];
+  const remove: Id<string>[] = [];
+
+  // 1) the card at `from`, plus every descendant (folder rename) → new id + retargeted title. `from` is a
+  //    prefix of each matched path (equal for the file itself), so the suffix carries over unchanged.
+  for (const r of records) {
+    if (r.typeName !== "node") continue;
+    if (r.id !== oldId && !r.id.startsWith(descPrefix)) continue;
+    const n = r as NodeRecord;
+    const newPath = to + n.title.slice(from.length);
+    const newId = fileNodeId(root, newPath);
+    idMap.set(n.id, newId);
+    put.push({ ...n, id: newId, title: newPath });
+    remove.push(n.id);
+  }
+  if (idMap.size === 0) return; // nothing pinned for this path — the watch alone keeps the listing honest
+
+  // 2) their layouts → re-keyed to the new node id, geometry (x/y/w/h/z) preserved.
+  for (const r of records) {
+    if (r.typeName !== "layout") continue;
+    const l = r as LayoutRecord;
+    const newNode = idMap.get(l.nodeId);
+    if (!newNode) continue;
+    put.push({ ...l, id: layoutId(newNode), nodeId: newNode });
+    remove.push(l.id);
+  }
+
+  // 3) edges touching a remapped node → carried across to the new endpoints. File cards rarely carry a wire,
+  //    but one must never be left dangling at a stale id (removeNode's cascade would otherwise drop it).
+  for (const r of records) {
+    if (r.typeName !== "edge") continue;
+    const e = r as EdgeRecord;
+    const nf = idMap.get(e.from);
+    const nt = idMap.get(e.to);
+    if (!nf && !nt) continue;
+    put.push({ ...e, from: nf ?? e.from, to: nt ?? e.to });
+    remove.push(e.id);
+  }
+
+  editor.commit({ type: "remapFileNodes", actor: "system", payload: { put, remove } });
 }
 
 // Where to drop newly-added content so it lands to the RIGHT of whatever's already on the board, instead
@@ -89,6 +203,37 @@ function spawnAt(m: InteractionManager, w: number, h: number): { x: number; y: n
   return { x, y };
 }
 
+// Where a DOUBLE-CLICK open lands (the sessions / directory browser's quick-open — the keyboard-free
+// twin of the drag-out, for when you don't want to carry the card to a spot by hand): a small down-right
+// nudge off the BROWSER card's TOP-LEFT, so the opened card lands SUBSTANTIALLY OVERLAPPING the list,
+// right where you clicked. That overlap is deliberate: a card that mostly covers the browser is impossible
+// to miss and a flick away from where you want it — strictly better than nudging it far enough to clear
+// the browser, which risks landing off-screen or somewhere you don't notice. Repeated double-clicks
+// cascade past any card already sitting there (the same step as spawnAt) so they fan out instead of
+// stacking into one pile. Falls back to spawnAt (viewport-centre cascade) when the browser card's layout
+// isn't on the board — e.g. a headless caller — so it degrades to the ordinary Add placement.
+const OPEN_OFFSET = 144; // ~half the browser card stays uncovered (and > CASCADE_STEP, so the FIRST open isn't bumped by the cascade)
+export function cascadeFrom(m: InteractionManager, anchorId: Id<"node">, w: number, h: number): Pos {
+  const records = m.editor.store.getSnapshot().records;
+  const anchor = records.find(
+    (r): r is LayoutRecord => r.typeName === "layout" && r.nodeId === anchorId,
+  );
+  if (!anchor) return spawnAt(m, w, h);
+  // A small offset off the browser's top-left → the new card sits over the list (substantial overlap),
+  // then cascades down-right off any card already there for the next double-click.
+  let x = anchor.x + OPEN_OFFSET;
+  let y = anchor.y + OPEN_OFFSET;
+  const occupied = (px: number, py: number): boolean =>
+    records.some(
+      (r) => r.typeName === "layout" && Math.abs(r.x - px) < CASCADE_STEP && Math.abs(r.y - py) < CASCADE_STEP,
+    );
+  for (let i = 0; i < 16 && occupied(x, y); i++) {
+    x += CASCADE_STEP;
+    y += CASCADE_STEP;
+  }
+  return { x: Math.round(x), y: Math.round(y) };
+}
+
 // The directory card's footprint — taller than a file card since it lists children.
 const DIR_CARD_W = 240;
 const DIR_CARD_H = 300;
@@ -102,14 +247,24 @@ const DIR_CARD_H = 300;
 // picker's `system` adds, a drag-out is a hand gesture, so ⌘Z undoes it. Deterministic (root, path) id →
 // idempotent: re-dragging the same path refreshes its card in place rather than duplicating. The new
 // card is selected so it's immediately live where you dropped it.
-export function materializeAt(
+// Is this file an Observable Notebooks 2.0 notebook? We SNIFF the `<notebook>` root marker rather than
+// trust the path, so a notebook opens as a reactive card wherever it lives — `notebooks/` today, and a
+// `.canvas/artefacts` artefact once that folder is reachable (shadow-git-ledger.md §8). Only `.html` files
+// are read; every other file short-circuits with no fetch. A plain `.html` (no marker) stays a file view.
+async function isNotebookFile(root: RootId, path: string): Promise<boolean> {
+  if (!path.toLowerCase().endsWith(".html")) return false;
+  const content = await readFileOnce(root, path);
+  return !!content && /<notebook\b/i.test(content);
+}
+
+export async function materializeAt(
   m: InteractionManager,
   root: RootId,
   path: string,
   kind: "file" | "dir",
   x: number,
   y: number,
-): void {
+): Promise<void> {
   const id = fileNodeId(root, path);
   if (kind === "dir") {
     m.editor.commit({
@@ -117,15 +272,112 @@ export function materializeAt(
       actor: "user",
       payload: { id, type: "directory", title: path, text: "", color: "purple", x, y, w: DIR_CARD_W, h: DIR_CARD_H },
     });
-  } else {
-    const kindInfo = fileKind(path);
+  } else if (await isNotebookFile(root, path)) {
+    // A notebook-format `.html` opens as a REACTIVE notebook card (not a plain file view), wherever it
+    // lives — the same node id/path as a file card, just the `notebook` type + its larger footprint. This
+    // is the "open an existing notebook" path: addNotebookCard mints new ones, a drag-out/row-click reopens
+    // any on disk. No write — the file already exists; we card the path as-is.
     m.editor.commit({
       type: "addNode",
       actor: "user",
-      payload: { id, type: "file", title: path, text: "", color: kindInfo.color, x, y, w: CARD_W, h: CARD_H },
+      payload: { id, type: "notebook", title: path, text: "", color: "green", x, y, w: NOTEBOOK_CARD_W, h: NOTEBOOK_CARD_H },
+    });
+  } else {
+    const kindInfo = fileKind(path);
+    // Markdown renders as prose (not a <pre>), so it opens at the larger reading footprint; code/data/etc.
+    // keep the compact preview size. Both still freely resize once on the board.
+    const prose = kindInfo.kind === "md";
+    m.editor.commit({
+      type: "addNode",
+      actor: "user",
+      payload: {
+        id,
+        type: "file",
+        title: path,
+        text: "",
+        color: kindInfo.color,
+        x,
+        y,
+        w: prose ? PROSE_CARD_W : CARD_W,
+        h: prose ? PROSE_CARD_H : CARD_H,
+      },
     });
   }
   m.selection.set([id]);
+}
+
+// Sanitise a dropped file's name into a safe root-relative path under IMAGE_DIR: keep the extension, slug
+// the stem (so spaces/odd chars/path separators can't escape the dir or break the URL), and fall back to a
+// neutral name for an empty stem. The server dedupes the basename and returns the FINAL path, so this only
+// needs to be safe, not unique.
+function imageDestPath(name: string): string {
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot).toLowerCase() : "";
+  const stemRaw = (dot > 0 ? name.slice(0, dot) : name).trim();
+  const stem = stemRaw.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64) || "image";
+  return `${IMAGE_DIR}/${stem}${ext}`;
+}
+
+// Fit a dropped image's natural pixel size into a card box that PRESERVES its aspect ratio: scale the
+// longer side down to IMAGE_MAX (never up — a small image stays its own size), then clamp to the resize
+// floor aspect-preserving (mirrors resizeBox's min logic so the card and the lock agree). An extreme
+// panorama/strip hits a min on one axis and lets the other run a touch over aspect — the documented edge.
+function fitImageBox(natW: number, natH: number): { w: number; h: number } {
+  const aspect = natW > 0 && natH > 0 ? natW / natH : IMAGE_CARD_W / IMAGE_CARD_H;
+  const down = Math.min(1, IMAGE_MAX / natW, IMAGE_MAX / natH);
+  let w = natW * down;
+  let h = natH * down;
+  if (w < IMAGE_MIN_W) {
+    w = IMAGE_MIN_W;
+    h = w / aspect;
+  }
+  if (h < IMAGE_MIN_H) {
+    h = IMAGE_MIN_H;
+    w = h * aspect;
+  }
+  return { w: Math.round(w), h: Math.round(h) };
+}
+
+// Decode a dropped image's bytes just far enough to read its intrinsic dimensions, then fit a card box to
+// them. Falls back to the fixed thumbnail footprint if the browser can't decode (corrupt/unsupported) —
+// the card still lands, just at the generic size. createImageBitmap is the cheap path (no DOM <img>).
+async function imageCardBox(file: File): Promise<{ w: number; h: number }> {
+  try {
+    const bmp = await createImageBitmap(file);
+    const box = fitImageBox(bmp.width, bmp.height);
+    bmp.close();
+    return box;
+  } catch {
+    return { w: IMAGE_CARD_W, h: IMAGE_CARD_H };
+  }
+}
+
+// Drop an IMAGE file onto the canvas (image-cards-on-canvas): write its bytes to a real repo file under
+// `.canvas/images/` (POST /api/asset, which dedupes the name and returns the path actually written), then
+// card THAT path as an `image` node at the drop point. Same (root, path) → node-id addressing as a file card,
+// so the dropped image is a first-class, peer-readable, shadow-git-versioned artefact — not an ephemeral paste.
+// Returns the node id on success, or null if the write was blocked (then no card is added).
+export async function materializeImageAt(
+  m: InteractionManager,
+  file: File,
+  x: number,
+  y: number,
+): Promise<Id<"node"> | null> {
+  const bytes = await file.arrayBuffer();
+  // Measure before writing so the card lands at the image's own aspect (no letterbox); a decode failure
+  // falls back to the generic footprint. The two awaits are independent, but the decode is cheap and the
+  // write dominates, so keeping them sequential keeps the flow readable.
+  const box = await imageCardBox(file);
+  const stored = await writeAsset("repo", imageDestPath(file.name), bytes);
+  if (!stored) return null;
+  const id = fileNodeId("repo", stored);
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "image", title: stored, text: "", color: "blue", x, y, w: box.w, h: box.h },
+  });
+  m.selection.set([id]);
+  return id;
 }
 
 // Add a directory CARD for a folder — the "File tree" widget (path "" = the repo root) and the engine
@@ -133,8 +385,14 @@ export function materializeAt(
 // the menu supplies it, else centred in the viewport (spawnAt). From here you drill INSIDE the card and
 // drag the level you want out onto the canvas.
 export function addFolderCard(m: InteractionManager, path: string, at?: Pos): void {
+  // The "File tree" button (path "") drops ONE combined card (the "roots" sentinel root) whose top level
+  // is every root — canonical + git worktrees — read reactively off rootsSignal, so a worktree appearing
+  // or vanishing updates the card in place. You drill into a worktree inside the card, and drag a root
+  // (or any folder/file) row OUT to pin it as its own single-root card. A specific sub-folder add
+  // (non-empty path) stays a single canonical card.
+  const root = path === "" ? "roots" : "repo";
   const { x, y } = at ?? spawnAt(m, DIR_CARD_W, DIR_CARD_H);
-  materializeAt(m, "repo", path, "dir", x, y);
+  void materializeAt(m, root, path, "dir", x, y); // dir branch commits synchronously (no await before it)
 }
 
 // Drop a single clock card on the board. It's an ordinary node (logged spatial state, draggable like any
@@ -311,6 +569,65 @@ export function addSessionsCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
+// A NOTEBOOK card (docs/notebook-card.md). A notebook is a file-backed card like any file
+// card: write a starter `.html` (Observable Notebooks 2.0 format) to a path under the canonical root, then
+// add the node via the file-card path so the card VIEWS that file — source on disk, body off the off-log
+// `fileContent` signal, never node.text (§4). So this is two acts: a content-tier file write (off the
+// log) + the one on-log addNode (the card's arrangement + its path reference). NOT a singleton — a fresh
+// timestamped name per Add, so notebooks are multiple and re-adds never collide; selected so it's live at
+// once. Default dir is `notebooks/`, NOT `.canvas/artefacts/`: `.canvas` is read- and watcher-excluded
+// (EXCLUDE_DIRS — the shadow-git echo-loop guard), so the file-card view path can't see it yet; serving
+// artefacts under `.canvas` is a later step (shadow-git-ledger.md §8). The `notebooks/` default is the
+// promote case that path already named.
+const NOTEBOOK_CARD_W = 460;
+const NOTEBOOK_CARD_H = 520;
+// A fresh notebook opens NEARLY EMPTY — one blank markdown cell, no demo. The five-cell tour that used to
+// ship here (x/y/interpolation/manual) read as the notebook's own content rather than a scratch surface, and
+// there was no way to clear it but hand-delete. The card now grows cells from its own +code/+markdown footer
+// and a per-cell md↔code toggle, so a single click-to-edit prose cell is the right starting point: a target
+// to type into that says "this is yours", not a demo to undo.
+const STARTER_NOTEBOOK = `<!doctype html>
+<notebook>
+  <title></title>
+  <script id="a1" type="text/markdown">
+  </script>
+</notebook>
+`;
+
+// Pick the next notebook filename — `notebook1`, `notebook2`, … rather than a long timestamp, so the path
+// (which is also the cross-card IMPORT handle, §11.2 — `data-in="x=./notebook1"`) is short and legible.
+// Uses MAX+1, not lowest-free, across BOTH the files already in `notebooks/` (disk) and the notebook cards
+// on the board: never reuses a number, so a name that was deleted but is still imported elsewhere can't be
+// resurrected onto a different notebook. Falls back to scanning only the board if the dir read fails.
+async function nextNotebookName(m: InteractionManager): Promise<string> {
+  const N = /(?:^|\/)notebook(\d+)\.html$/;
+  let max = 0;
+  const consider = (name: string): void => {
+    const hit = N.exec(name);
+    if (hit) max = Math.max(max, Number(hit[1]));
+  };
+  const listing = await listDirOnce("repo", "notebooks");
+  for (const f of listing?.files ?? []) consider(f);
+  for (const n of m.editor.store.query({ typeName: "node" }).get())
+    if ((n as { type?: string }).type === "notebook") consider((n as { title?: string }).title ?? "");
+  return `notebook${max + 1}`;
+}
+
+export async function addNotebookCard(m: InteractionManager, at?: Pos): Promise<void> {
+  const path = `notebooks/${await nextNotebookName(m)}.html`;
+  // Write the file FIRST (off-log content tier): if the write-back endpoint is unavailable, leave the
+  // board unchanged rather than dropping a card over a file that doesn't exist.
+  if (!(await writeFileContent("repo", path, STARTER_NOTEBOOK))) return;
+  const id = fileNodeId("repo", path);
+  const { x, y } = at ?? spawnAt(m, NOTEBOOK_CARD_W, NOTEBOOK_CARD_H);
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "notebook", title: path, text: "", color: "green", x, y, w: NOTEBOOK_CARD_W, h: NOTEBOOK_CARD_H },
+  });
+  m.selection.set([id]);
+}
+
 // The weather card (card-types/weather) — current local weather for a typed location. Its body reads
 // the off-log `weather` capability (Open-Meteo, polled server-side, keyed by the card's title) and
 // commits its location through setTitle. Like the clock/feed cards, this addNode is the only thing it
@@ -338,7 +655,9 @@ export function addWeatherCard(m: InteractionManager, at?: Pos): void {
 // distinct session is its own card and re-opening the same one (e.g. from the dropdown) is idempotent;
 // deleting the card never touches the .jsonl, so it reopens from the same list later.
 export async function openSession(m: InteractionManager, id?: string, at?: Pos): Promise<void> {
-  const res = await fetch(`/api/session${id ? `?id=${encodeURIComponent(id)}` : ""}`);
+  const res = await fetch(
+    `/api/session?board=${activeBoardId()}${id ? `&id=${encodeURIComponent(id)}` : ""}`,
+  );
   if (!res.ok) return; // no transcripts on this machine, or bad id — just skip the card
   // This GET does two off-log jobs: it RESOLVES the session id (omitted → most recent) and ARMS the
   // server-side file-tail (handleSession → ensureSessionFeed) that publishes session:<id>. The card
@@ -356,9 +675,9 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       // that session is (slice 1), and resumes in place if you recommence it.
       text: "",
       color: "blue",
-      ...(at ?? spawnAt(m, 400, 360)),
-      w: 400,
-      h: 360,
+      ...(at ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H)),
+      w: SESSION_CARD_W,
+      h: SESSION_CARD_H,
     },
   });
 }
@@ -370,7 +689,7 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
 // and turns stay in its own file/feed, REFERENCED, never replicated (session-timelines §3/§4). The
 // process writing files would arrive separately via the commit-watcher, attributed to that session.
 export async function spawnLiveSession(m: InteractionManager, at?: Pos): Promise<void> {
-  const res = await fetch("/api/session/spawn", {
+  const res = await fetch(`/api/session/spawn?board=${activeBoardId()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({}),
@@ -388,9 +707,9 @@ export async function spawnLiveSession(m: InteractionManager, at?: Pos): Promise
       title: id, // the session id: the template keys its `session` feed + `sessionInput` off it
       text: "",
       color: "blue",
-      ...(at ?? spawnAt(m, 400, 360)),
-      w: 400,
-      h: 360,
+      ...(at ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H)),
+      w: SESSION_CARD_W,
+      h: SESSION_CARD_H,
     },
   });
 }
@@ -421,7 +740,9 @@ export async function reprojectContent(m: InteractionManager): Promise<void> {
     .records.filter((r): r is NodeRecord => r.typeName === "node" && r.type === "session");
   await Promise.all(
     sessions.map((n) =>
-      fetch(`/api/session?id=${encodeURIComponent(n.title)}`).catch(() => undefined),
+      fetch(`/api/session?board=${activeBoardId()}&id=${encodeURIComponent(n.title)}`).catch(
+        () => undefined,
+      ),
     ),
   );
 }
@@ -518,28 +839,41 @@ export async function importBoard(m: InteractionManager, file: File): Promise<bo
 // arrangement (the card goes away), so it stays on the log as a removeNode (actor "remote" — the
 // provenance reads as "an external writer changed this", the channel-3 story for an agent editing a file).
 //
-// Gated to known cards: a single repo watch backs whatever folders the user has added, but a change to a
-// path with NO card is ignored — we don't auto-spawn cards for the whole repo (the pre-palette behaviour).
-// A genuinely-new file under an added folder therefore appears on the next "Add files" of that folder,
-// not live; that re-add is idempotent, so it just fills in the gap. Returns an unsubscribe fn.
+// Gated to known cards for CARD-LEVEL effects: a single repo watch backs whatever folders the user has
+// added, but a content change / unlink to a path with NO card touches no card — we don't auto-spawn cards
+// for the whole repo (the pre-palette behaviour). The in-card directory TREE is the exception and updates
+// LIVE: an add/unlink re-pulls its parent folder's off-log listing (refreshListing), so a file created or
+// removed on disk appears in / disappears from the tree at once — only PROMOTING a path to its own card
+// stays a deliberate drag-out. Returns an unsubscribe fn.
 export function watchDataset(
   m: InteractionManager,
   root: RootId,
   onEvent?: (e: WatchEvent) => void,
 ): () => void {
-  const es = new EventSource(`/api/watch?root=${root}`);
+  const es = new EventSource(`/api/watch?board=${activeBoardId()}&root=${encodeURIComponent(root)}`);
 
   es.onmessage = async (ev) => {
     const msg = JSON.parse(ev.data) as WatchEvent;
+
+    // Keep the in-card directory tree live FIRST, independent of whether a card exists for this path: an
+    // add/unlink changes the PARENT folder's children, so re-pull that one cached listing (no-op unless
+    // the folder was actually loaded). A `change` only touches file content, not membership, so skip it.
+    if (msg.type !== "change") refreshListing(root, parentDir(msg.path));
+
     const id = fileNodeId(root, msg.path);
-    if (!m.editor.store.get<"node">(id)) return; // no card for this path → not on the board, ignore
+    if (!m.editor.store.get<"node">(id)) return; // no card for this (root, path) → no card-level effect
 
     if (msg.type === "unlink") {
-      setFileContent(root, msg.path, undefined); // drop the off-log content with the card
-      m.editor.commit({ type: "removeNode", actor: "remote", payload: { id } });
+      // TOMBSTONE, don't remove (slice D): a pinned card is the user's spatial memory — silently
+      // deleting it on a disk unlink is the "where did my content go?" failure. Mark it gone so the
+      // template shows a tombstone the user dismisses deliberately; a re-add (below) clears it.
+      setGone(root, msg.path, true);
     } else {
-      const r = await fetch(`/api/file?root=${root}&path=${encodeURIComponent(msg.path)}`);
-      if (!r.ok) return;
+      setGone(root, msg.path, false); // re-created on disk → clear any tombstone
+      const r = await fetch(
+        `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(msg.path)}`,
+      );
+      if (!r.ok) return; // a directory event (no file body) or transient — its listing refreshes on re-subscribe
       setFileContent(root, msg.path, filePreview((await r.json()) as TreeFile));
     }
     onEvent?.(msg);

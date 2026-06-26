@@ -1,11 +1,11 @@
 import { Editor, type Subscribable } from "./core.js";
-import { Camera } from "./camera.js";
-import { Selection } from "./selection.js";
+import { Camera, pageToScreen, screenToPage, type CameraState } from "./camera.js";
+import { Selection, selectionBounds, worldBounds } from "./selection.js";
 import { BruteForceIndex, syncIndexFromStore, type SpatialIndex } from "./spatial.js";
 import { Observable } from "./observable.js";
 import type { Box, Vec } from "./geometry.js";
 import type { InputEvent, PointerInput } from "./input.js";
-import type { InteractionContext, Tool } from "./tools/tool.js";
+import type { ConnectDraw, InteractionContext, Tool } from "./tools/tool.js";
 import { SelectTool } from "./tools/select-tool.js";
 import { HandTool } from "./tools/hand-tool.js";
 
@@ -19,6 +19,10 @@ export interface InteractionOptions {
   zoomSpeed?: number;
   /** Per-node resize aspect-ratio lock (w/h); see InteractionContext.aspectLock. */
   aspectLock?: (nodeId: string) => number | null;
+  /** May a connect-drag start on this node? See InteractionContext.connectable. */
+  connectable?: (nodeId: string) => boolean;
+  /** The user wired `from`→`to` with a connect-drag; the host makes the edge. See InteractionContext.connect. */
+  connect?: (from: string, to: string) => void;
 }
 
 // Edge auto-scroll ("infinite canvas" pan-while-dragging): when a drag's pointer comes within
@@ -47,10 +51,16 @@ export class InteractionManager implements InteractionContext {
   readonly selection: Selection;
   readonly index: SpatialIndex;
   readonly marquee = new Observable<Box | null>(null);
+  /** Live connect-drag preview (alt-drag wiring); null when not connecting. See InteractionContext.connectDraw. */
+  readonly connectDraw = new Observable<ConnectDraw | null>(null);
   /** Node under the pointer (renderer hover affordance); updated on every pointer move. */
   readonly hovered = new Observable<string | null>(null);
   /** Per-node resize aspect-ratio lock supplied by the host; see InteractionContext.aspectLock. */
   readonly aspectLock?: (nodeId: string) => number | null;
+  /** May a connect-drag start on a node? Supplied by the host; see InteractionContext.connectable. */
+  readonly connectable?: (nodeId: string) => boolean;
+  /** Connect-drag completion handler supplied by the host; see InteractionContext.connect. */
+  readonly connect?: (from: string, to: string) => void;
 
   private tools = new Map<string, Tool>();
   private active: Tool;
@@ -80,6 +90,8 @@ export class InteractionManager implements InteractionContext {
     this.selection = new Selection();
     this.zoomSpeed = opts.zoomSpeed ?? 0.5;
     this.aspectLock = opts.aspectLock;
+    this.connectable = opts.connectable;
+    this.connect = opts.connect;
 
     // Open the channel-2 index subscription via the idempotent start() so a plain (non-React) host
     // and the Node tests get a live index immediately. The lifecycle is also re-entrant: a host can
@@ -133,6 +145,7 @@ export class InteractionManager implements InteractionContext {
   dispatch(e: InputEvent): void {
     switch (e.type) {
       case "pointerdown":
+        this.cancelFly(); // grabbing the canvas takes over any in-flight fly-to
         // Middle button = pan under any tool: intercept before the active tool ever sees it, so it
         // works the same whether you're in select, hand, or a future tool — and never starts a
         // marquee/drag. (The select tool already ignores non-primary buttons; this makes them useful.)
@@ -217,6 +230,11 @@ export class InteractionManager implements InteractionContext {
     this.viewportH = h;
   }
 
+  /** Current canvas pixel size (0×0 until setViewport runs) — e.g. to place a floating card in a corner. */
+  get viewportSize(): { w: number; h: number } {
+    return { w: this.viewportW, h: this.viewportH };
+  }
+
   /**
    * The page-space rectangle currently on screen (camera pose × viewport size) — the inverse of the
    * pan/zoom transform applied to the canvas's screen rect. A placer (e.g. "drop a new card where the
@@ -229,6 +247,84 @@ export class InteractionManager implements InteractionContext {
     const tl = this.camera.screenToPage({ x: 0, y: 0 });
     const br = this.camera.screenToPage({ x: this.viewportW, y: this.viewportH });
     return { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y };
+  }
+
+  // ── zoom to fit ─────────────────────────────────────────────────────────────────────────
+  // The two wayfinding moves, both expressed as "frame a box" over camera.fitBox: fitAll is the
+  // I'm-lost reset, fitSelection the zoom-into-this. They no-op on an empty board / before the
+  // viewport is measured (camera.fitBox guards the zero-area cases), so a host can bind them to keys
+  // without first checking there's anything to frame. `skipLayout` lets the host exclude content that
+  // isn't world-space — screen-anchored (floating) cards — from the all-bounds.
+
+  /** Frame every world node (the "fit all" reset). Won't zoom past 1× — a calm whole-board view. */
+  fitAll(skipLayout?: (l: import("./core.js").LayoutRecord) => boolean): void {
+    const box = worldBounds(this.editor.store, skipLayout);
+    if (!box) return;
+    const s = this.camera.fitState(box, this.viewportW, this.viewportH, { pad: 0.08, maxZoom: 1 });
+    if (s) this.flyTo(s);
+  }
+
+  /** Frame the current selection (the "zoom to this"); falls back to fitAll when nothing is selected. */
+  fitSelection(skipLayout?: (l: import("./core.js").LayoutRecord) => boolean): void {
+    const ids = this.selection.ids();
+    if (ids.length === 0) return this.fitAll(skipLayout);
+    const box = selectionBounds(this.editor.store, ids);
+    if (!box) return;
+    const s = this.camera.fitState(box, this.viewportW, this.viewportH, { pad: 0.15, maxZoom: 2 });
+    if (s) this.flyTo(s);
+  }
+
+  // ── animated camera moves ────────────────────────────────────────────────────────────────
+  // flyTo eases the camera to a target pose so a jump (fit, recall a saved view, step back) preserves
+  // spatial orientation instead of teleporting. The point that ends up centred (cEnd) is driven along a
+  // STRAIGHT LINE in SCREEN space from where it sits now to the viewport centre, while zoom eases in
+  // log space. That straight-screen path is the key: a naive lerp of the focal point in PAGE space,
+  // with zoom changing underneath it, makes a peripheral target drift and only snap to centre at the
+  // very end (its screen distance scales as (1-k)·z(t), and z grows as you zoom in) — the "curved,
+  // centres late" feel. Interpolating the centred point's screen position instead sends it directly to
+  // the middle on schedule. Endpoints are exact by construction (k=0 → current pose, k=1 → target).
+  // Any manual pan/zoom cancels an in-flight tween (cancelFly in onWheel / pointerdown). Falls back to
+  // an instant set when animation can't run (no rAF — Node tests — or the viewport size isn't known).
+  private flyRaf: number | null = null;
+  flyTo(target: CameraState, opts: { animate?: boolean; durationMs?: number } = {}): void {
+    this.cancelFly();
+    const animate = opts.animate ?? true;
+    if (!animate || typeof requestAnimationFrame !== "function" || this.viewportW <= 0 || this.viewportH <= 0) {
+      this.camera.set(target);
+      return;
+    }
+    const dur = Math.max(1, opts.durationMs ?? 300);
+    const vc: Vec = { x: this.viewportW / 2, y: this.viewportH / 2 };
+    const start = this.camera.state;
+    const cEnd = screenToPage(target, vc); // the page point that ends up centred
+    const s0 = pageToScreen(start, cEnd); // where that point sits on screen right now
+    const zStart = start.z;
+    const zEnd = target.z;
+    const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
+    const ease = (t: number): number => (t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2); // easeInOutQuad
+    let startTs: number | null = null;
+    const tick = (ts: number): void => {
+      if (startTs == null) startTs = ts;
+      const t = Math.min(1, (ts - startTs) / dur);
+      if (t >= 1) {
+        this.flyRaf = null;
+        this.camera.set(target); // snap to the exact endpoint (avoids log/round drift)
+        return;
+      }
+      const k = ease(t);
+      const z = Math.exp(lerp(Math.log(zStart), Math.log(zEnd), k));
+      // cEnd should appear at this screen point on this frame; solve the offset that puts it there.
+      const sx = lerp(s0.x, vc.x, k);
+      const sy = lerp(s0.y, vc.y, k);
+      this.camera.set({ x: sx - cEnd.x * z, y: sy - cEnd.y * z, z });
+      this.flyRaf = requestAnimationFrame(tick);
+    };
+    this.flyRaf = requestAnimationFrame(tick);
+  }
+  /** Stop an in-flight flyTo (a manual pan/zoom taking over, or a new flight). Idempotent. */
+  cancelFly(): void {
+    if (this.flyRaf != null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.flyRaf);
+    this.flyRaf = null;
   }
 
   // The pan velocity (screen px/frame) implied by the pointer's position: zero unless it sits within
@@ -296,6 +392,7 @@ export class InteractionManager implements InteractionContext {
 
   // ctrl/⌘ + wheel = zoom about the pointer; plain wheel = two-finger pan (trackpad scroll deltas).
   private onWheel(e: Extract<InputEvent, { type: "wheel" }>): void {
+    this.cancelFly(); // a manual zoom/pan takes over any in-flight fly-to
     if (e.ctrlKey || e.metaKey) {
       const factor = Math.exp((-e.deltaY / 100) * this.zoomSpeed);
       this.camera.zoomBy(factor, e.point);

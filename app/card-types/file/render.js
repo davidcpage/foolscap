@@ -28,6 +28,28 @@ export default {
   contract: 1,
   render(card) {
     const { base, dir, kind } = splitPath(card.fields.title);
+    const roots = card.signals.roots || [];
+    // The file's ROOT colour (slice C): a small swatch in the head matching the session-card activity
+    // dots + the tree folder, so a card opened from a worktree reads as belonging to it. Guarded for
+    // cards/mocks without the `roots` capability (the canonical "repo" root carries a colour too).
+    const hue = roots.find((r) => r.id === card.root)?.hue;
+    // TOMBSTONE (slice D): the backing file is gone (deleted on disk → `gone`) or its WORKTREE was removed
+    // (its root dropped out of the loaded roots list). Keep the card, mark it clearly, never silently drop
+    // it. `roots.length` gates the worktree check so we don't tombstone during the pre-load beat.
+    const rootGone = roots.length > 0 && card.root !== "roots" && !roots.some((r) => r.id === card.root);
+    if (card.signals.gone || rootGone) {
+      return html`
+        <div class="file-head file-gone">
+          <span class="file-name">${base}</span>
+          <span class="file-ext">${rootGone ? "removed" : "deleted"}</span>
+        </div>
+        <div class="file-gone-body">
+          <span class="file-gone-mark">🪦</span>
+          <span>${rootGone ? "worktree removed" : "deleted on disk"}</span>
+          <span class="file-gone-hint">${dir ? dir + "/" : ""}${base} · select + Delete to dismiss</span>
+        </div>
+      `;
+    }
     // Off-log content first, the static field as the pre-signal fallback. Reading the capability is
     // what subscribes the card to it, so a disk change re-renders just this body — no setText, no log.
     const text = card.signals.fileContent ?? card.fields.text;
@@ -41,6 +63,7 @@ export default {
         : html`<pre class="file-body" data-text>${text}</pre>`;
     return html`
       <div class="file-head">
+        ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
         <span class="file-name">${base}</span>
         <span class="file-ext">${kind}</span>
       </div>

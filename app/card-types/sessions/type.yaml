@@ -11,8 +11,15 @@
 #   • `sessionRefresh` — a per-card ACTION (a bound fn, not a signal) that re-pulls the list. There's no
 #     disk-watch push for the sessions dir, so the refresh button is how a long-open card picks up newly-
 #     written transcripts. Session-list-internal, never the canvas log.
+#   • `sessionDelete` — a board-global ACTION (a bound fn taking a row id) that HIDES one session from this
+#     list (select a row, Shift+Delete). Off-log and reversible: it adds the id to a localStorage hidden-set
+#     (content.ts), never the canvas log, and never deletes the .jsonl on disk (Claude Code's own data). The
+#     escape hatch for junk transcripts — e.g. a terminal session exited at once, named `<local-command-caveat>`.
+#   • `sessionOpen` — a per-card ACTION (a bound fn taking a row id) that OPENS that session as a card on
+#     double-click: the keyboard-free twin of the drag-out (loader.openSession), placed offset down-right
+#     from this browser card (loader.cascadeFrom) since a double-click carries no drop point.
 #
 # No `chrome` flag: a browser is a container and wants its frame (like the directory card, unlike the clock).
 name: sessions
 contract: 1
-capabilities: [sessionList, sessionRefresh]
+capabilities: [sessionList, sessionRefresh, sessionDelete, sessionOpen]

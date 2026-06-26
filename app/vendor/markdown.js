@@ -20,6 +20,17 @@ import { html } from "/vendor/lit-html.js";
 const INLINE_RE =
   /(`+)([\s\S]*?)\1|\*\*([\s\S]+?)\*\*|(?<!\w)__([\s\S]+?)__(?!\w)|\*([^\s*][\s\S]*?)\*|(?<!\w)_([^_]+?)_(?!\w)|~~([\s\S]+?)~~|\[([^\]]+)\]\(([^)\s]+)[^)]*\)/g;
 
+// A plain-text run between (or around) inline matches may itself span soft line breaks — a paragraph's
+// lines arrive joined by "\n" (see paraInline). Emit those breaks as <br> HERE, on the *text* runs, so
+// the inline matcher above still sees the whole joined paragraph and a span like **…\n…** stays intact.
+function pushText(out, str) {
+  const parts = str.split("\n");
+  for (let k = 0; k < parts.length; k++) {
+    if (k) out.push(html`<br />`);
+    if (parts[k]) out.push(parts[k]);
+  }
+}
+
 function inlineMd(text) {
   const out = [];
   let last = 0;
@@ -30,7 +41,7 @@ function inlineMd(text) {
     // clobbering its lastIndex. Snapshot the match end NOW, then restore it after recursing so this
     // loop keeps advancing — otherwise it re-matches the same span forever and blows the heap.
     const end = INLINE_RE.lastIndex;
-    if (m.index > last) out.push(text.slice(last, m.index));
+    if (m.index > last) pushText(out, text.slice(last, m.index));
     if (m[1] != null) out.push(html`<code class="md-icode">${m[2]}</code>`);
     else if (m[3] != null) out.push(html`<strong>${inlineMd(m[3])}</strong>`);
     else if (m[4] != null) out.push(html`<strong>${inlineMd(m[4])}</strong>`);
@@ -41,7 +52,7 @@ function inlineMd(text) {
     last = end;
     INLINE_RE.lastIndex = end;
   }
-  if (last < text.length) out.push(text.slice(last));
+  if (last < text.length) pushText(out, text.slice(last));
   return out;
 }
 
@@ -183,14 +194,11 @@ function parseBlocks(src) {
 }
 
 // Soft newlines inside a paragraph become <br> — in a transcript they're usually deliberate (a list
-// the model wrote without blank lines, an address), not just reflowable prose.
+// the model wrote without blank lines, an address), not just reflowable prose. The break conversion
+// happens INSIDE inlineMd (on text runs, via pushText), so the matcher sees the whole joined paragraph
+// and an inline span that straddles a soft line break — **bold\nacross lines** — is no longer severed.
 function paraInline(text) {
-  const out = [];
-  text.split("\n").forEach((ln, k) => {
-    if (k) out.push(html`<br />`);
-    out.push(...inlineMd(ln));
-  });
-  return out;
+  return inlineMd(text);
 }
 
 function renderMdItem(blocks) {

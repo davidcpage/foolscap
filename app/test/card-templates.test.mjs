@@ -50,12 +50,16 @@ const litUrl = new URL("vendor/lit-html.js", root).href;
 const toVendorData = (src) =>
   "data:text/javascript," + encodeURIComponent(src.replaceAll('"/vendor/lit-html.js"', `"${litUrl}"`));
 const mdUrl = toVendorData(fs.readFileSync(new URL("vendor/markdown.js", root), "utf8"));
+// The notebook template imports the vendored format parser; it depends on no DOM (string-based, so it
+// loads under node without a DOMParser) and imports nothing, so the same data:-URL rewrite suffices.
+const nbFmtUrl = toVendorData(fs.readFileSync(new URL("vendor/notebook-format.js", root), "utf8"));
 
 async function loadTemplate(type) {
   const src = fs.readFileSync(new URL(`card-types/${type}/render.js`, root), "utf8");
   const rewritten = src
     .replaceAll('"/vendor/lit-html.js"', `"${litUrl}"`)
-    .replaceAll('"/vendor/markdown.js"', `"${mdUrl}"`);
+    .replaceAll('"/vendor/markdown.js"', `"${mdUrl}"`)
+    .replaceAll('"/vendor/notebook-format.js"', `"${nbFmtUrl}"`);
   return (await import("data:text/javascript," + encodeURIComponent(rewritten))).default;
 }
 
@@ -186,9 +190,11 @@ test("directory template is an in-card tree: dirListing(path) per level, treeSta
   const card = {
     fields: { title: "interaction/src", text: "", color: "purple" },
     signals: {
-      dirListing: (p) => tree[p],
+      dirListing: (_root, p) => tree[p],
       treeState: { get: () => open, set: (v) => { open = v; } },
+      fsOpen: () => {},
     },
+    root: "repo", // single-root mode; treeState keys are (root, path) — see the expand step below
   };
   const out = flatten(mod.render(card));
 
@@ -208,9 +214,15 @@ test("directory template is an in-card tree: dirListing(path) per level, treeSta
   assert.ok(out.includes("dir-sub"), "a sub-dir row is marked distinct from a file row");
   assert.ok(out.includes("dir-grip"), "every row carries a persistent drag-out grip cue");
 
+  // Double-click is the drag-out's keyboard-free twin, on FILE rows only — the tooltip teaches it. The
+  // @dblclick handler is an event listener (not in the flattened string), so the contract test checks
+  // the documented affordance, like it does for drag. Folders keep click=expand and aren't double-openable.
+  assert.ok(out.includes("double-click or drag onto the canvas to open as a card"), "file rows document double-click open");
+  assert.ok(out.includes("click to expand · drag onto the canvas to pin"), "folder rows keep click=expand / drag=pin (no double-open)");
+
   // Expand the sub-folder (treeState carries the open path) → its children drill IN, in place, rather
   // than spawning a separate card. This is the §B in-card tree behaviour.
-  open = new Set(["interaction/src/tools"]);
+  open = new Set(["repo" + String.fromCharCode(0) + "interaction/src/tools"]); // treeState key is (root, path) joined by NUL
   const expanded = flatten(mod.render(card));
   assert.ok(expanded.includes(">select.ts<"), "an expanded sub-folder reveals its children in the card");
 
@@ -237,7 +249,7 @@ test("sessions template lists the off-log session list, each row draggable, with
   let refreshed = 0;
   const card = {
     fields: { title: "", text: "", color: "blue" },
-    signals: { sessionList: sessions, sessionRefresh: () => refreshed++ },
+    signals: { sessionList: sessions, sessionRefresh: () => refreshed++, sessionDelete: () => {}, sessionOpen: () => {} },
   };
   const out = flatten(mod.render(card));
 
@@ -253,6 +265,13 @@ test("sessions template lists the off-log session list, each row draggable, with
   // so grabbing a row drags it OUT, not the whole card).
   assert.ok(out.includes('draggable="true"'), "rows are draggable");
   assert.ok(out.includes('data-interactive="1"'), "rows are contained from the canvas pointer seam");
+
+  // Each row is FOCUSABLE (tabindex) so a click selects it — that focus is the cue Shift+Delete hides it
+  // from this list (sessionDelete). The tooltip teaches the otherwise-hidden gesture. (The keydown itself
+  // is an event listener, not in the flattened string — the contract test checks presence, like drag.)
+  assert.ok(out.includes('tabindex="0"'), "rows are focusable → selectable for the hide gesture");
+  assert.ok(out.includes("Shift+Delete"), "the row tooltip documents the hide gesture");
+  assert.ok(out.includes("double-click or drag onto the canvas to open"), "the row tooltip documents double-click open (the drag-out's twin)");
 
   // The refresh control is present with the grant, and routes through the capability.
   assert.ok(out.includes("ses-refresh"), "refresh button renders when sessionRefresh is granted");
@@ -325,6 +344,78 @@ test("session template applies the jsonl codec: turns, tool calls with results, 
   // Empty content renders the head + an empty marker, never crashes (the headless mount case).
   const empty = flatten(mod.render({ fields: { title: "x", text: "", color: "blue" }, signals: {} }));
   assert.ok(empty.includes("0 turns") && empty.includes("no turns"), "empty session");
+});
+
+test("session template folds TaskCreate/TaskUpdate into a current-state task panel", async () => {
+  const mod = await loadTemplate("session");
+  // TaskCreate's input has no id — the server assigns "Task #N" and only the tool_result echoes it; a
+  // later TaskUpdate references that numeric id. The reducer must pair create→result→update across turns,
+  // flip status, drop a deleted task, and show the running list as a checklist (not the raw inline rows).
+  const ev = [];
+  const create = (id, subject, description) => {
+    const tid = `c${id}`;
+    ev.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "tool_use", id: tid, name: "TaskCreate", input: { subject, description } }] },
+    });
+    ev.push({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: tid, content: `Task #${id} created successfully: ${subject}` }] },
+    });
+  };
+  const update = (id, input) => {
+    const tid = `u${id}-${input.status ?? "x"}`;
+    ev.push({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "tool_use", id: tid, name: "TaskUpdate", input: { taskId: String(id), ...input } }] },
+    });
+    ev.push({ type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: tid, content: `Updated task #${id}` }] } });
+  };
+  create(1, "Write pyproject.toml", "minimal hatchling pyproject");
+  create(2, "Add console script", "wire the entry point");
+  create(3, "Delete me", "created in error");
+  update(1, { status: "completed" });
+  update(2, { status: "in_progress", activeForm: "Adding the console script" });
+  update(3, { status: "deleted" });
+
+  const jsonl = ev.map((e) => JSON.stringify(e)).join("\n");
+  const out = flatten(mod.render({ fields: { title: "task1234", text: jsonl, color: "blue" }, signals: {} }));
+
+  assert.ok(out.includes("ses-tasks"), "the task panel renders");
+  assert.ok(out.includes("1/2"), "count reflects 1 completed of 2 live tasks (deleted one is gone)");
+  assert.ok(out.includes("Write pyproject.toml") && out.includes("ses-task-completed"), "task #1 shows completed");
+  assert.ok(out.includes("Adding the console script") && out.includes("ses-task-in_progress"), "in_progress shows activeForm");
+  assert.ok(!out.includes("Delete me"), "a status:deleted task is dropped from the panel");
+
+  // No task tools → no panel (the common case must not render an empty checklist).
+  const plain = [{ type: "user", message: { role: "user", content: "hi" } }].map((e) => JSON.stringify(e)).join("\n");
+  const pout = flatten(mod.render({ fields: { title: "x", text: plain, color: "blue" }, signals: {} }));
+  assert.ok(!pout.includes("ses-tasks"), "no task panel when the session used no task tools");
+});
+
+test("session template renders EVERY turn (no turn-count cap) — bounding is the upstream byte caps' job", async () => {
+  // The codec must not silently drop turns: that was the "truncated before resume" bug, where a head
+  // turn-slice hid where you left off. Memory is bounded once, upstream, by the byte caps on what the
+  // feed delivers (MAX_SESSION_BYTES / MAX_SESSION_FEED_BYTES, both tail-kept + flagged); the codec
+  // renders everything it's given — newest AND oldest — and only flags truncation when a BYTE cap says
+  // it cut (live.truncated / the x-truncated sentinel), never by guessing from turn count.
+  const mod = await loadTemplate("session");
+  const N = 500; // a long transcript: every turn still renders, no cap drops any
+  const jsonl = Array.from({ length: N }, (_, i) =>
+    JSON.stringify({ type: "user", message: { role: "user", content: `PROMPT_${i}` } }),
+  ).join("\n");
+
+  const out = flatten(mod.render({ fields: { title: "x", text: jsonl, color: "blue" }, signals: {} }));
+  assert.ok(out.includes("PROMPT_0"), "the oldest turn is rendered");
+  assert.ok(out.includes("PROMPT_499"), "the newest turn (where you left off) is rendered");
+  assert.ok(out.includes(`${N} turns`), "the head count is the true total");
+  assert.ok(!out.includes("⚠ truncated"), "no byte cap bit, so nothing is flagged truncated");
+
+  // A byte cap that DID cut is still flagged honestly, via the live feed's own signal.
+  const capped = flatten(
+    mod.render({ fields: { title: "x", text: jsonl, color: "blue" }, signals: { session: { content: jsonl, truncated: true } } }),
+  );
+  assert.ok(capped.includes("⚠ truncated"), "the feed's truncated flag still surfaces");
 });
 
 test("session template parses a streaming transcript incrementally without duplicating turns", async () => {
@@ -623,6 +714,14 @@ test("session template renders a ```ask block as an interactive question widget 
   assert.ok(live.includes("type=radio"), "single-select options render as radios");
   assert.ok(live.includes("value=red") && live.includes("value=blue"), "the option labels render");
   assert.ok(live.includes("ses-ask-submit"), "an interactive widget has a submit button");
+  // The widget contains keydown so a Space typed into the custom-answer field isn't swallowed by the
+  // canvas's hold-to-pan handler and a Backspace doesn't reach the app's delete-selected-card shortcut
+  // (which used to unmount the very card being typed in). Same containment the live `.ses-input` does.
+  assert.match(
+    live,
+    /class="ses-ask"\s*@keydown=[^\n]*stopPropagation/,
+    "the ask widget contains keydown (Space/Backspace must not reach the canvas)",
+  );
 
   // A historical card (no feed, no sessionInput) → read-only: same layout, static class, no submit.
   const hist = flatten(mod.render({ fields: { title: "s", text: turn, color: "blue" }, signals: {} }));
@@ -640,6 +739,40 @@ test("session template renders a ```ask block as an interactive question widget 
     }),
   );
   assert.ok(!streaming.includes("ses-ask-submit"), "an incomplete ask block does not render the widget yet");
+});
+
+test("session template renders multiple questions — one array AND two separate ```ask fences", async () => {
+  const mod = await loadTemplate("session");
+  const liveRender = (text) => {
+    const turn = JSON.stringify({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+    return flatten(
+      mod.render({
+        fields: { title: "abcd1234", text: "", color: "blue" },
+        signals: { session: { content: turn, truncated: false, status: "idle" }, sessionInput: () => {} },
+      }),
+    );
+  };
+  const askq = (s) => (s.match(/ses-ask-q/g) || []).length;
+
+  // The intended form: TWO questions in ONE block's `questions` array → both render in one widget.
+  const arrayJson = JSON.stringify({
+    questions: [
+      { question: "Which color?", header: "Color", multiSelect: false, options: [{ label: "red" }, { label: "blue" }] },
+      { question: "Which size?", header: "Size", multiSelect: false, options: [{ label: "S" }, { label: "L" }] },
+    ],
+  });
+  const oneBlock = liveRender("Two things:\n\n```ask\n" + arrayJson + "\n```");
+  assert.equal(askq(oneBlock), 2, "both questions of a single multi-question block render");
+  assert.ok(oneBlock.includes(">Color<") && oneBlock.includes(">Size<"), "each question keeps its own header");
+
+  // The defensive case: TWO SEPARATE ```ask fences in one turn → BOTH render as widgets (the old codec
+  // honored only the first and dumped the second as raw JSON), and no raw fence leaks into the output.
+  const j1 = JSON.stringify({ questions: [{ question: "Which color?", header: "Color", options: [{ label: "red" }] }] });
+  const j2 = JSON.stringify({ questions: [{ question: "Which size?", header: "Size", options: [{ label: "S" }] }] });
+  const twoBlocks = liveRender("First:\n\n```ask\n" + j1 + "\n```\n\nSecond:\n\n```ask\n" + j2 + "\n```");
+  assert.equal(askq(twoBlocks), 2, "two separate ask fences both render as widgets");
+  assert.ok(!twoBlocks.includes("```ask"), "no raw ask fence leaks through as text");
+  assert.ok(twoBlocks.includes(">Color<") && twoBlocks.includes(">Size<"), "both fences' questions are interactive");
 });
 
 test("usage template renders the account plan bars from the `usage` feed", async () => {
@@ -791,6 +924,193 @@ test("weather template renders current conditions from the off-log `weather` cap
   assert.equal(titled, "Tokyo", "the location commits through the granted setTitle capability");
 });
 
+test("notebook template views a .html file: prose, module cells with wiring/policy + Run + output, feeds the graph", async () => {
+  const mod = await loadTemplate("notebook");
+  assert.equal(mod.contract, 1);
+
+  // Source rides the off-log `fileContent` capability (content.ts), an Observable Notebooks 2.0 `.html`
+  // file — NOT node.text. The template deserializes it (vendored notebook-format.js) into cells, hands the
+  // graph to the scheduler via `syncCells`, and reads results from `cellOutputs`.
+  const htmlSrc = [
+    "<!doctype html>",
+    "<notebook>",
+    "  <title>Hello, notebook</title>",
+    '  <script id="a1" type="text/markdown">',
+    "    # Hello, notebook",
+    "  </script>",
+    '  <script id="a2" type="module" data-out="x">',
+    "    21",
+    "  </script>",
+    '  <script id="a3" type="module" data-in="x" data-out="y">',
+    "    x * 2",
+    "  </script>",
+    '  <script id="a4" type="module" data-in="x" data-policy="manual">',
+    "    Array.from({length: x}, (_, i) => i * i)",
+    "  </script>",
+    "</notebook>",
+  ].join("\n");
+
+  const ran = [];
+  let synced = null;
+  const card = {
+    fields: { title: "notebooks/hello.html", text: "", color: "green" },
+    signals: {
+      fileContent: htmlSrc,
+      cellOutputs: { a2: { status: "ok", value: 21 }, a3: { status: "ok", value: 42 } },
+      syncCells: (cells) => (synced = cells),
+      runCell: (id) => ran.push(id),
+      writeFile: () => {},
+    },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes('file-name">hello.html<'), "basename in the head");
+  assert.ok(out.includes('file-ext">notebook<'), "type label");
+  assert.ok(out.includes(">Hello, notebook<"), "the markdown cell renders as PROCESSED prose (heading text, '#' consumed)");
+  assert.ok(out.includes("md-h1") || out.includes("md-h "), "the '# …' becomes a heading element, not raw source");
+  assert.ok(out.includes("nb-md-prose"), "markdown cell wears the prose class, not a code box");
+  assert.ok(!out.includes("nb-md-source"), "a markdown cell shows prose by default, not the raw-edit textarea");
+  // Only DELAYED cells (manual/debounced) carry a Run button + status badge — a4 is manual. Standard (auto)
+  // cells re-run on defocus, so a2/a3 get no Run button and no "ok" badge; their output pane is the signal.
+  assert.ok((out.match(/nb-run/g) || []).length === 1, "a Run button only on the delayed (manual) cell, not the auto cells");
+  assert.ok(!out.includes("nb-status nb-ok"), "no 'ok' status badge on a standard (auto) cell");
+  assert.ok(out.includes(">21<"), "a2 output value renders");
+  assert.ok(out.includes(">42<"), "a3 (downstream) output value renders");
+
+  // Wiring is DISPLAY-ONLY now (the editable in/out boxes were removed; authoring moves into the cell code).
+  // Explicit declarations still render as chips: a2 defines x (→ x), a3 reads x + defines y (↓ x, → y). Only
+  // the policy stays editable when writeFile is granted (the click-to-cycle button).
+  assert.ok(!out.includes("nb-wire-input"), "the editable wiring boxes are gone");
+  assert.ok(out.includes("nb-policy-btn"), "policy is a click-to-cycle button");
+  assert.ok(out.includes("→ x"), "a2's explicit define (x) shows as a chip");
+  assert.ok(out.includes("↓ x") && out.includes("→ y"), "a3's explicit read (x) and define (y) show as chips");
+
+  // syncCells got the parsed graph, including wiring + policy, module cells carrying their declarations.
+  assert.ok(Array.isArray(synced) && synced.length === 4, "all cells (incl. markdown) handed to the scheduler");
+  const a3 = synced.find((c) => c.id === "a3");
+  assert.deepEqual(a3.inNames, ["x"], "a3 imports x");
+  assert.deepEqual(a3.outNames, ["y"], "a3 exports y");
+  const a4 = synced.find((c) => c.id === "a4");
+  assert.equal(a4.policy, "manual", "a4's policy reaches the scheduler");
+
+  // The Run button routes through the granted capability with just the cell id (the runtime holds source).
+  card.signals.runCell("a4");
+  assert.deepEqual(ran, ["a4"], "Run dispatches runCell(cellId)");
+
+  // A stale cell (inputs changed, awaiting a trigger) is a DELAYED-cell concept — a4 is manual. Its bar
+  // shows the stale badge while keeping the last value visible.
+  const stale = flatten(
+    mod.render({ ...card, signals: { ...card.signals, cellOutputs: { a4: { status: "ok", value: 42, stale: true } } } }),
+  );
+  assert.ok(stale.includes("nb-status nb-stale") && stale.includes("stale — inputs changed"), "a delayed cell shows the stale badge");
+  assert.ok(stale.includes(">42<"), "a stale cell still shows its last value");
+
+  // A running auto cell shows "running…" in its OUTPUT PANE (no bar); a running delayed cell also gets the
+  // bar's running badge. An error renders to a string, never a crash.
+  const running = flatten(
+    mod.render({ ...card, signals: { ...card.signals, cellOutputs: { a2: { running: true }, a4: { running: true } } } }),
+  );
+  assert.ok(running.includes("running…"), "running state shown in the output pane");
+  assert.ok(running.includes("nb-status nb-running"), "a delayed cell also shows the running badge");
+  const errOut = flatten(
+    mod.render({ ...card, signals: { ...card.signals, cellOutputs: { a2: { status: "error", error: "ReferenceError: oops is not defined" } } } }),
+  );
+  assert.ok(errOut.includes("oops is not defined") && errOut.includes("nb-out-error"), "error output shown, styled");
+
+  // No signals at all → falls back to fields.text, renders headlessly (no syncCells call), never throws.
+  const empty = flatten(mod.render({ fields: { title: "x.html", text: "", color: "green" }, signals: {} }));
+  assert.ok(empty.includes('file-ext">notebook<'), "renders the head without any signals");
+});
+
+test("notebook template shows INFERRED wiring (step-4a) as a muted hint where no data-in/data-out is written", async () => {
+  const mod = await loadTemplate("notebook");
+
+  // Two module cells with NO data-in/data-out: `x = 21` defines x, `y = x * 2` reads x + defines y. The
+  // runtime (acorn) does the inference and reports it back through cellOutputs as inReads/inDefines; the
+  // template only DISPLAYS it (it never parses JS). So we feed the inferred wiring via the cellOutputs mock.
+  const htmlSrc = [
+    "<!doctype html>",
+    "<notebook>",
+    "  <title>inferred</title>",
+    '  <script id="a2" type="module">',
+    "    x = 21",
+    "  </script>",
+    '  <script id="a3" type="module">',
+    "    y = x * 2",
+    "  </script>",
+    "</notebook>",
+  ].join("\n");
+  const cellOutputs = {
+    a2: { status: "ok", value: 21, inDefines: ["x"] },
+    a3: { status: "ok", value: 42, inReads: ["x"], inDefines: ["y"] },
+  };
+
+  // Wiring is DISPLAY-ONLY (the editable boxes were removed). Inferred reads AND defines render as the italic
+  // nb-wire-inf chip — the same way whether or not the card can write. a2 defines x (→ x); a3 reads x (↓ x)
+  // and defines y (→ y).
+  for (const signals of [
+    { fileContent: htmlSrc, cellOutputs, syncCells: () => {}, writeFile: () => {} }, // writable
+    { fileContent: htmlSrc, cellOutputs }, // read-only
+  ]) {
+    const o = flatten(mod.render({ fields: { title: "inferred.html", text: "", color: "green" }, signals }));
+    assert.ok(!o.includes("nb-wire-input"), "no editable wiring boxes");
+    assert.ok(o.includes("nb-wire-inf"), "inferred wiring renders as the italic chip");
+    assert.ok(o.includes("→ x") && o.includes("→ y"), "inferred defines (x, y) shown as → chips");
+    assert.ok(o.includes("↓ x"), "the inferred read (x) is shown as a ↓ chip");
+  }
+
+  // A cell with an EXPLICIT data-out renders the plain (non-italic) define chip, not the inferred one.
+  const explicitSrc = htmlSrc.replace('<script id="a3" type="module">', '<script id="a3" type="module" data-out="y">');
+  const overridden = flatten(mod.render({ fields: { title: "x.html", text: "", color: "green" }, signals: { fileContent: explicitSrc, cellOutputs: { a3: { status: "ok", value: 42, inDefines: ["y"] } }, writeFile: () => {} } }));
+  assert.ok(/nb-wire nb-out" title="defines">→ y/.test(overridden), "explicit data-out → plain define chip, not the inferred one");
+
+  // An inferred CROSS-card import (step-4b, an `import` statement) renders as a muted ↓ chip labelled
+  // name←path, the same way the runtime reports it via cellOutputs.inImports.
+  const crossOutputs = { a3: { status: "ok", value: 3, inImports: [{ name: "df", path: "./notebook1", export: "df" }] } };
+  const cross = flatten(mod.render({ fields: { title: "x.html", text: "", color: "green" }, signals: { fileContent: htmlSrc, cellOutputs: crossOutputs, writeFile: () => {} } }));
+  assert.ok(/nb-wire nb-in nb-wire-inf[^>]*>↓ df←\.\/notebook1#df/.test(cross), "inferred cross-card import shown as a muted name←path chip");
+});
+
+test("notebook template renders a reactive markdown cell's INTERPOLATED output as prose (`${ }`)", async () => {
+  const mod = await loadTemplate("notebook");
+  // A text/markdown cell with a `${ }` interpolation (Observable Notebook Kit 2.0) is scheduled like a code
+  // cell: the runtime compiles it to a template literal, runs it, and its OUTPUT VALUE is the interpolated
+  // prose STRING — which the card renders as markdown. The template doesn't run anything; we feed the
+  // computed string via the cellOutputs mock, exactly as the runtime would after a run.
+  const htmlSrc = [
+    "<!doctype html>",
+    "<notebook>",
+    "  <title>Live</title>",
+    '  <script id="a1" type="module" data-out="total">',
+    "    42",
+    "  </script>",
+    '  <script id="a2" type="text/markdown">',
+    "    ## Sales: ${total}",
+    "  </script>",
+    "</notebook>",
+  ].join("\n");
+  // a2's run produced the interpolated string "## Sales: 42".
+  const cellOutputs = { a2: { status: "ok", value: "## Sales: 42" } };
+  const out = flatten(
+    mod.render({ fields: { title: "live.html", text: "", color: "green" }, signals: { fileContent: htmlSrc, cellOutputs, syncCells: () => {}, writeFile: () => {} } }),
+  );
+  assert.ok(out.includes("nb-md-prose"), "the markdown cell still renders as prose, not a code box");
+  assert.ok(out.includes(">Sales: 42<"), "the INTERPOLATED value (42) renders, with the heading '##' consumed");
+  assert.ok(!out.includes("${total}"), "the raw ${total} source is NOT shown once interpolated");
+
+  // An interpolation error keeps the document readable (raw source as prose) and surfaces the error notice.
+  const errored = flatten(
+    mod.render({ fields: { title: "live.html", text: "", color: "green" }, signals: { fileContent: htmlSrc, cellOutputs: { a2: { status: "error", error: "ReferenceError: total is not defined" } }, syncCells: () => {}, writeFile: () => {} } }),
+  );
+  assert.ok(errored.includes("nb-md-error") && errored.includes("total is not defined"), "an interpolation error shows a muted notice");
+
+  // Before the first run (no output), the raw source shows as prose — a brief, harmless transient.
+  const pristine = flatten(
+    mod.render({ fields: { title: "live.html", text: "", color: "green" }, signals: { fileContent: htmlSrc, cellOutputs: {}, syncCells: () => {}, writeFile: () => {} } }),
+  );
+  assert.ok(pristine.includes("nb-md-prose"), "a not-yet-run interpolated cell still renders (its raw source)");
+});
+
 // Reassemble a TemplateResult (and nested results/arrays in its values) into a flat string.
 function flatten(value) {
   if (value == null) return "";
@@ -799,3 +1119,98 @@ function flatten(value) {
     return value.strings.reduce((acc, s, i) => acc + (i ? flatten(value.values[i - 1]) : "") + s, "");
   return String(value);
 }
+
+// worktree-activity slices A/C: the session card's touched-files activity strip — derived from the same
+// tool_use blocks as the turns — dedupes by path (newest touch wins), marks edited files as written
+// (sticky even after a later read), and colours each dot by the WORKTREE the absolute path falls under.
+test("session activity strip: dedupes touched files, distinguishes read/write, colours by worktree", async () => {
+  const mod = await loadTemplate("session");
+  const jsonl = [
+    {
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "t1", name: "Read", input: { file_path: "/repo/main/src/a.ts" } },
+          { type: "tool_use", id: "t2", name: "Edit", input: { file_path: "/repo/wt/src/b.ts" } },
+          { type: "tool_use", id: "t3", name: "Read", input: { file_path: "/repo/wt/src/b.ts" } }, // re-read → still written
+        ],
+      },
+    },
+  ]
+    .map((e) => JSON.stringify(e))
+    .join("\n");
+  const roots = [
+    { id: "repo", name: "main", path: "/repo/main", branch: "", head: "", hue: "hsl(10 60% 55%)" },
+    { id: "wt", name: "wt", path: "/repo/wt", branch: "feat", head: "", hue: "hsl(200 60% 55%)" },
+  ];
+  const out = flatten(mod.render({ fields: { title: "sess", text: jsonl, color: "blue" }, signals: { roots }, root: "repo" }));
+
+  assert.ok(out.includes("2 files"), "b.ts counted once across its edit + re-read");
+  assert.ok(out.includes("a.ts") && out.includes("b.ts"), "basenames in the expanded list");
+  assert.ok(out.includes("background:hsl(200 60% 55%)"), "edited file fills with its WORKTREE hue (written)");
+  assert.ok(out.includes("border-color:hsl(10 60% 55%)"), "read-only file takes the canonical hue as a ring");
+});
+
+// worktree-activity slice B/C: a root-level tree card (path "", card.root = a worktree id) shows the
+// worktree's name + branch and its colour swatch, looked up from the `roots` capability by card.root.
+test("directory root-level head shows the worktree name, branch, and colour swatch", async () => {
+  const mod = await loadTemplate("directory");
+  const roots = [{ id: "wt", name: "feature-tree", path: "/repo/wt", branch: "feat-x", head: "", hue: "hsl(123 60% 55%)" }];
+  const card = {
+    fields: { title: "", text: "", color: "purple" },
+    signals: { dirListing: () => ({ dirs: [], files: [] }), treeState: { get: () => new Set(), set() {} }, roots },
+    root: "wt",
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("feature-tree"), "worktree name in the head (not the bare path)");
+  assert.ok(out.includes("feat-x"), "branch in the ext slot");
+  assert.ok(out.includes("hsl(123 60% 55%)"), "root colour swatch");
+});
+
+// worktree-activity (combined file-tree card): card.root === "roots" lists every board root (canonical +
+// worktrees) as a colour-swatched, drillable, drag-outable top-level row — reactively off the `roots` cap.
+test("directory combined mode lists every root, colour-swatched and drag-outable", async () => {
+  const mod = await loadTemplate("directory");
+  const roots = [
+    { id: "repo", name: "main", path: "/r/main", branch: "", head: "", hue: "hsl(10 60% 55%)" },
+    { id: "wt", name: "feature", path: "/r/wt", branch: "feat-x", head: "", hue: "hsl(200 60% 55%)" },
+  ];
+  const card = {
+    fields: { title: "", text: "", color: "purple" },
+    signals: { dirListing: () => ({ dirs: [], files: [] }), treeState: { get: () => new Set(), set() {} }, roots },
+    root: "roots",
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("file tree") && out.includes("2 roots"), "header names the combined tree + root count");
+  assert.ok(out.includes(">main<") && out.includes(">feature<"), "every root listed as a top-level row");
+  assert.ok(out.includes("feat-x"), "a worktree's branch shown on its row");
+  assert.ok(out.includes("hsl(10 60% 55%)") && out.includes("hsl(200 60% 55%)"), "each root row swatched by its hue");
+  assert.ok(out.includes("dir-root-row") && out.includes('draggable="true"'), "root rows drag out to their own card");
+});
+
+// worktree-activity slice D: a pinned card whose backing is deleted/removed shows a TOMBSTONE (kept +
+// marked), not a silent removal (files) or a stuck "loading…" (folders/worktrees).
+test("file card tombstones a deleted file (gone) instead of vanishing", async () => {
+  const mod = await loadTemplate("file");
+  const out = flatten(
+    mod.render({ fields: { title: "core/src/store.ts", text: "", color: "blue" }, signals: { gone: true }, root: "repo" }),
+  );
+  assert.ok(out.includes("file-gone"), "tombstone styling");
+  assert.ok(out.includes("store.ts") && out.includes("deleted on disk"), "names the deleted file");
+});
+
+test("directory card tombstones when its worktree root is gone (root absent from the loaded roots)", async () => {
+  const mod = await loadTemplate("directory");
+  // roots loaded (non-empty) but card.root not among them → the worktree was removed.
+  const roots = [{ id: "repo", name: "main", path: "/r", branch: "", head: "", hue: "hsl(1 60% 55%)" }];
+  const card = {
+    fields: { title: "", text: "", color: "purple" },
+    signals: { dirListing: () => undefined, treeState: { get: () => new Set(), set() {} }, roots, gone: false },
+    root: "ghost-wt",
+  };
+  const out = flatten(mod.render(card));
+  assert.ok(out.includes("file-gone") && out.includes("worktree removed"), "worktree-removed tombstone");
+});

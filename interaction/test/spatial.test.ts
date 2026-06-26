@@ -56,3 +56,26 @@ test("syncIndexFromStore seeds from snapshot and tracks layout diffs (channel 2)
 
   off();
 });
+
+test("floating (anchor screen) cards are excluded from the index, and toggling re-syncs", () => {
+  const ix = new BruteForceIndex();
+  const e = new Editor();
+  // A normal world card and a floating one whose x/y are SCREEN px (here colliding in page space).
+  e.commit({ type: "addNode", payload: { id: "node:world", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:float", x: 0, y: 0, w: 100, h: 100, anchor: "screen" }, actor: "human" });
+  const off = syncIndexFromStore(e.store, ix);
+
+  // The floating card is NOT in the index — a press at its page coords hits the world card beneath it.
+  assert.equal(ix.hitPoint(vec(10, 10)), "node:world");
+  assert.equal(ix.boxOf("node:float"), undefined);
+
+  // Pin the world card → it leaves the index (becomes chrome).
+  e.commit({ type: "setAnchor", payload: { id: "node:world", anchor: "screen" }, actor: "human" });
+  assert.equal(ix.hitPoint(vec(10, 10)), undefined);
+
+  // Unpin the floating card → it re-enters the index at its (now page-space) box.
+  e.commit({ type: "setAnchor", payload: { id: "node:float", anchor: "world" }, actor: "human" });
+  assert.equal(ix.hitPoint(vec(10, 10)), "node:float");
+
+  off();
+});

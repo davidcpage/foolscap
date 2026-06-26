@@ -12,12 +12,25 @@ export type CommandHandler = (store: Store, payload: any) => void;
 // A canvas-shaped starter set. addNode emits the semantic + layout pair atomically (one diff with
 // two `added`); moveNode touches the layout record only (the hot path / semantic split, doc §9.3).
 export const defaultCommands: Record<string, CommandHandler> = {
-  addNode(store, p: { id?: Id<"node">; type?: string; title?: string; text?: string; color?: string; x?: number; y?: number; w?: number; h?: number; z?: number }) {
+  addNode(store, p: { id?: Id<"node">; type?: string; title?: string; text?: string; color?: string; x?: number; y?: number; w?: number; h?: number; z?: number; anchor?: "screen" | "world" }) {
     const id = p.id ?? nodeId();
     store.put([
       { typeName: "node", id, type: p.type ?? "note", title: p.title ?? "", text: p.text ?? "", color: p.color ?? pickColor(store) },
-      { typeName: "layout", id: layoutId(id), nodeId: id, x: p.x ?? 0, y: p.y ?? 0, w: p.w ?? 200, h: p.h ?? 120, z: p.z ?? nextZ(store) },
+      { typeName: "layout", id: layoutId(id), nodeId: id, x: p.x ?? 0, y: p.y ?? 0, w: p.w ?? 200, h: p.h ?? 120, z: p.z ?? nextZ(store), ...(p.anchor ? { anchor: p.anchor } : {}) },
     ]);
+  },
+
+  // Pin a card to the viewport (anchor "screen" → floating chrome) or drop it back onto the canvas
+  // ("world"), carrying the converted box so the toggle is visually seamless — the caller (which knows
+  // the camera) computes the screen↔page coordinates. Layout-only, like moveNode; the engine stays
+  // blind to anchoring (it just stops indexing a "screen" card — see syncIndexFromStore).
+  setAnchor(store, p: { id: Id<"node">; anchor: "screen" | "world"; x?: number; y?: number; w?: number; h?: number }) {
+    const patch: Partial<import("./records.js").LayoutRecord> = { anchor: p.anchor };
+    if (p.x != null) patch.x = p.x;
+    if (p.y != null) patch.y = p.y;
+    if (p.w != null) patch.w = p.w;
+    if (p.h != null) patch.h = p.h;
+    store.update<import("./records.js").LayoutRecord>(layoutId(p.id), patch);
   },
 
   // Recolour a note — the semantic counterpart to addNode's colour, so an agent can restyle the board.
@@ -36,7 +49,14 @@ export const defaultCommands: Record<string, CommandHandler> = {
   },
 
   removeNode(store, p: { id: Id<"node"> }) {
-    store.remove([p.id, layoutId(p.id)]);
+    // Cascade to connected edges: an edge whose endpoint node is gone is a dangling reference (never
+    // valid), so deleting a card tears down its wires too — a channel card removes its memberships, a
+    // session card removes the memberships pointing out of it, a computed card removes its input wires.
+    // One store.remove → one diff → one undoable IntentEvent that restores node + layout + edges together.
+    const edges = store.getSnapshot().records
+      .filter((r) => r.typeName === "edge" && (r.from === p.id || r.to === p.id))
+      .map((r) => r.id);
+    store.remove([p.id, layoutId(p.id), ...edges]);
   },
 
   setTitle(store, p: { id: Id<"node">; title: string }) {

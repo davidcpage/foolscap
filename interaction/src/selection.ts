@@ -58,3 +58,21 @@ export function selectionBounds(store: Store, ids: Iterable<string>): Box | null
   }
   return boxUnion(boxes);
 }
+
+/**
+ * Bounding box of EVERY node on the board in page space (null for an empty board) — what "zoom to fit
+ * all" frames. Reads the layout records straight off the snapshot (a coarse, on-demand op, not a hot
+ * path). A `skip` predicate drops layouts that aren't world content — screen-anchored (floating)
+ * cards store their x/y in screen pixels, so including them would warp the fit; the renderer passes a
+ * predicate that excludes them.
+ */
+export function worldBounds(store: Store, skip?: (l: LayoutRecord) => boolean): Box | null {
+  const boxes: Box[] = [];
+  for (const r of store.getSnapshot().records) {
+    if (r.typeName !== "layout") continue;
+    const l = r as LayoutRecord;
+    if (skip?.(l)) continue;
+    boxes.push({ x: l.x, y: l.y, w: l.w, h: l.h });
+  }
+  return boxUnion(boxes);
+}

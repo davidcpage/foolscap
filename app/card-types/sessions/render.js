@@ -16,6 +16,22 @@ function dragStart(e, id) {
   e.dataTransfer.effectAllowed = "copy";
 }
 
+// Row keyboard: a SELECTED row (click it → it takes focus, the `:focus` outline is the selection cue)
+// is HIDDEN from this list by Shift+Delete — a deliberate, two-key gesture for a rare, mildly-destructive
+// act (it never deletes the .jsonl, only drops it from the view; sessionDelete persists the hide). The
+// guard is the Shift: a bare Delete must NOT bite, both to demand intent and because the host's global
+// Delete removes the selected canvas card. So we stopPropagation on every Delete/Backspace in a focused
+// row (contain it from the canvas shortcuts, exactly as the live session input does) and only act when
+// Shift is held. `del` is card.signals.sessionDelete (absent if the capability wasn't granted → no-op).
+function onRowKey(e, id, del) {
+  if (e.key !== "Delete" && e.key !== "Backspace") return; // leave every other key for the host
+  e.stopPropagation(); // a focused row owns Delete/Backspace — never let it reach the canvas card-delete
+  if (e.shiftKey && del) {
+    e.preventDefault();
+    del(id);
+  }
+}
+
 // "how long ago", coarse and friendly — the meta line's clock. Mirrors feeds.ts timeAgo, inlined here
 // because a template may import only /vendor/ (the capability boundary), exactly as the directory card
 // inlines baseName/ext rather than reaching into the app.
@@ -41,6 +57,8 @@ export default {
     // Reading it subscribes the card; refreshSessionList() (the ⟳ button) re-pulls + notifies.
     const sessions = card.signals.sessionList;
     const refresh = card.signals.sessionRefresh;
+    const del = card.signals.sessionDelete; // hide-from-list action (Shift+Delete on a selected row)
+    const open = card.signals.sessionOpen; // double-click → open this session as a card (drag-out's twin)
     const count = sessions ? sessions.length : 0;
 
     return html`
@@ -62,11 +80,14 @@ export default {
         ${(sessions ?? []).map(
           (s) => html`
             <div
-              class="ses-row"
+              class="ses-row ${s.status ? `ses-status-${s.status}` : ""}"
               draggable="true"
               data-interactive="1"
-              title="drag onto the canvas to open this session"
+              tabindex="0"
+              title="double-click or drag onto the canvas to open · click then Shift+Delete to hide from this list"
               @dragstart=${(e) => dragStart(e, s.id)}
+              @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(s.id); }}
+              @keydown=${(e) => onRowKey(e, s.id, del)}
             >
               <span class="ses-row-title ${s.title ? "" : "ses-row-mono"}">${s.title || s.id.slice(0, 8)}</span>
               <span class="ses-row-meta">

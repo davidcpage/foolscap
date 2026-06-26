@@ -12,8 +12,23 @@
 #   • `treeState` — per-card EPHEMERAL view state: which sub-folders are expanded. Read-tracked + settable
 #     so a local expand/collapse re-renders the card, but never logged and gone on reload (browsing is
 #     view state, not authored state, §9).
+#   • `fsOpen` — a per-card ACTION (path, kind) that OPENS a FILE row as a card on double-click: the
+#     keyboard-free twin of the drag-out (loader.materializeAt), placed offset down-right from this browser
+#     card (loader.cascadeFrom). Files only — a FOLDER row's click already drills in (treeState), so folders
+#     keep click=expand / drag=pin and never double-click-open.
+#   • `fsRename` — a per-card ACTION (root, from, to) behind a row's Enter: an inline rename/move that POSTs
+#     a real disk move (/api/file/rename) and RE-KEYS any pinned card to the new (root, path) so it survives
+#     in place (loader.renameFileNodes) — the referential-integrity win over an external Finder rename.
+#   • `fsDelete` — a per-card ACTION (root, path) behind a row's Shift+Delete: a real disk delete
+#     (/api/file/delete). A pinned card for the path tombstones via the watch (the loader's `gone` rule).
+#   • `editState` — per-card EPHEMERAL view state (sibling of `treeState`): which row is mid-rename + any
+#     error. Read-tracked + settable, never logged, gone on reload — an in-flight edit is view state.
 #
 # No `chrome` flag: a directory is a container and wants its frame (unlike the bare clock).
 name: directory
 contract: 1
-capabilities: [dirListing, treeState]
+#   • `roots` — the board's roots (canonical + git worktrees). A root-level tree card looks up its OWN
+#     root (card.root) here for its colour swatch + the worktree name/branch in the head (slice C).
+#   • `gone` — true once this folder is deleted on disk (or its worktree removed). A single-root tree
+#     card shows a tombstone instead of hanging on "loading…" (worktree-activity slice D).
+capabilities: [dirListing, treeState, fsOpen, fsRename, fsDelete, editState, roots, gone]

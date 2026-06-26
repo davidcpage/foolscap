@@ -1,0 +1,23 @@
+# The notebook card type (docs/notebook-card.md). A notebook is CONTENT — cell source lives in a `.html`
+# file (the Observable Notebooks 2.0 format), the card is a VIEW over that file, exactly the file card's
+# content/record split (§4). It reuses the file card's content path and adds the reactive-runtime seam.
+# Source on disk, outputs off-log, only the node's arrangement on the durable log.
+#
+# GRANT:
+#   • fileContent — the `.html` source as an OFF-LOG signal projected from disk (content.ts), keyed by
+#     this card's path (the title). render deserializes it to cells; liveness comes from the watcher
+#     refreshing this signal, never a setText on the durable log (the file-card rule, §4).
+#   • writeFile — the serialize-back: a per-card action that POSTs the edited `.html` to disk (POST
+#     /api/file). Source lives in the FILE, not record.text — so an edit is a file write, not a log event.
+#     The watcher then refreshes `fileContent` on every card viewing this path.
+#   • syncCells — (action) hand the parsed cell list (id/source/data-in/data-out/data-policy) to the
+#     reactive scheduler (notebook-runtime.ts), which builds the dependency DAG and re-runs dirty cells (§5).
+#   • runCell — (action) force one `module` cell to run now, overriding its policy (the Run button, §6).
+#   • cellOutputs — (signal) this card's off-log cell-output projection (cellId → {status,value,running,stale}).
+#   • treeState — (ephemeral view state) which markdown cells are in RAW-EDIT mode. A markdown cell renders
+#     as processed prose by default and flips to a raw <textarea> on click (once the card is selected — the
+#     sticky card's gesture); that flip is per-card view state (off-log, gone on reload, never committed),
+#     exactly the directory card's expand-set shape.
+name: notebook
+contract: 1
+capabilities: [fileContent, writeFile, syncCells, runCell, cellOutputs, treeState]

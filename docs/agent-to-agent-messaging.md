@@ -307,3 +307,117 @@ a setting rather than a separate design.
 - The shared-canvas authz upgrade (per-user tokens, removing raw `/input`) — needed at multi-user, not
   solo (§7).
 - Watch-region granularity (per-card vs per-region) and its index — a spatial-index concern.
+
+## 15. Implemented evolution — channels and the inbox (2026-06-22)
+
+What shipped refines §4/§9 in two ways, after a build-and-demo pass:
+
+- **The relationship is a NODE, not an edge.** A **channel** is a card (`type:"channel"`) whose `text` is
+  the **charter** — editable inline like any card, fixing the write-once modal a per-edge brief implied.
+  A session joins via a `member:open` edge (session→channel); a post **fans out** to every other member.
+  1:1 chat is just a 2-member channel; an N-way channel needs no new primitive. The whole lifecycle still
+  rides `addNode`/`addEdge`/`removeEdge` (channel-3, §12); only the fan-out is server-side and off-log.
+  Agents work in **channel ids + their own session id** — `POST /api/channel/<id>/{message,join,leave,
+  invite}` — and the server fulfils join/leave/invite by *emitting* the bus command, so an agent never
+  constructs a node/edge id. On join the server pushes a one-time intro (charter + roster + the recipes),
+  so the protocol is self-teaching; the per-message stamp is then terse (`[<chanId> · from <sid>]`).
+
+- **Delivery: an off-log channel LOG + a content-free wake (the §10 derived conversation card, realized).**
+  A first cut injected each message into the recipient's stdin as synthetic user text — which made peer
+  messages *masquerade as the human's input* and scattered the conversation across session cards with no
+  legible home. The clean model: a channel message is recorded in the channel's **off-log message log**
+  (`{seq, ts, from, text}`, bounded tail), which is both (a) streamed on a `channel:<id>` feed the channel
+  card renders as the **conversation view** — one legible place to follow it — and (b) read by the agent
+  via a **tool call** (`GET /api/inbox?session=<sid>` → the unread messages, grouped by channel, advancing
+  a per-session read cursor), so the content lands in **tool output, never as a user turn**. The only thing
+  pushed to stdin is a **content-free nudge** (`[canvas] new channel messages: "X" (2 new) — read with …`),
+  fired idle-immediate or at the `result` boundary, coalesced (§9: ≤ one wake per boundary; an ignored
+  nudge isn't re-fired until new traffic). **Onboarding stays user text** — it's the wake, not a peer
+  message. Two bugs an earlier demo caught and fixed: a freshly-spawned session must start **idle** (it
+  emits `init`, never a `result`, so "running" would never drain), and a membership announce must fire
+  **only when the bus delivered** (else a failed join still announces). Demoed: a post lands as the peer's
+  *tool output* after a content-free nudge, and the channel card shows the running conversation.
+
+## 16. `ask` — synchronous request/response over channel membership (2026-06-23)
+
+*Design conversation, then build. The motivating use case is a **codebase oracle**: a long-lived
+session that keeps a tree-sitter/ast-grep outline of the repo warm and answers peers' questions in
+`file:line` pointers (cheap to send, cheap to consume) instead of dumping file contents. The channel
+machinery of §15 is **broadcast** — every member is nudged on every post — which is wrong for an oracle:
+a consultation is **binary** (one asker, one answerer) and the asker **needs the answer to continue**.*
+
+### The reframe (mirrors §1)
+
+A consultation bundles two wants the §15 channel doesn't serve:
+
+- **point-to-point routing** — wake *only* the answerer, and *only* the asker with the reply; the other
+  members shouldn't pay a wake-and-read cycle to discover "not for me"; and
+- **synchronous resumption** — asking is a tool call, and the agent has nothing to do until the answer
+  comes. The §15 async path *does* technically resume (ask → turn ends → idle → nudged by the reply →
+  wakes with it in tool output, same process/context preserved), but it has two real holes: **no
+  liveness/timeout** (nudges fire only on new traffic, so a dead/silent oracle hangs the asker forever)
+  and the **park/resume across a turn boundary is unnatural** when the answer is a hard dependency.
+
+### Rejected: a `to` field on channel messages
+
+The first design added an optional `to: sid` to `ChannelMsg` (directed pub/sub). It works, but it drags
+a cascade: directed messages live in the **durable shared log** → need **nudge-scoping** → need a
+**read-filter** (`all` vs `directed`) → need a **per-member delivery knob** seeded at join. Five
+touch-points threaded through the *riskiest* core (the log + cursor machinery this repo is rightly twitchy
+about — see CLAUDE.md on truncation/cursor footguns), all to **simulate request/response out of broadcast**.
+`ask` *is* request/response; building it from addressed broadcasts was the long way round.
+
+### Chosen: `ask`/`reply` as a brokered ephemeral stream, separate from the broadcast log
+
+A consultation is a transient RPC the server holds in memory, keyed by an **ask-id** (not a persisted
+recipient). The channel is **not** acting as a forum here — it is the **directory + consent + legibility
+substrate**, and `ask` rides on the *membership relation*, not the *broadcast semantics*. This is
+**layering, not conflating**, held by two disciplines: (1) ask/reply **never writes to the broadcast log**,
+and (2) an oracle channel may be **quiet** (askers ask; they don't broadcast to each other).
+
+Why tie to a channel at all rather than a bare session→session RPC: a channel already *is* a
+charter-bearing, edge-visible, consent-gated relationship on a card, and a bare RPC would **lose the two
+things the board exists for** — *discovery* (a new session reads the board, sees the oracle's channel card
+and its description, joins) and *legibility* (the member edges + the card show who's wired to the oracle;
+a peer-to-peer RPC is invisible on the canvas). Consent here is **opt-in, not authz** (§7, single-user
+board): channel membership is the oracle advertising "I answer asks" and the asker opting in. The cost is
+**join-before-ask ceremony**, which amortizes — askers are long-lived cards that consult repeatedly
+(join once, ask many).
+
+### Mechanics
+
+- **`POST /api/channel/<id>/ask {from, to, text, timeoutMs?}`** — `from` and `to` must both be members
+  (the consent check, mirroring the §15 post check). Registers a pending ask `{askId, chanId, from, to,
+  text, ts}` (askId = `crypto.randomUUID()`), arms a timer at `min(timeoutMs ?? 30s, 60s)` — capped under
+  the agent's Bash tool timeout so the socket never out-waits the tool — **nudges only `to`**, and **holds
+  the HTTP response open**. Resolves `{askId, reply:{from,text,ts}}` on reply or `{askId, timedOut:true}`
+  on timeout. Fails fast (`409`) if `to` isn't a live session. **Does not touch `channelLogs`.**
+- **`GET /api/asks?session=<sid>`** — the answerer's pending queue (open asks where `to===sid`), parallel
+  to `/api/inbox`. Read-only; doesn't resolve anything.
+- **`POST /api/channel/<id>/reply {from, askId, text}`** — only the addressee (`from===ask.to`) may
+  answer; resolves the asker's held connection, clears the timer, deletes the entry, and **echoes** the
+  Q→A for legibility (below).
+- **Nudge integration** — `flushNudge` gains a pending-ask line (`N pending question(s) — GET /api/asks`).
+  Setting the target's `nudge=true` reuses the existing coalescing: idle → fire now; busy → fire at the
+  `result` boundary. **Correlation = the ask-id**, carried by `/reply`, not a recipient on a stored
+  message — the durable log stays untouched.
+
+### The one seam — legibility echo
+
+Canvas legibility wants the Q→A on the channel card, but the card's conversation view derives from
+`channelLogs`, and a plain append there would re-nudge every member (the noise we just removed). Resolved
+with a **fixed `kind:"ask"` tag** on a single consolidated log entry written at `/reply`: the card renders
+it; `handleInboxRead` and `flushNudge` **skip `kind:"ask"`** (cursor still advances past it, so it never
+accumulates). This is a *fixed one-field rule*, **not** the configurable `to`+read-filter+delivery-knob
+cascade we rejected — the only place ask-awareness leaks into the log, and it's bounded.
+
+### Deferred (per the §14 ethos — don't build before demand)
+
+- **General `@mention`** (directed *notice* in a broadcast channel, no reply expected). `ask` is
+  request/response only; if directed-notice is ever wanted it's a separate small feature, not a reason to
+  resurrect `to`.
+- **Configurable per-member read-filter** (`all` vs `directed`). Moot once there are no persisted directed
+  messages; revisit only if a real multi-asker channel wants shared-knowledge replay.
+- **Oracle freshness** (re-index on the fs watch stream, or stamp answers with a freshness marker) — an
+  oracle-card concern, orthogonal to the transport built here.
+

@@ -14,17 +14,26 @@ import { DRAG_THRESHOLD, HANDLE_HIT, HIT_MARGIN, type InteractionContext, type T
 //
 // Selection-on-press follows the familiar rule so group drags work: shift toggles the hit node;
 // otherwise, pressing an UNselected node selects just it, while pressing an already-selected node
-// leaves the selection intact (so you can drag the whole group). The pointing/marquee origins are kept
+// leaves the selection intact (so you can drag the whole group).
+//
+// Bring-to-front rides the SAME press: a non-shift press that selects a card lifts the selection above
+// every other card right away (immediate stacking feedback — no need to start dragging first), opening
+// ONE gesture. If the press becomes a drag, the move frames ride that same gesture and it settles as a
+// "moveNodes" intent; if it stays a plain click, the gesture ends as a "raiseNodes" intent. Either way
+// the raise + any move are a single coalesced diff and a single undo step. When the selection is
+// already on top (nothing to restack) no gesture opens, so plain clicks don't litter the undo stack.
+// The pointing/marquee origins are kept
 // in SCREEN space so the drag threshold is zoom-independent; the drag itself anchors to a PAGE point
 // (`grab`, captured once at drag start) so that if the CAMERA pans mid-drag — e.g. edge auto-scroll as
 // you drag a note off the viewport — the node keeps tracking the pointer into the newly revealed area
 // (a pinned pointer over a panning camera still yields motion, which a screen-space delta would cancel).
 type State =
   | { kind: "idle" }
-  | { kind: "pointing"; nodeId: string; originScreen: Vec; narrowOnUp: boolean }
+  | { kind: "pointing"; nodeId: string; originScreen: Vec; narrowOnUp: boolean; gesture: Gesture | null }
   | { kind: "dragging"; grab: Vec; gesture: Gesture; start: Map<string, Vec> }
   | { kind: "handle"; corner: Corner; nodeId: string; startBox: Box; originScreen: Vec }
   | { kind: "resizing"; corner: Corner; nodeId: string; startBox: Box; grab: Vec; gesture: Gesture }
+  | { kind: "connecting"; from: string }
   | { kind: "marquee"; originScreen: Vec; base: ReadonlySet<string> };
 
 export class SelectTool implements Tool {
@@ -40,6 +49,19 @@ export class SelectTool implements Tool {
     // "cannot begin a gesture inside another change".
     this.abortInFlight();
     const page = this.ctx.camera.screenToPage(e.point);
+
+    // Alt-drag from a connectable node wires two cards instead of moving one: enter a connect-drag and
+    // let the host decide what edge the drop makes (ctx.connect). The engine carries the gesture +
+    // preview only — it never learns edge semantics (mirrors aspectLock's card-type-blindness). Checked
+    // before the handle/select paths so alt-over-a-node always means "wire", not "resize/move".
+    if (e.altKey) {
+      const onNode = this.ctx.index.hitPoint(page, HIT_MARGIN / this.ctx.camera.state.z);
+      if (onNode && (this.ctx.connectable?.(onNode) ?? true)) {
+        this.state = { kind: "connecting", from: onNode };
+        this.ctx.connectDraw.set({ from: onNode, to: page, toNode: null });
+        return;
+      }
+    }
 
     // A resize handle wins over everything: it sits at the lone selected node's corner, drawn on top,
     // and is the smaller target, so a press there means resize even though the node's box is also under
@@ -60,12 +82,17 @@ export class SelectTool implements Tool {
       // already part of a multi-selection (non-shift), keep the group so a drag moves all of it, but
       // remember to narrow to just this node if the press turns out to be a plain click (pointer-up).
       const narrowOnUp = !e.shiftKey && this.ctx.selection.has(hit) && this.ctx.selection.size > 1;
-      this.state = { kind: "pointing", nodeId: hit, originScreen: e.point, narrowOnUp };
+      // Lift the selection to the front on the press itself (non-shift only — shift is for assembling a
+      // set, where a restack underfoot would surprise). The open gesture is held in the pointing state:
+      // a drag reuses it, a plain click ends it (see onPointerUp). null when already on top.
+      const gesture = e.shiftKey ? null : this.raiseSelection();
+      this.state = { kind: "pointing", nodeId: hit, originScreen: e.point, narrowOnUp, gesture };
     } else if (!e.shiftKey && this.pointInSelectionBounds(page)) {
       // Inside the multi-selection's bounding box but not on a card (the gap between selected cards) →
       // grab the whole group, tldraw-style: the selection's bounds is a draggable surface. Keep the
       // selection intact (a drag moves all of it; a plain release is a no-op), so it doesn't collapse.
-      this.state = { kind: "pointing", nodeId: this.ctx.selection.ids()[0]!, originScreen: e.point, narrowOnUp: false };
+      const gesture = this.raiseSelection();
+      this.state = { kind: "pointing", nodeId: this.ctx.selection.ids()[0]!, originScreen: e.point, narrowOnUp: false, gesture };
     } else {
       // empty space → marquee; non-additive press clears immediately for live feedback
       const base = e.shiftKey ? new Set(this.ctx.selection.ids()) : new Set<string>();
@@ -106,7 +133,7 @@ export class SelectTool implements Tool {
     switch (s.kind) {
       case "pointing": {
         if (vecDist(e.point, s.originScreen) < DRAG_THRESHOLD) return; // still a click
-        this.startDrag(s.originScreen); // threshold crossed → begin the move gesture
+        this.startDrag(s.originScreen, s.gesture); // threshold crossed → reuse the raise gesture (or open one)
         this.applyDrag(e.point); // include the move that crossed the threshold
         break;
       }
@@ -122,6 +149,15 @@ export class SelectTool implements Tool {
       case "resizing":
         this.applyResize(e.point);
         break;
+      case "connecting": {
+        // Track the loose end and light up a legal drop target (a different, connectable node). No store
+        // mutation — the connector is pure channel-1 preview until the drop commits an edge via the host.
+        const page = this.ctx.camera.screenToPage(e.point);
+        const hit = this.ctx.index.hitPoint(page, HIT_MARGIN / this.ctx.camera.state.z);
+        const toNode = hit && hit !== s.from && (this.ctx.connectable?.(hit) ?? true) ? hit : null;
+        this.ctx.connectDraw.set({ from: s.from, to: page, toNode });
+        break;
+      }
       case "marquee": {
         const box = this.ctx.camera.screenBoxToPage(s.originScreen, e.point);
         this.ctx.marquee.set(box);
@@ -132,20 +168,31 @@ export class SelectTool implements Tool {
     }
   }
 
-  onPointerUp(_e: PointerInput): void {
+  onPointerUp(e: PointerInput): void {
     const s = this.state;
     if (s.kind === "dragging") {
-      s.gesture.end({ ids: [...s.start.keys()] }); // one IntentEvent for the whole drag
+      s.gesture.end({ ids: [...s.start.keys()] }, "moveNodes"); // one IntentEvent for the raise+move
     } else if (s.kind === "resizing") {
       s.gesture.end({ ids: [s.nodeId] }); // one resizeNodes IntentEvent for the whole resize
+    } else if (s.kind === "connecting") {
+      // Drop on a different, connectable node → hand the host the pair; it makes the edge (or not).
+      // Released over empty space / the source / a non-target → just cancel the preview. No gesture,
+      // so nothing to revert; the edge (if any) is the host's own committed addEdge.
+      const page = this.ctx.camera.screenToPage(e.point);
+      const hit = this.ctx.index.hitPoint(page, HIT_MARGIN / this.ctx.camera.state.z);
+      if (hit && hit !== s.from && (this.ctx.connectable?.(hit) ?? true)) this.ctx.connect?.(s.from, hit);
+      this.ctx.connectDraw.set(null);
     } else if (s.kind === "marquee") {
       this.ctx.marquee.set(null); // selection is already live
-    } else if (s.kind === "pointing" && s.narrowOnUp) {
-      // Plain click on a node that was part of a multi-selection → narrow to just it (the drag that
-      // would have kept the group never started, or we'd be in "dragging").
-      this.ctx.selection.set([s.nodeId]);
+    } else if (s.kind === "pointing") {
+      // A plain click (no drag). If the press lifted the selection, commit that raise as its own one
+      // undo step — "raiseNodes", since nothing moved. (No gesture → the selection was already on top.)
+      if (s.gesture) s.gesture.end({ ids: this.ctx.selection.ids() }, "raiseNodes");
+      // A node that was part of a multi-selection → narrow to just it (the drag that would have kept
+      // the group never started, or we'd be in "dragging"). Selection is ephemeral, so this is
+      // independent of the committed raise above.
+      if (s.narrowOnUp) this.ctx.selection.set([s.nodeId]);
     }
-    // "pointing" without narrowOnUp = a plain click whose selection was already set on press.
     this.state = { kind: "idle" };
   }
 
@@ -153,6 +200,10 @@ export class SelectTool implements Tool {
     const s = this.state;
     if (s.kind === "dragging" || s.kind === "resizing") {
       s.gesture.cancel(); // revert the live atoms; nothing reaches channel 2 / the log
+    } else if (s.kind === "pointing") {
+      s.gesture?.cancel(); // a raise that opened on press but never committed → revert its lift
+    } else if (s.kind === "connecting") {
+      this.ctx.connectDraw.set(null); // drop the in-flight connector; no edge committed
     } else if (s.kind === "marquee") {
       this.ctx.marquee.set(null);
       this.ctx.selection.set(s.base); // restore what we had before the rubber-band
@@ -173,42 +224,59 @@ export class SelectTool implements Tool {
   private abortInFlight(): void {
     const s = this.state;
     if (s.kind === "dragging" || s.kind === "resizing") s.gesture.cancel();
+    else if (s.kind === "pointing") s.gesture?.cancel();
+    else if (s.kind === "connecting") this.ctx.connectDraw.set(null);
     else if (s.kind === "marquee") this.ctx.marquee.set(null);
     this.state = { kind: "idle" };
   }
 
-  // ── drag mechanics ──────────────────────────────────────────────────────────────────
-  // Snapshot every selected node's start position, then open ONE gesture. Each frame rewrites the
-  // selection's layout atoms to start + pageDelta — coalesced by the store into a single diff and a
-  // single "moveNodes" intent at end(). Absolute (start + delta) rather than incremental so the move
-  // is idempotent per frame and a dropped move event can't accumulate error.
-  private startDrag(originScreen: Vec): void {
-    const start = new Map<string, Vec>();
+  // Lift the current selection above every OTHER card, as ONE gesture frame, preserving the selection's
+  // internal stacking order. Returns the open (un-ended) gesture so the caller can fold a subsequent
+  // drag into it, or null when the selection is already entirely on top (nothing to restack — a plain
+  // click that opens no gesture leaves the undo stack untouched). The base is the top z among
+  // NON-selected cards, so the lift is minimal and idempotent: pressing an already-front card is a no-op.
+  private raiseSelection(): Gesture | null {
+    const ids = this.ctx.selection.ids();
+    if (ids.length === 0) return null;
+    const sel = new Set(ids);
+    const base = this.ctx.index.topZ(sel); // highest z among cards we are NOT raising (−1 if none)
     const zNow = new Map<string, number>();
-    for (const nodeId of this.ctx.selection.ids()) {
+    let minSel = Infinity;
+    for (const nodeId of ids) {
       const l = this.ctx.editor.store.get<"layout">(layoutId(nodeId as Id<"node">)) as LayoutRecord | undefined;
       if (l) {
-        start.set(nodeId, { x: l.x, y: l.y });
         zNow.set(nodeId, l.z);
+        if (l.z < minSel) minSel = l.z;
       }
     }
-    // The grab anchor: the page point under the pointer at the instant the drag begins, captured with
-    // the camera as it is NOW. Every frame's delta is measured from this fixed page point, so a camera
-    // pan during the drag (edge auto-scroll) shifts the node even while the pointer holds still.
-    const grab = this.ctx.camera.screenToPage(originScreen);
-    const gesture = this.ctx.editor.beginGesture("moveNodes", "human");
-    // Lift the grabbed set above everything else, preserving their relative order, FOLDED INTO the
-    // move gesture: it rides the one coalesced diff (so it's a single undo step with the move and adds
-    // no intent-log noise) and the index/renderer pick up the new stacking via channel 1/2 like any
-    // layout change. Grabbing the top card just re-confirms it on top — cheap and harmless.
-    const base = this.ctx.index.topZ();
+    if (zNow.size === 0 || minSel > base) return null; // already strictly above every other card
+    const gesture = this.ctx.editor.beginGesture("raiseNodes", "human");
     const ordered = [...zNow.keys()].sort((a, b) => zNow.get(a)! - zNow.get(b)!);
     gesture.update(() => {
       ordered.forEach((nodeId, i) => {
         this.ctx.editor.store.update<LayoutRecord>(layoutId(nodeId as Id<"node">), { z: base + 1 + i });
       });
     });
-    this.state = { kind: "dragging", grab, gesture, start };
+    return gesture;
+  }
+
+  // ── drag mechanics ──────────────────────────────────────────────────────────────────
+  // Snapshot every selected node's start position. The gesture is the one opened at press for the
+  // bring-to-front (so the raise + the move coalesce into a single diff / single "moveNodes" intent /
+  // single undo step); if the press found nothing to raise none was opened, so open one now. Each frame
+  // rewrites the selection's layout atoms to start + pageDelta — absolute (start + delta) rather than
+  // incremental so the move is idempotent per frame and a dropped move event can't accumulate error.
+  private startDrag(originScreen: Vec, gesture: Gesture | null): void {
+    const start = new Map<string, Vec>();
+    for (const nodeId of this.ctx.selection.ids()) {
+      const l = this.ctx.editor.store.get<"layout">(layoutId(nodeId as Id<"node">)) as LayoutRecord | undefined;
+      if (l) start.set(nodeId, { x: l.x, y: l.y });
+    }
+    // The grab anchor: the page point under the pointer at the instant the drag begins, captured with
+    // the camera as it is NOW. Every frame's delta is measured from this fixed page point, so a camera
+    // pan during the drag (edge auto-scroll) shifts the node even while the pointer holds still.
+    const grab = this.ctx.camera.screenToPage(originScreen);
+    this.state = { kind: "dragging", grab, gesture: gesture ?? this.ctx.editor.beginGesture("moveNodes", "human"), start };
   }
 
   private applyDrag(pointScreen: Vec): void {

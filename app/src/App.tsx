@@ -5,13 +5,22 @@ import {
   Persistence,
   UndoManager,
   bindDom,
+  layoutId,
   vec,
+  type Id,
   type InputEvent,
+  type LayoutRecord,
 } from "./lib";
-import { IdbEventStore, IdbSnapshotStore } from "./idb";
+import { IdbEventStore, IdbSnapshotStore, boardDbName, migrateLegacyBoard } from "./idb";
+import { activeBoardId, resolveBoard } from "./board";
+import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
+import { onFeedsReconnect } from "./feeds";
+import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
+import { connectToChannel, createChannel, isChannelNode, isSessionNode } from "./channels";
 import { CanvasView } from "./CanvasView";
+import { MinimapHud } from "./Minimap";
 import { useSignal } from "./reactive";
 import { templatesSignal } from "./templates";
 import {
@@ -20,6 +29,7 @@ import {
   addGitHeadCard,
   addHnCard,
   addFolderCard,
+  addNotebookCard,
   addProvenanceCard,
   addSessionsCard,
   addStickyNote,
@@ -30,7 +40,9 @@ import {
   importBoard,
   interruptSelectedSession,
   materializeAt,
+  materializeImageAt,
   openSession,
+  registerFileCommands,
   reprojectContent,
   spawnLiveSession,
   watchDataset,
@@ -39,8 +51,13 @@ import {
 } from "./loader";
 import { baseName } from "./fileTypes";
 import { applyScrollKey, scrollableIn } from "./interior";
+import { preserveViewState } from "./viewstate";
 
 const SCROLL_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"]);
+
+// Floating (screen-anchored) cards are chrome, not world content, so zoom-to-fit ignores them — without
+// this a pinned minimap in the corner would warp "fit all" toward itself.
+const isFloating = (l: LayoutRecord): boolean => l.anchor === "screen";
 
 // The app. The engine is the UNCHANGED core + interaction, now DURABLY BACKED: its log is core's
 // Persistence (IndexedDB backends in idb.ts) instead of the in-memory default, so the board you arrange
@@ -64,25 +81,44 @@ interface Engine {
 //   4. build the manager AFTER the store is populated, so its spatial index seeds from real records;
 //   5. restore the camera pose, attach the snapshot half (debounced channel-2 saves), write a baseline;
 //   6. wire undo last, so the hydrated board isn't undoable.
-async function createEngine(): Promise<Engine> {
+async function createEngine(boardId: string, isDefault: boolean): Promise<Engine> {
+  // This board's own IndexedDB (canvas-notes:<boardId>). Migrate the legacy global DB into it on first
+  // boot of the DEFAULT board only, so the existing canvas survives the move to per-board storage — a
+  // freshly-mounted repo must not inherit the dev repo's log.
+  const dbName = boardDbName(boardId);
+  if (isDefault) await migrateLegacyBoard(dbName);
   const persistence = new Persistence({
-    events: new IdbEventStore(),
-    snapshots: new IdbSnapshotStore(),
+    events: new IdbEventStore(dbName),
+    snapshots: new IdbSnapshotStore(dbName),
     onError: (e) => console.error("[persistence]", e),
   });
   const editor = new Editor({ log: persistence });
+  registerFileCommands(editor); // the file-tree card's rename/move re-key (loader.renameFileNodes)
   await persistence.hydrate(editor.store);
   // A card type may pin its resize ratio (type.yaml `aspect`): the round clock stays square however you
   // drag a corner. The engine is card-type-blind, so resolve nodeId → type → template.aspect here and
-  // hand the rule down — null for every type that doesn't ask, i.e. free resize as before.
+  // hand the rule down — null for every type that doesn't ask, i.e. free resize as before. `aspect: auto`
+  // (the image card) is content-driven rather than a fixed number: lock to the node's CURRENT w/h, which
+  // was set to the image's own aspect at drop — so a corner drag scales the image and never reopens a gap.
   const m = new InteractionManager({
     editor,
     aspectLock: (nodeId) => {
       const node = editor.store.get<"node">(nodeId);
-      return (node && templatesSignal.get().get(node.type)?.aspect) ?? null;
+      if (!node) return null;
+      const tpl = templatesSignal.get().get(node.type);
+      if (tpl?.aspectAuto) {
+        const layout = editor.store.get<"layout">(layoutId(nodeId as Id<"node">));
+        return layout && layout.h > 0 ? layout.w / layout.h : null;
+      }
+      return tpl?.aspect ?? null;
     },
+    // Alt-drag wiring (channel membership): the engine carries the gesture, the app owns the meaning. A
+    // session card or a channel card can start/receive a wire; a drop between a session and a channel JOINS
+    // that session (member:open) — the human drawing it is the consent for their own agent (§8).
+    connectable: (nodeId) => isSessionNode(editor, nodeId) || isChannelNode(editor, nodeId),
+    connect: (from, to) => connectToChannel(editor, from, to),
   });
-  restoreAndPersistCamera(m.camera);
+  restoreAndPersistCamera(m.camera, boardId);
   persistence.attach(editor.store);
   await persistence.flush();
   const undo = new UndoManager(editor.store);
@@ -97,17 +133,123 @@ export function App() {
   useEffect(() => {
     if (started.current) return;
     started.current = true;
-    void createEngine().then(setEngine);
+    void resolveBoard()
+      .then((board) => createEngine(board.boardId, board.isDefault))
+      .then(setEngine);
   }, []);
   if (!engine) return <div className="app loading" />;
   return <Board {...engine} />;
 }
 
 function Board({ m, undo, persistence }: Engine) {
-  const [lastEvent, setLastEvent] = useState<WatchEvent | null>(null);
+  // The fs-watch corner chip. Each event carries a monotonic `seq` so the render can `key` off it
+  // (restarting the fade animation on a repeat event) and a timer can re-arm cleanly. It self-dismisses
+  // (see the timeout effect below) — the chip is a glance, not standing chrome.
+  const [lastEvent, setLastEvent] = useState<(WatchEvent & { seq: number }) | null>(null);
+  const eventSeq = useRef(0);
+  const pushEvent = useCallback((e: WatchEvent) => {
+    setLastEvent({ ...e, seq: ++eventSeq.current });
+  }, []);
+  // Auto-fade: clear the chip a few seconds after the latest event. A new event replaces `lastEvent`
+  // (new `seq`), which re-runs this effect and resets the timer, so the chip rides a burst then vanishes.
+  useEffect(() => {
+    if (!lastEvent) return;
+    const t = setTimeout(() => setLastEvent(null), 2600);
+    return () => clearTimeout(t);
+  }, [lastEvent]);
   // The right-click add-menu: `screen` positions the popover (viewport px), `at` is the page-space drop
   // point so a chosen widget lands under the cursor. Null = closed.
   const [menu, setMenu] = useState<{ screen: Pos; at: Pos } | null>(null);
+
+  // Saved camera views + the unwind stack (views.ts). Per-board, created once. A brief toast confirms a
+  // save/recall — these are keyboard moves with no on-screen target, so a flicker of feedback matters.
+  const views = useMemo(() => new ViewStore(activeBoardId()), []);
+  const [toast, setToast] = useState<{ text: string; seq: number } | null>(null);
+  const toastSeq = useRef(0);
+  // TAP Alt/Option to cycle the minimap through three modes: Off → On (plain map) → Frames (map +
+  // numbered saved-view frames, where numbers jump and Alt+Shift+N saves) → Off. A simple explicit
+  // cycle, no auto-show/fade — the minimap is just in the state you put it in. "Tap" = Alt pressed and
+  // released ALONE — if another key OR a pointer press happens while Alt is down it's a combo
+  // (Alt+Shift+N save, an alt-drag wire, …) and must not cycle. Tracked window-wide; a click or blur
+  // clears the pending tap so it never fires spuriously.
+  const [minimapMode, setMinimapMode] = useState<0 | 1 | 2>(0);
+  useEffect(() => {
+    let pristine = false; // Alt is down with nothing else since → still a tap candidate
+    const down = (e: KeyboardEvent) => {
+      if (e.key === "Alt") {
+        if (!e.repeat) pristine = true;
+      } else pristine = false; // any other key → the Alt press is a combo, not a tap
+    };
+    const up = (e: KeyboardEvent) => {
+      if (e.key !== "Alt") return;
+      if (pristine) setMinimapMode((v) => ((v + 1) % 3) as 0 | 1 | 2);
+      pristine = false;
+    };
+    const cancel = () => {
+      pristine = false; // a click/drag (e.g. alt-drag wiring) or losing focus ends the tap candidacy
+    };
+    window.addEventListener("keydown", down);
+    window.addEventListener("keyup", up);
+    window.addEventListener("pointerdown", cancel);
+    window.addEventListener("blur", cancel);
+    return () => {
+      window.removeEventListener("keydown", down);
+      window.removeEventListener("keyup", up);
+      window.removeEventListener("pointerdown", cancel);
+      window.removeEventListener("blur", cancel);
+    };
+  }, []);
+  const flash = useCallback((text: string) => setToast({ text, seq: ++toastSeq.current }), []);
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 1400);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // Persistent "your turn" stack: one chip per session currently WAITING (idle, blocked on you), derived
+  // straight from live status. A chip appears when a session stops for you and CLEARS ITSELF the moment
+  // that session is resolved — prompted back to working, picked up by a peer, or ended. No fade, no manual
+  // dismiss: the stack IS the set of sessions awaiting you, so it can't be missed or go stale. waiting-agent
+  // (blue, blocked on a peer) is excluded — it makes no demand on you. Read-only over /api/sessions; no
+  // canvas write, so no re-wake loop. Click a chip to fly to that session's card (jumpToSession, below).
+  const sessions = useSignal(sessionListSignal);
+  const waiting = useMemo(() => (sessions ?? []).filter((s) => s.status === "waiting"), [sessions]);
+  // Record where we're looking before any programmatic jump, so a step-back (`) can unwind it.
+  const navigate = useCallback(
+    (fn: () => void) => {
+      views.pushHistory(m.camera.state);
+      fn();
+    },
+    [views, m],
+  );
+
+  // Pin a card to the viewport / drop it back onto the canvas (the `p` key). Converts the box through
+  // the camera so the card doesn't visibly jump on the toggle: pinning maps page→screen and scales the
+  // size by the zoom; unpinning does the inverse. setAnchor is one undoable layout edit.
+  const togglePin = useCallback(
+    (id: Id<"node">) => {
+      const l = m.editor.store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
+      if (!l) return;
+      const z = m.camera.state.z;
+      if (l.anchor === "screen") {
+        const p = m.camera.screenToPage({ x: l.x, y: l.y });
+        m.editor.commit({
+          type: "setAnchor",
+          actor: "user",
+          payload: { id, anchor: "world", x: Math.round(p.x), y: Math.round(p.y), w: Math.round(l.w / z), h: Math.round(l.h / z) },
+        });
+      } else {
+        const s = m.camera.pageToScreen({ x: l.x, y: l.y });
+        m.editor.commit({
+          type: "setAnchor",
+          actor: "user",
+          payload: { id, anchor: "screen", x: Math.round(s.x), y: Math.round(s.y), w: Math.round(l.w * z), h: Math.round(l.h * z) },
+        });
+      }
+    },
+    [m],
+  );
+
   const canvasRef = useRef<HTMLDivElement>(null);
   const importRef = useRef<HTMLInputElement>(null);
   // Where a drag-out gesture began (screen point + the card it left), captured on dragstart. Dropping
@@ -120,13 +262,54 @@ function Board({ m, undo, persistence }: Engine) {
   const nodeQuery = useMemo(() => m.editor.store.query({ typeName: "node" }), [m]);
   const nodes = useSignal(nodeQuery);
 
-  // One repo-wide watch for the component's life — it only touches cards already on the board (loader
-  // gates it), so it's safe to run before any folder is added and to leave running across adds/removes.
-  useEffect(() => watchDataset(m, "repo", setLastEvent), [m]);
+  // Click a waiting-stack chip → fly to that session's card. A session node's `title` IS its session id
+  // (the card convention), so we resolve the chip's sid to its on-canvas node, select it, and frame it
+  // (via navigate so ` steps back out of the jump). If the session has no card on the board, say so rather
+  // than jumping nowhere.
+  const jumpToSession = useCallback(
+    (sid: string) => {
+      const node = nodes.find((n) => n.type === "session" && n.title === sid);
+      if (!node) {
+        flash("that session isn't on the canvas");
+        return;
+      }
+      m.selection.set([node.id as Id<"node">]);
+      navigate(() => m.fitSelection(isFloating));
+    },
+    [nodes, m, navigate, flash],
+  );
 
-  // Refresh hydrated file/session content from disk once on boot (and re-arm session live-tails).
+  // A file watch PER ROOT (the canonical checkout + each git worktree) for the component's life. Each
+  // only touches cards already on the board (loader gates it), so it's safe to run before any folder is
+  // added. The root set can GROW mid-session (a worktree created by an agent or the CLI), so the watches
+  // are (re)synced whenever rootsSignal changes; "repo" is always watched, even before /api/roots returns.
+  useEffect(() => {
+    const watches = new Map<string, () => void>();
+    const sync = (): void => {
+      const ids = new Set((rootsSignal.get() ?? []).map((r) => r.id));
+      ids.add("repo");
+      for (const id of ids) if (!watches.has(id)) watches.set(id, watchDataset(m, id, pushEvent));
+      for (const [id, off] of watches) if (!ids.has(id)) (off(), watches.delete(id));
+    };
+    sync();
+    const off = rootsSignal.subscribe(sync);
+    return () => {
+      off();
+      for (const o of watches.values()) o();
+    };
+  }, [m]);
+
+  // Refresh hydrated file/session content from disk once on boot (and re-arm session live-tails). Also
+  // re-run it whenever the feed stream RECONNECTS: a cold server restart drops the per-session file-tails
+  // (armed only by GET /api/session) and empties the feed cache, so a session card left open would stay
+  // stale until reload/resume. Re-projecting on reconnect re-arms those tails and re-pulls the list —
+  // what a page reload does, without the reload.
   useEffect(() => {
     void reprojectContent(m);
+    return onFeedsReconnect(() => {
+      void reprojectContent(m);
+      refreshSessionList();
+    });
   }, [m]);
 
   // Best-effort flush of the snapshot cache on close. Events are already durable per-commit, so even if
@@ -136,6 +319,12 @@ function Board({ m, undo, persistence }: Engine) {
     window.addEventListener("beforeunload", onUnload);
     return () => window.removeEventListener("beforeunload", onUnload);
   }, [persistence]);
+
+  // Carry ephemeral view state (interior scroll, focused field + its caret/in-progress text) across a
+  // full reload — chiefly the dev-server restart that a vite-fs-plugin.ts edit triggers. The camera
+  // already survives via session.ts; this covers the rest so an agent iterating on that file doesn't
+  // reset your scroll-back and half-typed message every save.
+  useEffect(() => preserveViewState(), []);
 
   // The one DOM-coupled wire (same as app/): normalize native events into the interaction layer and keep
   // the manager's viewport size current so edge auto-scroll knows where the edges are.
@@ -204,10 +393,47 @@ function Board({ m, undo, persistence }: Engine) {
           const sc = host && scrollableIn(host);
           if (sc && applyScrollKey(sc, e.key)) e.preventDefault();
         }
+      } else if (e.code === "Backquote" && !meta) {
+        // Step back through the unwind stack — bounce to wherever you were before the last jump.
+        e.preventDefault();
+        const prev = views.back();
+        if (prev) m.flyTo(prev);
+        else flash("nothing to go back to");
+      } else if (!meta && /^Digit[1-9]$/.test(e.code)) {
+        // The view keymap, all on the number row (`code` not `key` so it's layout-proof — Shift/Alt
+        // mangle the printed `key`):
+        //   Shift+1 / Shift+2  → zoom to fit all / to selection (the tldraw pair)
+        //   Alt+Shift+N        → save the current pose to slot N. A combo, so the Alt press never
+        //                        toggles Frames mode (see the tap detection above).
+        //   N (Frames mode on) → jump to saved view N. Numbers navigate ONLY while the minimap's
+        //                        Frames mode is on (tap Alt) — so they're inert otherwise and a stray
+        //                        digit can't clobber a slot or jump unexpectedly.
+        const n = Number(e.code.slice(5));
+        if (e.altKey && e.shiftKey) {
+          e.preventDefault();
+          views.save(n, m.camera.state);
+          flash(`saved view ${n}`);
+        } else if (e.shiftKey) {
+          e.preventDefault();
+          if (n === 1) navigate(() => m.fitAll(isFloating));
+          else if (n === 2) navigate(() => m.fitSelection(isFloating));
+        } else if (!e.altKey && minimapMode === 2) {
+          e.preventDefault();
+          const v = views.recall(n);
+          if (v) navigate(() => m.flyTo(v));
+          else flash(`view ${n} empty · ⌥⇧${n} to save`);
+        }
+      } else if ((e.key === "p" || e.key === "P") && !meta) {
+        // Pin / unpin the single selected card (float it in the viewport ⇄ drop it on the canvas).
+        const ids = m.selection.ids();
+        if (ids.length === 1) {
+          e.preventDefault();
+          togglePin(ids[0] as Id<"node">);
+        }
       } else if (e.key === "v" || e.key === "V") m.setTool("select");
       else if (e.key === "h" || e.key === "H") m.setTool("hand");
     },
-    [m, undo, deleteSelected],
+    [m, undo, deleteSelected, views, navigate, flash, togglePin, minimapMode],
   );
 
   // Drag-out from a browser card: a row dragged out of a directory card (a file/sub-folder,
@@ -225,6 +451,10 @@ function Board({ m, undo, persistence }: Engine) {
     const t = e.dataTransfer.types;
     return t.includes(FS_MIME) || t.includes(SESSION_MIME);
   };
+  // An OS file drag (a screenshot/image dragged in from Finder) advertises the "Files" type. We accept it
+  // in dragover so the browser fires `drop`, then filter to images in onDrop (the type isn't readable until
+  // drop) — image-cards-on-canvas. A non-image file drop is simply ignored, no card.
+  const hasFiles = (e: React.DragEvent) => e.dataTransfer.types.includes("Files");
   // A drop is a CANCEL when it lands back on the source card, or within DRAG_CANCEL_RADIUS of the grab
   // point. dragstart bubbles up from the row's handler (which has already set the mime) to here, so we
   // read the grab point + originating card off the event itself — the templates stay untouched.
@@ -246,7 +476,14 @@ function Board({ m, undo, persistence }: Engine) {
     dragOriginRef.current = null;
   }, []);
   const onDragOver = useCallback((e: React.DragEvent) => {
-    if (!isOurDrag(e)) return;
+    // An external file drag (Files, not one of our internal mimes): accept it as a copy so `drop` fires.
+    if (!isOurDrag(e)) {
+      if (hasFiles(e)) {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = "copy";
+      }
+      return;
+    }
     // In the cancel zone, leave the default (no-drop): the browser shows the universal no-drop cursor —
     // the clearest "release here to abort" cue — and never fires `drop`, so the release just cancels.
     // (The native snap-back-to-origin animation on release has a fixed duration JS can't tune, so we
@@ -271,18 +508,36 @@ function Board({ m, undo, persistence }: Engine) {
       const rect = el.getBoundingClientRect();
       const toPage = () => m.camera.screenToPage(vec(e.clientX - rect.left, e.clientY - rect.top));
 
+      // An OS file drop (image-cards-on-canvas): land every dropped IMAGE as a repo file + image card. Each
+      // is written under `.canvas/images/` and carded at the drop point, fanned out by a small step so a
+      // multi-image drop doesn't stack into one spot. Non-image files are ignored (no card).
+      const files = e.dataTransfer.files;
+      if (files && files.length) {
+        const images = Array.from(files).filter((f) => f.type.startsWith("image/"));
+        if (images.length) {
+          e.preventDefault();
+          const p = toPage();
+          images.forEach((file, i) => {
+            void materializeImageAt(m, file, Math.round(p.x + i * 24), Math.round(p.y + i * 24));
+          });
+          return;
+        }
+      }
+
       const fsRaw = e.dataTransfer.getData(FS_MIME);
       if (fsRaw) {
         e.preventDefault();
-        let payload: { path: string; kind: "file" | "dir" };
+        let payload: { root?: string; path: string; kind: "file" | "dir" };
         try {
           payload = JSON.parse(fsRaw);
         } catch {
           return;
         }
-        if (!payload.path) return;
+        // A root row drags out as { root, path: "" } — a worktree's own tree card — so an empty path is
+        // valid here (unlike a file/sub-folder). Older payloads without a root fall back to canonical.
+        if (payload.path == null) return;
         const p = toPage();
-        materializeAt(m, "repo", payload.path, payload.kind, Math.round(p.x), Math.round(p.y));
+        void materializeAt(m, payload.root ?? "repo", payload.path, payload.kind, Math.round(p.x), Math.round(p.y));
         return;
       }
 
@@ -343,15 +598,50 @@ function Board({ m, undo, persistence }: Engine) {
         <CanvasView m={m} />
       </div>
 
+      {/* The minimap HUD — a sibling of the canvas (so its pointer events never reach the interaction
+          engine). Tap Alt to cycle Off → On → Frames (+ numbered view frames). */}
+      <MinimapHud m={m} views={views} mode={minimapMode} />
+
       {/* The only standing chrome: a faint cue on an empty board, since right-click is otherwise invisible. */}
       {nodes.length === 0 && (
         <div className="empty-hint">right-click anywhere to add a widget</div>
       )}
 
-      {/* The live fs-watch indicator — an ephemeral corner chip (it only renders while an event is fresh). */}
+      {/* The live fs-watch indicator — an ephemeral corner chip that fades in, holds, then fades out and
+          self-dismisses (see the auto-fade effect). `key={seq}` restarts the animation on each new event. */}
       {lastEvent && (
-        <div className="event-chip">
+        <div className="event-chip" key={lastEvent.seq}>
           ← {lastEvent.type} <b>{baseName(lastEvent.path)}</b>
+        </div>
+      )}
+
+      {/* Transient confirmation for a keyboard view action (save / recall / step-back). Centred top, a
+          glance like the fs-watch chip; auto-clears via the toast effect. */}
+      {toast && (
+        <div className="view-toast" key={toast.seq}>
+          {toast.text}
+        </div>
+      )}
+
+      {/* Persistent "your turn" stack, top-centre: a chip per session waiting on you, each a light glassy
+          pill with the amber waiting dot. Clears itself as sessions resolve; click a chip to fly to its
+          card. A new chip slides in on mount (keyed by sid, so it animates only on arrival). Capped, with
+          a "+N more" when many wait at once. */}
+      {waiting.length > 0 && (
+        <div className="waiting-stack">
+          {waiting.slice(0, 4).map((s) => (
+            <button
+              key={s.id}
+              className="waiting-chip"
+              title="jump to this session"
+              onMouseDown={(e) => e.preventDefault()} // keep canvas keyboard focus; the click still fires
+              onClick={() => jumpToSession(s.id)}
+            >
+              <span className="session-headsup-dot" />
+              {s.title || s.id.slice(0, 8)}
+            </button>
+          ))}
+          {waiting.length > 4 && <div className="waiting-more">+{waiting.length - 4} more waiting</div>}
         </div>
       )}
 
@@ -424,8 +714,10 @@ function CanvasMenu({
         <div className="menu-section">Session</div>
         <button onClick={() => run(() => void spawnLiveSession(m, at))}>New session</button>
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
+        <button onClick={() => run(() => void createChannel(m.editor, at))}>New channel</button>
         <div className="menu-section">Files</div>
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
+        <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>
         <div className="menu-section">Notes &amp; widgets</div>
         <button onClick={() => run(() => addStickyNote(m, at))}>Sticky note</button>
         <button onClick={() => run(() => addClock(m, at))}>Clock</button>
@@ -437,6 +729,7 @@ function CanvasMenu({
         <button onClick={() => run(() => addProvenanceCard(m, at))}>Intent log</button>
         <div className="menu-divider" />
         <div className="menu-section">Board</div>
+        <button onClick={() => run(() => m.fitAll(isFloating))}>Zoom to fit <span className="menu-key">⇧1</span></button>
         <button onClick={() => run(() => exportBoard(m))}>Export…</button>
         <button onClick={() => { onImport(); onClose(); }}>Import…</button>
         <button onClick={() => run(() => clearBoard(m))}>Clear board</button>

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Editor } from "../src/core.js";
-import { Selection, selectionBounds } from "../src/selection.js";
+import { Selection, selectionBounds, worldBounds } from "../src/selection.js";
 
 test("set / add / remove / toggle / clear", () => {
   const sel = new Selection();
@@ -35,4 +35,18 @@ test("selectionBounds is the union of selected layout boxes (page space)", () =>
   e.commit({ type: "addNode", payload: { id: "node:b", x: 200, y: 50, w: 100, h: 100 }, actor: "human" });
   assert.deepEqual(selectionBounds(e.store, ["node:a", "node:b"]), { x: 0, y: 0, w: 300, h: 150 });
   assert.equal(selectionBounds(e.store, []), null);
+});
+
+test("worldBounds unions every node, and `skip` drops excluded layouts", () => {
+  const e = new Editor();
+  assert.equal(worldBounds(e.store), null, "empty board → null");
+  e.commit({ type: "addNode", payload: { id: "node:a", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:float", x: 999, y: 999, w: 50, h: 50 }, actor: "human" });
+  // Without a skip, the far-out node stretches the bounds.
+  assert.deepEqual(worldBounds(e.store), { x: 0, y: 0, w: 1049, h: 1049 });
+  // Skipping it (as the renderer does for screen-anchored cards) leaves just node:a's box.
+  assert.deepEqual(
+    worldBounds(e.store, (l) => l.nodeId === "node:float"),
+    { x: 0, y: 0, w: 100, h: 100 },
+  );
 });

@@ -82,6 +82,38 @@ export class Camera {
   reset(): void {
     this.obs.set({ x: 0, y: 0, z: 1 });
   }
+
+  /**
+   * Frame a page-space `box` in a `viewportW`×`viewportH` screen: choose the zoom that makes the box
+   * fill the viewport (less a `pad` fraction of margin on every side) and the offset that centers it.
+   * The inverse of `visibleBox()` — this is the one camera primitive zoom-to-fit / jump-to-card all
+   * sit on. `maxZoom` caps how far it will zoom IN (so framing a single small card doesn't slam to
+   * full magnification); the result is still clamped to the camera's own min/max by `set`. No-op for a
+   * zero-area viewport or box, so a pre-layout call (viewport not yet measured) is harmless.
+   */
+  fitBox(box: Box, viewportW: number, viewportH: number, opts: { pad?: number; maxZoom?: number } = {}): void {
+    const s = this.fitState(box, viewportW, viewportH, opts);
+    if (s) this.set(s);
+  }
+
+  /**
+   * The pose `fitBox` would jump to, returned instead of applied — null for a zero-area viewport/box.
+   * Pulled out so an animator (manager.flyTo) can tween TOWARD a fit target frame-by-frame instead of
+   * snapping. The z is clamped to the camera's own min/max here so the returned pose is the true
+   * endpoint (no late re-clamp at the tail of a tween).
+   */
+  fitState(box: Box, viewportW: number, viewportH: number, opts: { pad?: number; maxZoom?: number } = {}): CameraState | null {
+    if (viewportW <= 0 || viewportH <= 0 || box.w <= 0 || box.h <= 0) return null;
+    const pad = opts.pad ?? 0.08;
+    const availW = viewportW * (1 - pad * 2);
+    const availH = viewportH * (1 - pad * 2);
+    let z = Math.min(availW / box.w, availH / box.h);
+    if (opts.maxZoom != null) z = Math.min(z, opts.maxZoom);
+    z = clamp(z, this.minZoom, this.maxZoom);
+    const cx = box.x + box.w / 2;
+    const cy = box.y + box.h / 2;
+    return { x: viewportW / 2 - cx * z, y: viewportH / 2 - cy * z, z };
+  }
 }
 
 export function pageToScreen(c: CameraState, p: Vec): Vec {

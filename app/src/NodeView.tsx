@@ -1,12 +1,14 @@
-import { memo, useEffect, useMemo, useRef } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { layoutId, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
 import { feedSignal, shortSha, timeAgo, type GitHead, type HnStory } from "./feeds";
+import { activeBoardId } from "./board";
 import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { scrollableFromTarget } from "./interior";
+import { MEMBER_OPEN, postToChannel, setChannelHistory } from "./channels";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -17,7 +19,7 @@ import { scrollableFromTarget } from "./interior";
 // are migrating to runtime-loaded templates (card-types/, doc §7): clock, note, and file live
 // there now; the remaining hardcoded views below each go the same way as their capabilities
 // (inputs, log view) land in the contract, until this file is just box + dispatch.
-export const NodeView = memo(function NodeView({ m, id }: { m: InteractionManager; id: Id<"node"> }) {
+export const NodeView = memo(function NodeView({ m, id, screen }: { m: InteractionManager; id: Id<"node">; screen?: boolean }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
   const nodeSub = useMemo(() => store.getSignal<"node">(id), [store, id]);
@@ -31,12 +33,18 @@ export const NodeView = memo(function NodeView({ m, id }: { m: InteractionManage
 
   if (!layout || !node) return null;
 
-  const box = {
-    transform: `translate(${layout.x}px, ${layout.y}px)`,
-    width: layout.w,
-    height: layout.h,
-    zIndex: layout.z,
-  };
+  // A floating (anchor "screen") card lives in the screen-space layer, NOT in `.page`. The two layers
+  // both map the full node list, and each NodeView renders in exactly one of them: the `screen` flag
+  // says which layer is asking. A world card asked-for-by the screen layer (or vice-versa) renders
+  // nothing — so a pin/unpin (which flips `anchor`) just moves the card from one layer to the other.
+  const floating = layout.anchor === "screen";
+  if (floating !== !!screen) return null;
+
+  // World box positions in PAGE space (inside `.page`'s pan/zoom transform). A floating card fills its
+  // FloatingFrame, which carries the screen-pixel position; the card itself just stretches to it.
+  const box: React.CSSProperties = screen
+    ? { position: "absolute", inset: 0, zIndex: layout.z }
+    : { transform: `translate(${layout.x}px, ${layout.y}px)`, width: layout.w, height: layout.h, zIndex: layout.z };
 
   // Runtime-loaded card types (card-types-as-data.md §7) take precedence over the hardcoded views
   // below: if card-types/{type}/ defines a template, the host renders the box (SAME layout
@@ -45,34 +53,106 @@ export const NodeView = memo(function NodeView({ m, id }: { m: InteractionManage
   // capability, the tick re-renders one interior and commits nothing — same proof, but the proof
   // is now data in the folder instead of code in this file.
   const template = templates.get(node.type);
-  if (template)
-    return <TemplateCard m={m} id={id} template={template} box={box} selected={selected} />;
-
-  // Feed cards: same shape as the clock — logged spatial state, off-log body (feeds.ts signals).
-  if (node.type === "githead") return <GitHeadView box={box} selected={selected} />;
-  if (node.type === "hn") return <HnView box={box} selected={selected} />;
-  if (node.type === "computed") return <ComputedView m={m} id={id} box={box} selected={selected} />;
-  if (node.type === "provenance") return <ProvenanceView m={m} box={box} selected={selected} />;
-
-  // Lenient fallback (design-note cost #4): a typed card whose template hasn't loaded — or failed
-  // to — renders a placeholder shell, never crashes and never hard-fails the card. Note and file
-  // cards land here for the beat between mount and the registry's first load, then swap to their
-  // templates.
-  return (
-    <div className={`node feed c-${node.color}${selected ? " selected" : ""}`} style={box}>
-      <div className="file-head">
-        <span className="file-name">{node.title}</span>
-        <span className="file-ext">{node.type}</span>
+  let card: React.ReactElement;
+  if (template) {
+    card = <TemplateCard m={m} id={id} template={template} box={box} selected={selected} />;
+  } else if (node.type === "githead") {
+    card = <GitHeadView box={box} selected={selected} />; // feed cards: logged box, off-log body (feeds.ts)
+  } else if (node.type === "hn") {
+    card = <HnView box={box} selected={selected} />;
+  } else if (node.type === "computed") {
+    card = <ComputedView m={m} id={id} box={box} selected={selected} />;
+  } else if (node.type === "provenance") {
+    card = <ProvenanceView m={m} box={box} selected={selected} />;
+  } else if (node.type === "channel") {
+    card = <ChannelView m={m} id={id} node={node} box={box} selected={selected} />;
+  } else {
+    // Lenient fallback (design-note cost #4): a typed card whose template hasn't loaded — or failed
+    // to — renders a placeholder shell, never crashes and never hard-fails the card. Note and file
+    // cards land here for the beat between mount and the registry's first load, then swap to their
+    // templates.
+    card = (
+      <div className={`node feed c-${node.color}${selected ? " selected" : ""}`} style={box}>
+        <div className="file-head">
+          <span className="file-name">{node.title}</span>
+          <span className="file-ext">{node.type}</span>
+        </div>
+        <div className="feed-body feed-waiting">no template for type "{node.type}"…</div>
       </div>
-      <div className="feed-body feed-waiting">no template for type "{node.type}"…</div>
+    );
+  }
+
+  return screen ? <FloatingFrame m={m} id={id} layout={layout}>{card}</FloatingFrame> : card;
+});
+
+// The wrapper for a floating (screen-anchored) card: a screen-positioned box that the card fills. It
+// owns the things the engine does for a WORLD card but won't for chrome — moving it, and keeping the
+// press off the canvas. Per the interior-seam note, React's synthetic stopPropagation can't stop the
+// canvas's NATIVE bindDom listener, so the drag is wired with native listeners: a pointerdown on the
+// frame stops the canvas seeing it (no marquee behind the card), selects the card (so Delete / the
+// pin-toggle key apply), and — once the pointer actually moves — opens ONE move gesture that coalesces
+// every frame into a single diff / IntentEvent / undo step, exactly like a world drag. A press that
+// lands on an interactive interior (an input, a button, the minimap's own map surface, which stops the
+// event itself) never reaches this listener, so those keep their own behaviour.
+function FloatingFrame({
+  m,
+  id,
+  layout,
+  children,
+}: {
+  m: InteractionManager;
+  id: Id<"node">;
+  layout: LayoutRecord;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const store = m.editor.store;
+    const onDown = (e: PointerEvent) => {
+      e.stopPropagation(); // the canvas's native listener must not also see this press
+      m.selection.set([id]);
+      // Read the live layout at grab time (the effect's `layout` closure would be one render stale).
+      const l0 = store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
+      if (!l0) return;
+      const px = e.clientX;
+      const py = e.clientY;
+      let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
+      const onMove = (ev: PointerEvent) => {
+        const nx = Math.round(l0.x + (ev.clientX - px));
+        const ny = Math.round(l0.y + (ev.clientY - py));
+        gesture ??= m.editor.beginGesture("moveNode", "user"); // open lazily: a click with no move logs nothing
+        gesture.update(() => store.update<LayoutRecord>(layoutId(id), { x: nx, y: ny }));
+      };
+      const onUp = () => {
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+        gesture?.end({ ids: [id] }, "moveNode");
+      };
+      window.addEventListener("pointermove", onMove);
+      window.addEventListener("pointerup", onUp);
+    };
+    el.addEventListener("pointerdown", onDown);
+    return () => el.removeEventListener("pointerdown", onDown);
+  }, [m, id]);
+  return (
+    <div
+      ref={ref}
+      data-node-id={id}
+      className="floating-frame"
+      style={{ left: layout.x, top: layout.y, width: layout.w, height: layout.h, zIndex: layout.z }}
+    >
+      {children}
     </div>
   );
-});
+}
+
 
 // The repo's HEAD commit, live off the githead feed. The meta line re-renders each minute-ish via the
 // clock signal so "Xm ago" stays honest without the feed having to re-publish.
 function GitHeadView({ box, selected }: { box: React.CSSProperties; selected: boolean }) {
-  const head = useSignal(feedSignal<GitHead>("githead"));
+  const head = useSignal(feedSignal<GitHead>("githead:" + activeBoardId()));
   useSignal(nowSignal); // keep the relative timestamp ticking
   return (
     <div className={`node feed c-green${selected ? " selected" : ""}`} style={box}>
@@ -143,7 +223,7 @@ function ComputedView({
   // Hooks are unconditional, so both input signals are always subscribed; the EDGES decide which ones
   // the evaluation is allowed to see.
   const now = useSignal(nowSignal);
-  const head = useSignal(feedSignal<GitHead>("githead"));
+  const head = useSignal(feedSignal<GitHead>("githead:" + activeBoardId()));
 
   const wired = new Set(edges.map((e) => store.get<"node">(e.from)?.type));
   const missing = ["clock", "githead"].filter((t) => !wired.has(t));
@@ -207,6 +287,249 @@ function ProvenanceView({
   );
 }
 
+// The channel card (agent-to-agent-messaging.md §9, reified): a coordination space whose conversation is
+// the focus. Its `text` is an optional DESCRIPTION (Slack-topic style, blank by default — the first message
+// carries the framing). It lists its members (the member:* edges pointing at it), lets the human post to the
+// fan-out, set a member's history visibility, and edits the description/title inline. Membership is drawn (alt-drag a session onto it) or
+// proposed by an agent; accept/leave live on the edge popover. This is a hardcoded React view (like the
+// feed cards), so — unlike a template card — it must contain its own interior interactions: native
+// listeners stop an input's pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan /
+// Backspace→delete) from reaching the canvas. Mirrors TemplateCard's seam.
+type ChannelMsg = { seq: number; ts: number; from: string; text: string };
+const senderLabel = (from: string) => (from === "human" || from === "system" ? from : from.slice(0, 8));
+
+function ChannelView({
+  m,
+  id,
+  node,
+  box,
+  selected,
+}: {
+  m: InteractionManager;
+  id: Id<"node">;
+  node: NodeRecord;
+  box: React.CSSProperties;
+  selected: boolean;
+}) {
+  const store = m.editor.store;
+  const ref = useRef<HTMLDivElement>(null);
+  const edgeQuery = useMemo(
+    () => store.query({ typeName: "edge", where: (e) => e.to === id && e.type.startsWith("member:") }),
+    [store, id],
+  );
+  const edges = useSignal(edgeQuery);
+  useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
+  // The conversation lives off-log in the server's channel log, streamed on the channel:<id> feed (the same
+  // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
+  const feed = useSignal(feedSignal<{ messages: ChannelMsg[]; truncated?: boolean }>("channel:" + id));
+  const msgs = feed?.messages ?? [];
+
+  const [description, setDescription] = useState(node.text);
+  const [title, setTitle] = useState(node.title);
+  const [post, setPost] = useState("");
+  const [status, setStatus] = useState<string | null>(null);
+  // The history visibility last chosen for each member (sid → mode), for the per-member toggle's label.
+  // It's the human's last action, not a read-back of the server cursor (which only "means" a mode at the
+  // seeding instant), so it resets to the "full" default on reload — honest as a control, not a mirror.
+  const [histMode, setHistMode] = useState<Record<string, "full" | "future">>({});
+  // Tail-follow the conversation: scroll to the newest message when one arrives, UNLESS the user has
+  // scrolled up to read history (then leave them put). `stick` tracks "is at the bottom", set on scroll.
+  const logRef = useRef<HTMLDivElement>(null);
+  const postInputRef = useRef<HTMLInputElement>(null);
+  const stick = useRef(true);
+  const onLogScroll = () => {
+    const el = logRef.current;
+    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+  useEffect(() => {
+    const el = logRef.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [msgs.length]);
+  // Re-seed the local edit fields when the record changes underneath us (an agent edited the description).
+  useEffect(() => setDescription(node.text), [node.text]);
+  useEffect(() => setTitle(node.title), [node.title]);
+
+  useEffect(() => {
+    const host = ref.current;
+    if (!host) return;
+    const interactive = (t: EventTarget | null) =>
+      t instanceof Element && t.closest("input, textarea, button, [data-interactive]");
+    const onPD = (e: PointerEvent) => { if (interactive(e.target)) e.stopPropagation(); };
+    const onKD = (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest("input, textarea")) e.stopPropagation();
+    };
+    // Wheel over the scrollable conversation log scrolls it, not the canvas (the same seam TemplateCard uses).
+    const onWheel = (e: WheelEvent) => { if (!e.ctrlKey && scrollableFromTarget(e.target, host)) e.stopPropagation(); };
+    host.addEventListener("pointerdown", onPD);
+    host.addEventListener("keydown", onKD);
+    host.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      host.removeEventListener("pointerdown", onPD);
+      host.removeEventListener("keydown", onKD);
+      host.removeEventListener("wheel", onWheel);
+    };
+  }, []);
+
+  const members = edges
+    .map((e) => ({ edgeId: e.id, sid: store.get<"node">(e.from)?.title ?? "?", open: e.type === MEMBER_OPEN }))
+    .sort((a, b) => Number(b.open) - Number(a.open));
+  // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve
+  // and highlight against these sids; each gets its shortest unambiguous prefix as its click-to-tag string.
+  const openSids = members.filter((mem) => mem.open).map((mem) => mem.sid);
+  // Drop an @tag into the post box and focus it (so a human never types a hash). Adds a leading space if
+  // the box already has non-space content, and a trailing space so the next word doesn't fuse to the tag.
+  const insertTag = (tag: string) => {
+    setPost((p) => (p && !p.endsWith(" ") ? p + " " : p) + "@" + tag + " ");
+    postInputRef.current?.focus();
+  };
+
+  const commitDescription = () => {
+    if (description !== node.text) m.editor.commit({ type: "setText", actor: "user", payload: { id, text: description } });
+  };
+  // Flip a member between full backlog and future-only, optimistically (the chip label follows the human's
+  // click; the server is the source of truth for the cursor itself).
+  const toggleHistory = async (sid: string) => {
+    const next = (histMode[sid] ?? "full") === "full" ? "future" : "full";
+    setHistMode((h) => ({ ...h, [sid]: next }));
+    const r = await setChannelHistory(id, sid, next);
+    setStatus(r.ok ? `${sid.slice(0, 8)}: ${next === "full" ? "full history" : "future only"}` : (r.error ?? "failed"));
+  };
+  const commitTitle = () => {
+    const t = title.trim() || "channel";
+    if (t !== node.title) m.editor.commit({ type: "setTitle", actor: "user", payload: { id, title: t } });
+  };
+  const send = async () => {
+    const t = post.trim();
+    if (!t) return;
+    setStatus("sending…");
+    const r = await postToChannel(id, "human", t);
+    if (r.ok) { setPost(""); setStatus("posted"); }
+    else setStatus(r.error ?? "failed");
+  };
+
+  return (
+    <div ref={ref} className={`node channel c-${node.color}${selected ? " selected" : ""}`} style={box}>
+      <div className="file-head">
+        <input
+          className="chan-title"
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          onBlur={commitTitle}
+          onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
+        />
+        <span className="file-ext">channel</span>
+      </div>
+      <textarea
+        className="chan-description"
+        placeholder="add a description (optional)"
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        onBlur={commitDescription}
+      />
+      <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
+        {feed?.truncated && (
+          <span className="chan-empty">…earlier messages dropped (showing the most recent {msgs.length})</span>
+        )}
+        {msgs.length === 0 ? (
+          <span className="chan-empty">no messages yet</span>
+        ) : (
+          msgs.map((mm) => (
+            <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}`}>
+              <span className="chan-msg-from">{senderLabel(mm.from)}</span>
+              <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+              <div className="chan-msg-text">{renderTaggedText(mm.text, openSids)}</div>
+            </div>
+          ))
+        )}
+      </div>
+      <div className="chan-members">
+        {members.length === 0 ? (
+          <span className="chan-empty">no members — alt-drag a session card onto this channel to join it</span>
+        ) : (
+          members.map((mem) => {
+            const mode = histMode[mem.sid] ?? "full";
+            return (
+              <span key={mem.edgeId} className={`chan-member${mem.open ? " open" : " pending"}`} title={mem.sid}>
+                {mem.open ? (
+                  <button
+                    className="chan-member-tag"
+                    title={`tag @${shortTag(mem.sid, openSids)} — notify this member`}
+                    onClick={() => insertTag(shortTag(mem.sid, openSids))}
+                  >
+                    {mem.sid.slice(0, 8)}
+                  </button>
+                ) : (
+                  <>{mem.sid.slice(0, 8)} (invited)</>
+                )}
+                {mem.open && (
+                  <button
+                    className="chan-hist"
+                    title={`history: ${mode === "full" ? "full backlog" : "future only"} — click to ${mode === "full" ? "limit to new messages" : "replay the full backlog"}`}
+                    onClick={(e) => { e.stopPropagation(); void toggleHistory(mem.sid); }}
+                  >
+                    {mode === "full" ? "all" : "new"}
+                  </button>
+                )}
+              </span>
+            );
+          })
+        )}
+      </div>
+      <div className="chan-post">
+        <input
+          ref={postInputRef}
+          className="chan-post-input"
+          placeholder="post… @tag a member to notify, @all for everyone"
+          value={post}
+          onChange={(e) => setPost(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") void send(); }}
+        />
+        <button onClick={() => void send()}>Send</button>
+      </div>
+      {status && <span className="chan-status">{status}</span>}
+    </div>
+  );
+}
+
+// The shortest unambiguous id-prefix to tag a member by (min 2 chars), e.g. `a9` when no other member
+// shares it — what the member pill drops into the post box so a human never types a full hash. Falls back
+// to the first 8-char segment if even that collides. Mirrors the server's prefix resolution (channel-tags.js).
+function shortTag(sid: string, all: string[]): string {
+  for (let len = 2; len < 8; len++) {
+    const p = sid.slice(0, len).toLowerCase();
+    if (all.every((o) => o === sid || !o.toLowerCase().startsWith(p))) return sid.slice(0, len);
+  }
+  return sid.slice(0, 8);
+}
+
+// Render channel message text with @-tags highlighted. A token is highlighted only if it would actually
+// resolve — a keyword (@all/@human/…) or a prefix of a current member's sid — so unmatched prose `@`s stay
+// plain. The GRAMMAR mirrors channel-tags.js (the server is the authority for who a tag actually wakes;
+// this is cosmetic). Returns React nodes (the matched tags wrapped in a highlight span).
+const TAG_KEYWORDS = new Set(["all", "everyone", "channel", "here", "human", "user"]);
+function renderTaggedText(text: string, memberSids: string[]): React.ReactNode {
+  const re = /(?<![\w@])@([A-Za-z0-9][A-Za-z0-9-]*)/g;
+  const parts: React.ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text))) {
+    const tok = m[1].toLowerCase();
+    const hit = TAG_KEYWORDS.has(tok) || memberSids.some((s) => s.toLowerCase().startsWith(tok));
+    if (!hit) continue;
+    if (m.index > last) parts.push(text.slice(last, m.index));
+    parts.push(
+      <span key={key++} className="chan-tag">
+        {m[0]}
+      </span>,
+    );
+    last = m.index + m[0].length;
+  }
+  if (parts.length === 0) return text;
+  if (last < text.length) parts.push(text.slice(last));
+  return parts;
+}
+
 function formatSince(ms: number): string {
   const s = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(s / 3600);
@@ -253,7 +576,7 @@ function TemplateCard({
     const m0 = mountTemplate(
       ref.current,
       template,
-      buildCard(nodeSub, template.capabilities, { id, editor: m.editor }),
+      buildCard(nodeSub, template.capabilities, { id, editor: m.editor, m }),
     );
     mount.current = m0;
     applied.current = template;
@@ -273,7 +596,7 @@ function TemplateCard({
     applied.current = template;
     mount.current?.setTemplate(
       template,
-      buildCard(nodeSub, template.capabilities, { id, editor: m.editor }),
+      buildCard(nodeSub, template.capabilities, { id, editor: m.editor, m }),
     );
   }, [template, nodeSub, id, m.editor]);
 
@@ -296,9 +619,21 @@ function TemplateCard({
       // ctrl+wheel is pinch-zoom — leave it for the canvas even over a scrollable card.
       if (!e.ctrlKey && scrollableFromTarget(e.target, host)) e.stopPropagation();
     };
+    // keydown: when focus is in an interior text control (a notebook cell's <textarea>, a future input),
+    // contain it so the canvas's keyboard shortcuts never fire mid-type — otherwise Delete/Backspace would
+    // delete the card, arrows would scroll it, and v/h would swap tools. Mirrors ChannelView's seam.
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.target instanceof Element && e.target.closest("input, textarea, select, [data-interactive]"))
+        e.stopPropagation();
+    };
     const onPointerDown = (e: PointerEvent) => {
       const t = e.target;
       if (!(t instanceof Element)) return;
+      // Alt is the canvas-level wire gesture (alt-drag joins a session↔channel; select-tool.ts). It's
+      // never an interior interaction, so always let an alt-press reach the canvas — otherwise a press on
+      // the card's controls/text (a session card is almost all <summary>/<button>/<input>/[data-text])
+      // is contained here and the connect-drag can never start.
+      if (e.altKey) return;
       // Genuine interactive controls are contained regardless of selection — clicking one is
       // unambiguous and never a card grab. (The sticky's title/body are inputs and so land here too;
       // CSS makes them pointer-transparent until the card is selected, so the FIRST click selects the
@@ -313,9 +648,11 @@ function TemplateCard({
       if (host.classList.contains("selected") && t.closest("[data-text]")) e.stopPropagation();
     };
     host.addEventListener("wheel", onWheel, { passive: false });
+    host.addEventListener("keydown", onKeyDown);
     host.addEventListener("pointerdown", onPointerDown);
     return () => {
       host.removeEventListener("wheel", onWheel);
+      host.removeEventListener("keydown", onKeyDown);
       host.removeEventListener("pointerdown", onPointerDown);
     };
   }, []);

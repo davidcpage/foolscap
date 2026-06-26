@@ -28,8 +28,12 @@ export interface SpatialIndex {
   /** All node ids whose box intersects the query box (marquee), in ascending z-order. */
   hitTest(box: Box): string[];
   boxOf(nodeId: string): Box | undefined;
-  /** Highest z currently in the index (−1 when empty) — the base for "bring to front". */
-  topZ(): number;
+  /**
+   * Highest z currently in the index (−1 when empty) — the base for "bring to front". `exclude`
+   * skips a set of node ids, so a caller can ask "the top z among everything I'm NOT raising" and
+   * tell whether a selection is already on top (no restack needed).
+   */
+  topZ(exclude?: ReadonlySet<string>): number;
   clear(): void;
 }
 
@@ -49,9 +53,12 @@ export class BruteForceIndex implements SpatialIndex {
   boxOf(nodeId: string): Box | undefined {
     return this.entries.get(nodeId)?.box;
   }
-  topZ(): number {
+  topZ(exclude?: ReadonlySet<string>): number {
     let top = -1;
-    for (const { z } of this.entries.values()) if (z > top) top = z;
+    for (const [id, { z }] of this.entries) {
+      if (exclude?.has(id)) continue;
+      if (z > top) top = z;
+    }
     return top;
   }
   clear(): void {
@@ -92,17 +99,25 @@ const layoutBox = (l: LayoutRecord): Box => ({ x: l.x, y: l.y, w: l.w, h: l.h })
  * thing you're dragging mid-drag, and the renderer tracks live moves via channel 1 atoms regardless.
  */
 export function syncIndexFromStore(store: Store, index: SpatialIndex): () => void {
+  // A floating (anchor "screen") card is chrome, not world content: its x/y are SCREEN pixels, so
+  // indexing it would plant a phantom hit-box at those page coordinates. We skip it on insert and,
+  // crucially, REMOVE it on update — so flipping a live card to "screen" (pin) takes it out of
+  // hit-testing, and flipping back ("world") re-inserts it.
+  const sync = (r: LayoutRecord): void => {
+    if (r.anchor === "screen") index.remove(r.nodeId);
+    else index.update(r.nodeId, layoutBox(r), r.z);
+  };
   for (const r of store.getSnapshot().records) {
-    if (r.typeName === "layout") index.insert(r.nodeId, layoutBox(r), r.z);
+    if (r.typeName === "layout") sync(r);
   }
   const onLayout = (d: RecordsDiff) => {
     for (const id in d.added) {
       const r = d.added[id]!;
-      if (r.typeName === "layout") index.insert(r.nodeId, layoutBox(r), r.z);
+      if (r.typeName === "layout") sync(r);
     }
     for (const id in d.updated) {
       const r = d.updated[id]![1];
-      if (r.typeName === "layout") index.update(r.nodeId, layoutBox(r), r.z);
+      if (r.typeName === "layout") sync(r);
     }
     for (const id in d.removed) {
       const r = d.removed[id]!;

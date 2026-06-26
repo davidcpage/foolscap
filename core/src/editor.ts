@@ -75,8 +75,13 @@ export class Editor {
 export interface Gesture {
   /** Mutate the store for one frame; channel 1 fires, channel 2 waits for end(). */
   update(frame: () => void): void;
-  /** Commit the coalesced gesture: one diff on channel 2, one IntentEvent on channel 3. */
-  end(payload?: unknown): IntentEvent;
+  /**
+   * Commit the coalesced gesture: one diff on channel 2, one IntentEvent on channel 3. `type` (when
+   * given) overrides the label set at beginGesture — for a gesture whose final nature isn't known at
+   * open time (e.g. a press that raises a card and only *then* may become a drag, settling as
+   * "raiseNodes" on a plain click or "moveNodes" if it dragged).
+   */
+  end(payload?: unknown, type?: string): IntentEvent;
   /** Abort: revert the live atoms; nothing reaches channel 2 or the log. */
   cancel(): void;
 }
@@ -95,11 +100,11 @@ class GestureHandle implements Gesture {
     this.editor.store.gestureFrame(frame);
   }
 
-  end(payload: unknown = {}): IntentEvent {
+  end(payload: unknown = {}, type?: string): IntentEvent {
     if (this.done) throw new Error("Gesture: end after end/cancel");
     this.done = true;
     const diff = this.editor.store.endGesture(actorToSource(this.actor));
-    return this.editor.record({ type: this.type, payload, actor: this.actor }, this.parent, diff);
+    return this.editor.record({ type: type ?? this.type, payload, actor: this.actor }, this.parent, diff);
   }
 
   cancel(): void {

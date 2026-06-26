@@ -19,6 +19,13 @@
 #     from the on-disk .jsonl so history survives, then `claude --resume`s; the card flips from static
 #     transcript to live duplex with no new card. Also session-internal — resuming is a session act,
 #     not a board act; the only canvas-log entry was the card's original addNode.
+#   • `sessionDone` — the Phase-2 explicit teardown: a bound fn that POSTs /done to END this card's live
+#     session (terminate the process AND record `endReason:"done"` on the durable `.canvas/` marker), so
+#     the card settles into the calm "✓ done" band rather than a neutral exit. Session-internal like the
+#     others — a POST, never editor.commit, never a canvas-log entry.
 name: session
 contract: 1
-capabilities: [session, sessionInput, sessionResume]
+#   • `roots` — the board's roots (canonical checkout + git worktrees), each with a stable colour. Used
+#     ONLY to tint the touched-files activity strip by worktree (render.js maps the session's absolute
+#     tool-call paths onto these roots). Board-global + read-only — never a scope the session is bound to.
+capabilities: [session, sessionInput, sessionResume, sessionDone, roots]

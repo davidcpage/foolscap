@@ -147,6 +147,48 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* Pin the name to the left so a leading root-colour swatch sits beside it and the ext/branch stays
+     right — visually identical to the old two-child space-between when there's no swatch. */
+  margin-right: auto;
+}
+/* Tombstone (worktree-activity slice D): a pinned file/tree card whose backing was deleted on disk or
+   whose worktree was removed. The card is KEPT (the user's spatial memory) but clearly marked + dimmed,
+   dismissed deliberately — never silently dropped or left hanging on "loading…". */
+.file-head.file-gone {
+  opacity: 0.55;
+}
+.file-head.file-gone .file-name {
+  text-decoration: line-through;
+}
+.file-head.file-gone .file-ext {
+  color: #b91c1c;
+}
+.file-gone-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 18px 10px;
+  color: #a1a1aa;
+  font-size: 11px;
+  text-align: center;
+}
+.file-gone-mark {
+  font-size: 22px;
+  opacity: 0.7;
+}
+.file-gone-hint {
+  font-size: 9px;
+  color: #c4c4c8;
+}
+/* The per-root colour swatch (worktree-activity slice C): a small dot in a file/tree card head, the same
+   hue as the session-card activity dots — so a card reads as belonging to its worktree. */
+.dir-root-swatch {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  align-self: center;
 }
 .file-ext {
   flex: none;
@@ -198,6 +240,324 @@ body {
   font: 11px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   color: #3f3f46;
   white-space: normal;
+}
+
+/* ── image card (image-cards-on-canvas) ─────────── */
+/* A binary sibling of the file card, but with a MINIMAL frame: no header — the dropped image IS the card,
+   filling it edge-to-edge inside the .node rounded clip. The card opens at the image's own aspect ratio
+   (loader.fitImageBox) and resize is aspect-locked (type.yaml `aspect: auto`), so object-fit: contain
+   matches exactly and never letterboxes; the neutral backstop only shows for an extreme-ratio clamp. The
+   card drags from anywhere (the img is draggable=false so a grab doesn't start a native image drag). On a
+   failed load the template adds .image-broken, which swaps the <img> for the tombstone. */
+.image-body {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: #00000005;
+}
+.image-body img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+/* Filename as a hover-only caption (no resting chrome): a soft gradient strip along the bottom, faded in
+   on hover so the card stays a clean image at rest but stays identifiable on inspection. */
+.image-cap {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 10px 8px 4px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: #fff;
+  background: linear-gradient(transparent, #000000a8);
+  text-shadow: 0 1px 2px #000000cc;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+}
+.node.image:hover .image-cap {
+  opacity: 1;
+}
+/* The tombstone replaces the missing image, so the hover caption would be redundant noise — hide it. */
+.image-body.image-broken .image-cap {
+  display: none;
+}
+.image-gone {
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 18px 10px;
+  color: #a1a1aa;
+  font-size: 11px;
+  text-align: center;
+}
+.image-gone-mark {
+  font-size: 22px;
+  opacity: 0.7;
+}
+.image-body.image-broken img {
+  display: none;
+}
+.image-body.image-broken .image-gone {
+  display: flex;
+}
+
+/* ── notebook card (docs/notebook-card.md §13, step-0) ─────────── */
+/* A file-backed card like the file card (same left rail): its body is a stack of cells deserialized from
+   the `.html` source — markdown cells as prose, `module` cells as an editable source box + Run + output. */
+.node.notebook {
+  border-left-width: 4px;
+}
+.nb-body {
+  margin: 6px 0 0;
+  padding: 4px 8px 8px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  border-top: 1px solid #00000008;
+  background: #00000003;
+  display: flex;
+  flex-direction: column;
+  /* No flex gap: the between-cell insert zones (.nb-insert) ARE the inter-cell spacers now, so their hover
+     target sits exactly in the seam. A gap here would double the spacing and split the hover target. */
+  gap: 0;
+}
+.nb-body::-webkit-scrollbar { width: 8px; }
+.nb-body::-webkit-scrollbar-thumb { background: #00000022; border-radius: 4px; }
+.nb-title {
+  font-weight: 600;
+  font-size: 12px;
+  color: #3f3f46;
+}
+/* The editable notebook <title> (input form): reads as the same heading, no chrome until focused. */
+input.nb-title {
+  border: 1px solid transparent;
+  border-radius: 4px;
+  padding: 1px 4px;
+  margin: -1px -4px;
+  background: transparent;
+  font-family: inherit;
+}
+input.nb-title:hover { background: #00000005; }
+input.nb-title:focus { outline: none; border-color: #c4b5fd; background: #fff; }
+input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
+.nb-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.nb-cell-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+}
+.nb-cell-id {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a1a1aa;
+}
+.nb-wire {
+  padding: 0 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.nb-wire.nb-in { color: #6d28d9; background: #f3e8ff; }
+.nb-wire.nb-out { color: #15803d; background: #dcfce7; }
+.nb-policy {
+  color: #a1a1aa;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+/* Inferred wiring (step-4a): a `→ name` chip for the export acorn inferred from a `name = …` cell where no
+   explicit data-out was written. Italic + muted so it reads as derived (and overridable), not typed. */
+.nb-wire.nb-wire-inf { font-style: italic; opacity: 0.75; }
+/* The policy is a button (cycles auto→manual→debounced); reads like the old label until hovered. */
+.nb-policy-btn {
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: #a1a1aa;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 9px;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.nb-policy-btn:hover { border-color: #d4d4d8; color: #71717a; background: #fff; }
+/* A markdown cell renders as PROCESSED PROSE by default (the shared .md-prose codec), flipping to a raw
+   <textarea> on double-click. The accent border-left reads it as a prose block distinct from a code cell. */
+.nb-md-prose {
+  padding: 4px 8px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: #3f3f46;
+  border-left: 2px solid #00000010;
+  word-break: break-word;
+}
+.nb-md:not(.nb-md-editing) {
+  cursor: text;
+}
+.nb-md-empty {
+  color: #a1a1aa;
+  font-style: italic;
+}
+/* A failed `${ }` interpolation: the prose still renders (the raw source, structure intact) and this muted
+   notice surfaces the broken expression's error below it. */
+.nb-md-error {
+  padding: 2px 8px;
+  font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #b91c1c;
+  opacity: 0.85;
+}
+/* Raw-edit mode: the prose font on the source box so editing reads like the prose it became, not code.
+   The box AUTO-GROWS to its content (render.js autoGrow), so hide the internal scrollbar and drop the
+   manual resize grip — the card scrolls, not a cramped two-line window. A small floor keeps a one-line
+   cell comfortable to click into. */
+.nb-md-source {
+  font: 11px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  min-height: 3.4em;
+  resize: none;
+  overflow: hidden;
+  max-height: none; /* prose stays fully expanded — only CODE cells get the height cap below */
+}
+/* A code cell auto-grows to its content (render.js autoGrow) like a markdown raw-edit box, but with a hard
+   ceiling so a long program scrolls internally instead of pushing the whole card open. resize:none drops the
+   manual grip — sizing is automatic now. */
+.nb-source {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  min-height: 2.4em;
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 5px 7px;
+  border: 1px solid #00000014;
+  border-radius: 5px;
+  background: #fff;
+  color: #27272a;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.nb-cell-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.nb-run {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border: 1px solid #00000018;
+  border-radius: 5px;
+  background: #fafafa;
+  color: #3f3f46;
+  cursor: pointer;
+}
+.nb-run:hover { background: #f0f0f0; }
+.nb-run:disabled { opacity: 0.5; cursor: default; }
+.nb-status {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.nb-status.nb-running { color: #a16207; }
+.nb-status.nb-ok { color: #15803d; }
+.nb-status.nb-error { color: #b91c1c; }
+.nb-status.nb-stale { color: #b45309; font-style: italic; }
+.nb-output {
+  margin: 0;
+  padding: 4px 7px;
+  min-height: 1.2em;
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border-radius: 5px;
+  background: #00000005;
+  color: #52525b;
+}
+.nb-output.nb-out-error { color: #b91c1c; background: #fef2f2; }
+.nb-output.nb-out-empty { color: #c4c4c8; }
+/* The per-cell hover toolbar (type-switch / reorder / delete) was removed — those actions are the keyboard
+   layer's now (t / ↑↓ / x in command mode), and on a small card the floating bar flickered as the pointer
+   crossed cells. See render.js. The between-cell insert strips below stay (the mouse path for adding cells). */
+/* The between-cell insert strip: `+ code` / `+ text` centred on a hairline, revealed only when the seam is
+   hovered. It doubles as the inter-cell SPACER (a fixed ~12px band, the body has no gap), so the stack reads
+   normally spaced while the whole seam is the hover target. overflow:visible lets the revealed pills (taller
+   than the band) poke into the seam without enlarging it / shifting the cells. */
+.nb-insert {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 12px;
+  overflow: visible;
+  opacity: 0;
+  /* Dwell hysteresis: the trailing 0.3s delay lingers the strip on un-hover so passing the pointer over a
+     seam (one per cell-boundary, ~12px tall on a small card) doesn't flash `+ code`/`+ text` in and out. The
+     show-delay (on :hover) means a seam reveals only if you settle on it. */
+  transition: opacity 0.12s ease 0.3s;
+}
+.nb-insert:hover { opacity: 1; transition-delay: 0.12s; } /* dwell to reveal; height stays fixed so no shift */
+.nb-insert-open { opacity: 1; height: auto; margin: 6px 0; } /* empty notebook: no cells to shift, so expand */
+.nb-insert-line {
+  flex: 1 1 auto;
+  height: 1px;
+  background: #00000014;
+}
+.nb-insert-btn {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 7px;
+  border: 1px solid #00000014;
+  border-radius: 4px;
+  background: #fafafa;
+  color: #71717a;
+  cursor: pointer;
+}
+.nb-insert-btn:hover { background: #f0f0f0; color: #3f3f46; }
+/* Command mode (the keyboard layer, render.js): a cell wrapper is tabindex="-1", so focusing it IS selecting
+   it. The purple ring (matching the title/policy focus accent) is the only "this cell is selected" signal —
+   Jupyter's command-mode highlight. outline draws outside the box, so it never shifts the tight cell stack. */
+.nb-cell:focus {
+  outline: 2px solid #c4b5fd;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* The keyboard-shortcut legend (render.js footer()): the discovery surface for the command-mode keys, which
+   carry no hover chrome of their own. A SIBLING of .nb-body, so flex:0 0 auto keeps it a fixed bar at the
+   card's bottom while the cells scroll behind it — always in view. Muted to near-invisible until looked for. */
+.nb-foot {
+  flex: 0 0 auto;
+  padding: 5px 8px 6px;
+  border-top: 1px solid #00000010;
+  background: #fbfbfc;
+  font-size: 9px;
+  color: #b4b4bc;
+  line-height: 1.7;
+  user-select: none;
+}
+.nb-foot-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  padding: 0 3px;
+  border: 1px solid #00000014;
+  border-radius: 3px;
+  background: #fafafa;
+  color: #71717a;
 }
 
 /* ── directory card (file-trees-on-canvas.md §3) ─────────── */
@@ -315,6 +675,48 @@ body {
   border-radius: 4px;
   padding: 1px 5px;
 }
+/* A clicked row takes focus; that focus IS the selection — Enter then renames it inline, Shift+Delete
+   deletes it off disk. The tinted ring (not the UA dotted outline) is the cue the row is armed, mirroring
+   the sessions card's .ses-row:focus. */
+.dir-row:focus {
+  outline: none;
+  background: #6366f11a;
+  box-shadow: inset 0 0 0 1px #6366f159;
+}
+/* The inline rename row: the name span swapped for a text input. No drag/hover affordances while editing. */
+.dir-editing {
+  cursor: default;
+}
+.dir-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  color: #18181b;
+  padding: 1px 4px;
+  border: 1px solid #c4b5fd;
+  border-radius: 4px;
+  background: #fff;
+}
+.dir-rename:focus {
+  outline: none;
+  border-color: #8b5cf6;
+}
+/* The rename-failed marker (e.g. the name is already taken) — the input stays open so the edit isn't lost. */
+.dir-rename-err {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: #ef4444;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 14px;
+  text-align: center;
+  cursor: help;
+}
 
 /* ── sessions browser card (Phase C) ─────────────────────── */
 /* A persistent on-canvas list of historical agent sessions; each row drags out to OPEN that session as a
@@ -347,12 +749,30 @@ body {
   padding: 4px 8px;
   border-radius: 5px;
   cursor: grab;
+  /* Lifecycle status rail: a coloured left border per row (transparent by default so every row aligns,
+     status or not). Same five band colours as the card (.ses-frame-*) and session-status.ts, kept in step
+     by hand — change one, change all three. A glance down the list shows which sessions are live/waiting
+     vs wound-down. */
+  border-left: 3px solid transparent;
 }
+.ses-row.ses-status-working       { border-left-color: #16a34a; }
+.ses-row.ses-status-waiting       { border-left-color: #f59e0b; }
+.ses-row.ses-status-waiting-agent { border-left-color: #2563eb; }
+.ses-row.ses-status-done          { border-left-color: #86efac; }
+.ses-row.ses-status-crashed       { border-left-color: #ef4444; }
+.ses-row.ses-status-ended         { border-left-color: #d4d4d8; }
 .ses-row:hover {
   background: #6366f10f;
 }
 .ses-row:active {
   cursor: grabbing;
+}
+/* A clicked row takes focus; that focus IS the selection — Shift+Delete then hides it from the list.
+   The tinted ring (not the UA dotted outline) is the cue that the row is armed for the hide gesture. */
+.ses-row:focus {
+  outline: none;
+  background: #6366f11a;
+  box-shadow: inset 0 0 0 1px #6366f159;
 }
 .ses-row-title {
   font-size: 12px;
@@ -678,6 +1098,140 @@ body {
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
+/* Touched-files activity strip (worktree-activity slice A): a subtle, collapsed disclosure beneath the
+   head — recency-decaying dots + a count; click to expand the path list. Monochrome for now; the dots
+   split into per-worktree hues once multi-root discovery lands (slice C). */
+.ses-activity {
+  flex: none;
+  padding: 0 10px 5px;
+}
+.ses-activity > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.ses-activity > summary::-webkit-details-marker {
+  display: none;
+}
+.ses-act-dots {
+  display: inline-flex;
+  gap: 3px;
+  align-items: center;
+}
+.ses-act-dot {
+  box-sizing: border-box;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #818cf8;
+  flex: none;
+}
+/* Open circle = read-only; filled = edited (render.js sticks `written` once a path is edited). */
+.ses-act-dot.read {
+  background: transparent;
+  border: 1px solid #818cf8;
+}
+.ses-act-count {
+  letter-spacing: 0.02em;
+}
+.ses-act-list {
+  margin: 4px 0 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.ses-act-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #71717a;
+}
+.ses-act-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ses-act-tool {
+  margin-left: auto;
+  flex: none;
+  color: #a1a1aa;
+}
+/* Task panel (the TaskCreate/TaskUpdate todo list, folded to current state by render.js's taskList).
+   Sits under the head beside the activity strip; open by default. A checklist, not raw tool rows. */
+.ses-tasks {
+  flex: none;
+  padding: 0 10px 6px;
+}
+.ses-tasks > summary {
+  cursor: pointer;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.ses-tasks > summary::-webkit-details-marker {
+  display: none;
+}
+.ses-tasks-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: #71717a;
+}
+/* A long-running session's list only grows (TaskCreate appends, ids never reset; completed tasks linger
+   unless the agent deletes them). Bound the panel's HEIGHT and scroll internally rather than dropping old
+   tasks — the codebase's no-silent-caps rule (CLAUDE.md): nothing is hidden, the conversation below keeps
+   its space, and the done/total summary gives the at-a-glance count. */
+.ses-tasks-list {
+  margin: 5px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+.ses-task {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font: 11px/1.45 ui-sans-serif, system-ui, sans-serif;
+  color: #d4d4d8;
+}
+.ses-task-glyph {
+  flex: none;
+  width: 11px;
+  text-align: center;
+  color: #71717a;
+}
+.ses-task-subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* completed: dim + strike, green check. in_progress: brighter, amber glyph. pending: the defaults. */
+.ses-task-completed {
+  color: #71717a;
+}
+.ses-task-completed .ses-task-subject {
+  text-decoration: line-through;
+}
+.ses-task-completed .ses-task-glyph {
+  color: #4ade80;
+}
+.ses-task-in_progress {
+  color: #fafafa;
+}
+.ses-task-in_progress .ses-task-glyph {
+  color: #fbbf24;
+}
 /* Interactive question widget (the ```ask convention — render.js). The headless replacement for
    AskUserQuestion: clickable options that answer back through the input duplex. */
 .ses-ask {
@@ -772,14 +1326,141 @@ body {
 .ses-ask-warn .ses-ask-submit {
   background: #d97706;
 }
-/* Registry-backed status (slice 2): only a working turn pulses; idle/exited are steady. */
+/* Registry-backed status (slice 2): the idle pill reads as a bold amber "waiting" CHIP to match the
+   lifecycle band — `idle` means "your turn" (the default-loud model: every idle is treated as waiting-
+   for-human until an agent declares otherwise). running keeps its bare pulsing dot; exited stays red. */
 .ses-idle {
-  color: #a1a1aa;
+  color: #92400e;
+  background: #fde68a;
+  border-radius: 999px;
+  padding: 1px 7px;
   animation: none;
 }
 .ses-exited {
   color: #dc2626;
   animation: none;
+}
+/* inactive: a historical / post-restart card with no live process — muted, steady, no green "live" cue. */
+.ses-inactive {
+  color: #a1a1aa;
+  animation: none;
+}
+/* done (Phase 2): a session explicitly ended via /done — calm green, steady. The positive twin of the red
+   "exited"/"crashed" pill: work finished and wound down, nothing here wants you. */
+.ses-done {
+  color: #16a34a;
+  animation: none;
+}
+/* waiting-on-agent: idle, but blocked on a PEER (it @-tagged one in a channel), not on you — blue, steady,
+   no amber demand. "In flight elsewhere", not "your turn". */
+.ses-waiting-agent {
+  color: #2563eb;
+  animation: none;
+}
+
+/* Phase-1 lifecycle band (render.js): a bold status bar across the card's TOP edge, drawn by a template-
+   owned overlay so the React host stays type-agnostic. A band, not an inset ring — the host's border +
+   drop shadow + selection ring all live at the card edge and overflow:hidden forces an overlay inside
+   them, where a ring just nests as a second border. The band hugs the rounded top corners and pairs with
+   a tinted header (.ses-head[data-ses-state]) so the status reads even at zoom-out / in a minimap. */
+.ses-frame {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 4px;
+  pointer-events: none;
+  z-index: 3;
+  border-top-left-radius: 8px;
+  border-top-right-radius: 8px;
+}
+/* working: a calm green band — alive and busy, but making no demand on you. */
+.ses-frame-working {
+  background: #16a34a;
+}
+/* waiting: the LOUD band — idle and (by default) blocked on a human. Taller, amber, with a soft glow and
+   a slow opacity pulse to pull the eye across a board without the jitter of animating the bar's size. */
+.ses-frame-waiting {
+  height: 6px;
+  background: #f59e0b;
+  box-shadow: 0 1px 8px #f59e0bcc;
+  animation: ses-frame-pulse 1.5s ease-in-out infinite;
+}
+@keyframes ses-frame-pulse {
+  50% {
+    opacity: 0.5;
+  }
+}
+/* waiting-on-agent: idle but blocked on a PEER, not you (it @-tagged one in a channel). Blue and steady —
+   no amber glow/pulse, because it makes no demand on you; it's "in flight elsewhere", not "your turn". */
+.ses-frame-waiting-agent {
+  background: #2563eb;
+}
+/* ended: muted grey — the process has exited (a clean /terminate, or a status-less historical tail);
+   nothing here wants your attention. */
+.ses-frame-ended {
+  background: #d4d4d8;
+}
+/* done (Phase 2): a calm green band — work declared finished via /done. Distinct from the vivid, busy
+   "working" green by being lighter and steady (no pulse, no demand): a settled, positive end. */
+.ses-frame-done {
+  background: #86efac;
+}
+/* crashed (Phase 2): a loud red band — the process died on its own (not a /done, /terminate, or clean
+   server shutdown). Steady, not pulsing (the amber "waiting" pulse owns "act now"); red says "look here". */
+.ses-frame-crashed {
+  height: 6px;
+  background: #ef4444;
+  box-shadow: 0 1px 8px #ef4444aa;
+}
+
+/* The header picks up a matching wash so the whole title row carries the status, not just a 4px sliver —
+   this is the part that stays legible when the card is small on screen. Tints only; text stays dark. */
+.ses-head[data-ses-state="working"] {
+  background: #f0fdf4;
+}
+.ses-head[data-ses-state="waiting"] {
+  background: #fffbeb;
+}
+.ses-head[data-ses-state="waiting-agent"] {
+  background: #eff6ff;
+}
+.ses-head[data-ses-state="ended"] {
+  background: #fafafa;
+}
+.ses-head[data-ses-state="done"] {
+  background: #f0fdf4;
+}
+.ses-head[data-ses-state="crashed"] {
+  background: #fef2f2;
+}
+/* Phase-2 "End session" button (head, right of the meta): a quiet ghost control until you arm it. The
+   first click flips it to a red "end?" confirm (.armed); a second within the window fires /done. */
+.ses-end {
+  flex: none;
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #71717a;
+  background: transparent;
+  border: 1px solid #0000001f;
+  border-radius: 5px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.ses-end:hover {
+  color: #16a34a;
+  border-color: #16a34a66;
+}
+.ses-end.armed,
+.ses-end.armed:hover {
+  color: #fff;
+  background: #dc2626;
+  border-color: #dc2626;
+}
+.ses-end:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 /* The input half of the duplex — a session-internal prompt box, pinned below the scrolling body. */
 .ses-input-row {
@@ -1143,8 +1824,265 @@ body {
 }
 .edge-layer line {
   stroke: #c4b5fd;
-  stroke-width: 1.6;
   stroke-dasharray: 5 4;
+  /* stroke-width is set inline per line, divided by the camera zoom (CanvasView) so it stays a constant
+     screen px — the edges are drawn in page space under .page's scale(z) transform, so a fixed page-px
+     width would go sub-pixel (invisible) when zoomed out, exactly as the ResizeHandles compensate. */
+}
+
+/* ── agent attention-edges (msg:* / watch:*) ─────────────────
+   Proposed = dashed amber; open = solid green; watch = dotted blue (future). The fat transparent
+   hit-line over each makes the thin visible one clickable (the layer is otherwise pointer-events:none).
+   Selecting one thickens it and adds a soft glow. */
+.edge-layer line.edge-msg-pending {
+  stroke: #f59e0b;
+  stroke-dasharray: 6 4;
+}
+.edge-layer line.edge-msg-open {
+  stroke: #10b981;
+  stroke-dasharray: none;
+}
+.edge-layer line.edge-watch-open {
+  stroke: #38bdf8;
+  stroke-dasharray: 2 5;
+}
+.edge-layer line.edge-selected {
+  filter: drop-shadow(0 0 3px currentColor);
+}
+.edge-layer line.edge-hit {
+  stroke: transparent;
+  stroke-dasharray: none;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+.edge-layer line.edge-connect-preview {
+  stroke: #94a3b8;
+  stroke-dasharray: 4 4;
+  pointer-events: none;
+}
+.edge-layer line.edge-connect-preview.valid {
+  stroke: #10b981;
+  stroke-dasharray: none;
+}
+
+/* The action popover for the selected attention-edge (accept/sever a proposal; compose+send when open).
+   Screen-positioned at the edge midpoint; centred on it via the translate. Contains its own pointer/key
+   events (native, in the component) so the compose box doesn't leak to the canvas. */
+.edge-actions {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  background: #1e293b;
+  border: 1px solid #334155;
+  border-radius: 7px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  font-size: 12px;
+  color: #e2e8f0;
+  z-index: 20;
+  flex-wrap: wrap;
+  max-width: 260px;
+}
+.edge-actions-label {
+  color: #94a3b8;
+}
+/* ── channel card (agent-to-agent-messaging.md §9, reified) ──────────────────────────────── */
+.node.channel {
+  border-left: 4px solid #c49bff;
+}
+.chan-title {
+  font: inherit;
+  font-weight: 600;
+  font-size: 12px;
+  flex: 1 1 auto;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: #18181b;
+  padding: 0;
+}
+.chan-title:focus {
+  outline: none;
+  background: #faf6ff;
+}
+/* the description — optional, Slack-topic style: quiet by default so the conversation is the focus. Empty
+   shows just the muted placeholder; it grows on focus / when it has content. */
+.chan-description {
+  margin: 2px 10px 4px;
+  padding: 3px 7px;
+  min-height: 20px;
+  max-height: 60px;
+  flex: 0 0 auto;
+  resize: vertical;
+  font: 11px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: #71717a;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+.chan-description::placeholder { color: #b8b3c4; font-style: italic; }
+.chan-description:hover { border-color: #ece6f7; }
+.chan-description:focus {
+  outline: none;
+  color: #52525b;
+  border-color: #c49bff;
+  background: #faf8ff;
+}
+/* the conversation — the channel's legible home (4e). Scrolls; wheel contained by the ChannelView seam. */
+.chan-log {
+  flex: 1 1 auto;
+  min-height: 40px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 2px 4px;
+  padding: 2px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.chan-log::-webkit-scrollbar { width: 8px; }
+.chan-log::-webkit-scrollbar-thumb { background: #00000022; border-radius: 4px; }
+.chan-msg {
+  font-size: 11px;
+  line-height: 1.35;
+}
+.chan-msg-from {
+  font: 10px ui-monospace, Menlo, monospace;
+  font-weight: 600;
+  color: #6b21a8;
+}
+.chan-msg-time {
+  margin-left: 6px;
+  font-size: 9px;
+  color: #a1a1aa;
+}
+.chan-msg-text {
+  color: #3f3f46;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* a resolved @-tag inside a message (one that names a member / @all / @human) — tinted so the eye finds
+   "who this was for" at a glance. Cosmetic; the server decides who a tag actually wakes. */
+.chan-tag {
+  color: #2563eb;
+  font-weight: 600;
+}
+.chan-msg.sys {
+  opacity: 0.7;
+  font-style: italic;
+}
+.chan-msg.sys .chan-msg-from { color: #71717a; }
+.chan-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 2px 10px 4px;
+}
+.chan-empty {
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.chan-member {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font: 10px ui-monospace, Menlo, monospace;
+  padding: 1px 6px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+}
+/* the member name as a click-to-tag button — drops @<prefix> into the post box. Inherits the pill's mono
+   font/colour and reads as plain text until hovered, so the roster still scans as a list of names. */
+.chan-member-tag {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+}
+.chan-member-tag:hover {
+  text-decoration: underline;
+}
+/* per-member backlog-visibility toggle (full="all" / future="new") — the human's history control. */
+.chan-hist {
+  font: 9px ui-monospace, Menlo, monospace;
+  padding: 0 4px;
+  border-radius: 6px;
+  border: 1px solid #bbf7d0;
+  background: #ffffffcc;
+  color: #15803d;
+  cursor: pointer;
+}
+.chan-hist:hover { background: #fff; border-color: #15803d; }
+.chan-member.open {
+  background: #ecfdf3;
+  color: #15803d;
+  border-color: #bbf7d0;
+}
+.chan-member.pending {
+  background: #fffbeb;
+  color: #b45309;
+  border-color: #fde68a;
+}
+.chan-post {
+  display: flex;
+  gap: 5px;
+  padding: 4px 10px 8px;
+  margin-top: auto;
+}
+.chan-post-input {
+  font: inherit;
+  font-size: 11px;
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 7px;
+  border-radius: 6px;
+  border: 1px solid #e4e4e7;
+  background: #fff;
+}
+.chan-post button {
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid #c49bff;
+  background: #f3ecff;
+  color: #6b21a8;
+  cursor: pointer;
+}
+.chan-status {
+  padding: 0 10px 6px;
+  font-size: 10px;
+  font-style: italic;
+  color: #a1a1aa;
+}
+.edge-actions button {
+  font: inherit;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid #475569;
+  background: #334155;
+  color: #e2e8f0;
+  cursor: pointer;
+}
+.edge-actions button:hover {
+  background: #475569;
+}
+.edge-actions-input {
+  font: inherit;
+  width: 200px;
+  padding: 3px 6px;
+  border-radius: 5px;
+  border: 1px solid #475569;
+  background: #0f172a;
+  color: #e2e8f0;
+}
+.edge-actions-status {
+  color: #94a3b8;
+  font-style: italic;
 }
 
 /* ── overlays ────────────────────────────────────────────── */
@@ -1216,6 +2154,11 @@ body {
   display: flex;
   flex-direction: column;
   gap: 1px;
+  /* Cap the popover so a tall menu (many card types) never overflows the viewport with no way to reach the
+     clipped rows — scroll the overflow instead. Leaves headroom below the anchor on a short screen. */
+  max-height: min(70vh, 560px);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .menu-list button {
   display: flex;
@@ -1248,28 +2191,255 @@ body {
 .menu-section:first-child {
   padding-top: 2px;
 }
+/* A faint keyboard-shortcut hint trailing a menu item (e.g. "Zoom to fit  ⇧1"). Pushed to the right
+   edge of the button so the label and the chord read as two columns. */
+.menu-key {
+  float: right;
+  margin-left: 12px;
+  font-size: 10px;
+  color: #a1a1aa;
+  font-variant-numeric: tabular-nums;
+}
 
-/* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left, shown only while an
-   event is fresh (the component unmounts it otherwise). The last survivor of the removed status bar. */
+/* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left. It fades in, holds, then
+   fades out over ~2.6s (the JS timer unmounts it at the tail); the last survivor of the removed status bar.
+   Kept small and pointer-transparent so it never reads as standing chrome or intercepts a click. */
 .event-chip {
   position: absolute;
   bottom: 12px;
   left: 12px;
   z-index: 10;
-  padding: 4px 10px;
-  background: #ffffffd9;
+  padding: 3px 9px;
+  pointer-events: none;
+  background: #ffffffcc;
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
   border: 1px solid #00000010;
   border-radius: 8px;
   color: #6366f1;
-  font-size: 12px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+  animation: event-chip-fade 2600ms ease forwards;
 }
 .event-chip b {
   color: #6366f1;
   font-weight: 600;
+}
+@keyframes event-chip-fade {
+  0% { opacity: 0; transform: translateY(4px); }
+  6% { opacity: 0.92; transform: translateY(0); }
+  75% { opacity: 0.92; transform: translateY(0); }
+  100% { opacity: 0; transform: translateY(2px); }
+}
+
+/* The screen-space (viewport-anchored) layer — a sibling of .page, OUTSIDE the camera transform, so its
+   cards stay put under pan/zoom. The layer fills the canvas but is pointer-transparent, so empty space
+   falls through to the canvas (pan/marquee still work behind a floating card); each floating frame
+   re-enables pointer events on itself. */
+.screen-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 15; /* above .page cards, below the edge-action popover (20) and toasts (30) */
+}
+.floating-frame {
+  position: absolute;
+  pointer-events: auto;
+  cursor: grab;
+}
+/* Selection is drawn by the inner card's own .node.selected ring (so a floating card reads exactly like
+   a world card) — the frame adds no second outline. SelectionOverlay's resize handles are skipped for
+   floating cards (their page-space bounds are meaningless), so a lone floating selection shows the ring
+   alone. */
+/* A floating card fills its frame; drop the per-card drop-shadow drift and let the frame own placement. */
+.floating-frame > .node {
+  width: 100%;
+  height: 100%;
+}
+
+/* The minimap HUD — navigation chrome pinned top-right, OUTSIDE the canvas subtree. It fades in on
+   camera activity / held-Alt (the .show class) and out otherwise; pointer-transparent while hidden so
+   it never blocks the canvas under it. */
+.minimap-hud {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 240px;
+  height: 180px;
+  z-index: 25; /* above cards + screen-layer, below toasts (30) */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease;
+}
+.minimap-hud.show {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* The minimap panel itself (fills the HUD). A slim header labels it; the map surface below handles the
+   pan press / view-frame clicks. */
+.minimap {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #ffffffee;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000018;
+  border-radius: 8px; /* match .node so it doesn't read as a different, rounder card */
+  box-shadow: 0 6px 20px #0000001f;
+}
+.minimap-head {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+  border-bottom: 1px solid #00000010;
+  user-select: none;
+}
+.minimap-svg {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  cursor: crosshair;
+  background: #f4f4f5;
+}
+/* Each rect is tinted with its card's hue but MUTED — fill at low opacity over the pale map so the
+   colours read as soft pastels (recognition where colour matters, never confetti); a slightly stronger
+   same-hue stroke gives definition at minimap scale. The default (no/unknown colour key) is indigo. */
+.minimap-card {
+  fill: #818cf8;
+  fill-opacity: 0.45;
+  stroke: #818cf8;
+  stroke-opacity: 0.85;
+  stroke-width: 1px;
+  vector-effect: non-scaling-stroke; /* constant 1px screen regardless of the viewBox scale */
+}
+.minimap-card.c-yellow { fill: #ffd84d; stroke: #ffd84d; }
+.minimap-card.c-pink   { fill: #ff8fab; stroke: #ff8fab; }
+.minimap-card.c-blue   { fill: #7cc4ff; stroke: #7cc4ff; }
+.minimap-card.c-green  { fill: #6fd86a; stroke: #6fd86a; }
+.minimap-card.c-orange { fill: #ffb45c; stroke: #ffb45c; }
+.minimap-card.c-purple { fill: #c49bff; stroke: #c49bff; }
+/* Session lifecycle band, echoed onto the minimap as a strip across a session card's top edge (fill comes
+   inline from session-status.ts so the colour stays single-sourced with the card band). Full opacity so
+   it reads over the translucent card; no stroke. `waiting` pulses — the one state that wants a human —
+   mirroring the card's amber pulse so a board scan still finds "your turn" when zoomed out. */
+.minimap-status {
+  stroke: none;
+}
+.minimap-status-pulse {
+  animation: ses-frame-pulse 1.5s ease-in-out infinite;
+}
+.minimap-frustum {
+  fill: #6366f120;
+  stroke: #4f46e5;
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+}
+/* Numbered saved-view frames, shown only while Alt summons the HUD. Each is clickable to fly there. */
+.minimap-view {
+  cursor: pointer;
+}
+.minimap-view text {
+  user-select: none;
+  paint-order: stroke;
+  stroke: #ffffffcc;
+  stroke-width: 0.5px;
+  vector-effect: non-scaling-stroke;
+}
+
+/* Transient confirmation for a keyboard view action (saved view N / recall / step-back). Centred near
+   the top so it reads as a HUD message distinct from the bottom-left fs-watch chip; pointer-transparent
+   and short-lived (the JS timer unmounts it). */
+.view-toast {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  z-index: 30;
+  padding: 4px 12px;
+  pointer-events: none;
+  background: #1e1b4bdd;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-radius: 999px;
+  color: #e0e7ff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  animation: view-toast-fade 1400ms ease forwards;
+}
+@keyframes view-toast-fade {
+  0% { opacity: 0; transform: translate(-50%, -6px); }
+  10% { opacity: 1; transform: translate(-50%, 0); }
+  80% { opacity: 1; transform: translate(-50%, 0); }
+  100% { opacity: 0; transform: translate(-50%, -3px); }
+}
+
+/* Persistent "your turn" stack — sessions waiting on you, top-centre (clear of the minimap at top-right).
+   A vertical column of light glassy chips (the fs-watch chip idiom: translucent white, blur, hairline
+   border) so it reads as quiet canvas chrome, not a loud banner; the only colour is the small amber waiting
+   dot. The column itself is pointer-transparent; each chip re-enables clicks (jump to the session). It
+   persists — no fade — and shrinks/clears itself as sessions resolve. */
+.waiting-stack {
+  position: absolute;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  pointer-events: none;
+}
+.waiting-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 12px;
+  pointer-events: auto;
+  cursor: pointer;
+  background: #ffffffe6;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000012;
+  box-shadow: 0 2px 10px #0000001a;
+  border-radius: 999px;
+  color: #3f3f46;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+  animation: waiting-chip-in 220ms ease; /* slides in on arrival (keyed by sid, so only on mount) */
+}
+.waiting-chip:hover {
+  border-color: #f59e0b66;
+  box-shadow: 0 2px 12px #f59e0b33;
+}
+.waiting-more {
+  pointer-events: none;
+  color: #71717a;
+  font-size: 10px;
+  font-weight: 500;
+}
+.session-headsup-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: #f59e0b; /* the waiting amber, as a small accent rather than flooding the pill */
+  animation: ses-frame-pulse 1.5s ease-in-out infinite; /* same gentle pulse as the card's waiting band */
+}
+@keyframes waiting-chip-in {
+  0% { opacity: 0; transform: translateY(-6px); }
+  100% { opacity: 1; transform: translateY(0); }
 }
 
 /* The empty-board cue — the one piece of standing chrome, since right-click is otherwise undiscoverable.

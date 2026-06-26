@@ -1,0 +1,860 @@
+import type { Subscribable } from "./lib";
+import { fileContentSignal } from "./content";
+import { activeBoardId } from "./board";
+import { analyzeCell, analyzeMarkdown } from "../vendor/notebook-infer.js";
+
+// The notebook RUNTIME (docs/notebook-card.md §3/§5/§6) — an app subsystem, NOT the card template
+// (templates stay pure render, §2/§6). This is the ONLY place a Worker is created. It is the reactive
+// SCHEDULER: it owns the per-card dependency DAG (built from each cell's explicit `data-in`/`data-out`
+// declarations — §5 "explicit first"), the off-log export atoms (a value per exported name), topological
+// dirty-tracking, the per-cell `auto | manual | debounced` execution policy (§6), and supersede-based
+// cancellation. The template FEEDS it the parsed cells (`syncCells`) and READS the per-cell outputs
+// (`cellOutputs`); everything reactive happens here.
+//
+// Separation of tracking from triggering (§1/§6): the graph is always live and cheap to maintain;
+// *running* a cell is the opt-in cost, governed per cell by its policy. Nothing here touches the durable
+// intent log — outputs are derived/off-log, recomputed, exactly like content.ts's fileContentSignal.
+
+export type Policy = { kind: "auto" | "manual" | "debounced"; ms: number };
+
+// One declared import (the `data-in` grammar, §11.2). `path` null = a LOCAL sibling-cell export named
+// `name` (the step-1 form). `path` set = a cross-card import resolved against THIS notebook's directory:
+// a notebook (object of its exports, or one export when `export` is set) or a data file (its text). The
+// runtime decides notebook-vs-file at resolve time (it knows which cards are open); the parser only splits.
+export interface CellImport {
+  name: string; // the local variable the value binds to inside the cell
+  path: string | null; // relative path to another notebook/file, or null for a local export
+  export: string | null; // a single export name to pull (the `#export` form), else null
+}
+
+// What the template hands in per cell (already parsed from the `.html` by the vendored format parser).
+export interface CellSpec {
+  id: string;
+  type: string; // only "module" cells execute; prose cells (text/markdown, …) are ignored by the scheduler
+  source: string;
+  inNames: string[]; // local binding names (= imports.map(name)); kept for display + the spec signature
+  imports?: CellImport[]; // structured imports (step-2); absent → treat inNames as all-local (step-1)
+  outNames: string[]; // declared exports (data-out)
+  policy: string; // raw data-policy: "" | "auto" | "manual" | "debounced" | "debounced:300"
+  // ── filled by the runtime from acorn inference (step-4a/4b), not the template ──
+  runSource?: string; // the code the worker runs (RHS of a `name = …` define / a rewritten block / === source)
+  block?: boolean; // runSource is a statement BLOCK (step-4b) — the worker runs it as a body, not an expression
+  keyedExports?: boolean; // the block returns an object keyed by define names → map keys→exports even for one
+  reExports?: string[]; // local names this cell republishes from its cross-card imports (Observable's import-cell)
+  inferredIn?: boolean; // imports were inferred from the code (no explicit data-in present)
+  inferredOut?: boolean; // outNames were inferred from a `name = …` define (no explicit data-out present)
+}
+
+// Normalise a cell's imports: the structured form if present, else every inName as a local export (the
+// step-1 shape, so a spec built the old way still works).
+function importsOf(spec: CellSpec): CellImport[] {
+  return spec.imports ?? spec.inNames.map((name) => ({ name, path: null, export: null }));
+}
+
+// Which cells the scheduler runs: every `module` cell, PLUS a prose cell (text/markdown / text/html) that
+// carries a `${ }` interpolation (Observable Notebook Kit 2.0's reactive markdown — docs/notebook-card.md §8).
+// The `${`-regex is a cheap gate so a plain prose cell never reaches acorn; analyzeMarkdown (in
+// computeEffective) is the precise decision (a literal `${` in prose that isn't a real interpolation is
+// dropped back to content there).
+const PROSE_TYPES = new Set(["text/markdown", "text/html"]);
+function isScheduled(c: CellSpec): boolean {
+  return c.type === "module" || (PROSE_TYPES.has(c.type) && c.source.includes("${"));
+}
+
+// The per-cell view the card renders: the last run's RESULT plus the live scheduling flags.
+export interface CellOutput {
+  status?: "ok" | "error"; // the last completed run's kind (absent = never run)
+  value?: unknown; // the value (already structured-clone-safe), for an "ok" run
+  error?: string; // the error string, for an "error" run
+  running?: boolean; // a run is queued or in flight
+  stale?: boolean; // inputs changed since the last run; awaiting a trigger (manual click / debounce timer)
+  // Inferred wiring (step-4a/4b) for the card to DISPLAY as a muted hint where no explicit declaration was
+  // written — so a cell that auto-wired by its code shows what it reads/defines, not an empty box.
+  inReads?: string[]; // LOCAL reads inferred from free variables (only when data-in was absent)
+  inImports?: CellImport[]; // CROSS-card imports inferred from `import` statements (step-4b; data-in absent)
+  inDefines?: string[]; // exports inferred from a `name = …` define (only when data-out was absent)
+}
+
+type RunState = "idle" | "queued" | "running" | "stale";
+
+interface NB {
+  sig: string; // signature of the last synced spec set — a no-op sync (re-render) is detected and ignored
+  root: string; // the card's worktree root, parsed from its node id (node:<root>:<path>)
+  dir: string; // the card's directory, the base for resolving a relative import path
+  pathKey: string; // this notebook's canonical path key (root + normalised, .html-stripped) — its address
+  specs: Map<string, CellSpec>; // module cells only, by id
+  producers: Map<string, string>; // export name → the cell id that defines it
+  importByName: Map<string, Set<string>>; // export name → cell ids that import it (LOCAL only)
+  depsOf: Map<string, Set<string>>; // cell id → the producer cell ids it depends on (LOCAL only)
+  cyclic: Set<string>; // cells in a dependency cycle — marked error, never scheduled
+  exportsVal: Map<string, unknown>; // export name → current value (the off-log atom)
+  state: Map<string, RunState>;
+  job: Map<string, number>; // cell id → its current jobId, so a superseded run's reply is ignored
+  timer: Map<string, ReturnType<typeof setTimeout>>; // debounce timers, by cell id
+}
+
+const nbs = new Map<string, NB>();
+
+// ── cross-card wiring (step-2, docs/notebook-card.md §11.2) ────────────────────────────────────────
+// Imports address other cards by RELATIVE PATH (a notebook IS a file, §4 — the filesystem is the
+// namespace), so resolution is board-wide, not per-NB. Three registries make a cell in card A re-run when
+// the notebook/file it imports from changes:
+//
+//   • nbByPath   — every OPEN notebook card's address → its cardKey, so an import path resolves to a live NB.
+//   • pathImporters — a target address → the importer cells waiting on it (with an optional export filter),
+//                     so when a producer's export changes (applyExports) we re-dirty exactly its importers,
+//                     and when a notebook first OPENS at an address we re-dirty the cells that were waiting.
+//   • extState   — per importer cell, the external subscriptions currently held (file-content handles +
+//                  the pathImporters entries), so a re-sync can reconcile them: subscribe new, drop gone.
+const nbByPath = new Map<string, string>(); // pathKey → cardKey
+
+interface Importer {
+  cardKey: string;
+  cellId: string;
+  export: string | null; // null = an OBJECT import (re-dirty on ANY export change of the target)
+}
+const pathImporters = new Map<string, Map<string, Importer>>(); // pathKey → refKey → importer
+
+interface CellExt {
+  nb: Set<string>; // pathImporters refKeys this cell registered (so a re-sync can unregister gone ones)
+  files: Map<string, () => void>; // fileKey → unsubscribe handle for a data-file import
+}
+const extState = new Map<string, Map<string, CellExt>>(); // cardKey → cellId → its external subscriptions
+
+// ── path helpers ──────────────────────────────────────────────────────────────────────────────────
+// A cardKey is the node id `node:<root>:<path>`; root is colon-free, so the first two colons bound it.
+function parseCardKey(cardKey: string): { root: string; path: string } {
+  const m = /^node:([^:]+):(.*)$/.exec(cardKey);
+  return m ? { root: m[1]!, path: m[2]! } : { root: "repo", path: "" };
+}
+function dirOf(path: string): string {
+  const i = path.lastIndexOf("/");
+  return i >= 0 ? path.slice(0, i) : "";
+}
+// Resolve a relative import path against the importing notebook's directory, collapsing `.`/`..`. A
+// leading "/" is root-absolute (within the same worktree root). The filesystem is the import namespace.
+function resolvePath(dir: string, rel: string): string {
+  const base = rel.startsWith("/") ? [] : dir.split("/").filter(Boolean);
+  for (const seg of rel.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") base.pop();
+    else base.push(seg);
+  }
+  return base.join("/");
+}
+const stripHtml = (p: string): string => p.replace(/\.html$/i, "");
+const pathKeyOf = (root: string, normPath: string): string => root + " " + normPath;
+const refKeyOf = (cardKey: string, cellId: string, exp: string | null): string =>
+  cardKey + " " + cellId + " " + (exp ?? "*");
+const fileKeyOf = (root: string, path: string): string => root + " " + path;
+
+// ── the off-log per-card output projection (cellOutputs) ──────────────────────────────────────────
+const EMPTY: Record<string, CellOutput> = {};
+const outputs = new Map<string, Record<string, CellOutput>>();
+const subs = new Map<string, Set<() => void>>();
+const signals = new Map<string, Subscribable<Record<string, CellOutput>>>();
+
+function notify(cardKey: string): void {
+  for (const fn of subs.get(cardKey) ?? []) fn();
+  scheduleOutputsPush(cardKey); // §7 agent-legibility: relay the new outputs to the server (debounced)
+}
+
+// Merge a patch into one cell's output and publish a NEW map reference (the read-tracker bails out on
+// Object.is, like the registry snapshot), so the card re-renders.
+function patchOutput(cardKey: string, cellId: string, patch: Partial<CellOutput>): void {
+  const cur = outputs.get(cardKey) ?? EMPTY;
+  outputs.set(cardKey, { ...cur, [cellId]: { ...cur[cellId], ...patch } });
+  notify(cardKey);
+}
+
+function dropOutput(cardKey: string, cellId: string): void {
+  const cur = outputs.get(cardKey);
+  if (!cur || !(cellId in cur)) return;
+  const next = { ...cur };
+  delete next[cellId];
+  outputs.set(cardKey, next);
+  notify(cardKey);
+}
+
+// Channel-1 handle for one notebook card's cell outputs, keyed by the card's node id — the SAME
+// Subscribable<T> seam fileContentSignal exposes, so the card subscribes to its outputs as it would to any
+// signal, and a finished run re-renders just this card.
+export function cellOutputsSignal(cardKey: string): Subscribable<Record<string, CellOutput>> {
+  let s = signals.get(cardKey);
+  if (!s) {
+    s = {
+      get: () => outputs.get(cardKey) ?? EMPTY,
+      subscribe(onChange) {
+        let set = subs.get(cardKey);
+        if (!set) subs.set(cardKey, (set = new Set()));
+        set.add(onChange);
+        return () => set!.delete(onChange);
+      },
+    };
+    signals.set(cardKey, s);
+  }
+  return s;
+}
+
+// ── agent-legibility: relay outputs to the server (docs/notebook-card.md §7, step-3) ───────────────
+// A notebook card's cell outputs are off-log atoms living HERE in the browser — absent from the file tree
+// and the /api/canvas snapshot, so an agent that reads the source with `Read` still can't see what a cell
+// PRODUCED. We mirror the agentBus snapshot push: on every output change (the notify above), debounce, then
+// POST an agent-friendly blob to /api/notebook/<id>/outputs, where the server holds it as a dumb relay (it
+// has data only WHILE A TAB IS LIVE — the deliberate step-3 scope; a durable/diffable artefact is the
+// step-4 memo-cache/shadow store). Values are bounded HERE, at the one serialization point (CLAUDE.md): a
+// pathological cell value is clamped to MAX_VALUE_CHARS with a per-value `truncated` flag, keeping the blob
+// valid JSON (a snapshot, not an append-only log — so no tail-trimming).
+const MAX_VALUE_CHARS = 64 * 1024;
+const PUSH_DEBOUNCE_MS = 400;
+const pushTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+// Render one value for the blob: keep the native (JSON-ish, already clone-safe) value when small so an
+// agent gets real structure; clamp to a string prefix + `truncated` when it would blow the cap.
+function clampValue(v: unknown): { value: unknown; truncated?: boolean } {
+  let s: string;
+  try {
+    s = typeof v === "string" ? v : JSON.stringify(v);
+  } catch {
+    s = String(v);
+  }
+  if (s == null) s = String(v); // JSON.stringify(undefined) → undefined
+  if (s.length > MAX_VALUE_CHARS) return { value: s.slice(0, MAX_VALUE_CHARS), truncated: true };
+  return { value: v };
+}
+
+function buildOutputsBlob(cardKey: string): string {
+  const nb = nbs.get(cardKey);
+  const out = outputs.get(cardKey) ?? EMPTY;
+  const cells = Object.entries(out).map(([id, o]) => {
+    const cell: Record<string, unknown> = { id, status: o.status, running: !!o.running, stale: !!o.stale };
+    if (o.status === "error") cell.error = o.error;
+    else if (o.status === "ok") {
+      const c = clampValue(o.value);
+      cell.value = c.value;
+      if (c.truncated) cell.truncated = true;
+    }
+    return cell;
+  });
+  // The headline "what did this notebook produce": each export name → its current value (same clamp).
+  const exportsObj: Record<string, unknown> = {};
+  if (nb) for (const [name, val] of nb.exportsVal) exportsObj[name] = clampValue(val).value;
+  const { root, path } = parseCardKey(cardKey);
+  return JSON.stringify({ ts: Date.now(), root, path, cells, exports: exportsObj });
+}
+
+function scheduleOutputsPush(cardKey: string): void {
+  if (typeof fetch === "undefined") return; // headless harness (no DOM/network) — nothing to relay to
+  if (pushTimers.has(cardKey)) return; // a push is already pending; it will capture the latest state
+  pushTimers.set(
+    cardKey,
+    setTimeout(() => {
+      pushTimers.delete(cardKey);
+      try {
+        const board = activeBoardId();
+        void fetch(`/api/notebook/${encodeURIComponent(cardKey)}/outputs?board=${board}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: buildOutputsBlob(cardKey),
+        }).catch(() => {}); // server gone (dev restart) — the next output change re-pushes
+      } catch {
+        /* board/fetch unavailable — outputs stay browser-local, the safe direction */
+      }
+    }, PUSH_DEBOUNCE_MS),
+  );
+}
+
+// ── the worker (a single shared, stateless worker) ────────────────────────────────────────────────
+let worker: Worker | null = null;
+let nextJob = 0;
+const pending = new Map<number, { cardKey: string; cellId: string }>();
+
+function ensureWorker(): Worker {
+  if (worker) return worker;
+  const w = new Worker("/notebook-worker.js", { type: "module" });
+  w.onmessage = (e: MessageEvent) => {
+    const { jobId, ok, value, error } = e.data ?? {};
+    const job = pending.get(jobId);
+    if (!job) return;
+    pending.delete(jobId);
+    onReply(job.cardKey, job.cellId, jobId, ok, value, error);
+  };
+  w.onerror = () => {
+    // A worker-level crash fails every in-flight job (rather than leaving cells stuck "running") and drops
+    // the worker so the next run respawns a clean one.
+    for (const job of pending.values()) {
+      setState(job.cardKey, job.cellId, "idle");
+      patchOutput(job.cardKey, job.cellId, { running: false, status: "error", error: "worker crashed" });
+    }
+    pending.clear();
+    w.terminate();
+    if (worker === w) worker = null;
+  };
+  worker = w;
+  return w;
+}
+
+// ── policy + value helpers ────────────────────────────────────────────────────────────────────────
+const DEFAULT_DEBOUNCE = 400;
+function parsePolicy(raw: string): Policy {
+  const [kind, ms] = (raw || "auto").trim().split(":");
+  if (kind === "manual") return { kind: "manual", ms: 0 };
+  if (kind === "debounced") return { kind: "debounced", ms: Number(ms) > 0 ? Number(ms) : DEFAULT_DEBOUNCE };
+  return { kind: "auto", ms: 0 };
+}
+
+// Cheap structural equality so an upstream that recomputes the SAME value doesn't needlessly cascade
+// (worker results are clone-safe — primitives or JSON-ish — so JSON compare is sound and bounded).
+function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a && b && typeof a === "object" && typeof b === "object") {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function setState(cardKey: string, cellId: string, s: RunState): void {
+  nbs.get(cardKey)?.state.set(cellId, s);
+}
+function stateOf(nb: NB, cellId: string): RunState {
+  return nb.state.get(cellId) ?? "idle";
+}
+
+// ── graph build (DAG from declared in/out, with cycle detection) ──────────────────────────────────
+function buildGraph(nb: NB): void {
+  nb.producers = new Map();
+  nb.importByName = new Map();
+  nb.depsOf = new Map();
+  nb.cyclic = new Set();
+  // A cell produces its computed exports AND the names it re-exports from cross-card imports (step-4b), so a
+  // sibling reading an imported name wires to the importing cell.
+  for (const c of nb.specs.values()) {
+    for (const name of c.outNames) nb.producers.set(name, c.id);
+    for (const name of c.reExports ?? []) nb.producers.set(name, c.id);
+  }
+  for (const c of nb.specs.values()) {
+    const deps = new Set<string>();
+    // Only LOCAL imports (no path) form intra-card DAG edges + the topological order; cross-card imports
+    // (path set) are wired separately (wireExternal) and re-dirty eventually, like a file change.
+    for (const imp of importsOf(c)) {
+      if (imp.path) continue;
+      const name = imp.name;
+      let set = nb.importByName.get(name);
+      if (!set) nb.importByName.set(name, (set = new Set()));
+      set.add(c.id);
+      const p = nb.producers.get(name);
+      if (p && p !== c.id) deps.add(p);
+    }
+    nb.depsOf.set(c.id, deps);
+  }
+  // Kahn's algorithm: peel cells whose deps are all resolved; whatever never peels is in a cycle.
+  const indeg = new Map<string, number>();
+  for (const [id, deps] of nb.depsOf) indeg.set(id, deps.size);
+  const queue = [...indeg].filter(([, n]) => n === 0).map(([id]) => id);
+  const dependentsOf = (id: string): Set<string> => {
+    const out = new Set<string>();
+    const c = nb.specs.get(id);
+    if (c)
+      for (const name of [...c.outNames, ...(c.reExports ?? [])])
+        for (const dep of nb.importByName.get(name) ?? []) out.add(dep);
+    return out;
+  };
+  let peeled = 0;
+  while (queue.length) {
+    const id = queue.shift()!;
+    peeled++;
+    for (const d of dependentsOf(id)) {
+      indeg.set(d, (indeg.get(d) ?? 0) - 1);
+      if (indeg.get(d) === 0) queue.push(d);
+    }
+  }
+  if (peeled < nb.specs.size) {
+    for (const [id, n] of indeg) if (n > 0) nb.cyclic.add(id);
+  }
+}
+
+// ── inference: derive the intra-notebook DAG from the CODE (step-4a, docs/notebook-card.md §11.4a) ──
+// The template hands in the RAW parsed cells (their explicit data-in/data-out, if any). Here we fold in
+// acorn free-variable inference so a cell wires itself: `y = x * 2` defines `y` and reads `x` with no
+// declarations. Explicit declarations are an OVERRIDE — when a cell carries data-in / data-out we keep it
+// verbatim; only an ABSENT declaration is filled from inference. Cross-card imports (a `path` set) are
+// always explicit (the step-2 attribute), so a cell with only cross-card imports still gets its LOCAL reads
+// inferred. The result is the EFFECTIVE spec set the rest of the runtime (graph, exports, worker) uses.
+function computeEffective(modules: CellSpec[]): CellSpec[] {
+  // Pass 1: per-cell analysis + everything the notebook PRODUCES, which a sibling's reads can match: the
+  // effective EXPORT names (explicit data-out or inferred defines) AND the RE-EXPORTS — the local names a
+  // cross-card `import {y} from "./nb"` republishes as notebook-local exports (Observable's import-cell, so
+  // other cells can read `y`). A cross-card import is one with a `path` (from an `import` statement or the
+  // explicit data-in grammar); its binding name becomes a producer of this notebook.
+  const analysis = new Map<string, ReturnType<typeof analyzeCell>>();
+  const effOut = new Map<string, string[]>();
+  const reExp = new Map<string, string[]>();
+  const scheduled: CellSpec[] = []; // the cells that actually run (module cells + interpolated markdown)
+  for (const c of modules) {
+    // A markdown/html cell is COMPILED to a template literal (analyzeMarkdown) and runs like a single-
+    // expression cell; a `module` cell is analyzed as code. A prose cell with no live `${ }` interpolation is
+    // pure content — drop it from the graph entirely (no worker run, no output); the card renders its source.
+    const a = c.type === "module" ? analyzeCell(c.source) : analyzeMarkdown(c.source);
+    if (c.type !== "module" && !("interpolated" in a && (a as { interpolated?: boolean }).interpolated)) continue;
+    analysis.set(c.id, a);
+    effOut.set(c.id, c.outNames.length ? c.outNames : a.defines);
+    const explicitIn = importsOf(c);
+    const crossImports = explicitIn.length ? explicitIn.filter((i) => i.path) : a.imports;
+    reExp.set(c.id, crossImports.map((i) => i.name));
+    scheduled.push(c);
+  }
+  const produced = new Set<string>();
+  for (const names of effOut.values()) for (const n of names) produced.add(n);
+  for (const names of reExp.values()) for (const n of names) produced.add(n);
+  // Pass 2: effective imports. With no explicit data-in, the imports come from the CODE: inferred LOCAL reads
+  // (a free var some sibling produces or re-exports — free globals like Math/Array match nothing and are
+  // dropped) PLUS the cross-notebook `import` statements acorn found (step-4b, already in {name,path,export}
+  // shape). An explicit data-in wins outright (the override). Either way `runSource`/`block` come from
+  // inference — the worker always runs the import-stripped body, since it can't execute `import`.
+  return scheduled.map((c) => {
+    const a = analysis.get(c.id)!;
+    const hasExplicitIn = importsOf(c).length > 0;
+    const inferredIn = !hasExplicitIn;
+    const inferredLocal: CellImport[] = a.reads.filter((n) => produced.has(n)).map((name) => ({ name, path: null, export: null }));
+    const imports = hasExplicitIn ? importsOf(c) : [...inferredLocal, ...a.imports];
+    return {
+      ...c,
+      imports,
+      inNames: imports.map((i) => i.name),
+      outNames: effOut.get(c.id)!,
+      reExports: reExp.get(c.id)!,
+      runSource: a.valueSource,
+      block: a.block,
+      keyedExports: a.keyedExports,
+      inferredIn,
+      inferredOut: c.outNames.length === 0,
+    };
+  });
+}
+
+// ── sync: the template feeds the parsed cells in; we diff and (re)schedule ────────────────────────
+export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
+  const rawScheduled = rawCells.filter(isScheduled); // module cells + interpolated markdown cells
+  // The signature is over the RAW cells the template parsed — what the user actually wrote (type + source +
+  // explicit data-in/data-out/policy). Inference is a pure function of those sources, so an unchanged raw
+  // signature means an unchanged EFFECTIVE graph: gate on it FIRST, so a mere re-render (an output change)
+  // never re-parses every cell with acorn — only a real source/wiring edit pays for computeEffective. `type`
+  // is in the signature so a markdown↔module conversion (same source) still re-syncs.
+  const sig = JSON.stringify(rawScheduled.map((c) => [c.id, c.type, c.source, importsOf(c), c.outNames, c.policy]));
+  let nb = nbs.get(cardKey);
+  if (nb && nb.sig === sig) return; // a pure re-render (outputs changed) — same graph, nothing to do
+
+  // The graph actually changed → fold in acorn inference to get the EFFECTIVE specs (inferred reads/defines
+  // where no explicit declaration was written) that the rest of the runtime schedules and runs.
+  const modules = computeEffective(rawScheduled);
+
+  const prev = nb;
+  const prevSpecs = prev?.specs ?? new Map<string, CellSpec>();
+  const prevDeps = prev?.depsOf ?? new Map<string, Set<string>>();
+  const { root, path } = parseCardKey(cardKey);
+  const pathKey = pathKeyOf(root, stripHtml(path));
+  nb = {
+    sig,
+    root,
+    dir: dirOf(path),
+    pathKey,
+    specs: new Map(modules.map((c) => [c.id, c])),
+    producers: new Map(),
+    importByName: new Map(),
+    depsOf: new Map(),
+    cyclic: new Set(),
+    exportsVal: prev?.exportsVal ?? new Map(),
+    state: prev?.state ?? new Map(),
+    job: prev?.job ?? new Map(),
+    timer: prev?.timer ?? new Map(),
+  };
+  nbs.set(cardKey, nb);
+  // Publish this notebook's address so other cards' imports resolve to it. New address (first sync / a
+  // moved card) → re-dirty the cells that were waiting on this path, so they pick up its exports.
+  const firstAtPath = nbByPath.get(pathKey) !== cardKey;
+  nbByPath.set(pathKey, cardKey);
+  buildGraph(nb);
+
+  // Removed cells: drop their view + scheduling state, and the exports they alone produced (their importers
+  // then see `undefined` and re-run — never a silently-stale value, the project's "where did it go?" rule).
+  for (const id of prevSpecs.keys()) {
+    if (nb.specs.has(id)) continue;
+    const t = nb.timer.get(id);
+    if (t) clearTimeout(t);
+    nb.timer.delete(id);
+    nb.state.delete(id);
+    nb.job.delete(id);
+    tearDownExt(cardKey, id); // drop the removed cell's cross-card subscriptions
+    dropOutput(cardKey, id);
+  }
+  for (const name of [...nb.exportsVal.keys()]) {
+    if (!nb.producers.has(name)) {
+      nb.exportsVal.delete(name);
+      for (const importer of nb.importByName.get(name) ?? []) markDirty(cardKey, importer);
+      // A vanished export must also wake cross-card importers (they'd otherwise hold a stale value) —
+      // both those naming it and object-importers of this notebook.
+      for (const imp of pathImporters.get(nb.pathKey)?.values() ?? [])
+        if (imp.export === name || imp.export === null) markDirty(imp.cardKey, imp.cellId);
+    }
+  }
+
+  // Cyclic cells: mark error, never schedule.
+  for (const id of nb.cyclic) {
+    setState(cardKey, id, "idle");
+    patchOutput(cardKey, id, { running: false, stale: false, status: "error", error: "circular dependency" });
+  }
+
+  // Publish each module cell's INFERRED wiring (step-4a/4b) so the card can show it as a muted hint where the
+  // user wrote no explicit declaration — an auto-wired cell otherwise renders an empty reads/defines box. The
+  // inferred imports split into LOCAL reads (free vars matching a sibling → bare names) and CROSS-card imports
+  // (`import` statements → name←path labels). We set all keys every sync (clearing to undefined when a
+  // declaration is now explicit, or no longer inferred), so a stale hint never lingers.
+  for (const c of nb.specs.values()) {
+    const inf = c.inferredIn ? importsOf(c) : [];
+    const localReads = inf.filter((i) => !i.path).map((i) => i.name);
+    const crossImports = inf.filter((i) => i.path);
+    patchOutput(cardKey, c.id, {
+      inReads: localReads.length ? localReads : undefined,
+      inImports: crossImports.length ? crossImports : undefined,
+      inDefines: c.inferredOut && c.outNames.length ? c.outNames : undefined,
+    });
+  }
+
+  // Dirty = a cell that is new, whose spec changed, or whose set of producer cells changed (a rewiring).
+  for (const c of nb.specs.values()) {
+    if (nb.cyclic.has(c.id)) continue;
+    const old = prevSpecs.get(c.id);
+    const depsChanged = !setsEqual(prevDeps.get(c.id), nb.depsOf.get(c.id));
+    const specChanged =
+      !old ||
+      old.source !== c.source ||
+      old.policy !== c.policy ||
+      old.inNames.join(",") !== c.inNames.join(",") ||
+      old.outNames.join(",") !== c.outNames.join(",");
+    if (specChanged || depsChanged) markDirty(cardKey, c.id);
+  }
+
+  // Reconcile this card's CROSS-CARD subscriptions (notebook-object/export imports + data-file imports)
+  // against the new spec set: register new waiters, drop gone ones, (un)subscribe file handles.
+  wireExternal(cardKey);
+
+  // This notebook just became the live card at its address → wake the cells elsewhere that import it, so
+  // they re-run against its (now resolvable) exports rather than sitting on undefined.
+  if (firstAtPath) {
+    for (const imp of pathImporters.get(pathKey)?.values() ?? []) markDirty(imp.cardKey, imp.cellId);
+  }
+
+  tick(cardKey);
+}
+
+// Reconcile one card's external (cross-card) wiring after a sync. For every cell, work out the imports
+// that point OUTSIDE this notebook, resolve each to a notebook address or a data file, and diff the
+// resulting subscriptions against what the cell held before: add the new, drop the gone. This is the only
+// place pathImporters entries and file-content subscriptions are created/destroyed, so they can't leak
+// across edits. A re-dirty fires when a subscribed file's content changes.
+function wireExternal(cardKey: string): void {
+  const nb = nbs.get(cardKey);
+  if (!nb) return;
+  let cells = extState.get(cardKey);
+  if (!cells) extState.set(cardKey, (cells = new Map()));
+
+  for (const spec of nb.specs.values()) {
+    const wantNb = new Set<string>(); // pathImporters refKeys this cell should hold
+    const wantFiles = new Map<string, { root: string; path: string }>(); // fileKey → (root, path)
+    if (!nb.cyclic.has(spec.id)) {
+      for (const imp of importsOf(spec)) {
+        if (!imp.path) continue; // a local export — handled by the intra-card DAG, not here
+        const r = resolveImport(nb, imp);
+        if (r.kind === "nb") wantNb.add(refKeyOf(cardKey, spec.id, imp.export));
+        else wantFiles.set(fileKeyOf(r.root, r.path), { root: r.root, path: r.path });
+      }
+    }
+
+    let ext = cells.get(spec.id);
+    if (!ext) cells.set(spec.id, (ext = { nb: new Set(), files: new Map() }));
+
+    // Notebook waiters: register what's wanted (keyed under the TARGET's pathKey, with the export filter),
+    // drop what's no longer wanted. We re-derive the target pathKey from the refKey-bearing import again.
+    for (const imp of importsOf(spec)) {
+      if (!imp.path) continue;
+      const r = resolveImport(nb, imp);
+      if (r.kind !== "nb") continue;
+      const refKey = refKeyOf(cardKey, spec.id, imp.export);
+      let m = pathImporters.get(r.pathKey);
+      if (!m) pathImporters.set(r.pathKey, (m = new Map()));
+      m.set(refKey, { cardKey, cellId: spec.id, export: imp.export });
+    }
+    for (const refKey of ext.nb) {
+      if (!wantNb.has(refKey)) removeImporter(refKey);
+    }
+    ext.nb = wantNb;
+
+    // Data-file subscriptions: subscribe the new files, unsubscribe the gone. A file's content change
+    // re-dirties this cell (per its policy), exactly as an upstream export change does.
+    for (const [fileKey, off] of ext.files) {
+      if (!wantFiles.has(fileKey)) {
+        off();
+        ext.files.delete(fileKey);
+      }
+    }
+    for (const [fileKey, { root, path }] of wantFiles) {
+      if (ext.files.has(fileKey)) continue;
+      const off = fileContentSignal(root, path).subscribe(() => markDirty(cardKey, spec.id));
+      ext.files.set(fileKey, off);
+    }
+  }
+}
+
+// Resolve one cross-card import against the importing notebook. NOTEBOOK when an open card already lives
+// at the address, or the `#export` form is used, or the path names a `.html`; otherwise a DATA FILE read
+// from disk by relative path (the "normal fileload mechanism", §11.2) — which needn't be an open card.
+type ResolvedImport =
+  | { kind: "nb"; pathKey: string }
+  | { kind: "file"; root: string; path: string };
+function resolveImport(nb: NB, imp: CellImport): ResolvedImport {
+  const resolved = resolvePath(nb.dir, imp.path!);
+  const pathKey = pathKeyOf(nb.root, stripHtml(resolved));
+  // A NOTEBOOK when: the `#export` form is used, a notebook is already open at the address, the path names
+  // a `.html`, OR the path has NO extension (the "drop the .html" convention, §11.2 — a bare `./prices`
+  // is a sibling notebook). A path with any OTHER extension (`.csv`, `.json`, …) is a DATA FILE read from
+  // disk. The extensionless rule is what lets an importer resolve to a notebook that isn't open YET (so it
+  // wakes when that notebook opens) rather than mis-resolving to a non-existent file.
+  const base = resolved.slice(resolved.lastIndexOf("/") + 1);
+  const hasExt = base.includes(".");
+  const looksNotebook = imp.export != null || nbByPath.has(pathKey) || /\.html$/i.test(resolved) || !hasExt;
+  if (looksNotebook) return { kind: "nb", pathKey };
+  return { kind: "file", root: nb.root, path: resolved };
+}
+
+// Drop one notebook-import registration (a re-sync no longer wants it, or the cell was removed).
+function removeImporter(refKey: string): void {
+  for (const [pk, m] of pathImporters) {
+    if (m.delete(refKey) && m.size === 0) pathImporters.delete(pk);
+  }
+}
+
+// Tear down all of one cell's external subscriptions (cell removed, or whole card torn down).
+function tearDownExt(cardKey: string, cellId: string): void {
+  const ext = extState.get(cardKey)?.get(cellId);
+  if (!ext) return;
+  for (const refKey of ext.nb) removeImporter(refKey);
+  for (const off of ext.files.values()) off();
+  extState.get(cardKey)!.delete(cellId);
+}
+
+function setsEqual(a: Set<string> | undefined, b: Set<string> | undefined): boolean {
+  const x = a ?? new Set<string>();
+  const y = b ?? new Set<string>();
+  if (x.size !== y.size) return false;
+  for (const v of x) if (!y.has(v)) return false;
+  return true;
+}
+
+// ── dirtying, triggering, the scheduler tick ──────────────────────────────────────────────────────
+// Mark a cell dirty per its POLICY (§6): auto runs asap; manual/debounced go STALE (a badge + a wait),
+// debounced additionally arming a timer. This is the master cost lever — nothing expensive auto-runs.
+function markDirty(cardKey: string, cellId: string): void {
+  const nb = nbs.get(cardKey);
+  if (!nb || nb.cyclic.has(cellId)) return;
+  const spec = nb.specs.get(cellId);
+  if (!spec) return;
+  const policy = parsePolicy(spec.policy);
+  if (policy.kind === "auto") return trigger(cardKey, cellId);
+  // manual / debounced: show it's stale (keep the last value visible), don't run yet.
+  if (stateOf(nb, cellId) !== "running") setState(cardKey, cellId, "stale");
+  patchOutput(cardKey, cellId, { stale: true });
+  if (policy.kind === "debounced") {
+    const existing = nb.timer.get(cellId);
+    if (existing) clearTimeout(existing);
+    nb.timer.set(
+      cellId,
+      setTimeout(() => {
+        nb.timer.delete(cellId);
+        trigger(cardKey, cellId);
+      }, policy.ms),
+    );
+  }
+}
+
+// Make a cell run as soon as it's READY — used by auto-dirty, a fired debounce timer, and the manual Run
+// button (which overrides policy). If it's mid-run, remember to re-run on completion (supersede).
+function trigger(cardKey: string, cellId: string): void {
+  const nb = nbs.get(cardKey);
+  if (!nb || nb.cyclic.has(cellId) || !nb.specs.has(cellId)) return;
+  const t = nb.timer.get(cellId);
+  if (t) (clearTimeout(t), nb.timer.delete(cellId));
+  if (stateOf(nb, cellId) === "running") {
+    redoSet(cardKey).add(cellId); // re-run once the in-flight job returns (inputs changed mid-run)
+    return;
+  }
+  setState(cardKey, cellId, "queued");
+  patchOutput(cardKey, cellId, { running: true, stale: false });
+  tick(cardKey);
+}
+
+// Cells re-dirtied while running, to be re-run once their in-flight job returns (per card, by id).
+const redo = new Map<string, Set<string>>();
+function redoSet(cardKey: string): Set<string> {
+  let s = redo.get(cardKey);
+  if (!s) redo.set(cardKey, (s = new Set()));
+  return s;
+}
+
+// Start every queued cell whose upstream producers have all SETTLED (not queued/running) — readiness IS
+// the topological order: a downstream cell simply waits, and a producer's completion re-ticks. A stale
+// (manual/debounced-waiting) or cyclic upstream counts as settled, so a downstream runs with that
+// producer's last/undefined value rather than deadlocking.
+function tick(cardKey: string): void {
+  const nb = nbs.get(cardKey);
+  if (!nb) return;
+  for (const [id, st] of nb.state) {
+    if (st !== "queued") continue;
+    const deps = nb.depsOf.get(id) ?? new Set();
+    let ready = true;
+    for (const p of deps) {
+      const ps = stateOf(nb, p);
+      if (ps === "queued" || ps === "running") (ready = false);
+    }
+    if (ready) startRun(cardKey, id);
+  }
+}
+
+// The current value to bind for one import (§11.2): a LOCAL export from this card, a cross-card notebook
+// export (one, or the whole notebook as an object of its exports), or a data file's text content. Anything
+// not yet available (a notebook not open, a file still fetching) resolves to undefined — the cell runs
+// now and re-runs when it arrives (the subscriptions wired in wireExternal), never a deadlock.
+function resolveInput(nb: NB, imp: CellImport): unknown {
+  if (!imp.path) return nb.exportsVal.get(imp.name);
+  const r = resolveImport(nb, imp);
+  if (r.kind === "file") return fileContentSignal(r.root, r.path).get();
+  const target = nbs.get(nbByPath.get(r.pathKey) ?? "");
+  if (!target) return undefined; // the imported notebook isn't open on the board
+  if (imp.export) return target.exportsVal.get(imp.export);
+  return Object.fromEntries(target.exportsVal); // whole notebook as an object of its exports
+}
+
+function startRun(cardKey: string, cellId: string): void {
+  const nb = nbs.get(cardKey);
+  const spec = nb?.specs.get(cellId);
+  if (!nb || !spec) return;
+  // An empty (or whitespace-only) cell has nothing to evaluate — a fresh `+ code` cell, or one mid-authoring.
+  // Don't hand it to the worker: an empty expression wraps to `return ()`, a SyntaxError. Present a clean
+  // empty pane (no error, no value), clear any exports it used to define, and unblock its dependents.
+  const runSrc = spec.runSource ?? spec.source ?? "";
+  if (!runSrc.trim()) {
+    setState(cardKey, cellId, "idle");
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: undefined, value: undefined, error: undefined });
+    applyExports(cardKey, cellId, undefined);
+    afterRun(cardKey, cellId);
+    return;
+  }
+  const inputs: Record<string, unknown> = {};
+  for (const imp of importsOf(spec)) inputs[imp.name] = resolveInput(nb, imp);
+  setState(cardKey, cellId, "running");
+  patchOutput(cardKey, cellId, { running: true, stale: false });
+  const jobId = ++nextJob;
+  nb.job.set(cellId, jobId);
+  pending.set(jobId, { cardKey, cellId });
+  try {
+    // `runSource` is what the worker evaluates: the RHS for a `name = …` named-cell define, a rewritten
+    // statement block (imports stripped, last expression returned — step-4b), or the source verbatim; `block`
+    // tells the worker which (§11.4a/4b). The bare define assignment never leaks a global into the worker.
+    ensureWorker().postMessage({ jobId, source: spec.runSource ?? spec.source, inputs, block: spec.block });
+  } catch (err) {
+    pending.delete(jobId);
+    setState(cardKey, cellId, "idle");
+    patchOutput(cardKey, cellId, { running: false, status: "error", error: String(err) });
+  }
+}
+
+function onReply(cardKey: string, cellId: string, jobId: number, ok: boolean, value: unknown, error: unknown): void {
+  const nb = nbs.get(cardKey);
+  if (!nb) return;
+  // Supersede: ignore a reply that isn't this cell's current job (the inputs changed mid-run).
+  if (nb.job.get(cellId) !== jobId) {
+    afterRun(cardKey, cellId);
+    return;
+  }
+  setState(cardKey, cellId, "idle");
+  if (ok) {
+    // A multi-define block returns an object keyed by EVERY defined name (keyedExports). That object is the
+    // EXPORT map (applyExports picks the per-name atoms off it), but it is NOT what the cell should DISPLAY:
+    // Observable-style, a cell shows its FINAL value — here the last defined name's value — not an object of
+    // all its bindings. Split the two: exports get the whole object, the pane gets the final value only.
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: displayValue(nb.specs.get(cellId), value), error: undefined });
+    applyExports(cardKey, cellId, value);
+  } else {
+    // A failed cell keeps its downstream's last-good values (no cascade) — only its own pane shows the error.
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "error", error: String(error) });
+  }
+  afterRun(cardKey, cellId);
+}
+
+// Re-run a cell that was re-dirtied while it was in flight, then advance the scheduler.
+function afterRun(cardKey: string, cellId: string): void {
+  const rs = redo.get(cardKey);
+  if (rs?.has(cellId)) {
+    rs.delete(cellId);
+    setState(cardKey, cellId, "idle");
+    trigger(cardKey, cellId);
+  }
+  tick(cardKey);
+}
+
+// Write a finished cell's exports to the off-log atoms; any CHANGED name marks its importers dirty (per
+// their own policy), which is the reactive cascade. This is the one place a value flows along an edge. A cell
+// publishes both its COMPUTED exports (mapped from the worker value) and its RE-EXPORTS — the values it pulls
+// from cross-card imports, republished under the local name so sibling cells can read them (step-4b).
+function applyExports(cardKey: string, producerId: string, value: unknown): void {
+  const nb = nbs.get(cardKey);
+  const spec = nb?.specs.get(producerId);
+  if (!nb || !spec) return;
+  for (const [name, val] of computeExports(spec, value)) publishExport(cardKey, nb, producerId, name, val);
+  // Re-exports (Observable's import-cell): an imported binding becomes a notebook-local export whose value is
+  // the resolved import. It tracks the upstream because a change there re-dirties this cell (wireExternal).
+  for (const imp of importsOf(spec)) if (imp.path) publishExport(cardKey, nb, producerId, imp.name, resolveInput(nb, imp));
+}
+
+// Publish one export value; on a real change, re-dirty its importers — local (this card) and cross-card
+// (other cards pulling this exact export, plus object-importers depending on any export of this notebook).
+function publishExport(cardKey: string, nb: NB, producerId: string, name: string, val: unknown): void {
+  if (valuesEqual(nb.exportsVal.get(name), val)) return;
+  nb.exportsVal.set(name, val);
+  for (const importer of nb.importByName.get(name) ?? []) if (importer !== producerId) markDirty(cardKey, importer);
+  for (const imp of pathImporters.get(nb.pathKey)?.values() ?? [])
+    if (imp.export === name || imp.export === null) markDirty(imp.cardKey, imp.cellId);
+}
+
+// What a cell's pane should DISPLAY (vs. what it exports). For an ordinary cell the displayed value IS the
+// worker value. A multi-define block (keyedExports) instead returns a { value, exports } pair — `value` is the
+// cell's FINAL expression (Observable's "a cell shows its last expression"), `exports` is the named-binding
+// map for wiring. Show the `value` half. Falls back to the whole value if the shape is unexpected, so display
+// never throws.
+function displayValue(spec: CellSpec | undefined, value: unknown): unknown {
+  return spec?.keyedExports && value && typeof value === "object" ? (value as { value: unknown }).value : value;
+}
+
+// Map a cell's value to its declared exports: 0 outputs → none (a display-only cell); a keyedExports block →
+// pick the named keys off its `exports` map (the worker returned a { value, exports } pair); >1 names on a
+// non-keyed cell → pick the keys off the value object directly; a single non-keyed name → the value IS that export.
+function computeExports(spec: CellSpec, value: unknown): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  const names = spec.outNames;
+  if (spec.keyedExports) {
+    const exp = value && typeof value === "object" ? (value as { exports?: unknown }).exports : undefined;
+    for (const name of names) out.set(name, exp && typeof exp === "object" ? (exp as Record<string, unknown>)[name] : undefined);
+  } else if (names.length > 1) {
+    for (const name of names) out.set(name, value && typeof value === "object" ? (value as Record<string, unknown>)[name] : undefined);
+  } else if (names.length === 1) out.set(names[0]!, value);
+  return out;
+}
+
+// The manual Run button (and the keyboard-free twin a template might add): force this cell to run now,
+// overriding its policy.
+export function runCell(cardKey: string, cellId: string): void {
+  trigger(cardKey, cellId);
+}

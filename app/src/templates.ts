@@ -1,9 +1,21 @@
 import { nothing, render as litRender } from "../vendor/lit-html.js";
-import type { Editor, Id, Subscribable } from "./lib";
+import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal } from "./feeds";
-import { fileContentSignal, dirListingSignal, sessionListSignal, refreshSessionList, type DirListing } from "./content";
+import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
+import { openSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+import { cellOutputsSignal, runCell, syncCells, type CellSpec } from "./notebook-runtime";
 import { weatherSignal, type WeatherData } from "./weather";
+import { activeBoardId } from "./board";
+
+// A board-scoped feed (e.g. `githead:<boardId>`): the repo a feed reflects is this tab's board. The
+// boardId isn't known at module-load (resolveBoard runs first), so resolve it LAZILY at first subscribe —
+// always after boot, since a card can only subscribe once it's rendered. Cached so the handle is stable.
+function boardFeedSignal(prefix: string): Subscribable<unknown> {
+  let inner: Subscribable<unknown> | null = null;
+  const resolve = (): Subscribable<unknown> => (inner ??= feedSignal(prefix + ":" + activeBoardId()));
+  return { get: () => resolve().get(), subscribe: (cb) => resolve().subscribe(cb) };
+}
 
 // The card-type registry + template host (card-types-as-data.md §3, experiment §7). Types are
 // folders under card-types/ — type.yaml (capability grant) + render.js (the interior, loaded with
@@ -33,6 +45,10 @@ export interface CardFields {
 export interface CardApi {
   fields: CardFields;
   signals: Record<string, unknown>;
+  // The card's ROOT (worktree-activity slice B): parsed from its node id (`node:<root>:<path>`), so a
+  // file/directory template knows which worktree it belongs to without a new field. "repo" (the
+  // canonical checkout) for non-file cards and any id that doesn't carry a root — harmless there.
+  root: RootId;
 }
 
 export interface CardTemplateModule {
@@ -54,6 +70,10 @@ export interface CardTemplate {
   // proportions so a corner drag scales it uniformly (the round clock → `aspect: 1`, always square).
   // The host hands this to the interaction layer's resize as a per-node lock; absent = free resize.
   aspect?: number;
+  // `aspect: auto` instead of a number: the ratio isn't fixed by the TYPE but by each card's CONTENT —
+  // an image card locks to whatever proportions it currently has (set to the image's own aspect at drop).
+  // The host resolves this to the node's live w/h ratio; can't live in the static `aspect` number.
+  aspectAuto?: boolean;
   module: CardTemplateModule;
 }
 
@@ -61,10 +81,11 @@ export interface CardTemplate {
 // note. Adding a capability means adding a line here, not widening what templates can reach for.
 const CAPABILITY_SIGNALS: Record<string, Subscribable<unknown>> = {
   now: nowSignal,
-  githead: feedSignal("githead"),
+  githead: boardFeedSignal("githead"), // this board's repo HEAD (githead:<boardId>)
   hn: feedSignal("hn"),
   usage: feedSignal("usage"), // account-level plan windows, polled server-side (vite-fs-plugin.ts)
   sessionList: sessionListSignal, // the historical-transcript list (GET /api/sessions), the sessions card's body
+  roots: rootsSignal, // the board's roots (canonical + git worktrees), each with a colour — worktree-activity slice B/C
 };
 
 // The per-card WRITE capabilities a type.yaml may request: capability name → the command's payload
@@ -84,6 +105,11 @@ const WRITE_CAPS: Record<string, string> = {
 export interface CardHost {
   id: Id<"node">;
   editor: Editor;
+  // The full manager, for the few capabilities that perform an authored canvas ACT placed relative to
+  // this card — the browsers' double-click open (sessionOpen/fsOpen), which commits a new node offset
+  // from THIS card's box (cascadeFrom needs the viewport + layout). Still never handed to the template:
+  // the capability is the bound, scoped action; `m` stays host-side, like `editor`.
+  m: InteractionManager;
 }
 
 // ── read-tracking over Subscribable<T> ──────────────────────────────────────────────────────────
@@ -173,6 +199,14 @@ export function mountTemplate(
   };
 }
 
+// Parse the rootId out of a node id (`node:<root>:<path>`). The root is colon-free (a slug), so the first
+// two colons bound it; ids without a (root, path) shape (node:clock, node:session:<id>) don't match and
+// fall back to the canonical "repo" — which those cards never read, so the fallback is harmless.
+function rootOfId(id: string): RootId {
+  const m = /^node:([^:]+):/.exec(id);
+  return (m ? m[1] : "repo") as RootId;
+}
+
 // Build the capability object for one card: content fields off the node's channel-1 handle, plus
 // the declared off-log signals. All reads route through tracked(), so render-time access = subscription.
 export function buildCard(
@@ -181,6 +215,8 @@ export function buildCard(
   host?: CardHost,
 ): CardApi {
   const signals: Record<string, unknown> = {};
+  // The card's root (worktree-activity slice B) — which checkout/worktree its (root, path) reference is in.
+  const root: RootId = host ? rootOfId(host.id) : "repo";
   for (const name of capabilities) {
     // `setText`/`setTitle`/`setColor` are the WRITE capabilities — the "validated commit surface" the
     // design note defers, kept deliberately narrow: a per-card ACTION (not a signal, like
@@ -213,8 +249,57 @@ export function buildCard(
     // holds only the card's arrangement and this (root, path) reference (root is the one allow-listed
     // `repo`, as everywhere). Reading it re-renders the card on a disk change without any setText.
     if (name === "fileContent") {
-      const content = fileContentSignal("repo", nodeSub.get()?.title ?? "");
+      const content = fileContentSignal(root, nodeSub.get()?.title ?? "");
       Object.defineProperty(signals, "fileContent", { enumerable: true, get: () => tracked(content) });
+      continue;
+    }
+    // `writeFile` is the notebook card's serialize-back ACTION (docs/notebook-card.md §13): a per-card
+    // bound fn that POSTs new content for THIS card's (root, path) to disk (content.ts → POST /api/file).
+    // Source lives in the FILE, not record.text (§4), so an edit is a file write, NOT a setText on the
+    // log — the watcher then refreshes `fileContent` on every card viewing this path. Keyed by the card's
+    // own (root, path) like `fileContent`, so a card can only write its own backing file. Not read-tracked
+    // (writing is an act, not a dependency), mirroring sessionInput.
+    if (name === "writeFile") {
+      const path = nodeSub.get()?.title ?? "";
+      signals.writeFile = (content: string): Promise<boolean> => writeFileContent(root, path, content);
+      continue;
+    }
+    // `cellOutputs` is the notebook card's OFF-LOG cell-output projection (notebook-runtime.ts), keyed by
+    // this card's node id — the `fileContent` shape applied to derived run results (cellId → {status,
+    // value, error}). Reading it during render subscribes the card, so a finished run re-renders just this
+    // card; never persisted (recomputed/cached, §4). A no-op key when there's no host (the headless mock).
+    if (name === "cellOutputs") {
+      const sig = cellOutputsSignal(host?.id ?? nodeSub.get()?.title ?? "");
+      Object.defineProperty(signals, "cellOutputs", { enumerable: true, get: () => tracked(sig) });
+      continue;
+    }
+    // `runCell` is the notebook card's manual-run ACTION (docs/notebook-card.md §6): force ONE module cell
+    // to run now (the Run button / a manual cell's trigger), overriding its policy. The runtime
+    // (notebook-runtime.ts — the only place a Worker is made) already holds the cell's source + wiring from
+    // `syncCells`, so this just names the cell. Keyed by the same node id as cellOutputs so a run lands on
+    // the card that asked. Not read-tracked — running is an act.
+    if (name === "runCell") {
+      const cardKey = host?.id ?? nodeSub.get()?.title ?? "";
+      signals.runCell = (cellId: string): void => runCell(cardKey, cellId);
+      continue;
+    }
+    // `syncCells` is the notebook card's graph-feed ACTION (docs/notebook-card.md §5): the template parses
+    // its `.html` source and hands the cell list (id/source/in/out/policy) to the reactive scheduler, which
+    // diffs it and (re)builds the dependency DAG. Called from render but DIFF-GUARDED in the runtime (a
+    // no-op when the spec set is unchanged), so it rides the same render beat as fileContent without
+    // re-running cells on an unrelated re-render. Keyed by this card's node id. Not read-tracked.
+    if (name === "syncCells") {
+      const cardKey = host?.id ?? nodeSub.get()?.title ?? "";
+      signals.syncCells = (cells: CellSpec[]): void => syncCells(cardKey, cells);
+      continue;
+    }
+    // `gone` (slice D): true once this card's (root, path) backing is deleted on disk (the watch's unlink
+    // or a 404). The file/dir card reads it to render a TOMBSTONE instead of content / a stuck "loading…".
+    // Per-card (keyed by this card's root + path). Worktree-removal isn't tracked here — the card derives
+    // that reactively from `roots` (its root dropping out of the list).
+    if (name === "gone") {
+      const sig = goneSignal(root, nodeSub.get()?.title ?? "");
+      Object.defineProperty(signals, "gone", { enumerable: true, get: () => tracked(sig) });
       continue;
     }
     // `dirListing` is the directory card's PER-CARD off-log capability — a CALLABLE keyed by PATH, not a
@@ -226,7 +311,10 @@ export function buildCard(
     // only the card's arrangement + its (root, path). DRAGGING a row onto the canvas is the one act that
     // promotes it (loader.materializeAt). `repo` is the one allow-listed root, as everywhere.
     if (name === "dirListing") {
-      signals.dirListing = (path: string): DirListing | undefined => tracked(dirListingSignal("repo", path));
+      // (rootId, path) → that root's listing. The combined "File tree" card spans MANY roots, so the
+      // capability takes the root explicitly rather than closing over this card's own `root`.
+      signals.dirListing = (rootId: string, path: string): DirListing | undefined =>
+        tracked(dirListingSignal(rootId, path));
       continue;
     }
     // `weather` is the weather card's PER-CARD off-log capability — a CALLABLE keyed by a free-text
@@ -290,7 +378,22 @@ export function buildCard(
     if (name === "sessionResume") {
       const id = nodeSub.get()?.title ?? "";
       signals.sessionResume = (): Promise<boolean> =>
-        fetch(`/api/session/${encodeURIComponent(id)}/resume`, { method: "POST" }).then(
+        fetch(`/api/session/${encodeURIComponent(id)}/resume?board=${activeBoardId()}`, {
+          method: "POST",
+        }).then(
+          (r) => r.ok,
+          () => false,
+        );
+      continue;
+    }
+    // `sessionDone` is the Phase-2 explicit teardown: a per-card ACTION (like sessionResume) that POSTs
+    // /done to end this card's live session — terminate the process AND record `endReason:"done"` on the
+    // durable marker, so the card settles into the calm "✓ done" band. Session-internal: a POST, never
+    // editor.commit, never a canvas-log entry. The id is the live UUID, globally unique, so no ?board=.
+    if (name === "sessionDone") {
+      const id = nodeSub.get()?.title ?? "";
+      signals.sessionDone = (): Promise<boolean> =>
+        fetch(`/api/session/${encodeURIComponent(id)}/done`, { method: "POST" }).then(
           (r) => r.ok,
           () => false,
         );
@@ -304,6 +407,98 @@ export function buildCard(
       signals.sessionRefresh = (): void => refreshSessionList();
       continue;
     }
+    // `sessionDelete` is the sessions browser card's hide ACTION (select a row, Shift+Delete): drop one
+    // historical transcript from THIS list. Board-global and off-log like `sessionRefresh` — it adds the
+    // id to a localStorage hidden-set (content.ts), never the canvas log, and never touches the .jsonl on
+    // disk (Claude Code's own data). A bound fn taking the row's id, not a signal.
+    if (name === "sessionDelete") {
+      signals.sessionDelete = (id: string): void => hideSession(id);
+      continue;
+    }
+    // `sessionOpen` is the sessions browser's DOUBLE-CLICK open — the keyboard-free twin of the drag-out
+    // (App.tsx's drop → openSession). Same authored addNode, but placed by cascadeFrom (offset down-right
+    // from THIS browser card) since a double-click carries no drop point. Per-card: it needs the host id
+    // to anchor the cascade. A no-op without a host (the headless mock has none).
+    if (name === "sessionOpen") {
+      if (host) {
+        const { m, id } = host;
+        signals.sessionOpen = (sid: string): void => void openSession(m, sid, cascadeFrom(m, id, 520, 400));
+      }
+      continue;
+    }
+    // `fsOpen` is the directory browser's DOUBLE-CLICK open — the drag-out's twin (App.tsx's drop →
+    // materializeAt), placed by cascadeFrom off this browser card. Only the FILE rows use it; a folder
+    // row's click already drills in (treeState), so it keeps click=expand / drag=pin and doesn't open.
+    if (name === "fsOpen") {
+      if (host) {
+        const { m, id } = host;
+        signals.fsOpen = (rootId: string, path: string, kind: "file" | "dir"): void => {
+          const at = cascadeFrom(m, id, kind === "dir" ? 240 : 250, kind === "dir" ? 300 : 180);
+          void materializeAt(m, rootId, path, kind, at.x, at.y);
+        };
+      }
+      continue;
+    }
+    // `fsRename` is the directory card's in-app RENAME/MOVE ACTION (select a row, Enter): a per-card bound
+    // fn that POSTs (root, from, to) to /api/file/rename — a real disk move, never editor.commit on the
+    // file content. On success it RE-KEYS any pinned card from the old (root, path) to the new one
+    // (loader.renameFileNodes) so a standalone card for that file survives in place rather than tombstoning
+    // — the referential-integrity edge an external Finder rename can't reach. `rename ≡ move`, so a `to`
+    // under a different parent moves it (the server mkdir's the parent). Not read-tracked — renaming is an
+    // act. A no-op without a host (the headless mock has no editor to re-key through).
+    if (name === "fsRename") {
+      const editor = host?.editor;
+      signals.fsRename = (rootId: string, from: string, to: string): Promise<boolean> =>
+        fetch(`/api/file/rename?board=${activeBoardId()}&root=${encodeURIComponent(rootId)}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from, to }),
+        }).then(
+          (r) => {
+            if (!r.ok) return false;
+            if (editor) renameFileNodes(editor, rootId, from, to);
+            return true;
+          },
+          () => false,
+        );
+      continue;
+    }
+    // `fsDelete` is the directory card's DELETE ACTION (select a row, Shift+Delete): a per-card bound fn
+    // that POSTs (root, path) to /api/file/delete — a real disk delete. No browser-side bookkeeping: a
+    // pinned card for the path is left to the watch's unlink → `gone` TOMBSTONE (the loader's "don't
+    // silently vanish a card" rule), which the user dismisses deliberately. Not read-tracked.
+    if (name === "fsDelete") {
+      signals.fsDelete = (rootId: string, path: string): Promise<boolean> =>
+        fetch(
+          `/api/file/delete?board=${activeBoardId()}&root=${encodeURIComponent(rootId)}&path=${encodeURIComponent(path)}`,
+          { method: "POST" },
+        ).then((r) => r.ok, () => false);
+      continue;
+    }
+    // `editState` is per-card EPHEMERAL view state shaped exactly like `treeState` (same factory): which
+    // row (if any) is mid-rename, plus any transient error. Read-tracked + settable so opening/committing
+    // the inline rename input re-renders the card; never logged, gone on reload — an in-flight edit is view
+    // state, not authored state. Kept SEPARATE from `treeState` (the expand-set) so a rename doesn't perturb
+    // which folders are open.
+    if (name === "editState") {
+      let value: unknown = undefined;
+      const watchers = new Set<() => void>();
+      const sub: Subscribable<unknown> = {
+        get: () => value,
+        subscribe(fn) {
+          watchers.add(fn);
+          return () => watchers.delete(fn);
+        },
+      };
+      signals.editState = {
+        get: (): unknown => tracked(sub),
+        set: (next: unknown): void => {
+          value = next;
+          for (const fn of watchers) fn();
+        },
+      };
+      continue;
+    }
     const s = CAPABILITY_SIGNALS[name];
     if (s) Object.defineProperty(signals, name, { enumerable: true, get: () => tracked(s) });
   }
@@ -313,6 +508,7 @@ export function buildCard(
       return { title: n?.title ?? "", text: n?.text ?? "", color: n?.color ?? "grey" };
     },
     signals,
+    root,
   };
 }
 
@@ -320,17 +516,28 @@ export function buildCard(
 
 // Minimal flat-yaml reader for type.yaml — `key: value` lines and one inline list. The day a type
 // needs nesting is the day this becomes a real parser; refusing that now keeps type.yaml honest.
-function parseTypeYaml(src: string): { contract: number; capabilities: string[]; chrome?: string; aspect?: number } {
+function parseTypeYaml(src: string): {
+  contract: number;
+  capabilities: string[];
+  chrome?: string;
+  aspect?: number;
+  aspectAuto?: boolean;
+} {
   let contract = 1;
   let capabilities: string[] = [];
   let chrome: string | undefined;
   let aspect: number | undefined;
+  let aspectAuto: boolean | undefined;
   for (const line of src.split("\n")) {
     const m = /^(\w+):\s*(.*?)\s*(?:#.*)?$/.exec(line);
     if (!m) continue;
     if (m[1] === "contract") contract = Number(m[2]) || 1;
     if (m[1] === "chrome") chrome = m[2] || undefined;
-    if (m[1] === "aspect") aspect = Number(m[2]) || undefined;
+    // `aspect: auto` → content-driven lock (aspectAuto); any number → a fixed type ratio.
+    if (m[1] === "aspect") {
+      if (m[2] === "auto") aspectAuto = true;
+      else aspect = Number(m[2]) || undefined;
+    }
     if (m[1] === "capabilities")
       capabilities = m[2]!
         .replace(/^\[|\]$/g, "")
@@ -338,7 +545,7 @@ function parseTypeYaml(src: string): { contract: number; capabilities: string[];
         .map((s) => s.trim())
         .filter(Boolean);
   }
-  return { contract, capabilities, chrome, aspect };
+  return { contract, capabilities, chrome, aspect, aspectAuto };
 }
 
 // Snapshot-on-write: get() must return a NEW reference when the registry changes (channel-1
@@ -363,14 +570,14 @@ const loadGen = new Map<string, number>();
 async function loadType(type: string, yaml: string): Promise<void> {
   const gen = (loadGen.get(type) ?? 0) + 1;
   loadGen.set(type, gen);
-  const { contract, capabilities, chrome, aspect } = parseTypeYaml(yaml);
+  const { contract, capabilities, chrome, aspect, aspectAuto } = parseTypeYaml(yaml);
   try {
     const mod = (
       await import(/* @vite-ignore */ `/card-types/${type}/render.js?t=${Date.now()}-${gen}`)
     ).default as CardTemplateModule;
     if (typeof mod?.render !== "function") throw new Error("template has no render()");
     if (loadGen.get(type) !== gen) return;
-    setType(type, { type, contract, capabilities, chrome, aspect, module: mod });
+    setType(type, { type, contract, capabilities, chrome, aspect, aspectAuto, module: mod });
   } catch (err) {
     if (loadGen.get(type) !== gen) return;
     // A broken template must never take the canvas down — drop the type, card falls back to the

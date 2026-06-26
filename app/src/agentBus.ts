@@ -1,4 +1,5 @@
 import type { InteractionManager } from "./lib";
+import { activeBoardId } from "./board";
 
 // The browser end of the agent bus (demo §10 step 4). Inbound: commands posted to /api/command
 // arrive over SSE and run through editor.commit — the same one-mutation-API a gesture or the loader
@@ -7,15 +8,20 @@ import type { InteractionManager } from "./lib";
 // diff schedules a debounced push of the snapshot + recent intent to /api/canvas, so an agent can
 // READ the live board with one GET. Together they're the MCP server's dress rehearsal:
 //
-//   curl localhost:5173/api/canvas
-//   curl -X POST localhost:5173/api/command -d '{"type":"addNode","actor":"claude","payload":{...}}'
+//   curl 'localhost:5173/api/canvas?board=<id>'
+//   curl -X POST 'localhost:5173/api/command?board=<id>' -d '{"type":"addNode","actor":"claude","payload":{...}}'
+//
+// Both legs are PER BOARD (Phase 3): this tab subscribes and pushes under its own activeBoardId, so a
+// command only reaches the boards showing that repo and each board's snapshot is read back on its own id.
 
 const PUSH_DEBOUNCE_MS = 500;
 
 export function connectAgentBus(m: InteractionManager): () => void {
   const editor = m.editor;
+  // One tab = one board; resolved before the engine built, so it's stable for this connection's life.
+  const board = activeBoardId();
 
-  const es = new EventSource("/api/bus");
+  const es = new EventSource(`/api/bus?board=${board}`);
   es.onmessage = (ev) => {
     let cmd: { type?: string; payload?: unknown; actor?: string };
     try {
@@ -35,7 +41,7 @@ export function connectAgentBus(m: InteractionManager): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
   const push = () => {
     timer = null;
-    void fetch("/api/canvas", {
+    void fetch(`/api/canvas?board=${board}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({

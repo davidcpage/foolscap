@@ -16,3 +16,12 @@ npm-debug.log*
 # local working notes (in-flight state, not for the repo)
 HANDOFF.md
 sticky-colours-task.md
+
+# shadow-git ledger: canvas-owned, high-resolution file/artefact history (docs/shadow-git-ledger.md).
+# The human repo must NOT swallow the shadow object DBs; everything canvas-owned lives under .canvas/.
+.canvas/
+
+# notebook-card step-0 scratch output: "Add notebook" writes timestamped starter files here (the doc's
+# `notebooks/` deliverable dir, used as scratch until the temp-vs-persistent split lands). Generated, not
+# source — keep it out of the repo for now; revisit when promotion (artefacts → notebooks/) is designed.
+notebooks/

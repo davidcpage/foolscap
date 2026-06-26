@@ -3,8 +3,23 @@ import type { Camera } from "../camera.js";
 import type { Selection } from "../selection.js";
 import type { SpatialIndex } from "../spatial.js";
 import type { Observable } from "../observable.js";
-import type { Box } from "../geometry.js";
+import type { Box, Vec } from "../geometry.js";
 import type { KeyInput, PointerInput, WheelInput } from "../input.js";
+
+/**
+ * The live connect-drag preview (alt-drag from one card toward another to wire them). PAGE space; a
+ * renderer draws a connector from the source node's centre to `to`, solid-ish once `toNode` names a
+ * valid drop target. The engine carries the gesture and the geometry; what edge (if any) the drop
+ * makes is the host's call (InteractionContext.connect) — the engine never learns edge semantics.
+ */
+export interface ConnectDraw {
+  /** Source node id the drag began on. */
+  from: string;
+  /** Current pointer position in page space (the loose end of the preview). */
+  to: Vec;
+  /** Node currently under the pointer if it's a legal drop target (≠ from, connectable), else null. */
+  toNode: string | null;
+}
 
 // What a tool is given to do its job. This is the seam between the manager (input routing + shared
 // session state) and the individual tools (the actual gesture grammars). A tool reads hit results
@@ -24,6 +39,22 @@ export interface InteractionContext {
    * the resolver from its template registry, the select tool just asks.
    */
   readonly aspectLock?: (nodeId: string) => number | null;
+  /**
+   * Live connect-drag preview (null when not connecting). The select tool sets it during an alt-drag so
+   * a renderer can draw the in-flight connector; like `marquee`, it's session-tier channel-1 chrome.
+   */
+  readonly connectDraw: Observable<ConnectDraw | null>;
+  /**
+   * Optional: may a connect-drag START on this node? Lets the host restrict wiring to the cards it has
+   * a relationship model for (e.g. session↔session attention-edges) without the engine learning card
+   * types — same shape as aspectLock. Absent ⇒ any node is connectable.
+   */
+  readonly connectable?: (nodeId: string) => boolean;
+  /**
+   * Optional: the user completed a connect-drag from `from` to `to` (two distinct nodes). The host
+   * decides what edge to create (or to ignore it) — the engine carries the gesture, not the meaning.
+   */
+  readonly connect?: (from: string, to: string) => void;
   /** Switch the active tool by name (e.g. a tool that finishes returns to "select"). */
   setTool(name: string): void;
 }

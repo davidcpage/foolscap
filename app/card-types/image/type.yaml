@@ -1,0 +1,13 @@
+# The image card type (image-cards-on-canvas). A binary sibling of the file card: its title carries the
+# image's path relative to its dataset root, and the interior is an <img> pointing straight at the raw
+# bytes (GET /api/asset?root&path) — NOT the off-log `fileContent` signal, which is text-only. So the
+# capability grant is EMPTY: like the plain note, the whole interior renders off the node record
+# (card.fields.title) + card.root, and the card commits nothing. The bytes live as a real repo file
+# (dropped onto the canvas → POST /api/asset → .canvas/images/<name>), so any session can read them too.
+name: image
+contract: 1
+capabilities: []
+# Lock resize to the card's OWN proportions (set to the image's aspect at drop, loader.fitImageBox), so a
+# corner drag scales the image uniformly and the contain-fit never reopens a letterbox gap. `auto`, not a
+# number, because the ratio is per-image, not per-type — the host resolves it from the node's live w/h.
+aspect: auto

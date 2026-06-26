@@ -16,6 +16,45 @@ test("commit(addNode) writes node+layout, appends ONE intent event carrying the 
   assert.equal(e.store.version, 1);
 });
 
+test("addNode carries the optional anchor; setAnchor flips it and patches the box", () => {
+  const e = new Editor();
+  // A plain card has no anchor (≡ world); a floating one is born "screen".
+  e.commit({ type: "addNode", payload: { id: "node:a" }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:f", anchor: "screen", x: 8, y: 9 }, actor: "human" });
+  assert.equal((e.store.get<"layout">("layout:node:a") as LayoutRecord).anchor, undefined);
+  assert.equal((e.store.get<"layout">("layout:node:f") as LayoutRecord).anchor, "screen");
+
+  // setAnchor pins the world card, carrying the converted box the caller computed.
+  e.commit({ type: "setAnchor", payload: { id: "node:a", anchor: "screen", x: 40, y: 50, w: 200, h: 160 }, actor: "human" });
+  const l = e.store.get<"layout">("layout:node:a") as LayoutRecord;
+  assert.deepEqual([l.anchor, l.x, l.y, l.w, l.h], ["screen", 40, 50, 200, 160]);
+});
+
+test("commit(removeNode) cascades to connected edges (no dangling refs), as one undoable event", () => {
+  const e = new Editor();
+  const undo = new UndoManager(e.store); // attach before the commits so the removeNode is on its stack
+  e.commit({ type: "addNode", payload: { id: "node:chan" }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:a" }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:b" }, actor: "human" });
+  e.commit({ type: "addEdge", payload: { id: "edge:a", from: "node:a", to: "node:chan", type: "member:open" }, actor: "human" });
+  e.commit({ type: "addEdge", payload: { id: "edge:b", from: "node:b", to: "node:chan", type: "member:open" }, actor: "human" });
+  // An unrelated edge between two other nodes must survive.
+  e.commit({ type: "addEdge", payload: { id: "edge:keep", from: "node:a", to: "node:b", type: "links" }, actor: "human" });
+
+  const evt = e.commit({ type: "removeNode", payload: { id: "node:chan" }, actor: "human" });
+  assert.equal(e.store.get("node:chan"), undefined);
+  assert.equal(e.store.get("edge:a"), undefined); // membership pointing AT the channel — gone
+  assert.equal(e.store.get("edge:b"), undefined);
+  assert.equal(e.store.get<"edge">("edge:keep")?.typeName, "edge"); // untouched
+  assert.equal(Object.keys(evt.diff.removed).length, 4); // node + layout + 2 edges, one diff
+
+  // ...and one undo restores all of them together.
+  undo.undo();
+  assert.equal(e.store.get<"node">("node:chan")?.typeName, "node");
+  assert.equal(e.store.get<"edge">("edge:a")?.typeName, "edge");
+  assert.equal(e.store.get<"edge">("edge:b")?.typeName, "edge");
+});
+
 test("commit(addShape) is replayable: the shape tool's gesture intent reconstructs the node+layout", () => {
   // The shape tool records its draw as an `addShape` IntentEvent with the final box+colour in the
   // payload. "One mutation API, three clients" means an agent can replay that intent via commit — so

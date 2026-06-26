@@ -9,6 +9,10 @@
 #     from the watcher refreshing this signal (channel-1, derived from the one source) — never a
 #     setText on the durable log. The log keeps only the card's arrangement + its path reference.
 #     This is the clock rule (§9.1) applied to the file cards' own bodies.
+#   • `roots` — the board's roots (canonical + git worktrees); the head reads its OWN root (card.root)
+#     from here for a colour swatch matching the session-card dots + the tree (worktree-activity slice C).
+#   • `gone` — true once this file is deleted on disk (or its root removed). The card shows a tombstone
+#     instead of vanishing, so a pinned card is never silently dropped (worktree-activity slice D).
 name: file
 contract: 1
-capabilities: [fileContent]
+capabilities: [fileContent, roots, gone]

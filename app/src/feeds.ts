@@ -30,15 +30,32 @@ const values = new Map<string, unknown>();
 const subs = new Map<string, Set<() => void>>();
 let es: EventSource | null = null;
 
+// Fired when the feed stream RECONNECTS after a drop (not the first connect). Some feeds carry
+// server-side state a restart loses and only a client request rebuilds: a session card's file-tail is
+// armed by GET /api/session, so after a cold server restart (browser left open) the card goes stale until
+// something re-arms it. Listeners (App.tsx) re-run the same re-projection a page reload does.
+const reconnectListeners = new Set<() => void>();
+export function onFeedsReconnect(fn: () => void): () => void {
+  reconnectListeners.add(fn);
+  return () => reconnectListeners.delete(fn);
+}
+
 // One connection for all feeds, opened on first subscription and kept for the page's life (a spike,
 // not a connection manager — EventSource auto-reconnects, and the server replays last values).
 function ensureConnected(): void {
   if (es) return;
+  let connectedOnce = false;
   es = new EventSource("/api/feeds");
   es.onmessage = (ev) => {
     const { feed, value } = JSON.parse(ev.data) as FeedFrame;
     values.set(feed, value);
     for (const fn of subs.get(feed) ?? []) fn();
+  };
+  // onopen fires on every successful (re)connection; skip the first so only a genuine reconnect — where
+  // the server may have restarted with empty feed state — triggers the re-arm.
+  es.onopen = () => {
+    if (connectedOnce) for (const fn of reconnectListeners) fn();
+    connectedOnce = true;
   };
 }
 

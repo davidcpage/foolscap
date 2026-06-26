@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { Editor, layoutId, type LayoutRecord } from "../src/core.js";
+import { Editor, UndoManager, layoutId, type LayoutRecord } from "../src/core.js";
 import { InteractionManager } from "../src/manager.js";
 import type { InputEvent, ModifierState } from "../src/input.js";
 import { vec, type Vec } from "../src/geometry.js";
@@ -133,13 +133,48 @@ test("dragging a node lifts it above the others (z), within one gesture", () => 
   assert.equal(ch2, 1, "the lift rode the SAME coalesced diff as the move");
 });
 
-test("group drag lifts both but preserves their relative stacking order", () => {
+test("group drag preserves the relative stacking order (nothing else to raise above)", () => {
   const { editor, m } = setup(); // a.z=0, b.z=1
   m.selection.set(["node:a", "node:b"]);
-  m.dispatch(down(vec(50, 50))); // press a (in the group) → group drag
-  m.dispatch(move(vec(70, 50)));
+  m.dispatch(down(vec(50, 50))); // press a (in the group) → group drag; the whole board is selected,
+  m.dispatch(move(vec(70, 50))); // so there is nothing to lift above → no restack, just the move
   m.dispatch(up(vec(70, 50)));
-  assert.ok(z(editor, "node:a") < z(editor, "node:b"), "a still below b after both were raised");
+  assert.ok(z(editor, "node:a") < z(editor, "node:b"), "a still below b");
+});
+
+test("a plain click brings the selected card to the front as ONE raiseNodes intent", () => {
+  const { editor, m } = setup(); // a.z=0, b.z=1 → a starts behind b
+  const logBefore = editor.log.all().length;
+  m.dispatch(down(vec(50, 50))); // press a (below b)
+  m.dispatch(up(vec(50, 50))); // plain click, no drag
+  assert.deepEqual(m.selection.ids(), ["node:a"]);
+  assert.ok(z(editor, "node:a") > z(editor, "node:b"), "a lifted above b on the click itself");
+  const events = editor.log.all();
+  assert.equal(events.length, logBefore + 1, "one intent event for the select-raise");
+  assert.equal(events[events.length - 1]!.type, "raiseNodes");
+});
+
+test("clicking the already-front card restacks nothing (no log/undo noise)", () => {
+  const { editor, m } = setup(); // b.z=1 is already the top card
+  const logBefore = editor.log.all().length;
+  let ch2 = 0;
+  editor.store.listen(() => ch2++);
+  m.dispatch(down(vec(250, 50))); // press b — already on top
+  m.dispatch(up(vec(250, 50)));
+  assert.deepEqual(m.selection.ids(), ["node:b"]);
+  assert.equal(editor.log.all().length, logBefore, "no gesture opened → no intent event");
+  assert.equal(ch2, 0, "nothing reached channel 2");
+});
+
+test("the select-raise is a single undo step (⌘Z lowers the card back)", () => {
+  const { editor, m } = setup();
+  const undo = new UndoManager(editor.store); // human acts only
+  const z0a = z(editor, "node:a");
+  m.dispatch(down(vec(50, 50))); // click a → raises it above b
+  m.dispatch(up(vec(50, 50)));
+  assert.ok(z(editor, "node:a") > z(editor, "node:b"), "raised");
+  undo.undo();
+  assert.equal(z(editor, "node:a"), z0a, "one undo restores the prior z");
 });
 
 test("Escape mid-drag reverts the z lift along with the move", () => {
@@ -359,4 +394,44 @@ test("hit margin lets a click just outside an edge still land", () => {
   m.dispatch(down(vec(120, 50))); // well into the gap, beyond the margin
   m.dispatch(up(vec(120, 50)));
   assert.deepEqual(m.selection.ids(), [], "clear of the margin hits nothing");
+});
+
+test("fitAll frames every node (instant in Node — no rAF), centred at z≤1", () => {
+  const { m } = setup();
+  m.setViewport(800, 600);
+  m.fitAll();
+  // a∪b spans x 0..300, y 0..100 → 300×100. Capped at z=1 (fitAll's maxZoom), so it just centres the
+  // union: centre (150,50) maps to the viewport centre (400,300).
+  assert.equal(m.camera.state.z, 1);
+  const c = m.camera.pageToScreen({ x: 150, y: 50 });
+  assert.ok(Math.hypot(c.x - 400, c.y - 300) < 1e-9, "union centre sits at viewport centre");
+});
+
+test("fitAll is inert before the viewport is measured", () => {
+  const { m } = setup();
+  const before = m.camera.state;
+  m.fitAll(); // viewport still 0×0
+  assert.deepEqual(m.camera.state, before);
+});
+
+test("flyTo with no rAF (Node) lands exactly on the target pose", () => {
+  const { m } = setup();
+  m.setViewport(800, 600);
+  m.flyTo({ x: 12, y: -34, z: 2 });
+  assert.deepEqual(m.camera.state, { x: 12, y: -34, z: 2 });
+  m.cancelFly(); // idempotent, safe with nothing in flight
+});
+
+test("fitSelection frames the selected node, falling back to fitAll when empty", () => {
+  const { m } = setup();
+  m.setViewport(800, 600);
+  m.selection.set(["node:b"]); // 200..300 × 0..100
+  m.fitSelection();
+  const c = m.camera.pageToScreen({ x: 250, y: 50 }); // node:b centre → viewport centre
+  assert.ok(Math.hypot(c.x - 400, c.y - 300) < 1e-6, "selection centre sits at viewport centre");
+  // Empty selection → behaves like fitAll (union centre).
+  m.selection.clear();
+  m.fitSelection();
+  const c2 = m.camera.pageToScreen({ x: 150, y: 50 });
+  assert.ok(Math.hypot(c2.x - 400, c2.y - 300) < 1e-6);
 });

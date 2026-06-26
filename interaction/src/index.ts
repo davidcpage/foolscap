@@ -25,12 +25,12 @@ export { Camera, pageToScreen, screenToPage } from "./camera.js";
 export type { SpatialIndex } from "./spatial.js";
 export { BruteForceIndex, syncIndexFromStore } from "./spatial.js";
 
-export { Selection, selectionBounds } from "./selection.js";
+export { Selection, selectionBounds, worldBounds } from "./selection.js";
 
 export type { InputEvent, PointerInput, WheelInput, KeyInput, ModifierState } from "./input.js";
 export { bindDom } from "./input.js";
 
-export type { Tool, InteractionContext } from "./tools/tool.js";
+export type { Tool, InteractionContext, ConnectDraw } from "./tools/tool.js";
 export { DRAG_THRESHOLD } from "./tools/tool.js";
 export { SelectTool } from "./tools/select-tool.js";
 export { HandTool } from "./tools/hand-tool.js";

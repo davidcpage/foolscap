@@ -69,12 +69,14 @@ changes (one small core change: selective undo):
   the log grows.
 - **The agent bus** (`src/agentBus.ts`): `POST /api/command` → SSE `/api/bus` → `editor.commit`
   (attributed, default `actor: "claude"`); the browser pushes snapshot + recent intent back so
-  `GET /api/canvas` reads the live board.
+  `GET /api/canvas` reads the live board. The bus is **per board** — every endpoint takes `?board=<id>`
+  (default board if omitted, so the calls below work as-is); `GET /api/boards` lists the mounted boards.
 
 ```bash
-curl localhost:5173/api/canvas   # read: snapshot + recent intent
+curl localhost:5173/api/canvas   # read: snapshot + recent intent (default board)
 curl -X POST localhost:5173/api/command \
      -d '{"type":"addNode","actor":"claude","payload":{"title":"hello","text":"from outside","x":900,"y":300}}'
+# another board: curl 'localhost:5173/api/canvas?board=<id>'  (ids from GET /api/boards)
 ```
 
 ## How it's wired
