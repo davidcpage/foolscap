@@ -1115,9 +1115,11 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "RECEIVING. Channel messages do NOT arrive as your input — they are recorded in the channel. When a peer",
     "posts, you get a short nudge line `[canvas] new channel messages: ...`. READ the actual messages with a",
     "tool call (a normal GET — the result comes back as tool output, any time you like):",
-    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel, title, messages:[{seq,ts,from,text}] }] }`,
+    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel, title, messages:[{seq,t,from,text}] }] } (from = a short @-taggable handle; t = MM-DD HH:MM)`,
     "  It returns only what is new since your last read and marks it read. Call it when nudged, or proactively",
-    "during a long task to check for updates without waiting for a nudge.",
+    "during a long task to check for updates without waiting for a nudge. For a LONG backlog, window the recent",
+    `  tail with ?limit=N (last N messages) and/or ?bytes=K (text-byte budget) — e.g. ${base}/api/inbox?session=${sessionId}&bytes=20000;`,
+    "  the response carries a `truncated` note when older messages were windowed out (re-join history:\"full\" to replay all).",
     "",
     "ANSWERING ASKS. If a peer /asks you, the nudge says `N pending question(s)`. Read them (they HANG waiting):",
     `  GET ${base}/api/asks?session=${sessionId}  → { asks:[{ askId, channel, from, text, ts }] }`,
@@ -2499,7 +2501,10 @@ function maybeAnnounceMembership(
     const mode = pendingHistoryMode.get(historyKey(chan.id, sid)) ?? "full";
     pendingHistoryMode.delete(historyKey(chan.id, sid));
     const log = channelLogs.get(chan.id) ?? [];
-    const backlog = log.length && mode === "full" ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read)` : "";
+    const backlog =
+      log.length && mode === "full"
+        ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read${log.length > 60 ? "; for a long backlog window the tail with ?bytes=20000 or ?limit=40" : ""})`
+        : "";
     sendSessionInput(
       sid,
       `[canvas] You joined channel ${chan.id} "${title}".\n${descLine}members: ${roster}\n` +
@@ -2773,28 +2778,105 @@ async function handleChannelReply(
   sendJson(res, 200, { ok: true, askId: ask.askId, channel: chanId, delivered: true });
 }
 
+// The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ChannelMsg. Two
+// changes vs the raw record: `from` is a short HANDLE not a 36-char UUID (see inboxHandle), and `ts` (an
+// opaque 13-digit epoch-ms) becomes `t`, a compact local `MM-DD HH:MM` (see fmtTs) — which is both readable
+// AND fewer bytes than the epoch it replaces, while still carrying date + time so timing conflicts and
+// natural-language references ("continuing yesterday's work") survive. `seq` still gives strict ordering, so
+// seconds/year are dropped as redundant noise. 92% of a backlog read is message text; this is a readability
+// win first, a few-percent size win second.
+interface InboxMsg {
+  seq: number;
+  t: string; // compact local timestamp, `MM-DD HH:MM`
+  from: string; // a short, @-taggable handle (see inboxHandle), not the full session UUID
+  text: string;
+}
+
+// A sender's short handle for the agent-facing inbox: its role name (`RoleName.<short-sid>`, when spawned as
+// a role) else an 8-char sid prefix — both of which are valid `@`-tag / prefix handles, so a reader can reply
+// to or tag the sender straight from what it sees. `human`/`system` pass through unchanged. (The full sid for
+// `/ask`'s `to` / `/invite`'s `target` stays available from the channel's member roster, as it always was.)
+function inboxHandle(records: Array<Record<string, unknown>>, from: string): string {
+  if (from === "human" || from === "system") return from;
+  return sessionNameForSid(records, from) ?? from.slice(0, 8);
+}
+
+// A stored epoch-ms `ts` → compact LOCAL `MM-DD HH:MM`. Local (the board is single-user, on this machine) so
+// the time reads as the human/agent would discuss it; minute precision (seq carries exact order, so seconds
+// add nothing); month-day so a cross-day reference still resolves; year dropped (rarely ambiguous in a live
+// channel — re-add if a board ever spans new year).
+function fmtTs(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Opt-in WINDOWING of a channel's unread tail (CLAUDE.md truncation discipline: bound in ONE place, keep the
+// TAIL — recent matters most for a scroll-to-bottom log — and surface a `truncated` flag; never a silent
+// drop). Applies a max message COUNT (`limit`) and/or a max TEXT-BYTE budget (`bytes`) to `fresh`, keeping
+// the most recent. Always keeps ≥1 message (a budget smaller than the last message still yields it, flagged).
+// Returns the kept tail + how many older messages were omitted (0 ⇒ nothing trimmed).
+function windowTail(fresh: ChannelMsg[], limit: number | null, bytes: number | null): { kept: ChannelMsg[]; omitted: number } {
+  if (limit == null && bytes == null) return { kept: fresh, omitted: 0 };
+  let kept = limit != null && fresh.length > limit ? fresh.slice(fresh.length - limit) : fresh.slice();
+  if (bytes != null) {
+    const out: ChannelMsg[] = [];
+    let used = 0;
+    for (let i = kept.length - 1; i >= 0; i--) {
+      const size = Buffer.byteLength(kept[i]!.text, "utf8");
+      if (out.length > 0 && used + size > bytes) break; // always keep ≥1, then stop once the budget is spent
+      out.unshift(kept[i]!);
+      used += size;
+    }
+    kept = out;
+  }
+  return { kept, omitted: fresh.length - kept.length };
+}
+
 // GET /api/inbox?session=<sid> — the read tool. Returns this session's UNREAD channel messages (across all
 // channels it's joined to), grouped by channel, and advances its read cursors. The agent fetches this with
 // Bash, so the messages land in TOOL OUTPUT, never as a user turn — the whole point of 4e. Content lives
 // only in the off-log channel log; this is the read side of it.
-function handleInboxRead(res: ServerResponse, sid: string | null): void {
+function handleInboxRead(res: ServerResponse, sid: string | null, limit: number | null, bytes: number | null): void {
   if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
   const s = liveSessions.get(sid);
   if (!s) return sendJson(res, 404, { error: "no such live session" });
   const records = boardSnapshotRecords(boardIdentity(s.repoPath).boardId);
-  const channels: Array<{ channel: string; title: string; messages: ChannelMsg[] }> = [];
+  type OutChan = { channel: string; title: string; messages: InboxMsg[]; truncated?: { omitted: number; hint: string } };
+  const channels: OutChan[] = [];
   if (records) {
     for (const chanId of sessionChannels(records, sid)) {
       const log = channelLogs.get(chanId) ?? [];
       const since = s.read[chanId] ?? 0;
       const fresh = log.filter((mng) => mng.seq > since && mng.kind !== "ask"); // §16: ask-echoes are card-only
-      if (fresh.length)
-        channels.push({ channel: chanId, title: channelNode(records, chanId)?.title || "", messages: fresh });
+      // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
+      // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
+      // which re-seeds the cursor to 0). Surfaced as `truncated`, never silently dropped (CLAUDE.md).
+      const { kept, omitted } = windowTail(fresh, limit, bytes);
+      if (kept.length) {
+        const out: OutChan = {
+          channel: chanId,
+          title: channelNode(records, chanId)?.title || "",
+          messages: kept.map((m) => ({ seq: m.seq, t: fmtTs(m.ts), from: inboxHandle(records, m.from), text: m.text })),
+        };
+        if (omitted > 0)
+          out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
+        channels.push(out);
+      }
       if (log.length) s.read[chanId] = log[log.length - 1]!.seq; // mark all read (incl. skipped ask-echoes)
     }
   }
   const count = channels.reduce((n, c) => n + c.messages.length, 0);
   sendJson(res, 200, { channels, count });
+}
+
+// Parse an opt-in positive-integer window param (?limit= / ?bytes=); null when absent/invalid (⇒ uncapped,
+// the default — no silent truncation for a caller that didn't ask for it).
+function windowParam(url: URL, key: string): number | null {
+  const raw = url.searchParams.get(key);
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 export function fsApi(): Plugin {
@@ -2843,7 +2925,7 @@ export function fsApi(): Plugin {
         if (doneMatch && req.method === "POST") return handleSessionDone(res, doneMatch[1]!);
         // The channel-message read tool (session id is a global UUID, so no ?board= needed).
         if (url.pathname === "/api/inbox" && req.method === "GET")
-          return handleInboxRead(res, url.searchParams.get("session"));
+          return handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes"));
         // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
         if (url.pathname === "/api/asks" && req.method === "GET")
           return handleAsksRead(res, url.searchParams.get("session"));
