@@ -89,7 +89,12 @@ export default {
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(s.id); }}
               @keydown=${(e) => onRowKey(e, s.id, del)}
             >
-              <span class="ses-row-title ${s.title ? "" : "ses-row-mono"}">${s.title || s.id.slice(0, 8)}</span>
+              <span class="ses-row-line">
+                ${s.roleName
+                  ? html`<span class="ses-row-role c-${s.roleColour || "blue"}" title=${`role: ${s.roleName}`}>${s.roleName}</span>`
+                  : ""}
+                <span class="ses-row-title ${s.title ? "" : "ses-row-mono"}">${s.title || s.id.slice(0, 8)}</span>
+              </span>
               <span class="ses-row-meta">
                 ${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${fmtSize(s.bytes)}
               </span>

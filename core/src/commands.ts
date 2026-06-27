@@ -12,10 +12,12 @@ export type CommandHandler = (store: Store, payload: any) => void;
 // A canvas-shaped starter set. addNode emits the semantic + layout pair atomically (one diff with
 // two `added`); moveNode touches the layout record only (the hot path / semantic split, doc §9.3).
 export const defaultCommands: Record<string, CommandHandler> = {
-  addNode(store, p: { id?: Id<"node">; type?: string; title?: string; text?: string; color?: string; x?: number; y?: number; w?: number; h?: number; z?: number; anchor?: "screen" | "world" }) {
+  addNode(store, p: { id?: Id<"node">; type?: string; title?: string; text?: string; color?: string; name?: string; x?: number; y?: number; w?: number; h?: number; z?: number; anchor?: "screen" | "world" }) {
     const id = p.id ?? nodeId();
     store.put([
-      { typeName: "node", id, type: p.type ?? "note", title: p.title ?? "", text: p.text ?? "", color: p.color ?? pickColor(store) },
+      // `name` is the optional display handle (see NodeRecord) — only stamped when supplied, so an ordinary
+      // card stays name-less and the renderer falls back to its title.
+      { typeName: "node", id, type: p.type ?? "note", title: p.title ?? "", text: p.text ?? "", color: p.color ?? pickColor(store), ...(p.name ? { name: p.name } : {}) },
       { typeName: "layout", id: layoutId(id), nodeId: id, x: p.x ?? 0, y: p.y ?? 0, w: p.w ?? 200, h: p.h ?? 120, z: p.z ?? nextZ(store), ...(p.anchor ? { anchor: p.anchor } : {}) },
     ]);
   },

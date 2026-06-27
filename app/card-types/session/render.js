@@ -747,6 +747,10 @@ export default {
     // .copied class flips the label to a ✓ without any per-card signal (transient DOM view state, same
     // category as the slash menu's selection). Closes over the full id, so it never enters the DOM.
     const sessionId = card.fields.title;
+    // A role-spawned session carries a friendly `name` ("<RoleName>.<short-sid>"); a bare session has none,
+    // so the head falls back to the clipped sid as before. The id stays the title (it keys the live feed) and
+    // is still what the copy button puts on the clipboard — the name is display-only.
+    const displayName = card.fields.name || clip(sessionId, 8);
 
     // The touched-files activity strip (slice A): a collapsed disclosure under the head. Its <details>
     // open state survives streamed re-renders for the same reason the tool/thinking rows' do — lit never
@@ -832,7 +836,7 @@ export default {
       ${frame}
       <div class="ses-head" data-ses-state=${frameState ?? "none"}>
         <button class="ses-name" type="button" title="Copy session id" @click=${copyId}>
-          ${clip(sessionId, 8)}
+          ${displayName}
         </button>
         ${pill}${usagePill}
         <span class="ses-meta">

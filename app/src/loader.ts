@@ -738,14 +738,45 @@ export function openChannel(m: InteractionManager, chanId: string, title: string
 // through `sessionInput`. The one addNode is the only thing on the intent log — the session's prompts
 // and turns stay in its own file/feed, REFERENCED, never replicated (session-timelines §3/§4). The
 // process writing files would arrive separately via the commit-watcher, attributed to that session.
-export async function spawnLiveSession(m: InteractionManager, at?: Pos): Promise<void> {
+// A role the user can spawn a session "as" (agent-roles.md). A role is a folder under `.canvas/roles/`
+// authored as role.md (frontmatter {name, colour} + charter prose); the server reads them and lists them
+// here. The frontend only needs the id (to spawn under), the display name, and a colour to swatch in the
+// picker — the charter never reaches the browser (the server appends it to the spawned session's prompt).
+export interface Role {
+  roleId: string;
+  name: string;
+  colour?: string; // a NOTE_COLORS key or a CSS colour — the picker treats it as a swatch background
+}
+
+// The roles available to spawn under (GET /api/roles). Returns [] on any failure (endpoint not yet live,
+// no claude, a parse error), so the picker degrades cleanly to just the "No role" option rather than erroring.
+export async function fetchRoles(): Promise<Role[]> {
+  try {
+    const res = await fetch(`/api/roles?board=${activeBoardId()}`);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { roles?: Role[] };
+    return Array.isArray(data.roles) ? data.roles : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function spawnLiveSession(m: InteractionManager, at?: Pos, roleId?: string): Promise<void> {
+  // When spawning UNDER a role, the server reads that role's role.md, appends the charter to the system
+  // prompt, stamps roleId/roleName on the session marker, and returns the role's display name so the card
+  // can carry a friendly handle. A bare spawn (no roleId) behaves exactly as before.
   const res = await fetch(`/api/session/spawn?board=${activeBoardId()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({}),
+    body: JSON.stringify(roleId ? { roleId } : {}),
   });
   if (!res.ok) return; // no claude on PATH, or the spawn failed — leave the board unchanged
-  const { id } = (await res.json()) as { id: string };
+  const { id, roleName } = (await res.json()) as { id: string; roleName?: string };
+  // The card's display NAME = "<RoleName>.<short-sid>" when spawned under a role, so two instances of the
+  // same role stay distinguishable (and @RoleName prefix-matching can disambiguate by the sid suffix). The
+  // title MUST stay the raw session id — the template keys its `session` feed + `sessionInput` off it — so
+  // the name rides as a SEPARATE field (NodeRecord.name) the head/list render in preference to the title.
+  const name = roleName ? `${roleName}.${id.slice(0, 8)}` : undefined;
   // Placed in the current viewport (spawnAt). Node id carries the session id, so each spawn is its own
   // card (and idempotent if somehow committed twice).
   m.editor.commit({
@@ -757,6 +788,7 @@ export async function spawnLiveSession(m: InteractionManager, at?: Pos): Promise
       title: id, // the session id: the template keys its `session` feed + `sessionInput` off it
       text: "",
       color: "blue",
+      ...(name ? { name } : {}),
       ...(at ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H)),
       w: SESSION_CARD_W,
       h: SESSION_CARD_H,

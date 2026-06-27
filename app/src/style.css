@@ -774,6 +774,14 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #6366f11a;
   box-shadow: inset 0 0 0 1px #6366f159;
 }
+/* The title line: an optional role chip then the session title, on one row (the chip never shrinks, the
+   title takes the rest and ellipsises). */
+.ses-row-line {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
 .ses-row-title {
   font-size: 12px;
   color: #3f3f46;
@@ -781,6 +789,28 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* The role chip (agent-roles.md) — a small tinted pill carrying the role name a session was spawned under.
+   Colour-keyed like the sticky/minimap swatches; an unknown/raw colour falls through to the neutral base. */
+.ses-row-role {
+  flex: none;
+  max-width: 40%;
+  padding: 0 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  color: #1f2937;
+  background: #e4e4e7;
+  border-radius: 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ses-row-role.c-yellow { background: #fff0b8; }
+.ses-row-role.c-pink   { background: #ffd6e0; }
+.ses-row-role.c-blue   { background: #d6ecff; }
+.ses-row-role.c-green  { background: #cdf0cb; }
+.ses-row-role.c-orange { background: #ffe4c2; }
+.ses-row-role.c-purple { background: #e8d9ff; }
 .ses-row-mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -2192,6 +2222,53 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   font-size: 10px;
   color: #a1a1aa;
   font-variant-numeric: tabular-nums;
+}
+
+/* The "New session" role picker (agent-roles.md). The parent row is an ordinary menu button with a caret;
+   expanding it reveals an indented list of roles to spawn under. */
+.menu-expand[aria-expanded="true"] {
+  background: #00000008;
+}
+.menu-caret {
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.menu-rolelist {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* Indented under "New session" so the options read as its children, with a hairline guide. */
+  margin: 1px 0 2px 8px;
+  padding-left: 6px;
+  border-left: 1px solid #00000010;
+}
+/* A role option: a colour swatch then the role name, left-aligned (overriding the menu's space-between). */
+.menu-list .menu-roleopt {
+  justify-content: flex-start;
+  gap: 8px;
+}
+.menu-roleswatch {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: #d4d4d8;
+  box-shadow: inset 0 0 0 1px #00000014;
+}
+.menu-roleswatch-none {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px #00000026;
+}
+.menu-roleswatch.c-yellow { background: #ffd84d; }
+.menu-roleswatch.c-pink   { background: #ff8fab; }
+.menu-roleswatch.c-blue   { background: #7cc4ff; }
+.menu-roleswatch.c-green  { background: #6fd86a; }
+.menu-roleswatch.c-orange { background: #ffb45c; }
+.menu-roleswatch.c-purple { background: #c49bff; }
+.menu-rolehint {
+  padding: 4px 8px;
+  font-size: 11px;
+  color: #a1a1aa;
 }
 
 /* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left. It fades in, holds, then

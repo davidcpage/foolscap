@@ -279,6 +279,11 @@ export interface SessionMeta {
   // session card paints: a live process is working/waiting, an ended one done/crashed/ended. Drives the
   // status indicators (list bar, minimap dot, the move-to-waiting heads-up) off one source.
   status?: "working" | "waiting" | "waiting-agent" | "done" | "crashed" | "ended";
+  // The ROLE a session was spawned under (agent-roles.md), if any — stamped on the session marker at spawn
+  // and echoed by /api/sessions. Drives a small role chip on the list row (and is what "<RoleName>.<sid>"
+  // is built from on the live card). Absent for a bare session. `roleColour` swatches the chip.
+  roleName?: string;
+  roleColour?: string;
 }
 
 let sessionListRaw: SessionMeta[] | undefined; // the unfiltered server list, as fetched

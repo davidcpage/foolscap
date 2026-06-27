@@ -47,8 +47,10 @@ import {
   registerFileCommands,
   reprojectContent,
   spawnLiveSession,
+  fetchRoles,
   watchDataset,
   type Pos,
+  type Role,
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
@@ -689,6 +691,63 @@ function Board({ m, undo, persistence }: Engine) {
   );
 }
 
+// The "New session" menu item, expanded into a ROLE PICKER (agent-roles.md). Click it to reveal the roles
+// a session can be spawned "as" — "No role" (a bare session, the original behaviour) plus each role read
+// from GET /api/roles, swatched by its colour. Picking one spawns a session under it (the server appends
+// the role's charter to the prompt and stamps roleId/roleName), and the new card carries the friendly
+// "<RoleName>.<short-sid>" name. Roles are fetched lazily on first expand (not on every menu open) and
+// cached for the menu's life; the list degrades to just "No role" until the backend endpoint lands or if
+// no roles exist, so the picker is always usable.
+function NewSessionItem({
+  m,
+  at,
+  run,
+}: {
+  m: InteractionManager;
+  at: Pos;
+  run: (fn: () => void) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [roles, setRoles] = useState<Role[] | null>(null); // null = not yet fetched
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && roles === null) void fetchRoles().then(setRoles);
+  };
+  const spawn = (roleId?: string) => run(() => void spawnLiveSession(m, at, roleId));
+  return (
+    <div className="menu-roles">
+      <button className="menu-expand" aria-expanded={open} onClick={toggle}>
+        <span>New session</span>
+        <span className="menu-caret">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="menu-rolelist">
+          <button className="menu-roleopt" onClick={() => spawn()}>
+            <span className="menu-roleswatch menu-roleswatch-none" />
+            No role
+          </button>
+          {roles === null && <div className="menu-rolehint">loading roles…</div>}
+          {roles?.map((r) => (
+            <button key={r.roleId} className="menu-roleopt" onClick={() => spawn(r.roleId)}>
+              <span className={`menu-roleswatch c-${r.colour ?? "blue"}`} style={swatchStyle(r.colour)} />
+              {r.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// A role's colour may be a NOTE_COLORS key (styled via the `c-<key>` class) or an explicit CSS colour. We
+// can't know which here, so when it doesn't look like a bare palette key we set it as an inline background
+// too — the class covers the keys, the inline style covers raw colours, and one of them always paints.
+function swatchStyle(colour?: string): React.CSSProperties | undefined {
+  if (!colour) return undefined;
+  return /[#(]/.test(colour) ? { background: colour } : undefined;
+}
+
 // The right-click add menu — the single affordance for putting things on the board, replacing the
 // header toolbar. Every item is placed at `at` (the click's page-space point) and drops ONE card; the
 // browser cards (File tree, Sessions) then let you drill in and drag the specific file/session out (the
@@ -731,7 +790,7 @@ function CanvasMenu({
     <div className="canvas-menu" ref={ref} style={{ left: screen.x, top: screen.y }}>
       <div className="menu-list">
         <div className="menu-section">Session</div>
-        <button onClick={() => run(() => void spawnLiveSession(m, at))}>New session</button>
+        <NewSessionItem m={m} at={at} run={run} />
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
         <button onClick={() => run(() => void createChannel(m.editor, at))}>New channel</button>
         <button onClick={() => run(() => addChannelsCard(m, at))}>Channels</button>

@@ -38,6 +38,8 @@ export interface CardFields {
   title: string;
   text: string;
   color: string;
+  name?: string; // optional display handle (NodeRecord.name) — a card renders this in preference to its
+  // title where present (e.g. a role-spawned session's "<RoleName>.<short-sid>"); absent → fall back to title.
 }
 
 // What a template receives — the whole v1 contract surface. `signals` holds only the capabilities
@@ -211,7 +213,7 @@ function rootOfId(id: string): RootId {
 // Build the capability object for one card: content fields off the node's channel-1 handle, plus
 // the declared off-log signals. All reads route through tracked(), so render-time access = subscription.
 export function buildCard(
-  nodeSub: Subscribable<{ title: string; text: string; color: string } | undefined>,
+  nodeSub: Subscribable<{ title: string; text: string; color: string; name?: string } | undefined>,
   capabilities: string[],
   host?: CardHost,
 ): CardApi {
@@ -524,7 +526,7 @@ export function buildCard(
   return {
     get fields(): CardFields {
       const n = tracked(nodeSub);
-      return { title: n?.title ?? "", text: n?.text ?? "", color: n?.color ?? "grey" };
+      return { title: n?.title ?? "", text: n?.text ?? "", color: n?.color ?? "grey", ...(n?.name ? { name: n.name } : {}) };
     },
     signals,
     root,

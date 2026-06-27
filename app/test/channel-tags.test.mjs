@@ -59,3 +59,42 @@ test("mixed: a member tag plus @human resolves both channels", () => {
   assert.deepEqual(r.members, [MEMBERS[0]]);
   assert.equal(r.human, true);
 });
+
+// ── tagging by role NAME (agent-roles.md): a card spawned as a role is named `<RoleName>.<short-sid>`,
+// and a tag prefix-matches that name as well as the sid — so `@Oracle` reaches the role, `@Oracle.a8`
+// one instance, all through the same prefix mechanism. Members may be {sid,name} entries OR bare sids.
+const NAMED = [
+  { sid: "a87c860f-1111", name: "Oracle.a87c860f" },
+  { sid: "b1234567-2222", name: "Oracle.b1234567" },
+  { sid: "c0ffee00-3333", name: "Scribe.c0ffee00" },
+];
+
+test("parseTags keeps a Name.sid handle as ONE token (the dot is in the grammar)", () => {
+  assert.deepEqual(parseTags("ping @Oracle.a8 now"), ["oracle.a8"]);
+  assert.deepEqual(parseTags("ask @Oracle please"), ["oracle"]);
+});
+
+test("@RoleName wakes every live instance of that role", () => {
+  const r = resolveTags("@Oracle what's the entry point?", NAMED);
+  assert.deepEqual(r.members, ["a87c860f-1111", "b1234567-2222"], "both Oracle instances");
+  assert.deepEqual(r.unknown, []);
+});
+
+test("@RoleName.sidprefix disambiguates a single instance", () => {
+  assert.deepEqual(resolveTags("@Oracle.b1 take this", NAMED).members, ["b1234567-2222"]);
+});
+
+test("a bare sid prefix still resolves alongside name matching", () => {
+  assert.deepEqual(resolveTags("@c0ffee go", NAMED).members, ["c0ffee00-3333"]);
+});
+
+test("resolveTags still accepts bare sid strings (back-compat) — no names known", () => {
+  const r = resolveTags("@oracle anyone?", ["oracle-is-an-id-here", "other-id"]);
+  assert.deepEqual(r.members, ["oracle-is-an-id-here"], "matches the sid prefix as before");
+});
+
+test("a role tag matching nothing is prose, not an error", () => {
+  const r = resolveTags("@Ghost around?", NAMED);
+  assert.deepEqual(r.members, []);
+  assert.deepEqual(r.unknown, ["ghost"]);
+});

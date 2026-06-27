@@ -4,5 +4,5 @@
 export function parseTags(text: string): string[];
 export function resolveTags(
   text: string,
-  memberSids: string[],
+  members: Array<string | { sid: string; name?: string | null }>,
 ): { wakeAll: boolean; human: boolean; members: string[]; unknown: string[] };

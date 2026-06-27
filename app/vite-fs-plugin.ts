@@ -11,6 +11,7 @@ import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
 import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, upsertChannelMeta } from "./channel-ledger.js";
 import { resolveTags } from "./channel-tags.js";
+import { createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import chokidar from "chokidar";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -658,11 +659,19 @@ function sessionStatus(repoPath: string, id: string): SessionBand {
 // needs no canvas persistence — the .jsonl is the source of truth. listSessions() stays a cheap
 // readdir+stat (handleSession leans on it too); the per-transcript title/turn parse is added only here.
 function handleSessions(res: ServerResponse, dir: string, repoPath: string): void {
-  const sessions = listSessions(dir, repoPath).map((s) => ({
-    ...s,
-    ...sessionSummary(path.join(dir, s.id + ".jsonl"), s.mtime),
-    status: sessionStatus(repoPath, s.id),
-  }));
+  const sessions = listSessions(dir, repoPath).map((s) => {
+    const marker = readCanvasSession(repoPath, s.id);
+    return {
+      ...s,
+      ...sessionSummary(path.join(dir, s.id + ".jsonl"), s.mtime),
+      status: sessionStatus(repoPath, s.id),
+      // The role this session instantiates, if any — lets the list/minimap render `<RoleName>.<short-sid>`,
+      // with roleColour so a historical row's role chip tints the same as the live picker swatch.
+      roleId: (marker?.roleId as string | undefined) ?? null,
+      roleName: (marker?.roleName as string | undefined) ?? null,
+      roleColour: (marker?.roleColour as string | undefined) ?? null,
+    };
+  });
   sendJson(res, 200, { sessions });
 }
 
@@ -702,6 +711,37 @@ function handleChannels(res: ServerResponse, repoPath: string): void {
     mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
   }));
   sendJson(res, 200, { channels });
+}
+
+// GET /api/roles → every role this board has on disk (by name), for the role-picker on "new session".
+// Mirrors handleChannels: a cheap read of the `.canvas/roles/` markers, NOT the charters — the picker
+// wants name/colour, the charter is read only when a role is actually instantiated (handleSessionSpawn).
+function handleRoles(res: ServerResponse, repoPath: string): void {
+  sendJson(res, 200, { roles: listRoles(repoPath) });
+}
+
+// POST /api/roles { name, charter?, colour? } → create a role (writes `.canvas/roles/<roleId>/role.md`).
+// 400 on a bad/missing name, 409 if a role with that id already exists. Returns the created role.
+async function handleRolesCreate(req: IncomingMessage, res: ServerResponse, repoPath: string): Promise<void> {
+  let body: { name?: unknown; charter?: unknown; colour?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.name !== "string" || !body.name) return sendJson(res, 400, { error: "missing name" });
+  try {
+    const role = createRole(repoPath, {
+      name: body.name,
+      charter: typeof body.charter === "string" ? body.charter : "",
+      colour: typeof body.colour === "string" ? body.colour : undefined,
+    });
+    publishFeed("roles:" + boardIdentity(repoPath).boardId, { ts: Date.now() }); // nudge any open picker to re-pull
+    sendJson(res, 200, { role });
+  } catch (err) {
+    const msg = String(err instanceof Error ? err.message : err);
+    return sendJson(res, /already exists/.test(msg) ? 409 : 400, { error: msg });
+  }
 }
 
 // ── channels-list feed (the channels browser card's live push) ──────────────────────────────────
@@ -1281,13 +1321,29 @@ function seedFromTranscript(s: LiveSession): void {
 // Spawn (or, when `resume`, continue) a Claude Code process under id and wire its stdout to the feed.
 // Idempotent per id: a second call returns the existing live session. The process owns its own
 // `.jsonl`; we only read its stdout — never write the transcript ourselves (the agent authors it, §5).
-function ensureLiveSession(id: string, repoPath: string, resume = false, origin = "localhost:5173"): LiveSession {
+function ensureLiveSession(
+  id: string,
+  repoPath: string,
+  resume = false,
+  origin = "localhost:5173",
+  roleId: string | null = null,
+): LiveSession {
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
 
+  // The role this session instantiates (agent-roles.md): an explicit roleId on a fresh spawn, else the one
+  // recorded on a prior marker so a --resume keeps its role. Its charter is appended to the system prompt
+  // and its identity stamped on the marker (below), so the role survives a restart and names the card.
+  const prior = readCanvasSession(repoPath, id) ?? {};
+  const effectiveRoleId = roleId ?? (typeof prior.roleId === "string" ? prior.roleId : null);
+  const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
+
   // Appended system prompt = the ```ask convention + the canvas collaboration brief (env + protocol +
-  // norms), with this session's own identity baked in. One --append-system-prompt flag, both blocks.
-  const appendPrompt = ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin);
+  // norms) + the role charter if this session has one, with this session's own identity baked in. One
+  // --append-system-prompt flag, all blocks.
+  const appendPrompt =
+    ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
+    (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "");
   const args = [
     "-p",
     resume ? "--resume" : "--session-id",
@@ -1318,7 +1374,13 @@ function ensureLiveSession(id: string, repoPath: string, resume = false, origin 
   // Record ownership in the durable ledger: this is now a canvas-spawned session, so it lists/projects as
   // one and survives a restart as ours. Covers both a fresh spawn and a --resume of an exited one (which
   // re-enters here past the not-exited early return). Best-effort; a failed write never blocks the spawn.
-  markCanvasSession(repoPath, id, { spawnedAt: Date.now(), origin });
+  markCanvasSession(repoPath, id, {
+    spawnedAt: Date.now(),
+    origin,
+    ...(effectiveRoleId
+      ? { roleId: effectiveRoleId, roleName: role?.name ?? effectiveRoleId, roleColour: role?.colour ?? null }
+      : {}),
+  });
   stopSessionFeed(id); // the registry now owns this feed — drop any out-of-band file-tail for it
 
   let buf = "";
@@ -1548,7 +1610,7 @@ const MAX_LIVE_SESSIONS = 12;
 const liveSessionCount = (): number => [...liveSessions.values()].filter((s) => s.status !== "exited").length;
 
 async function handleSessionSpawn(req: IncomingMessage, res: ServerResponse, repoPath: string): Promise<void> {
-  let body: { prompt?: unknown } = {};
+  let body: { prompt?: unknown; roleId?: unknown } = {};
   try {
     const raw = await readBody(req);
     if (raw) body = JSON.parse(raw);
@@ -1557,14 +1619,27 @@ async function handleSessionSpawn(req: IncomingMessage, res: ServerResponse, rep
   }
   if (liveSessionCount() >= MAX_LIVE_SESSIONS)
     return sendJson(res, 429, { error: `live-session cap reached (${MAX_LIVE_SESSIONS}); terminate one first` });
+  // Optional: spawn this session AS a role — its charter is appended to the system prompt and its identity
+  // stamped on the marker (agent-roles.md). An unknown roleId is a client error, not a silent bare spawn.
+  let roleId: string | null = null;
+  let roleName: string | null = null;
+  let roleColour: string | null = null;
+  if (body.roleId != null && body.roleId !== "") {
+    if (typeof body.roleId !== "string") return sendJson(res, 400, { error: "roleId must be a string" });
+    const role = readRole(repoPath, body.roleId);
+    if (!role) return sendJson(res, 404, { error: `unknown role "${body.roleId}"` });
+    roleId = role.roleId;
+    roleName = role.name;
+    roleColour = role.colour;
+  }
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, originOf(req));
+    ensureLiveSession(id, repoPath, false, originOf(req), roleId);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }
   if (typeof body.prompt === "string" && body.prompt.trim()) sendSessionInput(id, body.prompt);
-  sendJson(res, 200, { id });
+  sendJson(res, 200, { id, roleId, roleName, roleColour });
 }
 
 // POST /api/session/<id>/input  { text } → write a prompt into the live process. Session-internal: no
@@ -1974,6 +2049,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   startWorktreesFeed(boardId, repoPath);
   seedChannelLogs(repoPath); // restore channel conversations from `.canvas/channels/` (cold-restart fix)
   startChannelsFeed(boardId, repoPath); // live-push the channels-list rail as channels gain activity
+  seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
 }
 
@@ -2285,6 +2361,16 @@ function channelNode(records: Array<Record<string, unknown>>, chanId: string): S
   return n && n.type === "channel" ? n : null;
 }
 
+// A session card's display NAME (the new `name` field a role-spawned card carries, `<RoleName>.<short-sid>`),
+// or null if it has none. The renderer falls back to the short sid; tag resolution uses it so `@RoleName`
+// reaches a role by its handle. Found by the same title===sid convention as sessionNodeForSid.
+function sessionNameForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
+  const n = records.find(
+    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
+  ) as (SnapNode & { name?: unknown }) | undefined;
+  return n && typeof n.name === "string" && n.name ? n.name : null;
+}
+
 // The session ids of a channel's OPEN members (from each member:open edge session→channel).
 function channelMemberSids(records: Array<Record<string, unknown>>, chanId: string): string[] {
   const out: string[] = [];
@@ -2442,7 +2528,9 @@ async function handleChannelMessage(
   const msg = appendChannelMsg(boardId, chanId, from, body.text);
   // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
   // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
-  const { wakeAll, human, members: tagged } = resolveTags(body.text, members);
+  // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
+  const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
+  const { wakeAll, human, members: tagged } = resolveTags(body.text, memberEntries);
   const wakeSids = wakeAll ? null : new Set(tagged);
   const ss = liveSessions.get(from);
   if (ss) {
@@ -2769,6 +2857,12 @@ export function fsApi(): Plugin {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
           return handleChannels(res, b.repoPath);
+        }
+        if (url.pathname === "/api/roles") {
+          const b = reqBoard(url);
+          if (!b) return sendJson(res, 400, { error: "unknown board" });
+          if (req.method === "POST") return void handleRolesCreate(req, res, b.repoPath);
+          return handleRoles(res, b.repoPath);
         }
         if (url.pathname === "/api/card-types") return handleCardTypesList(res);
         if (url.pathname === "/api/boards" && req.method === "POST")

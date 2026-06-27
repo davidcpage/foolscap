@@ -25,6 +25,11 @@ export interface NodeRecord extends BaseRecord {
   text: string;
   color: string; // a NOTE_COLORS key ("yellow" | …). Semantic, not layout: it's a property of the
   // note an agent can read/set, and the renderer maps the key → an actual swatch (see app CSS).
+  name?: string; // an OPTIONAL human display handle, distinct from `title`. Some cards key machinery off
+  // their title (a session card's title IS its session id — it keys the live feed), so a friendlier label
+  // can't overwrite it; `name` is that label, rendered in preference to the title where present (e.g. a
+  // role-spawned session reads "<RoleName>.<short-sid>"). Absent ≡ no override; the renderer falls back to
+  // the title. Semantic (agent-legible), not layout.
 }
 
 // The sticky-note palette, as agent-legible KEYS (the records store the key; the renderer owns the
