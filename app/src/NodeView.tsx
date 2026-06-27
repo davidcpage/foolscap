@@ -10,6 +10,7 @@ import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./
 import { scrollableFromTarget } from "./interior";
 import { MEMBER_OPEN, postToChannel, setChannelHistory } from "./channels";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
+import { matchTagSpans } from "../channel-tags.js";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -297,7 +298,16 @@ function ProvenanceView({
 // listeners stop an input's pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan /
 // Backspace→delete) from reaching the canvas. Mirrors TemplateCard's seam.
 type ChannelMsg = { seq: number; ts: number; from: string; text: string };
-const senderLabel = (from: string) => (from === "human" || from === "system" ? from : from.slice(0, 8));
+// A member's readable display handle: a role-spawned session carries a `.name` ("PM.97acc4bc"); show it as
+// "PM.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
+// (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
+function displayHandle(name: string | null | undefined, sid: string): string {
+  if (!name || !name.trim()) return sid.slice(0, 8);
+  const dot = name.indexOf(".");
+  return dot < 0 ? name : `${name.slice(0, dot + 3)}…`;
+}
+const senderLabel = (from: string, name?: string | null) =>
+  from === "human" || from === "system" ? from : displayHandle(name, from);
 
 function ChannelView({
   m,
@@ -376,11 +386,17 @@ function ChannelView({
   }, []);
 
   const members = edges
-    .map((e) => ({ edgeId: e.id, sid: store.get<"node">(e.from)?.title ?? "?", open: e.type === MEMBER_OPEN }))
+    .map((e) => {
+      const n = store.get<"node">(e.from);
+      return { edgeId: e.id, sid: n?.title ?? "?", name: n?.name ?? null, open: e.type === MEMBER_OPEN };
+    })
     .sort((a, b) => Number(b.open) - Number(a.open));
-  // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve
-  // and highlight against these sids; each gets its shortest unambiguous prefix as its click-to-tag string.
-  const openSids = members.filter((mem) => mem.open).map((mem) => mem.sid);
+  // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve and
+  // highlight against these entries — by sid OR role name, exactly the set the server (channel-tags.js) wakes.
+  const openMembers = members.filter((mem) => mem.open);
+  const openEntries = openMembers.map((mem) => ({ sid: mem.sid, name: mem.name }));
+  // The readable handle to show for a message's `from` sid (a current member's role name, else short sid).
+  const nameForSid = (sid: string) => members.find((mem) => mem.sid === sid)?.name ?? null;
   // Drop an @tag into the post box and focus it (so a human never types a hash). Adds a leading space if
   // the box already has non-space content, and a trailing space so the next word doesn't fuse to the tag.
   const insertTag = (tag: string) => {
@@ -473,9 +489,9 @@ function ChannelView({
         ) : (
           msgs.map((mm) => (
             <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}`}>
-              <span className="chan-msg-from">{senderLabel(mm.from)}</span>
+              <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
               <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-              <div className="chan-msg-text">{renderTaggedText(mm.text, openSids)}</div>
+              <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries)}</div>
             </div>
           ))
         )}
@@ -491,13 +507,13 @@ function ChannelView({
                 {mem.open ? (
                   <button
                     className="chan-member-tag"
-                    title={`tag @${shortTag(mem.sid, openSids)} — notify this member`}
-                    onClick={() => insertTag(shortTag(mem.sid, openSids))}
+                    title={`tag @${tagFor(mem, openMembers)} — notify this member`}
+                    onClick={() => insertTag(tagFor(mem, openMembers))}
                   >
-                    {mem.sid.slice(0, 8)}
+                    {displayHandle(mem.name, mem.sid)}
                   </button>
                 ) : (
-                  <>{mem.sid.slice(0, 8)} (invited)</>
+                  <>{displayHandle(mem.name, mem.sid)} (invited)</>
                 )}
                 {mem.open && (
                   <button
@@ -540,30 +556,43 @@ function shortTag(sid: string, all: string[]): string {
   return sid.slice(0, 8);
 }
 
+type TagEntry = { sid: string; name?: string | null };
+
+// What to drop into the post box when a member pill is clicked. Prefer the READABLE role handle (`@PM`) when
+// the member has a name and that role prefix is unambiguous among current members; disambiguate to the full
+// `Role.sid` handle on a role-name collision (two PMs); fall back to the shortest unambiguous sid prefix when
+// the member is unnamed. Every form resolves server-side (channel-tags.js matches sid OR name prefix).
+function tagFor(mem: TagEntry, open: TagEntry[]): string {
+  if (mem.name && mem.name.trim()) {
+    const dot = mem.name.indexOf(".");
+    const role = dot < 0 ? mem.name : mem.name.slice(0, dot);
+    const collides = open.some(
+      (o) => o.sid !== mem.sid && o.name && o.name.toLowerCase().startsWith(role.toLowerCase()),
+    );
+    return collides ? mem.name : role;
+  }
+  return shortTag(mem.sid, open.map((o) => o.sid));
+}
+
 // Render channel message text with @-tags highlighted. A token is highlighted only if it would actually
-// resolve — a keyword (@all/@human/…) or a prefix of a current member's sid — so unmatched prose `@`s stay
-// plain. The GRAMMAR mirrors channel-tags.js (the server is the authority for who a tag actually wakes;
-// this is cosmetic). Returns React nodes (the matched tags wrapped in a highlight span).
-const TAG_KEYWORDS = new Set(["all", "everyone", "channel", "here", "human", "user"]);
-function renderTaggedText(text: string, memberSids: string[]): React.ReactNode {
-  const re = /(?<![\w@])@([A-Za-z0-9][A-Za-z0-9-]*)/g;
+// resolve — a keyword (@all/@human/…) or a prefix of a current member's sid OR role name — by delegating to
+// the SERVER's own matcher (channel-tags.js `matchTagSpans`), so the highlight set never drifts from who a
+// tag actually wakes. Highlight-in-place: the shown text equals the logged text. Returns React nodes.
+function renderTaggedText(text: string, entries: TagEntry[]): React.ReactNode {
+  const spans = matchTagSpans(text, entries);
+  if (spans.length === 0) return text;
   const parts: React.ReactNode[] = [];
   let last = 0;
   let key = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text))) {
-    const tok = m[1].toLowerCase();
-    const hit = TAG_KEYWORDS.has(tok) || memberSids.some((s) => s.toLowerCase().startsWith(tok));
-    if (!hit) continue;
-    if (m.index > last) parts.push(text.slice(last, m.index));
+  for (const sp of spans) {
+    if (sp.start > last) parts.push(text.slice(last, sp.start));
     parts.push(
       <span key={key++} className="chan-tag">
-        {m[0]}
+        {text.slice(sp.start, sp.end)}
       </span>,
     );
-    last = m.index + m[0].length;
+    last = sp.end;
   }
-  if (parts.length === 0) return text;
   if (last < text.length) parts.push(text.slice(last));
   return parts;
 }

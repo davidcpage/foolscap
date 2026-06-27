@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseTags, resolveTags } from "../channel-tags.js";
+import { parseTags, resolveTags, tagHit, matchTagSpans } from "../channel-tags.js";
 
 const MEMBERS = ["a927e694-839d-4aea-b0a4-39353072a4e9", "83adfb9c-73ab-468b-9c4c-4bef636cf997"];
 
@@ -108,4 +108,45 @@ test("a role tag matching nothing is prose, not an error", () => {
   const r = resolveTags("@Ghost around?", NAMED);
   assert.deepEqual(r.members, []);
   assert.deepEqual(r.unknown, ["ghost"]);
+});
+
+// ── tagHit / matchTagSpans: the SHARED predicate + span finder the channel-card highlighter consumes, so it
+// lights exactly the tags resolveTags wakes (one grammar, no client/server drift). tagHit answers "would this
+// single token resolve?" (keyword OR sid/name prefix); matchTagSpans returns the highlight ranges in `text`.
+
+test("tagHit: keyword, sid prefix, and role-name prefix all hit; prose misses", () => {
+  for (const kw of ["all", "everyone", "channel", "here", "human", "user"]) {
+    assert.equal(tagHit(kw, NAMED), true, `@${kw} is a keyword`);
+  }
+  assert.equal(tagHit("Oracle", NAMED), true, "role name prefix");
+  assert.equal(tagHit("oracle.b1", NAMED), true, "disambiguated role handle");
+  assert.equal(tagHit("c0ffee", NAMED), true, "bare sid prefix");
+  assert.equal(tagHit("PM", NAMED), false, "no member named PM → miss");
+  assert.equal(tagHit("nobody", NAMED), false, "prose → miss");
+  assert.equal(tagHit("a9", MEMBERS), true, "bare-sid members still match");
+});
+
+test("matchTagSpans: returns the highlight range of each RESOLVING tag only", () => {
+  const text = "hey @Oracle and @nobody, ping @all";
+  const spans = matchTagSpans(text, NAMED);
+  // @Oracle (hit) and @all (keyword hit) — @nobody is prose, no span.
+  assert.equal(spans.length, 2);
+  assert.deepEqual(spans.map((s) => text.slice(s.start, s.end)), ["@Oracle", "@all"]);
+  assert.deepEqual(spans.map((s) => s.token), ["oracle", "all"]);
+});
+
+test("matchTagSpans: a Name.sid handle highlights whole; a trailing full stop stays outside the span", () => {
+  const dotted = "ask @Oracle.b1 now";
+  assert.deepEqual(
+    matchTagSpans(dotted, NAMED).map((s) => dotted.slice(s.start, s.end)),
+    ["@Oracle.b1"],
+  );
+  // trailing sentence punctuation is NOT part of the highlight (matches parseTags' strip).
+  const ended = "Hi @c0ffee. done";
+  const [sp] = matchTagSpans(ended, NAMED);
+  assert.equal(ended.slice(sp.start, sp.end), "@c0ffee", "the period is left unhighlighted");
+});
+
+test("matchTagSpans: an email-ish @ is not a tag (no span)", () => {
+  assert.deepEqual(matchTagSpans("mail foo@bar.com please", NAMED), []);
 });

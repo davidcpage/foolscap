@@ -20,12 +20,61 @@
 const ALL_TOKENS = new Set(["all", "everyone", "channel", "here"]);
 const HUMAN_TOKENS = new Set(["human", "user"]);
 
+// The canonical tag-token grammar, defined ONCE so the resolver (server) and the highlighter (client, which
+// imports this module) can never drift apart — divergence here is exactly the @PM-doesn't-light-up bug.
+// `/g` is stateful (lastIndex), so hand out a FRESH RegExp per call rather than sharing one mutable literal.
+function tagRe() {
+  return /(?<![\w@])@([A-Za-z0-9][\w.-]*)/g;
+}
+
+// Normalize the members arg to `{ sid, name }` entries — bare sid strings (the original shape) still accepted.
+function normEntries(members) {
+  return (members ?? []).map((m) =>
+    typeof m === "string" ? { sid: m, name: null } : { sid: m.sid, name: m.name ?? null });
+}
+
+// Does a single normalized entry match a lowercased token? A token prefix-matches the entry's sid OR its
+// name (`<RoleName>.<short-sid>`), case-insensitive — the one rule shared by resolveTags and the highlighter.
+function entryMatches(entry, tok) {
+  return (
+    String(entry.sid).toLowerCase().startsWith(tok) ||
+    (entry.name && String(entry.name).toLowerCase().startsWith(tok))
+  );
+}
+
+/** Whether a single `@`-token would RESOLVE to a wake target — a keyword (@all/@human/…) or a member by sid /
+ *  name prefix. The predicate the channel-card highlighter uses so it lights exactly the tags the server honors
+ *  (this module is the single source of truth; the client adds no second grammar). `token` may be raw-cased. */
+export function tagHit(token, members) {
+  const tok = String(token).toLowerCase();
+  if (ALL_TOKENS.has(tok) || HUMAN_TOKENS.has(tok)) return true;
+  return normEntries(members).some((e) => entryMatches(e, tok));
+}
+
+/** The character spans of the resolving `@`-tags in `text`, for highlighting — `[{ start, end, token }]` over
+ *  the ORIGINAL string (no JSX; the React caller maps spans → highlight nodes). Mirrors parseTags' grammar and
+ *  trailing-punctuation strip, but keeps positions: `@26.` highlights `@26` (the `.` is sentence punctuation),
+ *  while an internal-dot handle `@Oracle.a8` highlights whole. Only tags that `tagHit` are returned. */
+export function matchTagSpans(text, members) {
+  const entries = normEntries(members);
+  const s = String(text);
+  const re = tagRe();
+  const spans = [];
+  let m;
+  while ((m = re.exec(s))) {
+    const raw = m[1].replace(/[.-]+$/, ""); // drop trailing `.`/`-` (sentence punctuation), as parseTags does
+    if (!raw || !tagHit(raw, entries)) continue;
+    spans.push({ start: m.index, end: m.index + 1 + raw.length, token: raw.toLowerCase() }); // +1 for the `@`
+  }
+  return spans;
+}
+
 /** The lowercased `@<token>` tags in `text`, in order, de-duplicated. `@` must not follow a word char (so
  *  an email-ish `foo@bar` is not a tag). Tokens are hex / hyphen / DOT (a `Name.sid` handle) / a few
  *  keywords (all/human/…). The dot lets a role handle `@Oracle.a8` parse as one tag, not `oracle` + stray. */
 export function parseTags(text) {
   const out = [];
-  const re = /(?<![\w@])@([A-Za-z0-9][\w.-]*)/g;
+  const re = tagRe();
   let m;
   while ((m = re.exec(String(text)))) {
     // The grammar admits a DOT (for a `Name.sid` handle) and a hyphen, so a tag at the end of a sentence —
@@ -52,8 +101,7 @@ export function parseTags(text) {
  *   • unknown — tags that matched no member and weren't a keyword (left as prose; surfaced for debugging).
  */
 export function resolveTags(text, members) {
-  const entries = (members ?? []).map((m) =>
-    typeof m === "string" ? { sid: m, name: null } : { sid: m.sid, name: m.name ?? null });
+  const entries = normEntries(members);
   let wakeAll = false;
   let human = false;
   const out = [];
@@ -61,11 +109,7 @@ export function resolveTags(text, members) {
   for (const tok of parseTags(text)) {
     if (ALL_TOKENS.has(tok)) { wakeAll = true; continue; }
     if (HUMAN_TOKENS.has(tok)) { human = true; continue; }
-    const matches = entries.filter(
-      (e) =>
-        String(e.sid).toLowerCase().startsWith(tok) ||
-        (e.name && String(e.name).toLowerCase().startsWith(tok)),
-    );
+    const matches = entries.filter((e) => entryMatches(e, tok));
     if (matches.length === 0) { unknown.push(tok); continue; }
     for (const e of matches) if (!out.includes(e.sid)) out.push(e.sid);
   }
