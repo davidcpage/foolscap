@@ -11,7 +11,7 @@ import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
 import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, upsertChannelMeta } from "./channel-ledger.js";
 import { resolveTags } from "./channel-tags.js";
-import { createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
+import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import chokidar from "chokidar";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -757,6 +757,23 @@ function startChannelsFeed(boardId: string, repoPath: string): void {
   chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("channels:" + boardId, { ts: Date.now() }), 200);
+  });
+}
+
+// ── roles-list feed (the roles browser card's live push) ─────────────────────────────────────────
+// The roles-list mirror of startChannelsFeed: watch `.canvas/roles/` and PING the `roles:<boardId>` feed on
+// any role create OR edit, so the roles-list card re-pulls /api/roles. POST /api/roles already pings on
+// create, but a role.md edited THROUGH the file write path (/api/file, the role card's save) wouldn't —
+// the watcher generalises it to any change. depth:1 because a role.md sits one level down (roles/<id>/role.md),
+// unlike the flat channel markers. mkdir first so chokidar has a dir to watch on a fresh board; not pinned on
+// fsState — boardFeedsStarted stops a reload from stacking a second.
+function startRolesFeed(boardId: string, repoPath: string): void {
+  const dir = canvasRolesDir(repoPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
+  let t: ReturnType<typeof setTimeout> | null = null;
+  chokidar.watch(dir, { ignoreInitial: true, depth: 1 }).on("all", () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("roles:" + boardId, { ts: Date.now() }), 200);
   });
 }
 
@@ -2050,6 +2067,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   seedChannelLogs(repoPath); // restore channel conversations from `.canvas/channels/` (cold-restart fix)
   startChannelsFeed(boardId, repoPath); // live-push the channels-list rail as channels gain activity
   seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
+  startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
 }
 

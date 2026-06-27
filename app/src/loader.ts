@@ -586,6 +586,24 @@ export function addChannelsCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
+// The roles browser card (card-types/roles, agent-roles.md) — the channels/sessions card's twin: a persistent
+// on-canvas list of this board's roles; LAUNCH a session under a role from a row's button, or (phase 2b) open a
+// role to edit its charter. Its body reads the off-log `rolesList` projection (content.ts, /api/roles), so this
+// addNode is the only thing it ever logs — the list churns off-log like the sessions/channels cards. A stable
+// singleton id (node:roles) → idempotent: re-adding is a no-op rather than littering the board. actor "user" +
+// selected, like addChannelsCard.
+export function addRolesCard(m: InteractionManager, at?: Pos): void {
+  const w = 280;
+  const h = 360;
+  const id = "node:roles" as Id<"node">;
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "roles", title: "", text: "", color: "orange", ...(at ?? spawnAt(m, w, h)), w, h },
+  });
+  m.selection.set([id]);
+}
+
 // A NOTEBOOK card (docs/notebook-card.md). A notebook is a file-backed card like any file
 // card: write a starter `.html` (Observable Notebooks 2.0 format) to a path under the canonical root, then
 // add the node via the file-card path so the card VIEWS that file — source on disk, body off the off-log

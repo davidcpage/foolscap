@@ -822,6 +822,65 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   text-overflow: ellipsis;
 }
 
+/* ── roles browser card (agent-roles.md) ─────────────────── */
+/* A role row: colour swatch · name (takes the slack) · optional live count · an explicit Launch button. One
+   line, unlike the stacked session/channel rows — a role has no meta line, just identity + the launch act. */
+.role-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  border-radius: 5px;
+}
+.role-row:hover {
+  background: #6366f10f;
+}
+.role-swatch {
+  flex: none;
+  width: 11px;
+  height: 11px;
+  border-radius: 3px;
+  background: #d4d4d8;
+  box-shadow: inset 0 0 0 1px #00000014;
+}
+.role-swatch.c-yellow { background: #ffd84d; }
+.role-swatch.c-pink   { background: #ff8fab; }
+.role-swatch.c-blue   { background: #7cc4ff; }
+.role-swatch.c-green  { background: #6fd86a; }
+.role-swatch.c-orange { background: #ffb45c; }
+.role-swatch.c-purple { background: #c49bff; }
+.role-row-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  color: #3f3f46;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The derived live-instance count — a quiet green dot+number, only shown when ≥1 session of this role is live. */
+.role-row-live {
+  flex: none;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: #16a34a;
+}
+.role-launch {
+  flex: none;
+  padding: 2px 8px;
+  font: inherit;
+  font-size: 11px;
+  color: #3730a3;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.role-launch:hover {
+  background: #e0e7ff;
+}
+
 /* ── feed cards (off-log bodies: git HEAD, HN) ───────────── */
 .node.feed {
   border-left-width: 4px;

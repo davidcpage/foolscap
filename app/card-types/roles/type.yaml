@@ -1,0 +1,23 @@
+# The roles browser card type (agent-roles.md) — a persistent on-canvas list of this board's roles, the
+# channels/sessions card's twin: put a browser on the board and either LAUNCH a session under a role (an
+# explicit button — spawning a real process / eating a session slot is too costly for a misclick) or DRAG a
+# row out / double-click to OPEN that role's card and edit its charter. A single board-global card (one
+# node:roles), so it carries no per-card key; FIELDS title/text/color are unused chrome (the body is the list).
+#
+# GRANT:
+#   • `rolesList` — the OFF-LOG list of this board's roles (content.ts, GET /api/roles): roleId + display name
+#     + colour key. Channel-1 / derived — listing the `.canvas/roles/` folders touches no diff/intent/persistence.
+#   • `sessionList` — the historical/live session list (GET /api/sessions), read ONLY to DERIVE each role's
+#     live-instance count (a client-side join on roleId), so presence needs no backend work.
+#   • `rolesRefresh` — a board-global ACTION (a bound fn) that re-pulls the list. A live push covers the common
+#     case (the roles watcher pings the roles feed); this ⟳ button is the manual force.
+#   • `roleLaunch` — a per-card ACTION (bound fn taking a roleId) that SPAWNS a session under that role and
+#     drops its card (loader.spawnLiveSession), placed offset off this browser card. The explicit launch path.
+#
+# (A `roleOpen` edit action — drag-out / double-click a row to open the role's CHARTER card — lands in
+# phase 2b, once the shared frontmatter codec exists to round-trip role.md.)
+#
+# No `chrome` flag: a browser is a container and wants its frame (like the directory / sessions / channels card).
+name: roles
+contract: 1
+capabilities: [rolesList, sessionList, rolesRefresh, roleLaunch]

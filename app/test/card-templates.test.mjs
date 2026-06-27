@@ -1214,3 +1214,58 @@ test("directory card tombstones when its worktree root is gone (root absent from
   const out = flatten(mod.render(card));
   assert.ok(out.includes("file-gone") && out.includes("worktree removed"), "worktree-removed tombstone");
 });
+
+// agent-roles.md: the roles browser card — the channels/sessions card's twin. Lists this board's roles
+// (the off-log `rolesList` projection), swatches each by its colour key, derives a LIVE-INSTANCE count from
+// the `sessionList` capability (a client-side join on roleId — no backend presence), and offers an EXPLICIT
+// per-row Launch button (roleLaunch) rather than a costly double-click spawn.
+test("roles template lists roles with colour swatches, a derived live count, and an explicit launch action", async () => {
+  const mod = await loadTemplate("roles");
+  assert.equal(mod.contract, 1);
+
+  const roles = [
+    { roleId: "oracle", name: "Oracle", colour: "purple" },
+    { roleId: "generalist", name: "Generalist", colour: "blue" },
+  ];
+  // Two live sessions under Oracle (one working, one waiting), one wound-down (ended → NOT counted), and a
+  // bare session with no roleId — so Oracle's derived count is 2 and Generalist's is 0 (no badge).
+  const sessions = [
+    { id: "s1", roleId: "oracle", status: "working" },
+    { id: "s2", roleId: "oracle", status: "waiting" },
+    { id: "s3", roleId: "oracle", status: "ended" },
+    { id: "s4", roleId: null, status: "working" },
+  ];
+  let launched = null;
+  let refreshed = 0;
+  const card = {
+    fields: { title: "", text: "", color: "orange" },
+    signals: {
+      rolesList: roles,
+      sessionList: sessions,
+      rolesRefresh: () => refreshed++,
+      roleLaunch: (id) => (launched = id),
+    },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("roles"), "header label");
+  assert.ok(out.includes('file-ext">2<'), "count badge reflects the number of roles");
+  assert.ok(out.includes("Oracle") && out.includes("Generalist"), "role names rendered");
+  assert.ok(out.includes("role-swatch c-purple") && out.includes("role-swatch c-blue"), "swatch tinted by the colour key");
+  assert.ok(out.includes("● 2"), "Oracle's derived live count = 2 (working+waiting, the ended one excluded)");
+  assert.ok(!out.includes("● 0"), "a role with no live sessions shows no count badge");
+
+  // Launch is an explicit button routing through the capability with the row's roleId.
+  assert.ok(out.includes("role-launch"), "launch button renders when roleLaunch is granted");
+  card.signals.roleLaunch("oracle");
+  assert.equal(launched, "oracle", "launch is dispatched with the role id");
+  card.signals.rolesRefresh();
+  assert.equal(refreshed, 1, "refresh routes through the granted capability");
+
+  // In-flight (rolesList undefined) → loading, never a throw; empty → its own marker; no launch grant → no button.
+  const loading = flatten(mod.render({ fields: { title: "", text: "", color: "orange" }, signals: {} }));
+  assert.ok(loading.includes("loading…"), "no list yet → loading placeholder");
+  assert.ok(!loading.includes("role-launch"), "no launch button without the grant");
+  const empty = flatten(mod.render({ fields: { title: "", text: "", color: "orange" }, signals: { rolesList: [] } }));
+  assert.ok(empty.includes("no roles yet"), "an empty list → empty marker");
+});

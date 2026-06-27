@@ -48,6 +48,7 @@ import {
   reprojectContent,
   spawnLiveSession,
   fetchRoles,
+  addRolesCard,
   watchDataset,
   type Pos,
   type Role,
@@ -792,6 +793,7 @@ function CanvasMenu({
         <div className="menu-section">Session</div>
         <NewSessionItem m={m} at={at} run={run} />
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
+        <button onClick={() => run(() => addRolesCard(m, at))}>Roles</button>
         <button onClick={() => run(() => void createChannel(m.editor, at))}>New channel</button>
         <button onClick={() => run(() => addChannelsCard(m, at))}>Channels</button>
         <div className="menu-section">Files</div>

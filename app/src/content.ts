@@ -445,6 +445,63 @@ export const channelListSignal: Subscribable<ChannelMeta[] | undefined> = {
   },
 };
 
+// ── off-log ROLES projection (the roles browser card) ──────────────────────────────────────────────
+// The channels-list mirror for ROLES (agent-roles.md): the roles this board has under `.canvas/roles/`
+// (GET /api/roles), on the SAME lazy-on-subscribe seam. Board-global and derived/channel-1 — listing the
+// role folders touches no diff/intent/persistence; LAUNCHING a session under a role (an explicit button)
+// or OPENING a role to edit (loader.openRole) are the acts. A live push (hookRolesFeed: the server's roles
+// watcher pings `roles:<boardId>` on any role.md add/edit) keeps an open card current; refreshRolesList()
+// is the manual re-pull. Each row carries roleId + display name + colour key; the live-instance COUNT is
+// NOT fetched here — the roles card derives it from the sessions list (sessionListSignal), so presence
+// stays a pure client-side join with no backend presence work.
+import type { Role } from "./loader"; // type-only (erased at runtime) → no import cycle with loader
+
+let rolesListValue: Role[] | undefined;
+const rolesListSubs = new Set<() => void>();
+let rolesListInflight = false;
+
+async function fetchRolesList(force = false): Promise<void> {
+  if (rolesListInflight && !force) return;
+  rolesListInflight = true;
+  try {
+    const r = await fetch(`/api/roles?board=${activeBoardId()}`);
+    if (r.ok) {
+      const d = (await r.json()) as { roles?: Role[] };
+      rolesListValue = d.roles ?? [];
+      for (const fn of rolesListSubs) fn();
+    }
+  } catch {
+    // offline / endpoint not yet live — leave unset; a later subscribe (or refresh) retries
+  } finally {
+    rolesListInflight = false;
+  }
+}
+
+// The roles card's ⟳ refresh button — re-pull and notify. A live push covers the common case (the roles
+// watcher), but this stays as the manual force (an offline retry, or a be-sure re-pull after an edit).
+export function refreshRolesList(): void {
+  void fetchRolesList(true);
+}
+
+// Live push for the roles list, mirroring hookChannelsFeed: the server's roles watcher pings `roles:<boardId>`
+// on any role.md add/edit; we re-pull once per ping (module-level, so N open roles cards still cause one fetch).
+let rolesFeedHooked = false;
+function hookRolesFeed(): void {
+  if (rolesFeedHooked) return;
+  rolesFeedHooked = true;
+  feedSignal<{ ts: number }>("roles:" + activeBoardId()).subscribe(() => void fetchRolesList(true));
+}
+
+export const rolesListSignal: Subscribable<Role[] | undefined> = {
+  get: () => rolesListValue,
+  subscribe(onChange) {
+    rolesListSubs.add(onChange);
+    hookRolesFeed(); // arm the live push (once) so a created/edited role appears without a manual refresh
+    if (rolesListValue === undefined) void fetchRolesList();
+    return () => rolesListSubs.delete(onChange);
+  },
+};
+
 // ── off-log ROOTS projection (worktree-activity slice B/C) ────────────────────────────────────────
 // A board's roots — its canonical checkout (id "repo") + any git worktrees — on the SAME lazy-fetch +
 // live-feed seam as the session list. Board-global (not per path), so it's a plain signal, not a

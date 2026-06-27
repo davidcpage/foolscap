@@ -18,6 +18,12 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { isValidRoleName, roleIdFor, renderRoleFile, parseRoleFile } from "./role-format.js";
+
+// The pure frontmatter codec (parse/serialise/validate) lives in role-format.js — a dependency-free module
+// the browser role card imports too, so the two sides never drift on the format. Re-export the validators
+// here so existing importers (vite-fs-plugin.ts, the ledger tests) keep their entry point.
+export { isValidRoleName, roleIdFor };
 
 /** The directory holding one sub-directory per role, under the board repo's `.canvas/` home. */
 export function canvasRolesDir(repoPath) {
@@ -29,48 +35,6 @@ function roleDir(repoPath, roleId) {
 }
 function rolePath(repoPath, roleId) {
   return path.join(roleDir(repoPath, roleId), "role.md");
-}
-
-// A role NAME is also the @-tag handle (cards are named `<Name>.<short-sid>`), so it must be a single
-// tag-safe token: a letter/digit start, then letters/digits/hyphens. No spaces or dots (the dot is the
-// name↔sid separator in a card name). roleId is the lowercased name — stable across renames-of-case.
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
-
-/** Is `name` a valid role handle (tag-safe single token)? */
-export function isValidRoleName(name) {
-  return typeof name === "string" && NAME_RE.test(name);
-}
-
-/** The filesystem-safe, stable id for a role name (lowercase slug). */
-export function roleIdFor(name) {
-  return String(name).toLowerCase();
-}
-
-// Serialize / parse the tiny frontmatter. Deliberately NOT a full YAML parser — flat `key: value` lines
-// between two `---` fences, values are plain strings. Matches what we write; tolerant of what it reads.
-function renderRoleFile({ name, colour, charter }) {
-  const fm = [`name: ${name}`];
-  if (colour) fm.push(`colour: ${colour}`);
-  return `---\n${fm.join("\n")}\n---\n\n${(charter ?? "").trim()}\n`;
-}
-
-function parseRoleFile(text, roleId) {
-  let name = roleId;
-  let colour = null;
-  let charter = text;
-  const m = /^---\n([\s\S]*?)\n---\n?/.exec(text);
-  if (m) {
-    for (const line of m[1].split("\n")) {
-      const i = line.indexOf(":");
-      if (i < 0) continue;
-      const k = line.slice(0, i).trim().toLowerCase();
-      const v = line.slice(i + 1).trim();
-      if (k === "name" && v) name = v;
-      else if (k === "colour" && v) colour = v;
-    }
-    charter = text.slice(m[0].length);
-  }
-  return { roleId, name, colour, charter: charter.trim() };
 }
 
 /**

@@ -2,8 +2,8 @@ import { nothing, render as litRender } from "../vendor/lit-html.js";
 import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal } from "./feeds";
-import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, openChannel, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
+import { openSession, openChannel, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
 import { cellOutputsSignal, runCell, syncCells, type CellSpec } from "./notebook-runtime";
 import { weatherSignal, type WeatherData } from "./weather";
 import { activeBoardId } from "./board";
@@ -88,6 +88,7 @@ const CAPABILITY_SIGNALS: Record<string, Subscribable<unknown>> = {
   usage: feedSignal("usage"), // account-level plan windows, polled server-side (vite-fs-plugin.ts)
   sessionList: sessionListSignal, // the historical-transcript list (GET /api/sessions), the sessions card's body
   channelList: channelListSignal, // the persisted-channel list (GET /api/channels), the channels card's body
+  rolesList: rolesListSignal, // this board's roles (GET /api/roles), the roles card's body (agent-roles.md)
   roots: rootsSignal, // the board's roots (canonical + git worktrees), each with a colour — worktree-activity slice B/C
 };
 
@@ -444,6 +445,24 @@ export function buildCard(
         const { m, id } = host;
         signals.channelOpen = (chanId: string, title: string, text: string): void =>
           openChannel(m, chanId, title, text, cascadeFrom(m, id, 300, 240));
+      }
+      continue;
+    }
+    // `rolesRefresh` is the roles browser card's re-pull ACTION (the channels card's `channelRefresh` twin):
+    // re-fetch the off-log roles list (content.ts) and notify. Board-global, never the canvas log.
+    if (name === "rolesRefresh") {
+      signals.rolesRefresh = (): void => refreshRolesList();
+      continue;
+    }
+    // `roleLaunch` is the roles browser's explicit LAUNCH action (agent-roles.md): spawn a live session UNDER
+    // a role and drop its card (loader.spawnLiveSession, which stamps the RoleName.<sid> name), placed by
+    // cascadeFrom off THIS browser card. A BUTTON, not a double-click — spawning a real process eats a session
+    // slot, too costly for a misclick. Per-card: needs the host id to anchor the cascade; no-op without a host.
+    if (name === "roleLaunch") {
+      if (host) {
+        const { m, id } = host;
+        signals.roleLaunch = (roleId: string): void =>
+          void spawnLiveSession(m, cascadeFrom(m, id, 800, 520), roleId);
       }
       continue;
     }
