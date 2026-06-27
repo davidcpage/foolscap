@@ -74,6 +74,17 @@ test("parseTags keeps a Name.sid handle as ONE token (the dot is in the grammar)
   assert.deepEqual(parseTags("ask @Oracle please"), ["oracle"]);
 });
 
+test("a tag at the end of a sentence drops the trailing full stop (so it still wakes)", () => {
+  // `@26.` must parse to `26`, not `26.` — a sid is dot-free, so the trailing period would orphan the wake.
+  assert.deepEqual(parseTags("Hi @26. I'm testing"), ["26"]);
+  assert.deepEqual(parseTags("now @26. Please commit"), ["26"]);
+  assert.deepEqual(parseTags("done @a9-"), ["a9"]);
+  // an INTERNAL dot (the role handle) is preserved; only a TRAILING one is punctuation.
+  assert.deepEqual(parseTags("@Oracle.a8. thanks"), ["oracle.a8"]);
+  // and it actually resolves: `@26.` reaches the member whose sid starts 26…
+  assert.deepEqual(resolveTags("Hi @26. testing", ["26a21ae7-f00"]).members, ["26a21ae7-f00"]);
+});
+
 test("@RoleName wakes every live instance of that role", () => {
   const r = resolveTags("@Oracle what's the entry point?", NAMED);
   assert.deepEqual(r.members, ["a87c860f-1111", "b1234567-2222"], "both Oracle instances");

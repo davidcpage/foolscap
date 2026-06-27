@@ -28,7 +28,13 @@ export function parseTags(text) {
   const re = /(?<![\w@])@([A-Za-z0-9][\w.-]*)/g;
   let m;
   while ((m = re.exec(String(text)))) {
-    const tok = m[1].toLowerCase();
+    // The grammar admits a DOT (for a `Name.sid` handle) and a hyphen, so a tag at the end of a sentence —
+    // `@26.` or `@Oracle.` — absorbs the trailing punctuation into the token (`26.`), which then fails to
+    // prefix-match the dot-free sid and the tagged member is never woken. A real handle never ENDS in a dot
+    // or hyphen (they only ever sit BETWEEN segments), so strip trailing `.`/`-`: `@26.` → `26`, while an
+    // internal-dot handle `@Oracle.a8` is untouched. (Other punctuation — `,` `?` `)` — already stops the
+    // regex, so this closes the last gap.)
+    const tok = m[1].toLowerCase().replace(/[.-]+$/, "");
     if (!out.includes(tok)) out.push(tok);
   }
   return out;
