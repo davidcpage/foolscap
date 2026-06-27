@@ -289,7 +289,10 @@ export function buildCard(
     if (name === "roleDoc") {
       const path = nodeSub.get()?.title ?? "";
       const roleId = roleIdFromDocPath(path);
-      const content = fileContentSignal(root, path);
+      // role.md lives under the REPO root (.canvas/roles/<id>/role.md), but this card's id is `node:role:<id>`,
+      // so the scope `root` (derived from the id prefix via rootOfId) would be the bogus root `role` → /api/file
+      // 400s → roleDoc never loads (card stuck on "loading…"). Pin to "repo", where the file actually is.
+      const content = fileContentSignal("repo", path);
       Object.defineProperty(signals, "roleDoc", {
         enumerable: true,
         get: () => {
@@ -306,8 +309,9 @@ export function buildCard(
     // by the card's own path, so a card can only write its own role.md. Not read-tracked — saving is an act.
     if (name === "roleSave") {
       const path = nodeSub.get()?.title ?? "";
+      // Same as roleDoc: write to the REPO root, not the `role` root the id prefix would otherwise yield.
       signals.roleSave = (doc: { name: string; colour?: string | null; charter?: string }): Promise<boolean> =>
-        writeFileContent(root, path, renderRoleFile({ name: doc.name, colour: doc.colour ?? undefined, charter: doc.charter }));
+        writeFileContent("repo", path, renderRoleFile({ name: doc.name, colour: doc.colour ?? undefined, charter: doc.charter }));
       continue;
     }
     // `cellOutputs` is the notebook card's OFF-LOG cell-output projection (notebook-runtime.ts), keyed by
