@@ -758,7 +758,7 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-row.ses-status-working       { border-left-color: #16a34a; }
 .ses-row.ses-status-waiting       { border-left-color: #f59e0b; }
 .ses-row.ses-status-waiting-agent { border-left-color: #2563eb; }
-.ses-row.ses-status-done          { border-left-color: #86efac; }
+.ses-row.ses-status-done          { border-left-color: #d4d4d8; }
 .ses-row.ses-status-crashed       { border-left-color: #ef4444; }
 .ses-row.ses-status-ended         { border-left-color: #d4d4d8; }
 .ses-row:hover {
