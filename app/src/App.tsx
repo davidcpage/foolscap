@@ -44,6 +44,7 @@ import {
   materializeImageAt,
   openSession,
   openChannel,
+  openRole,
   registerFileCommands,
   reprojectContent,
   spawnLiveSession,
@@ -451,11 +452,12 @@ function Board({ m, undo, persistence }: Engine) {
   const FS_MIME = "application/x-canvas-fsnode";
   const SESSION_MIME = "application/x-canvas-session";
   const CHANNEL_MIME = "application/x-canvas-channel";
+  const ROLE_MIME = "application/x-canvas-role";
   // Screen-px radius around the grab point that counts as "dropped back where it started" → cancel.
   const DRAG_CANCEL_RADIUS = 48;
   const isOurDrag = (e: React.DragEvent) => {
     const t = e.dataTransfer.types;
-    return t.includes(FS_MIME) || t.includes(SESSION_MIME) || t.includes(CHANNEL_MIME);
+    return t.includes(FS_MIME) || t.includes(SESSION_MIME) || t.includes(CHANNEL_MIME) || t.includes(ROLE_MIME);
   };
   // An OS file drag (a screenshot/image dragged in from Finder) advertises the "Files" type. We accept it
   // in dragover so the browser fires `drop`, then filter to images in onDrop (the type isn't readable until
@@ -574,6 +576,21 @@ function Board({ m, undo, persistence }: Engine) {
         if (!payload.chanId) return;
         const p = toPage();
         openChannel(m, payload.chanId, payload.title ?? "", payload.text ?? "", { x: Math.round(p.x), y: Math.round(p.y) });
+        return;
+      }
+
+      const roleRaw = e.dataTransfer.getData(ROLE_MIME);
+      if (roleRaw) {
+        e.preventDefault();
+        let payload: { roleId: string };
+        try {
+          payload = JSON.parse(roleRaw);
+        } catch {
+          return;
+        }
+        if (!payload.roleId) return;
+        const p = toPage();
+        openRole(m, payload.roleId, { x: Math.round(p.x), y: Math.round(p.y) });
       }
     },
     [m],

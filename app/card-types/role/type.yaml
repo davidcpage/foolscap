@@ -1,0 +1,19 @@
+# The role EDIT card type (agent-roles.md phase 2b) — a structured editor for one role's charter. A role is
+# authored as `.canvas/roles/<roleId>/role.md` (frontmatter {name, colour} + charter prose); this card is a
+# VIEW over that real file, exactly the file/notebook content/record split: source on disk, the durable log
+# holds only the card's arrangement + its (role.md) path reference. The frontmatter codec is NOT imported
+# here (a template may touch only /vendor/) — the HOST parses/serialises with the shared role-format codec
+# and hands this card structured fields, so role-format.js stays the one source for ledger + card.
+#
+# GRANT:
+#   • `roleDoc` — the PARSED role document as an OFF-LOG signal ({roleId, name, colour, charter}), keyed by
+#     this card's path. The host reads role.md off disk (content.ts) and parses it (parseRoleFile) before
+#     handing it over; liveness comes from the watcher refreshing the underlying file signal — never a setText.
+#   • `roleSave` — the serialize-back ACTION: a per-card bound fn taking {name, colour, charter} that the host
+#     serialises (renderRoleFile) and writes back to role.md through the file path (POST /api/file). The
+#     watcher then refreshes `roleDoc` here and pings the roles list. An edit is a file write, not a log event.
+#
+# No `chrome` flag: an editor wants its frame (like the sticky / notebook card).
+name: role
+contract: 1
+capabilities: [roleDoc, roleSave]

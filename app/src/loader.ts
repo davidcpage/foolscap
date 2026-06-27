@@ -750,6 +750,43 @@ export function openChannel(m: InteractionManager, chanId: string, title: string
   m.selection.set([id]);
 }
 
+// Open a ROLE's charter card to EDIT it (agent-roles.md phase 2b) — the channels card's edit-twin. A role is
+// authored as `.canvas/roles/<roleId>/role.md` (frontmatter {name, colour} + charter prose); this card is a
+// VIEW over that real file, exactly the file/notebook content/record split. So its node title carries the
+// role.md PATH (the `roleDoc` capability reads + parses that file off-log via the shared role-format codec,
+// host-side; `roleSave` serialises edits back through the same file write path). The node id is stable per
+// role (`node:role:<roleId>`) → idempotent: re-opening flies to the existing card rather than duplicating.
+// actor "user" (an undoable, attributed placement), like openChannel.
+const ROLES_DIR = ".canvas/roles";
+const ROLE_CARD_W = 460;
+const ROLE_CARD_H = 480;
+export function roleDocPath(roleId: string): string {
+  return `${ROLES_DIR}/${roleId}/role.md`;
+}
+export function openRole(m: InteractionManager, roleId: string, at?: Pos): void {
+  const id = `node:role:${roleId}` as Id<"node">;
+  if (m.editor.store.get<"node">(id)) {
+    m.selection.set([id]);
+    m.fitSelection();
+    return;
+  }
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: {
+      id,
+      type: "role",
+      title: roleDocPath(roleId), // the role.md path: the `roleDoc`/`roleSave` capabilities key off it
+      text: "",
+      color: "orange",
+      ...(at ?? spawnAt(m, ROLE_CARD_W, ROLE_CARD_H)),
+      w: ROLE_CARD_W,
+      h: ROLE_CARD_H,
+    },
+  });
+  m.selection.set([id]);
+}
+
 // Spawn a NEW live Claude Code session (agent-sessions §8 / slice 2) and drop a card showing it. The
 // server-side registry owns the process (decoupled from this card's lifecycle); we just mint a card
 // titled with the new session id, which subscribes to its `session:<id>` feed and can prompt it back

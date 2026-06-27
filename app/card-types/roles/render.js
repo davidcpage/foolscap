@@ -5,10 +5,20 @@
 // derived client-side from the `sessionList` capability (a join on roleId — no backend presence work). The
 // header's ⟳ button re-pulls the list (rolesRefresh); a live push (the roles watcher) covers the common case.
 //
-// LAUNCH is explicit: a "＋ session" button per row spawns a session UNDER that role (roleLaunch →
-// loader.spawnLiveSession), rather than a double-click — spawning a real claude process eats one of the
-// board's session slots, too costly for a misclick. (Charter editing — open a role card — is phase 2b.)
+// Two acts per row, gestures matching the other rails: DRAG-OUT / DOUBLE-CLICK opens the role's CHARTER card
+// to edit (roleOpen → loader.openRole) — the cheap, reversible act. LAUNCH is an explicit "＋ session" button
+// (roleLaunch → loader.spawnLiveSession), NOT a double-click — spawning a real claude process eats one of the
+// board's session slots, too costly for a misclick. So double-click never spawns, exactly like sessions/channels.
 import { html } from "/vendor/lit-html.js";
+
+// The drag payload mime — App.tsx's canvas drop handler reads the same key. openRole resolves the rest from
+// the roleId (role.md path), so the payload ships just the id; the drop point sets the position.
+const MIME = "application/x-canvas-role";
+
+function dragStart(e, roleId) {
+  e.dataTransfer.setData(MIME, JSON.stringify({ roleId }));
+  e.dataTransfer.effectAllowed = "copy";
+}
 
 // Count the LIVE sessions running under each role, by roleId, off the sessions list. "Live" = the working /
 // waiting / waiting-agent states (a wound-down done/ended/crashed session is not an instance), mirroring the
@@ -30,6 +40,7 @@ export default {
     const roles = card.signals.rolesList;
     const refresh = card.signals.rolesRefresh;
     const launch = card.signals.roleLaunch; // ＋ session → spawn under this role (explicit, never a dblclick)
+    const open = card.signals.roleOpen; // drag-out / double-click → open this role's charter card to edit
     const counts = liveCounts(card.signals.sessionList);
     const count = roles ? roles.length : 0;
 
@@ -52,7 +63,14 @@ export default {
         ${(roles ?? []).map((r) => {
           const live = counts.get(r.roleId) ?? 0;
           return html`
-            <div class="role-row" title=${`role: ${r.name}`}>
+            <div
+              class="role-row"
+              draggable="true"
+              data-interactive="1"
+              title=${`${r.name} — double-click or drag out to edit its charter · ＋ session to launch`}
+              @dragstart=${(e) => dragStart(e, r.roleId)}
+              @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(r.roleId); }}
+            >
               <span class="role-swatch c-${r.colour || "blue"}"></span>
               <span class="role-row-name">${r.name}</span>
               ${live ? html`<span class="role-row-live" title=${`${live} live session${live === 1 ? "" : "s"}`}>● ${live}</span>` : ""}

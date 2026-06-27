@@ -3,7 +3,11 @@ import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal } from "./feeds";
 import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, openChannel, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+import { openSession, openChannel, openRole, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+// The role.md codec — the ONE source for `role.md text <-> {name,colour,charter}`, shared with the server
+// ledger (role-ledger.js). The host parses/serialises here so the role CARD stays a pure view (it can only
+// import /vendor/, never this) — exactly how the host hands cards parsed sessionList/dirListing data.
+import { parseRoleFile, renderRoleFile } from "../role-format.js";
 import { cellOutputsSignal, runCell, syncCells, type CellSpec } from "./notebook-runtime";
 import { weatherSignal, type WeatherData } from "./weather";
 import { activeBoardId } from "./board";
@@ -81,6 +85,14 @@ export interface CardTemplate {
 
 // The off-log signals a type.yaml may request — the spike-derived capability list from the design
 // note. Adding a capability means adding a line here, not widening what templates can reach for.
+// A role edit card's title is its role.md path `.canvas/roles/<roleId>/role.md`; the roleId is the segment
+// after `roles/`. parseRoleFile takes the id as given (it knows it from the path), so we recover it here for
+// the `roleDoc`/`roleSave` capabilities. Falls back to "" for a malformed path (then name defaults to "").
+function roleIdFromDocPath(path: string): string {
+  const m = /(?:^|\/)\.canvas\/roles\/([^/]+)\/role\.md$/.exec(path);
+  return m ? m[1]! : "";
+}
+
 const CAPABILITY_SIGNALS: Record<string, Subscribable<unknown>> = {
   now: nowSignal,
   githead: boardFeedSignal("githead"), // this board's repo HEAD (githead:<boardId>)
@@ -266,6 +278,36 @@ export function buildCard(
     if (name === "writeFile") {
       const path = nodeSub.get()?.title ?? "";
       signals.writeFile = (content: string): Promise<boolean> => writeFileContent(root, path, content);
+      continue;
+    }
+    // `roleDoc` is the role edit card's PARSED view of its role.md (agent-roles.md 2b). Shaped like
+    // `fileContent` — keyed by this card's path (the title = `.canvas/roles/<roleId>/role.md`) — but the host
+    // PARSES the file text with the shared role-format codec before handing it over, so the card receives a
+    // structured {roleId, name, colour, charter} (never raw text + a parser — the card can't import the codec).
+    // Reading it tracks the underlying file signal, so an external role.md edit (or our own save) re-renders.
+    // `undefined` until the first fetch lands (a fresh card / pre-signal), so the template shows a loading state.
+    if (name === "roleDoc") {
+      const path = nodeSub.get()?.title ?? "";
+      const roleId = roleIdFromDocPath(path);
+      const content = fileContentSignal(root, path);
+      Object.defineProperty(signals, "roleDoc", {
+        enumerable: true,
+        get: () => {
+          const text = tracked(content);
+          return text == null ? undefined : parseRoleFile(text, roleId);
+        },
+      });
+      continue;
+    }
+    // `roleSave` is the role edit card's serialize-back ACTION (agent-roles.md 2b): the host serialises the
+    // edited {name, colour, charter} with the SAME role-format codec the ledger uses (renderRoleFile) and
+    // writes role.md back through the file path (writeFileContent → POST /api/file), exactly like the notebook
+    // card's `writeFile`. The watcher then refreshes `roleDoc` on this card (and pings the roles list). Keyed
+    // by the card's own path, so a card can only write its own role.md. Not read-tracked — saving is an act.
+    if (name === "roleSave") {
+      const path = nodeSub.get()?.title ?? "";
+      signals.roleSave = (doc: { name: string; colour?: string | null; charter?: string }): Promise<boolean> =>
+        writeFileContent(root, path, renderRoleFile({ name: doc.name, colour: doc.colour ?? undefined, charter: doc.charter }));
       continue;
     }
     // `cellOutputs` is the notebook card's OFF-LOG cell-output projection (notebook-runtime.ts), keyed by
@@ -463,6 +505,17 @@ export function buildCard(
         const { m, id } = host;
         signals.roleLaunch = (roleId: string): void =>
           void spawnLiveSession(m, cascadeFrom(m, id, 800, 520), roleId);
+      }
+      continue;
+    }
+    // `roleOpen` is the roles browser's EDIT open (agent-roles.md 2b) — drag-out / double-click a role row to
+    // open its charter card (loader.openRole, or fly-to if already on the board), placed by cascadeFrom off
+    // THIS browser card. The drag-out's keyboard-free twin, like channelOpen. Per-card: needs the host id to
+    // anchor the cascade; no-op without a host (the headless mock).
+    if (name === "roleOpen") {
+      if (host) {
+        const { m, id } = host;
+        signals.roleOpen = (roleId: string): void => openRole(m, roleId, cascadeFrom(m, id, 460, 480));
       }
       continue;
     }

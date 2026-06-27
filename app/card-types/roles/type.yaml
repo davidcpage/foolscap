@@ -13,11 +13,12 @@
 #     case (the roles watcher pings the roles feed); this ⟳ button is the manual force.
 #   • `roleLaunch` — a per-card ACTION (bound fn taking a roleId) that SPAWNS a session under that role and
 #     drops its card (loader.spawnLiveSession), placed offset off this browser card. The explicit launch path.
-#
-# (A `roleOpen` edit action — drag-out / double-click a row to open the role's CHARTER card — lands in
-# phase 2b, once the shared frontmatter codec exists to round-trip role.md.)
+#   • `roleOpen` — a per-card ACTION (bound fn taking a roleId) that OPENS that role's CHARTER card to edit
+#     (loader.openRole), on drag-out / double-click — the keyboard-free twin of the drag-out, placed by
+#     cascadeFrom off this browser card. EDIT is the cheap/reversible act (double-click); LAUNCH is the costly
+#     one (an explicit button), so the gestures match the other rails (double-click opens, never spawns).
 #
 # No `chrome` flag: a browser is a container and wants its frame (like the directory / sessions / channels card).
 name: roles
 contract: 1
-capabilities: [rolesList, sessionList, rolesRefresh, roleLaunch]
+capabilities: [rolesList, sessionList, rolesRefresh, roleLaunch, roleOpen]

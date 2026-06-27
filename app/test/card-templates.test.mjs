@@ -1269,3 +1269,51 @@ test("roles template lists roles with colour swatches, a derived live count, and
   const empty = flatten(mod.render({ fields: { title: "", text: "", color: "orange" }, signals: { rolesList: [] } }));
   assert.ok(empty.includes("no roles yet"), "an empty list → empty marker");
 });
+
+// agent-roles.md 2b: the role EDIT card — a structured view over role.md. The HOST parses role.md with the
+// shared codec and hands the card a `roleDoc` ({roleId,name,colour,charter}); the card renders name (read-only),
+// a colour swatch row (current ringed), and an editable charter, saving edits back through `roleSave`.
+test("role template edits a parsed role doc: read-only name, colour swatches, editable charter, save", async () => {
+  const mod = await loadTemplate("role");
+  assert.equal(mod.contract, 1);
+
+  let saved = null;
+  const card = {
+    fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" },
+    signals: {
+      roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "Answer in file:line." },
+      roleSave: (doc) => (saved = doc),
+    },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("Oracle"), "the role name is shown");
+  assert.ok(out.includes("role-name"), "name rendered as a (read-only) heading, not an input");
+  assert.ok(out.includes("Answer in file:line."), "the charter text rides into the textarea");
+  assert.ok(out.includes("role-charter"), "an editable charter textarea");
+  assert.ok(out.includes("role-swatch-row"), "the colour swatch row renders with the save grant");
+  for (const c of ["yellow", "pink", "blue", "green", "orange", "purple"])
+    assert.ok(out.includes(`c-${c}`), `a swatch for ${c}`);
+  assert.ok(out.includes("c-purple selected"), "the current colour (purple) is marked selected");
+  assert.ok(out.includes("role-save"), "an explicit save button with the grant");
+
+  // Direct dispatch through the capability (the DOM-gathering click handlers aren't exercised headless, but
+  // the capability is the contract): a save carries the {roleId,name,colour,charter} shape the host serialises.
+  card.signals.roleSave({ roleId: "oracle", name: "Oracle", colour: "green", charter: "New charter." });
+  assert.deepEqual(saved, { roleId: "oracle", name: "Oracle", colour: "green", charter: "New charter." });
+
+  // No roleDoc yet (first file read in flight) → a loading state, never a throw.
+  const loading = flatten(mod.render({ fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" }, signals: {} }));
+  assert.ok(loading.includes("loading…"), "no doc yet → loading placeholder");
+
+  // No roleSave grant (a read-only mount) → the charter is read-only and the editing chrome is absent, but the
+  // doc still renders (never throw for a missing capability — the sticky card's degrade rule).
+  const ro = flatten(mod.render({
+    fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" },
+    signals: { roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "x" } },
+  }));
+  assert.ok(ro.includes("?readonly=true"), "charter read-only without the save grant");
+  assert.ok(ro.includes("Oracle") && ro.includes("role-name"), "still shows the role read-only");
+  assert.ok(!ro.includes("role-swatch-row"), "no colour picker without the save grant");
+  assert.ok(!ro.includes("role-save"), "no save button without the grant");
+});

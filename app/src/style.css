@@ -881,6 +881,91 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #e0e7ff;
 }
 
+/* ── role edit card (agent-roles.md 2b) — structured editor over a role.md ── */
+.role-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  padding: 10px 12px;
+  box-sizing: border-box;
+}
+.role-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.role-head-swatch {
+  width: 13px;
+  height: 13px;
+}
+.role-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: #27272a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.role-save {
+  flex: none;
+  padding: 3px 12px;
+  font: inherit;
+  font-size: 12px;
+  color: #3730a3;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.role-save:hover {
+  background: #e0e7ff;
+}
+/* The colour-picker row — one swatch button per palette key, the current one ringed. Mirrors the sticky card's
+   swatch row; `.role-swatch` (sized in the roles-browser block) is reused, just made clickable here. */
+.role-swatch-row {
+  display: flex;
+  gap: 6px;
+}
+.role-swatch-row .role-swatch {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  border: none;
+  padding: 0;
+}
+.role-swatch.selected {
+  box-shadow: 0 0 0 2px #fff, 0 0 0 3px #3f3f46;
+}
+.role-charter-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.role-charter {
+  flex: 1 1 auto;
+  min-height: 120px;
+  resize: none;
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #27272a;
+  background: #fafafa;
+  border: 1px solid #e4e4e7;
+  border-radius: 6px;
+  box-sizing: border-box;
+}
+.role-charter:focus {
+  outline: none;
+  border-color: #a5b4fc;
+  background: #fff;
+}
+
 /* ── feed cards (off-log bodies: git HEAD, HN) ───────────── */
 .node.feed {
   border-left-width: 4px;
