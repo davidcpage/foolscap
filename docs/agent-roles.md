@@ -108,7 +108,9 @@ The quiet bonus: a persistent DM channel gives a **graded memory hierarchy** for
 | session transcript | per-instance | ephemeral |
 
 A waking oracle can read the DM backlog ("what has this person asked me before") without that being in
-its global memory.
+its global memory. Note the asymmetry the rows already imply: only the **role memory** layer is *curated
+knowledge*; the DM/channel log is the *conversation's own record*, and the transcript is disposable.
+Curation always flows **up into role memory, keyed to identity** — never into a channel-scoped store (§8).
 
 ## 5. The session lifecycle: reflex vs. cortex
 
@@ -209,6 +211,16 @@ named is *scope*:
 - **role-private memory** — facts in the role's `autoMemoryDirectory`, curated by/for that role.
 - **shared wiki** — docs that live in the repo (`docs/`) as canvas **file cards**, that *multiple*
   roles' memories link to *and* that humans read directly.
+
+> **Memory binds to the ROLE, not the channel.** A third scope is tempting — "what was learned in *this
+> channel*" — but it is a miscut. A channel (or DM) already *has* a durable record: **its log, plus any
+> wiki docs the work produced.** That record IS the channel's memory; a separate curated channel-memory
+> store would only duplicate it. So a *generalisable* lesson an agent learns while acting as a role goes to
+> that **role's** memory — shared across all its instances, in *any* channel (two Oracles summoned into two
+> different channels share it); the record of a *particular* collaboration stays that **channel's** log +
+> docs. Role memory is keyed to *identity*, a channel's memory is the *conversation itself* — orthogonal,
+> not nested. (This sharpens §4's hierarchy: the per-relationship "DM history" layer is the conversation
+> record, never a curated knowledge store — curation always lands in role memory.)
 
 So the "shared knowledge base" is `docs/` made first-class-linkable, with the existing file-card
 substrate doing the rendering (plus backlink computation). The hard parts are not storage:
