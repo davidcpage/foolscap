@@ -2097,6 +2097,35 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   border-color: #c49bff;
   background: #faf8ff;
 }
+/* charter render/edit toggle (Channel UI improvements). Both modes grow to fit the full charter — no inner
+   scroll/clip — so the box expands instead of cropping. The textarea autosizes via JS (height:auto+scrollHeight);
+   here we just drop the clamp and the manual resize handle so it doesn't fight that. */
+textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
+.chan-description-view {
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: none;
+  overflow: visible;
+}
+.chan-description-view:hover { border-color: #ece6f7; }
+.chan-desc-empty { color: #b8b3c4; font-style: italic; }
+/* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
+   link (any other href) is a dotted-underline focus affordance — clicking it opens/focuses the target card. */
+.chan-description-view a { color: #2563eb; }
+.chan-description-view .canvas-link {
+  color: #7c3aed;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.chan-description-view code {
+  font: 10px ui-monospace, Menlo, monospace;
+  background: #00000010;
+  padding: 0 3px;
+  border-radius: 3px;
+}
 /* the conversation — the channel's legible home (4e). Scrolls; wheel contained by the ChannelView seam. */
 .chan-log {
   flex: 1 1 auto;

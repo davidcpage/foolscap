@@ -750,6 +750,46 @@ export function openChannel(m: InteractionManager, chanId: string, title: string
   m.selection.set([id]);
 }
 
+// An IN-CANVAS link target, resolved from a markdown link's href (Channel UI: clickable charter links). The
+// rule: an http(s) href is an ordinary EXTERNAL link; ANY OTHER href names a card ON the canvas. A literal
+// `node:…` id IS that card; anything else is a repo-relative PATH → its file card (`node:repo:<path>`, the
+// fileNodeId scheme) — matching the notebook relative-path convention. The renderer presents external links
+// as <a target=_blank> and canvas links as a click-to-focus affordance (openCanvasLink below).
+export type CanvasLink =
+  | { external: true; href: string }
+  | { external: false; nodeId: Id<"node">; path?: string };
+export function resolveCanvasLink(href: string): CanvasLink {
+  if (/^https?:\/\//i.test(href)) return { external: true, href };
+  if (href.startsWith("node:")) return { external: false, nodeId: href as Id<"node"> };
+  const path = href.replace(/^\.?\//, ""); // tolerate a leading ./ or / on a repo-relative path
+  return { external: false, nodeId: fileNodeId("repo", path), path };
+}
+
+// Open/focus a repo FILE card by its root-relative PATH — the canvas-link click action. Mirrors openChannel's
+// "fly to it if it's already on the board" (select + fitSelection), except a file card may not exist yet, so
+// we materialize it first (same path→id scheme, materializeAt, which also detects notebook/prose footprints)
+// and then focus. Exported so any in-canvas link affordance can reuse it.
+export async function openFileByPath(m: InteractionManager, path: string): Promise<void> {
+  const clean = path.replace(/^\.?\//, "");
+  const id = fileNodeId("repo", clean);
+  if (!m.editor.store.get<"node">(id)) {
+    const { x, y } = spawnAt(m, CARD_W, CARD_H);
+    await materializeAt(m, "repo", clean, "file", x, y);
+  }
+  m.selection.set([id]);
+  m.fitSelection();
+}
+
+// Act on a clicked in-canvas link: external → open a new tab; a repo-relative path → materialize-and-focus
+// its file card; a literal node id → focus that card if it's on the board (we can't synthesize a non-file
+// card from an id alone, so an absent target is a quiet no-op rather than a broken card).
+export async function openCanvasLink(m: InteractionManager, href: string): Promise<void> {
+  const link = resolveCanvasLink(href);
+  if (link.external) { window.open(link.href, "_blank", "noopener,noreferrer"); return; }
+  if (link.path !== undefined) { await openFileByPath(m, link.path); return; }
+  if (m.editor.store.get<"node">(link.nodeId)) { m.selection.set([link.nodeId]); m.fitSelection(); }
+}
+
 // Open a ROLE's charter card to EDIT it (agent-roles.md phase 2b) — the channels card's edit-twin. A role is
 // authored as `.canvas/roles/<roleId>/role.md` (frontmatter {name, colour} + charter prose); this card is a
 // VIEW over that real file, exactly the file/notebook content/record split. So its node title carries the

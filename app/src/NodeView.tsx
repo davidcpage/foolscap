@@ -9,6 +9,7 @@ import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { scrollableFromTarget } from "./interior";
 import { MEMBER_OPEN, postToChannel, setChannelHistory } from "./channels";
+import { openCanvasLink, resolveCanvasLink } from "./loader";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -325,6 +326,10 @@ function ChannelView({
   const msgs = feed?.messages ?? [];
 
   const [description, setDescription] = useState(node.text);
+  // Charter render/edit toggle: read mode shows the rendered markdown (MarkdownInline), a click flips to the
+  // textarea, blur (or a record change underneath) commits + returns to read mode (Channel UI improvements).
+  const [editingDesc, setEditingDesc] = useState(false);
+  const descRef = useRef<HTMLTextAreaElement>(null);
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -386,6 +391,22 @@ function ChannelView({
   const commitDescription = () => {
     if (description !== node.text) m.editor.commit({ type: "setText", actor: "user", payload: { id, text: description } });
   };
+  // Grow the charter textarea to fit its content — no inner scroll/clip while editing (the human ask), to
+  // match the auto-height read-mode render. Driven on every change and once on entering edit mode.
+  const autosizeDesc = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight}px`;
+  };
+  const finishDescEdit = () => { commitDescription(); setEditingDesc(false); };
+  useEffect(() => {
+    if (!editingDesc) return;
+    const el = descRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    autosizeDesc(el);
+  }, [editingDesc]);
   // Flip a member between full backlog and future-only, optimistically (the chip label follows the human's
   // click; the server is the source of truth for the cursor itself).
   const toggleHistory = async (sid: string) => {
@@ -419,13 +440,30 @@ function ChannelView({
         />
         <span className="file-ext">channel</span>
       </div>
-      <textarea
-        className="chan-description"
-        placeholder="add a description (optional)"
-        value={description}
-        onChange={(e) => setDescription(e.target.value)}
-        onBlur={commitDescription}
-      />
+      {editingDesc ? (
+        <textarea
+          ref={descRef}
+          className="chan-description"
+          placeholder="add a charter (markdown — links open canvas cards)"
+          value={description}
+          onChange={(e) => { setDescription(e.target.value); autosizeDesc(e.target); }}
+          onBlur={finishDescEdit}
+          onKeyDown={(e) => { if (e.key === "Escape") { setDescription(node.text); setEditingDesc(false); } }}
+        />
+      ) : (
+        <div
+          className="chan-description chan-description-view"
+          title="click to edit the charter"
+          data-interactive
+          onClick={() => setEditingDesc(true)}
+        >
+          {description.trim() ? (
+            <MarkdownInline text={description} m={m} />
+          ) : (
+            <span className="chan-desc-empty">add a charter (markdown — links open canvas cards)</span>
+          )}
+        </div>
+      )}
       <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
         {feed?.truncated && (
           <span className="chan-empty">…earlier messages dropped (showing the most recent {msgs.length})</span>
@@ -528,6 +566,75 @@ function renderTaggedText(text: string, memberSids: string[]): React.ReactNode {
   if (parts.length === 0) return text;
   if (last < text.length) parts.push(text.slice(last));
   return parts;
+}
+
+// A tight, focused inline markdown renderer for the channel charter (Channel UI improvements). Deliberately
+// NOT the lit-html vendor parser (app/vendor/markdown.js): that emits raw target=_blank links and is the
+// wrong renderer for React. We handle exactly what a charter needs — [text](href), **bold**, `code`, and
+// line breaks — and route link clicks through resolveCanvasLink/openCanvasLink so a link to a card ON the
+// canvas FOCUSES that card instead of navigating away (http(s) hrefs stay ordinary external links). Links
+// are the point; bold/code are a small courtesy. data-interactive keeps a click off the canvas-drag seam.
+const MD_INLINE = /\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`/g;
+function renderInline(line: string, m: InteractionManager): React.ReactNode[] {
+  const out: React.ReactNode[] = [];
+  let last = 0;
+  let key = 0;
+  let mm: RegExpExecArray | null;
+  MD_INLINE.lastIndex = 0;
+  while ((mm = MD_INLINE.exec(line))) {
+    if (mm.index > last) out.push(line.slice(last, mm.index));
+    if (mm[1] !== undefined) {
+      const href = mm[2];
+      const link = resolveCanvasLink(href);
+      if (link.external) {
+        // stopPropagation so the click doesn't also bubble to the read-mode div's click-to-edit handler.
+        out.push(
+          <a
+            key={key++}
+            href={link.href}
+            target="_blank"
+            rel="noopener noreferrer"
+            data-interactive
+            onClick={(e) => e.stopPropagation()}
+          >
+            {mm[1]}
+          </a>,
+        );
+      } else {
+        out.push(
+          <a
+            key={key++}
+            className="canvas-link"
+            data-interactive
+            title={`open ${href} on the canvas`}
+            onClick={(e) => { e.preventDefault(); e.stopPropagation(); void openCanvasLink(m, href); }}
+          >
+            {mm[1]}
+          </a>,
+        );
+      }
+    } else if (mm[3] !== undefined) {
+      out.push(<strong key={key++}>{mm[3]}</strong>);
+    } else if (mm[4] !== undefined) {
+      out.push(<code key={key++}>{mm[4]}</code>);
+    }
+    last = mm.index + mm[0].length;
+  }
+  if (last < line.length) out.push(line.slice(last));
+  return out;
+}
+function MarkdownInline({ text, m }: { text: string; m: InteractionManager }) {
+  // Preserve the author's line breaks (a charter is a short prose block, not flowed paragraphs).
+  return (
+    <>
+      {text.split("\n").map((line, li) => (
+        <span key={li}>
+          {li > 0 && <br />}
+          {renderInline(line, m)}
+        </span>
+      ))}
+    </>
+  );
 }
 
 function formatSince(ms: number): string {
