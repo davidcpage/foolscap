@@ -684,10 +684,26 @@ async function loadType(type: string, yaml: string): Promise<void> {
   }
 }
 
-async function loadAll(): Promise<void> {
-  const res = await fetch("/api/card-types");
-  const { types } = (await res.json()) as { types: { type: string; yaml: string }[] };
-  await Promise.all(types.map((t) => loadType(t.type, t.yaml)));
+// The registry's boot fetch RACES a dev-server restart: Vite's client reloads the page the moment the
+// socket answers, which can be a beat before the API middleware is serving — and this load runs exactly
+// once per page. A one-shot failure here left EVERY template card on the "no template for type …"
+// placeholder until a manual reload, with only an unhandled-rejection warning to show for it (nothing
+// re-triggers the load except a template edit on disk). So retry with a short linear backoff — bounded,
+// so a genuinely dead server doesn't poll forever, and loud when it gives up.
+const LOAD_ALL_RETRIES = 5;
+async function loadAll(attempt = 0): Promise<void> {
+  try {
+    const res = await fetch("/api/card-types");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const { types } = (await res.json()) as { types: { type: string; yaml: string }[] };
+    await Promise.all(types.map((t) => loadType(t.type, t.yaml)));
+  } catch (err) {
+    if (attempt >= LOAD_ALL_RETRIES) {
+      console.error("card-types: registry load failed after retries — cards will show the placeholder", err);
+      return;
+    }
+    setTimeout(() => void loadAll(attempt + 1), 1000 * (attempt + 1));
+  }
 }
 
 // A template edit on disk arrives on the feed bus ("cardtypes", from the server's folder watch) and
