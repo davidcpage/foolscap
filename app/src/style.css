@@ -2185,6 +2185,22 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font-style: italic;
 }
 .chan-msg.sys .chan-msg-from { color: #71717a; }
+/* A work-intent typed act (threads-as-cards §6): a slim card-only status line, not a conversation turn.
+   Tints follow the session-status vocabulary — amber = your turn, blue = in flight elsewhere, green = done. */
+.chan-intent {
+  font-size: 10px;
+  line-height: 1.35;
+  color: #71717a;
+}
+.chan-intent .chan-msg-from { color: #71717a; }
+.chan-intent-glyph { margin-right: 4px; }
+.chan-intent-text { margin-left: 6px; font-style: italic; }
+.chan-intent.i-blocked-human { color: #b45309; }
+.chan-intent.i-blocked-human .chan-msg-from { color: #b45309; }
+.chan-intent.i-blocked-peer { color: #2563eb; }
+.chan-intent.i-blocked-peer .chan-msg-from { color: #2563eb; }
+.chan-intent.i-done { color: #16a34a; }
+.chan-intent.i-done .chan-msg-from { color: #16a34a; }
 .chan-members {
   display: flex;
   flex-wrap: wrap;

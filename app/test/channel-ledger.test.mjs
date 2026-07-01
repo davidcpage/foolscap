@@ -61,6 +61,25 @@ test("upsertChannelMeta writes createdAt once and refreshes title/activity", () 
   assert.equal(second.text, "the topic", "an absent field keeps its prior value (merge, not replace)");
 });
 
+test("a declared-intents index on the marker survives activity upserts (the work-intent act relies on it)", () => {
+  const repo = tmpRepo();
+  const id = "node:chan:wi";
+  // The intent handler writes the full latest-per-member map onto the marker…
+  upsertChannelMeta(repo, id, { intents: { s1: { intent: "working", ts: 100 } }, lastSeq: 1, lastTs: 100 });
+  // …and every ordinary post's activity upsert (lastSeq/lastTs/title) must shallow-merge AROUND it, not
+  // clobber it — the property that makes the marker a safe home for the index.
+  upsertChannelMeta(repo, id, { title: "build", lastSeq: 2, lastTs: 200 });
+  assert.deepEqual(readChannelMeta(repo, id).intents, { s1: { intent: "working", ts: 100 } });
+  // A later declaration replaces the map wholesale — the latest intent per member wins.
+  upsertChannelMeta(repo, id, {
+    intents: { s1: { intent: "blocked:human", ts: 300, note: "need a nod" }, s2: { intent: "done", ts: 300 } },
+  });
+  const final = readChannelMeta(repo, id);
+  assert.equal(final.intents.s1.intent, "blocked:human");
+  assert.equal(final.intents.s2.intent, "done");
+  assert.equal(final.title, "build", "the intent upsert keeps the activity fields");
+});
+
 test("listChannels returns every marked channel, newest activity first", () => {
   const repo = tmpRepo();
   upsertChannelMeta(repo, "node:chan:old", { title: "old", lastSeq: 1, lastTs: 100 });

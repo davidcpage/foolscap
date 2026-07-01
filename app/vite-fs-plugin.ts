@@ -9,8 +9,9 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
-import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, upsertChannelMeta } from "./channel-ledger.js";
+import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, readChannelMeta, upsertChannelMeta } from "./channel-ledger.js";
 import { resolveTags } from "./channel-tags.js";
+import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import chokidar from "chokidar";
 
@@ -714,6 +715,9 @@ function handleChannels(res: ServerResponse, repoPath: string): void {
     text: typeof m.text === "string" ? m.text : "",
     messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
     mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
+    // Latest declared work-intent per member (threads-as-cards §6, sid-keyed until seats) — the raw
+    // material the step-3 thread-state projection derives from; served here so it's already legible.
+    intents: m.intents ?? {},
   }));
   sendJson(res, 200, { channels });
 }
@@ -850,8 +854,15 @@ interface ChannelMsg {
   ts: number;
   from: string; // sender session id, or "human" / "system"
   text: string;
-  kind?: "ask"; // §16 legibility echo: a Q→A summary the CARD renders but inbox/nudge skip (card-only)
+  // CARD-ONLY entries: the card renders them but inbox/nudge skip them (they wake no one). "ask" is the
+  // §16 Q→A legibility echo; "intent" is the work-intent typed act (threads-as-cards §6) with the declared
+  // intent in `intent` (the machine truth — `text` is just its legible face, see intentLine).
+  kind?: "ask" | "intent";
+  intent?: WorkIntent;
 }
+// A card-only entry never wakes a member and never counts as inbox content — the shared gate for every
+// unread filter (an agent's own bookkeeping must not wake the room).
+const cardOnly = (m: ChannelMsg): boolean => m.kind != null;
 // §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —
 // the durable log stays broadcast-only). The HTTP response is parked until reply or timeout. Pinned in
 // fsState so the queue survives a hot re-eval; the held `res`/`timer` are process-bound (a restart times
@@ -1147,6 +1158,14 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     `  GET ${base}/api/asks?session=${sessionId}  → { asks:[{ askId, channel, from, text, ts }] }`,
     `  then answer each: POST ${base}/api/channel/<channel>/reply?board=${boardId} { from:"${sessionId}", askId, text }`,
     "  — which unblocks the asker. A consulting (oracle-style) session lives in this loop: be quick, answer in file:line.",
+    "",
+    "DECLARE YOUR WORK-INTENT. From the outside, idle-but-working, blocked-on-a-human, and finished look",
+    "IDENTICAL (a silent process) — only you know which, so SAY it. Post a typed status into the channel your",
+    "work belongs to (card-only: it wakes no one, it just keeps the board honest about whose turn it is):",
+    `  POST ${base}/api/channel/<chanId>/intent?board=${boardId}  { from:"${sessionId}", intent, note? }`,
+    '  intent ∈ "working" | "blocked:human" | "blocked:peer" | "done". Declare "blocked:human" whenever you ask',
+    '  the human something and stop; "blocked:peer" while you wait on another session; "done" when your part of',
+    "  the work is finished (then wind down, below). A short note says what you're blocked on / what you finished.",
     "",
     "WINDING DOWN. Every idle session is treated as WAITING-FOR-A-HUMAN by default (its card glows a loud",
     "amber \"waiting\" band), so when your work is genuinely finished and you don't need the human again, end",
@@ -1562,11 +1581,17 @@ const MAX_CHANNEL_MSGS = 200; // bounded TAIL — the feed republishes the whole
 // `channelLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
 // every caller already has it. The marker upsert also makes the channel appear in the channels-list rail and
 // keeps its title/description fresh from the live snapshot. Both disk writes are best-effort (channel-ledger).
-function appendChannelMsg(boardId: string, chanId: string, from: string, text: string, kind?: "ask"): ChannelMsg {
+function appendChannelMsg(
+  boardId: string,
+  chanId: string,
+  from: string,
+  text: string,
+  extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
+): ChannelMsg {
   let log = channelLogs.get(chanId);
   if (!log) channelLogs.set(chanId, (log = []));
   const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
-  const msg: ChannelMsg = { seq, ts: Date.now(), from, text, ...(kind ? { kind } : {}) };
+  const msg: ChannelMsg = { seq, ts: Date.now(), from, text, ...extra };
   log.push(msg);
   let truncated = false;
   if (log.length > MAX_CHANNEL_MSGS) { log.splice(0, log.length - MAX_CHANNEL_MSGS); truncated = true; } // keep recent
@@ -1689,7 +1714,7 @@ function flushNudge(s: LiveSession): void {
   for (const chanId of sessionChannels(records, s.id)) {
     const log = channelLogs.get(chanId) ?? [];
     const cursor = s.read[chanId] ?? 0;
-    const unread = log.filter((m) => m.seq > cursor && m.kind !== "ask").length; // §16: ask-echoes don't wake
+    const unread = log.filter((m) => m.seq > cursor && !cardOnly(m)).length; // card-only entries don't wake
     if (unread > 0) parts.push(`"${channelNode(records, chanId)?.title || chanId}" (${unread} new)`);
   }
   const asks = [...pendingAsks.values()].filter((a) => a.to === s.id).length; // §16 pending consultations
@@ -2578,6 +2603,7 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
 //   POST /api/channel/<chanId>/leave   ?board=  { from }       — drop the membership (sever)
 //   POST /api/channel/<chanId>/invite  ?board=  { from, target, history? } — propose membership for another session
 //   POST /api/channel/<chanId>/history ?board=  { target, mode } — set a member's backlog visibility (full|future)
+//   POST /api/channel/<chanId>/intent  ?board=  { from, intent, note? } — declare work-intent (card-only typed act)
 //   GET  /api/inbox ?session=<sid>                            — read this session's unread channel messages
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
 // never has to construct node/edge ids — it works in channel ids + its own sid only.
@@ -2759,6 +2785,7 @@ function maybeAnnounceMembership(
       `[canvas] You joined channel ${chan.id} "${title}".\n${descLine}members: ${roster}\n` +
         `post: POST ${base}/api/channel/${chan.id}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
         `consult one member and block for the answer: POST ${base}/api/channel/${chan.id}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
+        `declare your work-intent (card-only, wakes no one): POST ${base}/api/channel/${chan.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished\n` +
         `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
     );
     if (others.length) {
@@ -3023,8 +3050,59 @@ async function handleChannelReply(
 
   settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
   // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  appendChannelMsg(boardId, chanId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, "ask");
+  appendChannelMsg(boardId, chanId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
   sendJson(res, 200, { ok: true, askId: ask.askId, channel: chanId, delivered: true });
+}
+
+// POST /api/channel/<id>/intent { from, intent, note? } — the work-intent typed act (threads-as-cards §6,
+// migration §8 step 1). `idle+working`, `idle+blocked:human`, and `idle+done` are indistinguishable at the
+// process layer, so the agent DECLARES which it is: a structured entry in the channel's log, card-only
+// (rendered as a small status line; inbox/nudge skip it — an agent's own bookkeeping must not wake the
+// room). The latest declaration per member also rides the channel's meta marker (`intents`, keyed by sid —
+// the seat record's forerunner; step 2 moves the key to the seat so it survives an occupant respawn), which
+// is what /api/channels serves and what the step-3 thread-state projection will range over. `done` doubles
+// as the cooperative-yield signal — for now it informs slot management (a PM/human can see who is safe to
+// terminate); the reflex scheduler acting on it comes with the projection.
+async function handleChannelIntent(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  chanId: string,
+): Promise<void> {
+  let body: { from?: unknown; intent?: unknown; note?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  if (!isWorkIntent(body.intent))
+    return sendJson(res, 400, { error: `intent must be one of ${WORK_INTENTS.map((i) => `"${i}"`).join(" | ")}` });
+  if (body.note != null && typeof body.note !== "string")
+    return sendJson(res, 400, { error: "note must be a string" });
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
+  // Consent mirrors handleChannelMessage: a session must have joined to declare; a non-session `from`
+  // (the human at the card) is the board owner and may mark any channel.
+  if (sessionNodeForSid(records, body.from) && !channelMemberSids(records, chanId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this channel" });
+
+  const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
+  const msg = appendChannelMsg(boardId, chanId, body.from, intentLine(body.intent, note), {
+    kind: "intent",
+    intent: body.intent,
+  });
+  // The latest-per-member index: full-object replace onto the meta marker (appendChannelMsg's own meta
+  // upsert shallow-merges around it, so activity bumps never clobber it — pinned by the ledger test).
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (repoPath) {
+    const prior = readChannelMeta(repoPath, chanId)?.intents ?? {};
+    upsertChannelMeta(repoPath, chanId, {
+      intents: { ...prior, [body.from]: { intent: body.intent, ts: msg.ts, ...(note ? { note } : {}) } },
+    });
+  }
+  sendJson(res, 200, { ok: true, channel: chanId, from: body.from, intent: body.intent, seq: msg.seq });
 }
 
 // The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ChannelMsg. Two
@@ -3097,7 +3175,7 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
     for (const chanId of sessionChannels(records, sid)) {
       const log = channelLogs.get(chanId) ?? [];
       const since = s.read[chanId] ?? 0;
-      const fresh = log.filter((mng) => mng.seq > since && mng.kind !== "ask"); // §16: ask-echoes are card-only
+      const fresh = log.filter((mng) => mng.seq > since && !cardOnly(mng)); // ask-echoes / intent acts are card-only
       // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
       // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
       // which re-seeds the cursor to 0). Surfaced as `truncated`, never silently dropped (CLAUDE.md).
@@ -3112,7 +3190,7 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
           out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
         channels.push(out);
       }
-      if (log.length) s.read[chanId] = log[log.length - 1]!.seq; // mark all read (incl. skipped ask-echoes)
+      if (log.length) s.read[chanId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
     }
   }
   const count = channels.reduce((n, c) => n + c.messages.length, 0);
@@ -3180,7 +3258,7 @@ export function fsApi(): Plugin {
           return handleAsksRead(res, url.searchParams.get("session"));
         // Channels (Phase 4). The channel id is a node id carrying a colon (node:chan:<short>), so the
         // client percent-encodes it — match any non-slash segment and decode before the snapshot lookup.
-        const chanMatch = /^\/api\/channel\/([^/]+)\/(message|join|leave|invite|history|ask|reply)$/.exec(url.pathname);
+        const chanMatch = /^\/api\/channel\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent)$/.exec(url.pathname);
         if (chanMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -3190,6 +3268,7 @@ export function fsApi(): Plugin {
           if (action === "history") return void handleChannelHistory(req, res, b.boardId, chanId);
           if (action === "ask") return void handleChannelAsk(req, res, b.boardId, chanId);
           if (action === "reply") return void handleChannelReply(req, res, b.boardId, chanId);
+          if (action === "intent") return void handleChannelIntent(req, res, b.boardId, chanId);
           return void handleChannelMembership(req, res, b.boardId, chanId, action as "join" | "leave" | "invite", originOf(req));
         }
         if (url.pathname === "/api/session") {

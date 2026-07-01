@@ -11,6 +11,7 @@ import { scrollableFromTarget } from "./interior";
 import { MEMBER_OPEN, postToChannel, setChannelHistory } from "./channels";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../channel-tags.js";
+import { intentGlyph } from "../work-intent.js";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -297,7 +298,7 @@ function ProvenanceView({
 // feed cards), so — unlike a template card — it must contain its own interior interactions: native
 // listeners stop an input's pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan /
 // Backspace→delete) from reaching the canvas. Mirrors TemplateCard's seam.
-type ChannelMsg = { seq: number; ts: number; from: string; text: string };
+type ChannelMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
 // A member's readable display handle: a role-spawned session carries a `.name` ("PM.97acc4bc"); show it as
 // "PM.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
@@ -487,13 +488,24 @@ function ChannelView({
         {msgs.length === 0 ? (
           <span className="chan-empty">no messages yet</span>
         ) : (
-          msgs.map((mm) => (
-            <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}`}>
-              <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-              <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-              <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries)}</div>
-            </div>
-          ))
+          msgs.map((mm) =>
+            mm.kind === "intent" ? (
+              // A work-intent typed act (threads-as-cards §6): a small card-only status line — who declared
+              // what stance toward this work — not a conversation turn. The glyph/tint carry the intent.
+              <div key={mm.seq} className={`chan-intent i-${(mm.intent ?? "").replace(":", "-")}`}>
+                <span className="chan-intent-glyph">{intentGlyph(mm.intent)}</span>
+                <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                <span className="chan-intent-text">{mm.text}</span>
+                <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+              </div>
+            ) : (
+              <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}`}>
+                <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries)}</div>
+              </div>
+            ),
+          )
         )}
       </div>
       <div className="chan-members">

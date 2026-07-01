@@ -169,6 +169,13 @@ pinned across hot re-eval, **lost on a COLD restart** — which also kills the s
   pending queue), and answers with `POST /api/channel/<id>/reply {from, askId, text}` (only the addressee
   may; resolves the asker's held call). The Q→A is echoed into the channel log as a **card-only** entry
   (`kind:"ask"`) — it shows on the card but is **skipped** by `inbox`/nudges, so the other members aren't woken.
+- **Work-intent (typed act; `threads-as-cards.md` §6, migration step 1):** `POST /api/channel/<id>/intent
+  {from, intent:"working"|"blocked:human"|"blocked:peer"|"done", note?}` — a member declares its stance
+  toward the channel's work, because `idle+working` / `idle+blocked:human` / `idle+done` are identical at
+  the process layer and only the agent knows which. Card-only like the ask echo (`kind:"intent"` — rendered
+  as a status line, skipped by `inbox`/nudges, wakes no one). The latest declaration per member rides the
+  channel's meta marker and `GET /api/channels` (`intents`, sid-keyed until seats land at step 2); the
+  step-3 thread-state projection (active/waiting/dormant) derives from it. Enum lives in `app/work-intent.js`.
 
 Gotchas:
 - **Membership must be in the pushed snapshot before `ask`/`message` will accept it.** Membership is read from

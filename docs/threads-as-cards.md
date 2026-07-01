@@ -234,8 +234,9 @@ conversation's own record; nothing channel-scoped is built.
 Rename, don't rebuild — in dependency order:
 
 0. ~~Land the looping-role / spawn-cascade / baseline-permissions work~~ (committed).
-1. **Work-intent act** (§6) — the primitive everything derives from; useful for slot management on day
-   one, before any thread UI exists.
+1. ~~**Work-intent act** (§6) — the primitive everything derives from; useful for slot management on day
+   one, before any thread UI exists.~~ (committed — `POST /api/channel/<id>/intent` on today's channel
+   machinery, sid-keyed on the channel meta until seats land at step 2; enum in `app/work-intent.js`.)
 2. **Thread node + ledger** — rename the channel node type, `channel-ledger.js` → thread ledger under
    `.canvas/threads/`, endpoints `/api/thread/…` (keep `/api/channel/…` as aliases through the
    transition so live agents and the CLAUDE.md recipes don't break mid-flight). The ledger includes
