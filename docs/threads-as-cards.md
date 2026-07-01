@@ -6,8 +6,9 @@ wholesale), `agent-roles.md` (roles, reflex/cortex, read-policy), and `agent-to-
 are **not** sub-conversations anchored in channels; they are **first-class cards on the canvas**, and the
 long-lived channel as a coordination container is retired. Also decides: a single **threads rail card**
 as the attention surface, **@Role spawn-on-mention** as the staffing gesture, the **work-intent act** as
-the one net-new primitive this all rests on, wiki write-ups demoted to an optional closure action, and
-**flat over nested**.*
+the one net-new primitive this all rests on, the **seat** as the durable per-thread instance identity
+(how two PMs share a thread, and how "the Implementer here" survives respawn), wiki write-ups demoted to
+an optional closure action, and **flat over nested**.*
 
 ---
 
@@ -31,8 +32,8 @@ A per-task thread dissolves both. Its log is *history*, not documentation: when 
 record is complete and final — it can never drift, because it no longer tracks anything. The
 `agent-roles.md` §1 keystone gets **stronger** under this model: "ephemeral sessions are safe because the
 durable substrate is curated memory, not the transcript" — and now the unit of conversation and the unit
-of work are the same object, so the thread log *is* the checkpoint a cold-parked task resumes from (§6's
-cooperative yield writes into it naturally).
+of work are the same object, so the thread log *is* the checkpoint a cold-parked task resumes from
+(`agent-roles.md` §6's cooperative yield writes into it naturally).
 
 > **A thread is a task with a conversation attached — born when work starts, closed when it resolves,
 > placed on the canvas next to what it is about.**
@@ -53,7 +54,8 @@ a mode); they are explicitly not threads and not affected here.
   relationship).
 - **A durable ledger** — `.canvas/threads/<enc>.jsonl` + `.meta.json`, the direct rename of
   `channel-ledger.js`. Survives cold restart, rides the shadow-git ledger like the rest of `.canvas/`.
-- **Members via edges** — `member:open` edges from session cards (and the human) exactly as today.
+- **Members via edges** — `member:open` edges from session cards (and the human) exactly as today. The
+  durable *participant*, though, is the **seat** (§5); the edge marks its current live occupancy.
 - **A derived state** — `active / waiting / dormant`, the pure reflex projection over participants'
   (process-state × work-intent) pairs defined in `session-thread-lifecycle.md` §4, **plus one explicit
   terminal state**:
@@ -117,17 +119,76 @@ and cross-thread continuity comes from role memory, not a shared process).
 
 **Distinguishing "spawned fresh" from "woke the existing one"** — the ambiguity the human sees — is
 solved in the log, not the mind: the spawn emits a **card-only system entry** in the thread (the
-`kind:"ask"` echo pattern — rendered on the card, skipped by inbox/nudges): *"⟳ spawned Reviewer.3f2a"*
-vs. nothing extra for a plain wake. The roster chip shows the session handle (`RoleName.shortsid`) with
-its status dot, so "which instance, how fresh" is always one glance away. A `@Role` naming a role that
-doesn't exist at all is an error surfaced on the card (a red system entry), not a silent no-op — creating
-roles stays a deliberate act in the role editor, not a typo side-effect.
+`kind:"ask"` echo pattern — rendered on the card, skipped by inbox/nudges): *"⟳ `Reviewer` seat filled
+by 3f2a"* (or *re-filled*, on a respawn — §5) vs. nothing extra for a plain wake. The roster chip shows
+the **seat handle** with its occupant's status dot (`shortsid` on hover), so "which instance, how fresh"
+is always one glance away. A `@Role` naming a role that doesn't exist at all is an error surfaced on the
+card (a red system entry), not a silent no-op — creating roles stays a deliberate act in the role editor,
+not a typo side-effect. And `@Role` only ever fills-or-creates the role's **first** seat on a thread —
+bringing a *second* instance of the same role onto a thread is an explicit act (§5), never a mention
+side-effect.
 
 Trigger-coalescing across the spawn gap (`agent-roles.md` §12) applies directly: mentions landing while
 the spawn is in flight attach to the spawning session — the emitted-membership registry already built for
 the channel cascade is exactly this mechanism.
 
-## 5. The work-intent act — the one net-new primitive
+## 5. Same role, twice: instances, respawn, and the seat
+
+§4 quietly assumes one instance of a role per thread, and instance-naming quietly assumes the process is
+the participant. Both break — and the second breaks *first*, before any multiplicity: sessions die and
+respawn constantly **by design** (fresh-brief is the default re-engage; cold-park reclaims cap slots), so
+"the Implementer on this thread" changes sid — and any sid-derived handle — on every respawn. A log entry
+saying "as @Implementer.3f2a noted" points at a corpse within the hour. Instance addressing cannot be
+process addressing; the participant needs a name that survives its occupant.
+
+So apply the liveness ≠ identity keystone one tier down:
+
+| Tier | Identity | Lifetime | Handle |
+|---|---|---|---|
+| **role** | global — charter + memory | durable | `@PM` |
+| **seat** | a role's *post on one thread* — the participant | durable with the thread | `PM` (sole), `PM/incident` (labelled) |
+| **session** | the seat's current occupant | ephemeral | `RoleName.shortsid` (session cards only) |
+
+A **seat** is created when a role is first brought onto a thread and persists across occupant respawns.
+It carries the thread-scoped context: its brief/remit, its last declared work-intent (§6), its standing
+in the log. **Mentions address seats**; the reflex routes to the live occupant or cold-spawns a fresh
+session *into the seat* — which is exactly what fresh-brief re-engage already does; the seat just gives
+that continuity a name the conversation can keep using.
+
+The three cases that motivated this:
+
+- **One PM coordinating across several threads.** One session occupying a seat in each. Consistent with
+  `agent-roles.md` §10 — a session spans exactly the threads its work touches, and coordination *is* the
+  PM's work-unit, which inherently touches many. The PM is the principled exception, not a violation.
+- **Two PMs on one thread** (e.g. counterparts coordinating across their remits). Two seats of the same
+  role. The second seat **requires a label at creation** — the disambiguation forcing-function: bare
+  `@PM` stays unambiguous until someone deliberately adds `PM/upstream`. Once a role has multiple seats
+  on a thread: a bare `@Role` **broadcast wake** goes to *every* seat of that role (cheap — warm agents
+  glance and ignore; "PMs, …" is what a human means in a room), but an **`ask`** — which must hold one
+  connection to one addressee — rejects the ambiguous handle (**400**, listing the candidate seats).
+- **A second Implementer beside a working one.** Explicitly create a second seat: a "+ add another
+  ‹Role›" affordance on the thread card's roster (and the corresponding API verb), which mints the seat
+  with its required label. Multiplicity is always a deliberate act.
+
+Two structural payoffs. **Work-intent attaches to the seat, not the sid** — a declared `blocked:human`
+survives its occupant being cold-parked or crashing, which softens the crash-vs-done knot in
+`session-thread-lifecycle.md` §8. And the thread state machine's *participants* become seats — the thing
+§1 of that doc was reaching for ("a work-unit may have many participants; a session is one ephemeral
+participant"): the seat is that participant, named.
+
+One caution: **seat labels must not become shadow roles.** If `PM/frontend` and `PM/infra` recur on every
+thread for weeks, that is two *roles* wanting their own charters and memories, and the label is hiding an
+un-versioned charter fork. A seat label expresses *situational* multiplicity within one thread; anything
+durable about how the instances differ belongs in a role definition. Role memory stays shared across all
+seats — two PMs on a thread share curated knowledge; their differing remits live in their seat briefs.
+That is the right split.
+
+Implementation is lazy: a seat is a small ledger record, and until a second same-role seat exists, seats
+and roles are one-to-one per thread and everything degenerates to §4's unlabelled behaviour. Ship the
+record with the thread ledger (§8 step 2); ship labelling and the second-seat affordance when
+multiplicity is first actually wanted.
+
+## 6. The work-intent act — the one net-new primitive
 
 Everything above leans on the thread knowing `waiting` from `dormant`, and the canvas **cannot observe**
 that distinction: `idle+working`, `idle+blocked:human`, and `idle+done` are *identical* at the process
@@ -135,7 +196,8 @@ layer (a resident process emitting nothing). `session-thread-lifecycle.md` §2 p
 consequence here is concrete: **the rail's waiting-highlight and the dormant auto-fold are both derived
 from a signal only the agent can emit.**
 
-So sessions post a **typed act** into their thread — a ledger entry with structure, not prose:
+So a session posts a **typed act** into its thread — a ledger entry with structure, not prose, recorded
+against its **seat** (§5) so the declared state survives the occupant's respawn:
 
 ```
 POST /api/thread/<id>/intent {from, intent: "working"|"blocked:human"|"blocked:peer"|"done", note?}
@@ -151,7 +213,7 @@ forgotten signal errs toward surfacing, never toward burying. `done` also double
 signal that lets the scheduler reclaim the session's cap slot (`session-thread-lifecycle.md` §3) — the
 slot-management win pays for the primitive even before the rail ships.
 
-## 6. Closure, and the wiki demoted
+## 7. Closure, and the wiki demoted
 
 Closing is explicit: a **close verb** (`POST /api/thread/<id>/close {from, summary?}` + the card's "✓
 close" affordance, mirroring the session card's "✓ end") stamps the ledger meta with who/when/why. The
@@ -167,28 +229,30 @@ already specifies — thread-close was always the natural trigger; now it is the
 "skip it" is the common case. Role memory remains the sole curated store; the thread log remains the
 conversation's own record; nothing channel-scoped is built.
 
-## 7. Migration
+## 8. Migration
 
 Rename, don't rebuild — in dependency order:
 
 0. ~~Land the looping-role / spawn-cascade / baseline-permissions work~~ (committed).
-1. **Work-intent act** (§5) — the primitive everything derives from; useful for slot management on day
+1. **Work-intent act** (§6) — the primitive everything derives from; useful for slot management on day
    one, before any thread UI exists.
 2. **Thread node + ledger** — rename the channel node type, `channel-ledger.js` → thread ledger under
    `.canvas/threads/`, endpoints `/api/thread/…` (keep `/api/channel/…` as aliases through the
-   transition so live agents and the CLAUDE.md recipes don't break mid-flight). Existing channels carry
-   over as long-lived threads — permitted, just no longer the default shape; the standing dev channel can
-   simply stay open.
+   transition so live agents and the CLAUDE.md recipes don't break mid-flight). The ledger includes
+   **seat records** (§5) — one per role brought onto the thread; 1:1 with roles until labelling ships.
+   Existing channels carry over as long-lived threads — permitted, just no longer the default shape; the
+   standing dev channel can simply stay open.
 3. **Derived thread state** — the reflex projection (`session-thread-lifecycle.md` §4) computed
    server-side, exposed on `/api/threads` the way `status` rides `/api/sessions`.
 4. **Threads rail card** (§3) — list + waiting-first sort + drag-out; retire the channels rail.
 5. **@Role spawn-on-mention** (§4) — the tag parser already resolves member prefixes; teach it roles, and
-   wire the miss-path to the existing spawn cascade.
-6. **Close verb + the optional-write-up charter line** (§6).
+   wire the miss-path to the existing spawn cascade (fills-or-creates the first seat). Labelled seats +
+   the second-seat affordance (§5) come later still, when multiplicity is first wanted.
+6. **Close verb + the optional-write-up charter line** (§7).
 
 CLAUDE.md's channel section rewrites at step 2, when the endpoints actually move.
 
-## 8. Open knots
+## 9. Open knots
 
 - **Thread creation ceremony.** Must be one verb (`POST /api/threads {title, text?}` / one canvas
   gesture), or agents and humans will keep piggybacking on existing threads and scope-rot returns by the
