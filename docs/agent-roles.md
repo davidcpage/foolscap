@@ -91,7 +91,9 @@ Three conversation forms, deliberately distinct:
   member is `human | role | session`, not only a sid + the magic `"human"` post box.
 - **Thread** — a scoped sub-conversation *anchored in a channel*. For humans, threads de-interleave a
   busy stream. For agents the payoff is bigger and different: **a thread is a scope of attention and a
-  unit of work** (see §5, §7). It is the natural session boundary.
+  unit of work** (see §5, §7). It is the natural session boundary. *(Superseded 2026-07-01 on the
+  anchoring only: threads are first-class canvas cards, not channel sub-conversations, and the channel
+  container is retired — see `threads-as-cards.md`. Everything else in this section stands.)*
 - **DM** — a standalone 2-party (or N-party) channel: a *relationship*. **`ask`/`reply` is a DM, not a
   thread.** It existed pre-roles because there was no durable identity to address — you had to point at a
   live sid and hold the wire open.

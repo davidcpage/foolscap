@@ -166,7 +166,9 @@ the filter. It should arguably be the default *for agents* (humans can scroll; a
 - **No sub-threads yet.** Channels are flat (confirmed: no thread/archive concept in the bus today). So the
   first container this machine ranges over is the **channel**; "archive a channel" is the v0. Sub-threads
   are a finer granularity added later — they change *what the projection ranges over*, not the projection
-  logic.
+  logic. *(Resolved 2026-07-01: there will be no sub-threads. Threads are first-class canvas cards that
+  replace the channel container outright — the projection ranges over threads, flat — see
+  `threads-as-cards.md`.)*
 
 ## 9. Synthesis
 
