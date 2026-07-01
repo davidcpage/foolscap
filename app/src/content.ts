@@ -381,20 +381,22 @@ export const sessionListSignal: Subscribable<SessionMeta[] | undefined> = {
   },
 };
 
-// ── off-log CHANNEL LIST projection (the channels browser card) ─────────────────────────────────────
-// The sessions-list mirror for CHANNELS: the channels this board has persisted under `.canvas/channels/`
-// (GET /api/channels), on the SAME lazy-on-subscribe seam. Board-global and derived/channel-1 — listing the
-// markers touches no diff, no intent event, no persistence; only OPENING one commits an addNode
-// (loader.openChannel). The channels card subscribes to this and drags a row out to reopen that channel. A
-// live push (hookChannelsFeed: the server's `channels:<boardId>` feed pings on any marker add/change) keeps
-// an open card current; refreshChannelList() stays the manual re-pull, exposed as the `channelRefresh` capability.
-// Simpler than the session list — no hidden-set / delete: a channel marker IS foolscap's own data (unlike a
-// Claude Code transcript), so removing one is a real act, not a view preference, and is deferred.
+// ── off-log THREAD LIST projection (the threads browser card) ───────────────────────────────────────
+// The sessions-list mirror for THREADS (renamed from channels at threads-as-cards §8 step 2): the threads
+// this board has persisted under `.canvas/threads/` (GET /api/threads), on the SAME lazy-on-subscribe seam.
+// Board-global and derived/channel-1 — listing the markers touches no diff, no intent event, no
+// persistence; only OPENING one commits an addNode (loader.openChannel). The rail card subscribes to this
+// and drags a row out to reopen that thread. A live push (hookThreadsFeed: the server's `threads:<boardId>`
+// feed pings on any marker add/change) keeps an open card current; refreshChannelList() stays the manual
+// re-pull, exposed as the `channelRefresh` capability (the capability names keep their channel-era spelling
+// until the step-4 threads rail replaces the card). Simpler than the session list — no hidden-set / delete:
+// a thread marker IS foolscap's own data (unlike a Claude Code transcript), so removing one is a real act,
+// not a view preference, and is deferred.
 
 export interface ChannelMeta {
-  chanId: string;
+  chanId: string; // the thread id (the field keeps its channel-era name for the pre-rename rail card)
   title: string;
-  text: string; // the channel's description (Slack-topic style), blank by default
+  text: string; // the thread's task brief, blank by default
   messages: number; // total posts (the marker's last seq) — a "how much activity" proxy, like the session turn count
   mtime: number; // last-activity ms (the marker's lastTs), for the "how long ago" line + newest-first ordering
 }
@@ -407,10 +409,10 @@ async function fetchChannelList(force = false): Promise<void> {
   if (channelListInflight && !force) return; // a normal lazy fetch de-dupes; a forced refresh always runs
   channelListInflight = true;
   try {
-    const r = await fetch(`/api/channels?board=${activeBoardId()}`);
+    const r = await fetch(`/api/threads?board=${activeBoardId()}`);
     if (r.ok) {
-      const d = (await r.json()) as { channels?: ChannelMeta[] };
-      channelListValue = d.channels ?? [];
+      const d = (await r.json()) as { threads?: ChannelMeta[] };
+      channelListValue = d.threads ?? [];
       for (const fn of channelListSubs) fn();
     }
   } catch {
@@ -420,26 +422,26 @@ async function fetchChannelList(force = false): Promise<void> {
   }
 }
 
-// The channels card's ⟳ refresh button — re-pull and notify. A live push covers the common case
-// (hookChannelsFeed), but this stays as the manual force (an offline retry, or a be-sure re-pull).
+// The rail card's ⟳ refresh button — re-pull and notify. A live push covers the common case
+// (hookThreadsFeed), but this stays as the manual force (an offline retry, or a be-sure re-pull).
 export function refreshChannelList(): void {
   void fetchChannelList(true);
 }
 
-// Live push for the channels list, mirroring hookSessionsFeed: the server pings `channels:<boardId>` on any
-// marker add/change; we re-pull once per ping (module-level, so N open channels cards still cause one fetch).
-let channelsFeedHooked = false;
-function hookChannelsFeed(): void {
-  if (channelsFeedHooked) return;
-  channelsFeedHooked = true;
-  feedSignal<{ ts: number }>("channels:" + activeBoardId()).subscribe(() => void fetchChannelList(true));
+// Live push for the threads list, mirroring hookSessionsFeed: the server pings `threads:<boardId>` on any
+// marker add/change; we re-pull once per ping (module-level, so N open rail cards still cause one fetch).
+let threadsFeedHooked = false;
+function hookThreadsFeed(): void {
+  if (threadsFeedHooked) return;
+  threadsFeedHooked = true;
+  feedSignal<{ ts: number }>("threads:" + activeBoardId()).subscribe(() => void fetchChannelList(true));
 }
 
 export const channelListSignal: Subscribable<ChannelMeta[] | undefined> = {
   get: () => channelListValue,
   subscribe(onChange) {
     channelListSubs.add(onChange);
-    hookChannelsFeed(); // arm the live push (once) so a new channel appears without a manual refresh
+    hookThreadsFeed(); // arm the live push (once) so a new thread appears without a manual refresh
     if (channelListValue === undefined) void fetchChannelList();
     return () => channelListSubs.delete(onChange);
   },

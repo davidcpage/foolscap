@@ -717,17 +717,19 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   });
 }
 
-// Reopen a channel as a card from the channels browser (the sessions card's twin, card-types/channels). Unlike
-// openSession there's NO server round-trip: a channel's node id IS the channel id (`node:chan:<short>`), and its
-// message log already lives server-side (seeded from `.canvas/channels/` at boot, streamed on channel:<id>), so
-// reopening is purely a canvas act — re-add the node with the SAME id and the card's NodeView re-subscribes to
-// the feed and shows the restored backlog. If a card for this channel is already on the board, FLY to it (select
-// + fitSelection) instead of littering a duplicate; otherwise add it (at the drop point, else viewport-centred)
-// and select it. actor "user" (like createChannel / addSessionsCard) so a reopen is an undoable, attributed act.
-const CHANNEL_CARD_W = 300;
-const CHANNEL_CARD_H = 240;
-export function openChannel(m: InteractionManager, chanId: string, title: string, text: string, at?: Pos): void {
-  const id = chanId as Id<"node">;
+// Reopen a thread as a card from the rail (the sessions card's twin, card-types/channels). Unlike
+// openSession there's NO server round-trip: a thread's node id IS the thread id (`node:thread:<short>`, or
+// a carried-over `node:chan:<short>`), and its message log already lives server-side (seeded from
+// `.canvas/threads/` at boot, streamed on thread:<id>), so reopening is purely a canvas act — re-add the
+// node with the SAME id and the card's NodeView re-subscribes to the feed and shows the restored backlog.
+// The reopened node is typed "thread" regardless of the id's vintage (both types render the same card). If
+// a card for this thread is already on the board, FLY to it (select + fitSelection) instead of littering a
+// duplicate; otherwise add it (at the drop point, else viewport-centred) and select it. actor "user" (like
+// createThread / addSessionsCard) so a reopen is an undoable, attributed act.
+const THREAD_CARD_W = 300;
+const THREAD_CARD_H = 240;
+export function openChannel(m: InteractionManager, threadId: string, title: string, text: string, at?: Pos): void {
+  const id = threadId as Id<"node">;
   if (m.editor.store.get<"node">(id)) {
     m.selection.set([id]);
     m.fitSelection();
@@ -738,13 +740,13 @@ export function openChannel(m: InteractionManager, chanId: string, title: string
     actor: "user",
     payload: {
       id,
-      type: "channel",
-      title: title || "channel",
+      type: "thread",
+      title: title || "thread",
       text: text ?? "",
       color: "purple",
-      ...(at ?? spawnAt(m, CHANNEL_CARD_W, CHANNEL_CARD_H)),
-      w: CHANNEL_CARD_W,
-      h: CHANNEL_CARD_H,
+      ...(at ?? spawnAt(m, THREAD_CARD_W, THREAD_CARD_H)),
+      w: THREAD_CARD_W,
+      h: THREAD_CARD_H,
     },
   });
   m.selection.set([id]);

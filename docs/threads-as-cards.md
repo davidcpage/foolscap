@@ -237,12 +237,16 @@ Rename, don't rebuild — in dependency order:
 1. ~~**Work-intent act** (§6) — the primitive everything derives from; useful for slot management on day
    one, before any thread UI exists.~~ (committed — `POST /api/channel/<id>/intent` on today's channel
    machinery, sid-keyed on the channel meta until seats land at step 2; enum in `app/work-intent.js`.)
-2. **Thread node + ledger** — rename the channel node type, `channel-ledger.js` → thread ledger under
+2. ~~**Thread node + ledger** — rename the channel node type, `channel-ledger.js` → thread ledger under
    `.canvas/threads/`, endpoints `/api/thread/…` (keep `/api/channel/…` as aliases through the
    transition so live agents and the CLAUDE.md recipes don't break mid-flight). The ledger includes
    **seat records** (§5) — one per role brought onto the thread; 1:1 with roles until labelling ships.
    Existing channels carry over as long-lived threads — permitted, just no longer the default shape; the
-   standing dev channel can simply stay open.
+   standing dev channel can simply stay open.~~ (committed — `thread-ledger.js` with a one-time
+   `.canvas/channels/`→`.canvas/threads/` boot migration + legacy `chanId`-marker normalization; node
+   type `"thread"` with `"channel"` accepted as the carried-over legacy type; seats filled at
+   member:open onboarding for role-spawned joiners, work-intents re-keyed to seats; spawn takes
+   `thread` with `channel` aliased; CLAUDE.md rewritten.)
 3. **Derived thread state** — the reflex projection (`session-thread-lifecycle.md` §4) computed
    server-side, exposed on `/api/threads` the way `status` rides `/api/sessions`.
 4. **Threads rail card** (§3) — list + waiting-first sort + drag-out; retire the channels rail.

@@ -18,7 +18,7 @@ import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
 import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
-import { connectToChannel, createChannel, isChannelNode, isSessionNode } from "./channels";
+import { connectToThread, createThread, isThreadNode, isSessionNode } from "./threads";
 import { CanvasView } from "./CanvasView";
 import { MinimapHud } from "./Minimap";
 import { useSignal } from "./reactive";
@@ -118,11 +118,11 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
       }
       return tpl?.aspect ?? null;
     },
-    // Alt-drag wiring (channel membership): the engine carries the gesture, the app owns the meaning. A
-    // session card or a channel card can start/receive a wire; a drop between a session and a channel JOINS
+    // Alt-drag wiring (thread membership): the engine carries the gesture, the app owns the meaning. A
+    // session card or a thread card can start/receive a wire; a drop between a session and a thread JOINS
     // that session (member:open) — the human drawing it is the consent for their own agent (§8).
-    connectable: (nodeId) => isSessionNode(editor, nodeId) || isChannelNode(editor, nodeId),
-    connect: (from, to) => connectToChannel(editor, from, to),
+    connectable: (nodeId) => isSessionNode(editor, nodeId) || isThreadNode(editor, nodeId),
+    connect: (from, to) => connectToThread(editor, from, to),
   });
   restoreAndPersistCamera(m.camera, boardId);
   persistence.attach(editor.store);
@@ -811,8 +811,8 @@ function CanvasMenu({
         <NewSessionItem m={m} at={at} run={run} />
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
         <button onClick={() => run(() => addRolesCard(m, at))}>Roles</button>
-        <button onClick={() => run(() => void createChannel(m.editor, at))}>New channel</button>
-        <button onClick={() => run(() => addChannelsCard(m, at))}>Channels</button>
+        <button onClick={() => run(() => void createThread(m.editor, at))}>New thread</button>
+        <button onClick={() => run(() => addChannelsCard(m, at))}>Threads</button>
         <div className="menu-section">Files</div>
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>

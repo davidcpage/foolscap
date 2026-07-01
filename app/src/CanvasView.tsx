@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { layoutId, selectionBounds, type Box, type CameraState, type Id, type InteractionManager, type Vec } from "./lib";
 import { NodeView } from "./NodeView";
 import { useSignal } from "./reactive";
-import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./channels";
+import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires

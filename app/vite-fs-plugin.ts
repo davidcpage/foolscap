@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
-import { appendChannelLine, canvasChannelsDir, listChannels, readChannelLog, readChannelMeta, upsertChannelMeta } from "./channel-ledger.js";
+import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta } from "./thread-ledger.js";
 import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
@@ -702,28 +702,33 @@ function startSessionsFeed(boardId: string, dir: string): void {
   });
 }
 
-// GET /api/channels → every channel this board has on disk (newest activity first), for the channels-list
-// rail (the channels browser card, the sessions card's twin). Mirrors handleSessions: a cheap readdir of the
-// `.canvas/channels/` markers, NOT the message logs — the rail wants title/description/activity, not the
-// conversation (the card reads that off the channel:<id> feed once opened). `messages` is the last seq, the
-// monotonic count of everything posted; a channel deleted from the canvas still lists here, so "reopen it
-// later" needs no canvas persistence — the marker is the source of truth (the sessions list's .jsonl rationale).
-function handleChannels(res: ServerResponse, repoPath: string): void {
-  const channels = listChannels(repoPath).map((m) => ({
-    chanId: m.chanId as string,
+// GET /api/threads (alias: /api/channels) → every thread this board has on disk (newest activity first),
+// for the list rail (the threads browser card, the sessions card's twin). Mirrors handleSessions: a cheap
+// readdir of the `.canvas/threads/` markers, NOT the message logs — the rail wants title/brief/activity,
+// not the conversation (the card reads that off the thread:<id> feed once opened). `messages` is the last
+// seq, the monotonic count of everything posted; a thread deleted from the canvas still lists here, so
+// "reopen it later" needs no canvas persistence — the marker is the source of truth (the sessions list's
+// .jsonl rationale). Each entry carries the id under BOTH `threadId` (canonical) and `chanId` (what the
+// pre-rename rail card reads), and the response under both `threads` and `channels` — transition aliases.
+function handleThreads(res: ServerResponse, repoPath: string): void {
+  const threads = listThreads(repoPath).map((m) => ({
+    threadId: m.threadId,
+    chanId: m.threadId,
     title: typeof m.title === "string" ? m.title : "",
     text: typeof m.text === "string" ? m.text : "",
     messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
     mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
-    // Latest declared work-intent per member (threads-as-cards §6, sid-keyed until seats) — the raw
-    // material the step-3 thread-state projection derives from; served here so it's already legible.
+    // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
+    // declarer holds one, else sid) — the raw material the step-3 thread-state projection derives from.
     intents: m.intents ?? {},
+    // The §5 seat records: the durable per-thread participants (role posts), 1:1 with roles until labels.
+    seats: m.seats ?? {},
   }));
-  sendJson(res, 200, { channels });
+  sendJson(res, 200, { threads, channels: threads });
 }
 
 // GET /api/roles → every role this board has on disk (by name), for the role-picker on "new session".
-// Mirrors handleChannels: a cheap read of the `.canvas/roles/` markers, NOT the charters — the picker
+// Mirrors handleThreads: a cheap read of the `.canvas/roles/` markers, NOT the charters — the picker
 // wants name/colour, the charter is read only when a role is actually instantiated (handleSessionSpawn).
 function handleRoles(res: ServerResponse, repoPath: string): void {
   sendJson(res, 200, { roles: listRoles(repoPath) });
@@ -756,21 +761,21 @@ async function handleRolesCreate(req: IncomingMessage, res: ServerResponse, repo
 // ── channels-list feed (the channels browser card's live push) ──────────────────────────────────
 // The channels-list mirror of startSessionsFeed: watch `.canvas/channels/` and PING the `channels:<boardId>`
 // feed on any marker add/change (a channel gaining its first message, or a title/activity update); the client
-// re-pulls /api/channels once per ping (content.ts). A bare ping, not the list — handleChannels stays the one
+// re-pulls /api/channels once per ping (content.ts). A bare ping, not the list — handleThreads stays the one
 // place the list is built. mkdir first so chokidar has a directory to watch even before any channel has been
 // persisted (a fresh board). Not pinned on fsState — boardFeedsStarted stops a reload from stacking a second.
-function startChannelsFeed(boardId: string, repoPath: string): void {
-  const dir = canvasChannelsDir(repoPath);
+function startThreadsFeed(boardId: string, repoPath: string): void {
+  const dir = canvasThreadsDir(repoPath);
   try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
   let t: ReturnType<typeof setTimeout> | null = null;
   chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
     if (t) clearTimeout(t);
-    t = setTimeout(() => publishFeed("channels:" + boardId, { ts: Date.now() }), 200);
+    t = setTimeout(() => publishFeed("threads:" + boardId, { ts: Date.now() }), 200);
   });
 }
 
 // ── roles-list feed (the roles browser card's live push) ─────────────────────────────────────────
-// The roles-list mirror of startChannelsFeed: watch `.canvas/roles/` and PING the `roles:<boardId>` feed on
+// The roles-list mirror of startThreadsFeed: watch `.canvas/roles/` and PING the `roles:<boardId>` feed on
 // any role create OR edit, so the roles-list card re-pulls /api/roles. POST /api/roles already pings on
 // create, but a role.md edited THROUGH the file write path (/api/file, the role card's save) wouldn't —
 // the watcher generalises it to any change. depth:1 because a role.md sits one level down (roles/<id>/role.md),
@@ -849,7 +854,7 @@ interface SseClient {
 // watcher on every reload.
 // One channel's off-log message log (4e): the durable-for-the-process record of a channel's conversation,
 // the source for both the channel:<id> feed (the card's conversation view) and the agent's GET /api/inbox.
-interface ChannelMsg {
+interface ThreadMsg {
   seq: number; // monotonic per channel — a session's read cursor is "last seq pulled"
   ts: number;
   from: string; // sender session id, or "human" / "system"
@@ -862,14 +867,14 @@ interface ChannelMsg {
 }
 // A card-only entry never wakes a member and never counts as inbox content — the shared gate for every
 // unread filter (an agent's own bookkeeping must not wake the room).
-const cardOnly = (m: ChannelMsg): boolean => m.kind != null;
+const cardOnly = (m: ThreadMsg): boolean => m.kind != null;
 // §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —
 // the durable log stays broadcast-only). The HTTP response is parked until reply or timeout. Pinned in
 // fsState so the queue survives a hot re-eval; the held `res`/`timer` are process-bound (a restart times
 // them out, which is the correct degradation).
 interface PendingAsk {
   askId: string;
-  chanId: string;
+  threadId: string;
   from: string; // asker sid (its /ask connection is held open)
   to: string; // answerer sid
   text: string;
@@ -885,7 +890,7 @@ interface CanvasFsState {
   sessionWatchers: Map<string, ReturnType<typeof chokidar.watch>>;
   sessionCleanupHooked: boolean;
   shuttingDown?: boolean; // set by killAll so the exit handler tells a clean server shutdown from a real crash
-  channelLogs: Map<string, ChannelMsg[]>; // chanId → its message log (pinned so it survives a hot re-eval)
+  threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
   pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (added via ??= for old pinned state)
 }
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
@@ -895,7 +900,7 @@ const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState
   liveSessions: new Map<string, LiveSession>(),
   sessionWatchers: new Map<string, ReturnType<typeof chokidar.watch>>(),
   sessionCleanupHooked: false,
-  channelLogs: new Map<string, ChannelMsg[]>(),
+  threadLogs: new Map<string, ThreadMsg[]>(),
 });
 // Reference-typed collections aliased by identity so the rest of the file is untouched; the two
 // boolean guards are read/written through fsState (a primitive can't be aliased and still survive).
@@ -905,7 +910,7 @@ const liveSessions = fsState.liveSessions;
 const sessionWatchers = fsState.sessionWatchers;
 // `??=` so a fsState pinned BEFORE this field existed (a hot re-eval) gets the map added in place rather
 // than reading `undefined` and crashing — the object initializer above only runs when fsState is absent.
-const channelLogs = (fsState.channelLogs ??= new Map<string, ChannelMsg[]>());
+const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
 const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
 
 function publishFeed(feed: string, value: unknown): void {
@@ -1105,11 +1110,12 @@ const ASK_CONVENTION =
   "labels short and put the rationale in `description`. Use it whenever the answer is a choice among options.";
 
 // The CANVAS COLLABORATION BRIEF: an appended system-prompt block that tells a canvas-spawned session
-// where it is running and how to coordinate with peers through CHANNELS. The agent learns its own identity
-// (board id, session id, server origin) — all known at spawn — so the protocol is concrete, not "discover
-// the port yourself". Two jobs: TEACH the mechanics (read the board, join/post/flush a channel) and SET
-// NORMS (coordinate & propose; don't execute large/irreversible work without a human nod). The agent works
-// in channel ids + its own sid — the server handles node/edge ids. See docs/agent-to-agent-messaging.md.
+// where it is running and how to coordinate with peers through THREADS (threads-as-cards.md — the per-task
+// container that replaced the long-lived channel; the machinery is identical). The agent learns its own
+// identity (board id, session id, server origin) — all known at spawn — so the protocol is concrete, not
+// "discover the port yourself". Two jobs: TEACH the mechanics (read the board, join/post/read a thread) and
+// SET NORMS (coordinate & propose; don't execute large/irreversible work without a human nod). The agent
+// works in thread ids + its own sid — the server handles node/edge ids.
 function collabBrief(boardId: string, sessionId: string, origin: string): string {
   const base = `http://${origin}`;
   return [
@@ -1120,49 +1126,51 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     `  • your session id: ${sessionId}`,
     `  • server: ${base}`,
     "",
-    "READ THE BOARD (pull — you learn board state by asking; nothing is pushed except channel messages):",
+    "READ THE BOARD (pull — you learn board state by asking; nothing is pushed except thread messages):",
     `  GET ${base}/api/canvas?board=${boardId}  → { snapshot: { records: [...] } }. Records are nodes`,
-    '  (cards) and edges. A session card is {type:"session"} titled with its session id. A CHANNEL is a',
-    '  card {type:"channel"} whose `text` is the channel DESCRIPTION; sessions join it via {type:"member:open"}',
-    "  edges (from session card → channel card).",
+    '  (cards) and edges. A session card is {type:"session"} titled with its session id. A THREAD is a card',
+    '  {type:"thread"} (legacy boards may still carry {type:"channel"} — same thing) whose `text` is the task',
+    '  BRIEF; sessions join it via {type:"member:open"} edges (from session card → thread card).',
     "",
-    "CHANNELS are how you talk to peers. You work in CHANNEL IDS + your own session id; the server resolves",
-    "the rest. A post is always LOGGED for everyone, but it only WAKES the members you @-tag — so name who you",
+    "THREADS are how you talk to peers: a thread is a TASK with a conversation attached — born when work",
+    "starts, closed when it resolves. You work in THREAD IDS + your own session id; the server resolves the",
+    "rest. A post is always LOGGED for everyone, but it only WAKES the members you @-tag — so name who you",
     "need. Tag a member by a prefix of their session id (`@a927e694`, or any unambiguous shorter prefix like",
     "`@a9`); `@all` wakes the whole room; an UNTAGGED post wakes no one (it's ambient — peers see it when they",
     "next read, but you won't interrupt them). If you tag a specific peer and then go idle, your card shows",
     "\"waiting on an agent\" (not \"waiting on a human\"), so untag-and-broadcast only when you really mean it.",
-    `  • post:   POST ${base}/api/channel/<chanId>/message?board=${boardId}  { from:"${sessionId}", text }  (put @tags in text)`,
-    `  • join / accept an invite:  POST ${base}/api/channel/<chanId>/join?board=${boardId}   { from:"${sessionId}" }`,
-    `  • leave / decline:          POST ${base}/api/channel/<chanId>/leave?board=${boardId}  { from:"${sessionId}" }`,
-    `  • invite another session:   POST ${base}/api/channel/<chanId>/invite?board=${boardId} { from:"${sessionId}", target:"<their sid>" }`,
+    `  • post:   POST ${base}/api/thread/<threadId>/message?board=${boardId}  { from:"${sessionId}", text }  (put @tags in text)`,
+    `  • join / accept an invite:  POST ${base}/api/thread/<threadId>/join?board=${boardId}   { from:"${sessionId}" }`,
+    `  • leave / decline:          POST ${base}/api/thread/<threadId>/leave?board=${boardId}  { from:"${sessionId}" }`,
+    `  • invite another session:   POST ${base}/api/thread/<threadId>/invite?board=${boardId} { from:"${sessionId}", target:"<their sid>" }`,
     "    (join/invite take an optional history:\"full\"|\"future\" — default full replays the backlog on first read)",
-    `  • ASK one member (consult & BLOCK for the answer): POST ${base}/api/channel/<chanId>/ask?board=${boardId}`,
+    `  • ASK one member (consult & BLOCK for the answer): POST ${base}/api/thread/<threadId>/ask?board=${boardId}`,
     `      { from:"${sessionId}", to:"<their sid>", text, timeoutMs? } — the call HANGS until they reply (or it`,
     "      times out, ≤60s): { reply:{from,text,ts} } or { timedOut:true }. Use this when you NEED an answer to",
     "      continue (e.g. asking an oracle session); use /message for fire-and-forget. Only the two of you are woken.",
-    "  When you JOIN, the server messages you the channel's description, its members, and these recipes — so you",
-    "  don't need to memorise them. To start a fresh channel, addNode {type:\"channel\", title, text:<description>}",
+    "  When you JOIN, the server messages you the thread's brief, its members, and these recipes — so you",
+    "  don't need to memorise them. To start a fresh thread, addNode {type:\"thread\", title:<the task>, text:<brief>}",
     `  via POST ${base}/api/command?board=${boardId} { type, actor:"${sessionId}", payload }, then invite peers.`,
+    "  One task, one thread: put new work in a new thread rather than piggybacking on an old one.",
     "",
-    "RECEIVING. Channel messages do NOT arrive as your input — they are recorded in the channel. When a peer",
-    "posts, you get a short nudge line `[canvas] new channel messages: ...`. READ the actual messages with a",
+    "RECEIVING. Thread messages do NOT arrive as your input — they are recorded in the thread. When a peer",
+    "posts, you get a short nudge line `[canvas] new thread messages: ...`. READ the actual messages with a",
     "tool call (a normal GET — the result comes back as tool output, any time you like):",
-    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel, title, messages:[{seq,t,from,text}] }] } (from = a short @-taggable handle; t = MM-DD HH:MM)`,
+    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel:<threadId>, title, messages:[{seq,t,from,text}] }] } (from = a short @-taggable handle; t = MM-DD HH:MM)`,
     "  It returns only what is new since your last read and marks it read. Call it when nudged, or proactively",
     "during a long task to check for updates without waiting for a nudge. For a LONG backlog, window the recent",
     `  tail with ?limit=N (last N messages) and/or ?bytes=K (text-byte budget) — e.g. ${base}/api/inbox?session=${sessionId}&bytes=20000;`,
     "  the response carries a `truncated` note when older messages were windowed out (re-join history:\"full\" to replay all).",
     "",
     "ANSWERING ASKS. If a peer /asks you, the nudge says `N pending question(s)`. Read them (they HANG waiting):",
-    `  GET ${base}/api/asks?session=${sessionId}  → { asks:[{ askId, channel, from, text, ts }] }`,
-    `  then answer each: POST ${base}/api/channel/<channel>/reply?board=${boardId} { from:"${sessionId}", askId, text }`,
+    `  GET ${base}/api/asks?session=${sessionId}  → { asks:[{ askId, channel:<threadId>, from, text, ts }] }`,
+    `  then answer each: POST ${base}/api/thread/<threadId>/reply?board=${boardId} { from:"${sessionId}", askId, text }`,
     "  — which unblocks the asker. A consulting (oracle-style) session lives in this loop: be quick, answer in file:line.",
     "",
     "DECLARE YOUR WORK-INTENT. From the outside, idle-but-working, blocked-on-a-human, and finished look",
-    "IDENTICAL (a silent process) — only you know which, so SAY it. Post a typed status into the channel your",
+    "IDENTICAL (a silent process) — only you know which, so SAY it. Post a typed status into the thread your",
     "work belongs to (card-only: it wakes no one, it just keeps the board honest about whose turn it is):",
-    `  POST ${base}/api/channel/<chanId>/intent?board=${boardId}  { from:"${sessionId}", intent, note? }`,
+    `  POST ${base}/api/thread/<threadId>/intent?board=${boardId}  { from:"${sessionId}", intent, note? }`,
     '  intent ∈ "working" | "blocked:human" | "blocked:peer" | "done". Declare "blocked:human" whenever you ask',
     '  the human something and stop; "blocked:peer" while you wait on another session; "done" when your part of',
     "  the work is finished (then wind down, below). A short note says what you're blocked on / what you finished.",
@@ -1171,17 +1179,17 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "amber \"waiting\" band), so when your work is genuinely finished and you don't need the human again, end",
     "your OWN session — its card then settles into a calm \"✓ done\" instead of nagging for attention:",
     `  POST ${base}/api/session/${sessionId}/done   → records this session done and terminates it.`,
-    "  Do this only AFTER you've reported your result / posted any handoff to the channel — it ends the turn.",
-    "  A session is EPHEMERAL: its durable trace is the channel log + any handoff/wiki you leave, NOT the process.",
-    "  To continue this work later, a FRESH session is spawned with the task as its first turn — don't rely on",
-    "  being resumed; a revived session can't tell new instructions from replayed backlog and will just re-finish.",
+    "  Do this only AFTER you've reported your result / posted any handoff to the thread — it ends the turn.",
+    "  A session is EPHEMERAL: its durable trace is the thread log + any handoff/write-up you leave, NOT the",
+    "  process. To continue this work later, a FRESH session is spawned with the task as its first turn — don't",
+    "  rely on being resumed; a revived session can't tell new instructions from replayed backlog and will just re-finish.",
     "",
-    "NORMS. Read the board, talk in channels, and claim work before racing a peer on the same file. Stay within",
-    "your channel's scope/intent. Doing the work you were spawned for — editing files, running tests, and",
+    "NORMS. Read the board, talk in threads, and claim work before racing a peer on the same file. Stay within",
+    "your thread's task/brief. Doing the work you were spawned for — editing files, running tests, and",
     "COMMITTING your work to the local repo — is in bounds and needs no nod: a local commit is a normal act, and",
     "it is NOT a push (they are separate — committing never reaches a remote). What DOES need a human nod first is",
     "the RED LINE: pushing to a remote, anything externally-visible or hard to reverse, deleting another agent's",
-    "work, changing a channel's scope, or spawning a large/costly fan-out of sessions. When one of those is",
+    "work, changing a thread's task/brief, or spawning a large/costly fan-out of sessions. When one of those is",
     "warranted, surface a short plan and wait — otherwise just do the work.",
   ].join("\n");
 }
@@ -1219,13 +1227,13 @@ interface LiveSession {
   // last seq it has read (so a read returns just what's new), plus whether a content-free "you have mail"
   // nudge is owed (fired idle-immediate / at turn-end, coalesced — §9). `origin` is the host:port this
   // session was reached on, kept so a nudge fired without a request can still build absolute URLs.
-  read: Record<string, number>; // chanId → last seq this session has pulled
+  read: Record<string, number>; // threadId → last seq this session has pulled
   nudge: boolean; // a wake nudge is owed (new unread arrived since the last one)
   // Waiting-on-an-agent (channel @-tag): the peer sid(s) this session named in its last channel post and
   // is now waiting on. While set AND idle, the card/status reads blue "waiting on an agent" instead of the
   // loud orange "waiting on a human" (default-loud) — an INFERRED signal (the tag is the evidence, no self-
   // report). Set/overwritten by the session's own posts; PERSISTS across nudges; cleared only when the
-  // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleChannelMessage
+  // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleThreadMessage
   // + sendSessionInput). Not a per-turn flag — it tracks an actual outstanding wait.
   waitingOn: string[] | null;
   // Operating-loop heartbeat (agent-roles.md): a looping ROLE (e.g. the PM) has its idle sessions woken on a
@@ -1404,13 +1412,13 @@ function seedFromTranscript(s: LiveSession): void {
 // tells the worker to expect that and — crucially — NOT to wind down before it arrives (the failure mode
 // that made a stood-down session re-finish on nothing). Its inbox cursor is seeded to the channel tail at
 // spawn (handleSessionSpawn), so the first thing it reads is its assignment, not the backlog.
-function workerBrief(channel: string): string {
+function workerBrief(threadId: string): string {
   return [
-    `YOUR ASSIGNMENT. You were spawned as a worker for channel ${channel}. Your task is NOT in this prompt —`,
-    "it arrives as a CHANNEL MESSAGE tagged to you. Read it with GET /api/inbox (the most recent message",
+    `YOUR ASSIGNMENT. You were spawned as a worker for thread ${threadId}. Your task is NOT in this prompt —`,
+    "it arrives as a THREAD MESSAGE tagged to you. Read it with GET /api/inbox (the most recent message",
     "addressed to you is your assignment); if your inbox is empty it is on its way — stay idle and you'll be",
     "nudged when it lands. Do NOT wind down (/done) until you have received AND completed a task. Read the",
-    "channel's wiki/charter for context, claim files before editing, and report back in the channel.",
+    "thread's brief for context, claim files before editing, and report back in the thread.",
   ].join("\n");
 }
 
@@ -1420,7 +1428,7 @@ function ensureLiveSession(
   resume = false,
   origin = "localhost:5173",
   roleId: string | null = null,
-  channel: string | null = null,
+  threadId: string | null = null,
 ): LiveSession {
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
@@ -1433,12 +1441,12 @@ function ensureLiveSession(
   const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
 
   // Appended system prompt = the ```ask convention + the canvas collaboration brief (env + protocol +
-  // norms) + the role charter if this session has one + a worker brief if spawned into a channel, with this
+  // norms) + the role charter if this session has one + a worker brief if spawned into a thread, with this
   // session's own identity baked in. One --append-system-prompt flag, all blocks.
   const appendPrompt =
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
     (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
-    (channel ? "\n\n" + workerBrief(channel) : "");
+    (threadId ? "\n\n" + workerBrief(threadId) : "");
   const args = [
     "-p",
     resume ? "--resume" : "--session-id",
@@ -1558,7 +1566,7 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
   // But a channel NUDGE (flushNudge passes keepWaitingOn) must NOT clear it: being told to read the channel
   // doesn't end the wait, and clearing on every nudge made the blue evaporate the instant any traffic arrived
   // (the bug that made it un-observable). The wait is ended deliberately — by the awaited peer posting (see
-  // handleChannelMessage) or by the session itself posting something new — not by a passing wake.
+  // handleThreadMessage) or by the session itself posting something new — not by a passing wake.
   if (!opts?.keepWaitingOn) s.waitingOn = null;
   s.child.stdin.write(
     JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }) + "\n",
@@ -1574,78 +1582,79 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
 // READS by tool call (GET /api/inbox → tool output, never a user turn). The only thing pushed to stdin is
 // a content-free NUDGE: "you have N new in channel X — go read it." Coalescing (§9) lives in the nudge:
 // ≤ one wake per idle/result boundary, and an ignored nudge isn't re-fired until NEW traffic arrives.
-const MAX_CHANNEL_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
+const MAX_THREAD_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
 
 // Append to a channel's log, trim to the tail, republish its feed (the card's conversation view), and
 // PERSIST the message to the board's `.canvas/channels/` ledger so it survives a cold restart (the in-memory
-// `channelLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
+// `threadLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
 // every caller already has it. The marker upsert also makes the channel appear in the channels-list rail and
-// keeps its title/description fresh from the live snapshot. Both disk writes are best-effort (channel-ledger).
-function appendChannelMsg(
+// keeps its title/description fresh from the live snapshot. Both disk writes are best-effort (thread-ledger).
+function appendThreadMsg(
   boardId: string,
-  chanId: string,
+  threadId: string,
   from: string,
   text: string,
   extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
-): ChannelMsg {
-  let log = channelLogs.get(chanId);
-  if (!log) channelLogs.set(chanId, (log = []));
+): ThreadMsg {
+  let log = threadLogs.get(threadId);
+  if (!log) threadLogs.set(threadId, (log = []));
   const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
-  const msg: ChannelMsg = { seq, ts: Date.now(), from, text, ...extra };
+  const msg: ThreadMsg = { seq, ts: Date.now(), from, text, ...extra };
   log.push(msg);
   let truncated = false;
-  if (log.length > MAX_CHANNEL_MSGS) { log.splice(0, log.length - MAX_CHANNEL_MSGS); truncated = true; } // keep recent
-  publishFeed("channel:" + chanId, { messages: log, truncated });
+  if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
+  publishFeed("thread:" + threadId, { messages: log, truncated });
   const repoPath = boards.get(boardId)?.repoPath;
   if (repoPath) {
-    appendChannelLine(repoPath, chanId, msg);
-    // Refresh the marker. Title/description ride along only when the snapshot can resolve the channel node
+    appendThreadLine(repoPath, threadId, msg);
+    // Refresh the marker. Title/brief ride along only when the snapshot can resolve the thread node
     // (so a momentary no-snapshot post bumps activity without clobbering a good title with a blank one).
     const records = boardSnapshotRecords(boardId);
-    const chan = records ? channelNode(records, chanId) : null;
+    const thread = records ? threadNode(records, threadId) : null;
     const meta: Record<string, unknown> = { lastSeq: msg.seq, lastTs: msg.ts };
-    if (chan) { meta.title = chan.title ?? ""; meta.text = typeof chan.text === "string" ? chan.text : ""; }
-    upsertChannelMeta(repoPath, chanId, meta);
+    if (thread) { meta.title = thread.title ?? ""; meta.text = typeof thread.text === "string" ? thread.text : ""; }
+    upsertThreadMeta(repoPath, threadId, meta);
   }
   return msg;
 }
 
-// Restore a board's channel logs from `.canvas/channels/*.jsonl` into the in-memory map at boot (once per
-// board, gated by startBoardFeeds). This is the cold-restart fix: without it, a process restart emptied every
-// channel card's conversation. Republishing each restored log to its `channel:<id>` feed seeds feedValues, so
-// a tab that connects to /api/feeds AFTER the restart gets the history replayed (handleFeeds) — the channel
-// card renders its backlog with no message having to arrive first. Channel ids are globally unique, so the
-// shared (cross-board) channelLogs map is safe to seed per board; a log already in memory (a hot re-eval kept
-// it pinned) is left alone — disk and memory agree, and we don't want to clobber a live tail with a stale read.
-function seedChannelLogs(repoPath: string): void {
-  for (const meta of listChannels(repoPath)) {
-    const chanId = meta.chanId as string;
-    if (channelLogs.has(chanId)) continue; // pinned from before a hot re-eval — keep the live one
-    let log = readChannelLog(repoPath, chanId);
-    if (log.length > MAX_CHANNEL_MSGS) log = log.slice(log.length - MAX_CHANNEL_MSGS); // keep the recent tail
-    channelLogs.set(chanId, log);
-    if (log.length) publishFeed("channel:" + chanId, { messages: log, truncated: false });
+// Restore a board's thread logs from `.canvas/threads/*.jsonl` into the in-memory map at boot (once per
+// board, gated by startBoardFeeds, after migrateChannelLedger has moved any pre-rename dir). This is the
+// cold-restart fix: without it, a process restart emptied every thread card's conversation. Republishing
+// each restored log to its `thread:<id>` feed seeds feedValues, so a tab that connects to /api/feeds AFTER
+// the restart gets the history replayed (handleFeeds) — the thread card renders its backlog with no message
+// having to arrive first. Thread ids are globally unique, so the shared (cross-board) threadLogs map is
+// safe to seed per board; a log already in memory (a hot re-eval kept it pinned) is left alone — disk and
+// memory agree, and we don't want to clobber a live tail with a stale read.
+function seedThreadLogs(repoPath: string): void {
+  for (const meta of listThreads(repoPath)) {
+    const threadId = meta.threadId as string;
+    if (threadLogs.has(threadId)) continue; // pinned from before a hot re-eval — keep the live one
+    let log = readThreadLog(repoPath, threadId);
+    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS); // keep the recent tail
+    threadLogs.set(threadId, log);
+    if (log.length) publishFeed("thread:" + threadId, { messages: log, truncated: false });
   }
 }
 
-// The channel ids a session is an OPEN member of (the reverse of channelMemberSids), for nudge/read.
+// The thread ids a session is an OPEN member of (the reverse of threadMemberSids), for nudge/read.
 // Memberships the SERVER has just emitted (a member:open over the bus), so wake / inbox / message logic
 // counts a new member IMMEDIATELY — before the browser's snapshot round-trips back (the ~500ms-to-seconds
 // window the CLAUDE.md "membership must be in the pushed snapshot" gotcha warns about, and what made a task
-// posted right after a spawn miss the new worker). Keyed edgeId → {chan, sid, ts}; channelMemberSids and
-// sessionChannels UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
+// posted right after a spawn miss the new worker). Keyed edgeId → {thread, sid, ts}; threadMemberSids and
+// sessionThreads UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
 // human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
-const emittedMembers = new Map<string, { chan: string; sid: string; ts: number }>();
+const emittedMembers = new Map<string, { thread: string; sid: string; ts: number }>();
 const EMITTED_MEMBER_TTL = 60_000;
 const sidFromSessionNode = (node: string): string | null =>
   node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
 // Non-expired emitted memberships, pruning stale ones in passing.
-function liveEmittedMembers(): Array<{ chan: string; sid: string }> {
+function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
   const now = Date.now();
-  const out: Array<{ chan: string; sid: string }> = [];
+  const out: Array<{ thread: string; sid: string }> = [];
   for (const [edgeId, m] of emittedMembers) {
     if (now - m.ts > EMITTED_MEMBER_TTL) emittedMembers.delete(edgeId);
-    else out.push({ chan: m.chan, sid: m.sid });
+    else out.push({ thread: m.thread, sid: m.sid });
   }
   return out;
 }
@@ -1660,37 +1669,37 @@ function trackEmittedMembership(cmd: { type: string; payload?: Record<string, un
   if (cmd.type !== "addEdge" || String(p.type ?? "") !== "member:open") return;
   const sid = typeof p.from === "string" ? sidFromSessionNode(p.from) : null;
   if (typeof p.id === "string" && typeof p.to === "string" && sid)
-    emittedMembers.set(p.id, { chan: p.to, sid, ts: Date.now() });
+    emittedMembers.set(p.id, { thread: p.to, sid, ts: Date.now() });
 }
 
-function sessionChannels(records: Array<Record<string, unknown>>, sid: string): string[] {
+function sessionThreads(records: Array<Record<string, unknown>>, sid: string): string[] {
   const out: string[] = [];
   const node = sessionNodeForSid(records, sid);
   if (node)
     for (const r of records)
-      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && channelNode(records, String(r.to)))
+      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && threadNode(records, String(r.to)))
         out.push(String(r.to));
-  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.chan)) out.push(m.chan);
+  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
   return out;
 }
 
-// A message arrived in a channel: mark every OTHER live member as owing a nudge and wake the idle ones now
+// A message arrived in a thread: mark every OTHER live member as owing a nudge and wake the idle ones now
 // (busy ones fire at their turn boundary). Returns how many live members were notified.
 // Wake the members a post NAMED (4-tag era): `wakeSids` is the explicit set of sids to nudge (the @-tag
 // resolution). A null set means "the whole room" (an `@all` post, or any non-tagging caller) — the old
 // broadcast. An empty set wakes no one: an untagged post is ambient — logged for everyone to read on their
 // own cursor, but it interrupts nobody. The sender is always skipped. The unread CURSOR is untouched here,
 // so a member that wasn't woken still sees the message next time it reads — wake is gated, content is not.
-function wakeChannelMembers(
+function wakeThreadMembers(
   boardId: string,
-  chanId: string,
+  threadId: string,
   exceptSid: string,
   wakeSids: Set<string> | null,
 ): number {
   const records = boardSnapshotRecords(boardId);
   if (!records) return 0;
   let woken = 0;
-  for (const sid of channelMemberSids(records, chanId)) {
+  for (const sid of threadMemberSids(records, threadId)) {
     if (sid === exceptSid) continue;
     if (wakeSids && !wakeSids.has(sid)) continue; // named-only; null ⇒ broadcast (whole room)
     const s = liveSessions.get(sid);
@@ -1704,22 +1713,22 @@ function wakeChannelMembers(
 
 // The content-free wake: one coalesced user-text line naming the channels with unread + the read recipe.
 // Message CONTENT is deliberately absent — the agent fetches it with the tool call, so it lands in tool
-// output. Clears the nudge flag; re-armed only when new traffic calls wakeChannelMembers again.
+// output. Clears the nudge flag; re-armed only when new traffic calls wakeThreadMembers again.
 function flushNudge(s: LiveSession): void {
   s.nudge = false;
   const boardId = boardIdentity(s.repoPath).boardId;
   const records = boardSnapshotRecords(boardId);
   if (!records) return;
   const parts: string[] = [];
-  for (const chanId of sessionChannels(records, s.id)) {
-    const log = channelLogs.get(chanId) ?? [];
-    const cursor = s.read[chanId] ?? 0;
+  for (const threadId of sessionThreads(records, s.id)) {
+    const log = threadLogs.get(threadId) ?? [];
+    const cursor = s.read[threadId] ?? 0;
     const unread = log.filter((m) => m.seq > cursor && !cardOnly(m)).length; // card-only entries don't wake
-    if (unread > 0) parts.push(`"${channelNode(records, chanId)?.title || chanId}" (${unread} new)`);
+    if (unread > 0) parts.push(`"${threadNode(records, threadId)?.title || threadId}" (${unread} new)`);
   }
   const asks = [...pendingAsks.values()].filter((a) => a.to === s.id).length; // §16 pending consultations
   const lines: string[] = [];
-  if (parts.length) lines.push(`new channel messages: ${parts.join(", ")} — GET http://${s.origin}/api/inbox?session=${s.id}`);
+  if (parts.length) lines.push(`new thread messages: ${parts.join(", ")} — GET http://${s.origin}/api/inbox?session=${s.id}`);
   if (asks) lines.push(`${asks} pending question${asks === 1 ? "" : "s"} — GET http://${s.origin}/api/asks?session=${s.id}`);
   if (lines.length === 0) return;
   sendSessionInput(s.id, `[canvas] ${lines.join("; ")}`, { keepWaitingOn: true });
@@ -1750,10 +1759,10 @@ function loopWorldSig(s: LiveSession): string {
   const records = boardSnapshotRecords(boardId);
   if (!records) return s.loopSig; // no snapshot to read → treat as unchanged, don't thrash the cadence
   const parts: string[] = [];
-  for (const chanId of sessionChannels(records, s.id)) {
-    const log = channelLogs.get(chanId) ?? [];
-    parts.push(chanId + ":" + (log.length ? log[log.length - 1]!.seq : 0));
-    for (const sid of channelMemberSids(records, chanId)) {
+  for (const threadId of sessionThreads(records, s.id)) {
+    const log = threadLogs.get(threadId) ?? [];
+    parts.push(threadId + ":" + (log.length ? log[log.length - 1]!.seq : 0));
+    for (const sid of threadMemberSids(records, threadId)) {
       const m = liveSessions.get(sid);
       parts.push(sid + "=" + (m ? m.status + (m.waitingOn?.length ? "/wa" : "") : "off"));
     }
@@ -1841,14 +1850,14 @@ const WORKER_CARD_H = 520;
 // visible), stepping down-right. Falls back to a near-origin cascade when the channel isn't resolvable.
 function placeWorkerCard(
   records: Array<Record<string, unknown>> | null,
-  chanId: string | null,
+  threadId: string | null,
 ): { x: number; y: number; w: number; h: number } {
   const OVERLAP_X = 120; // worker's left edge sits this far inside the channel card's right edge
   const CASCADE = 56; // per-worker down-right step
-  const n = records && chanId ? channelMemberSids(records, chanId).length : 0;
+  const n = records && threadId ? threadMemberSids(records, threadId).length : 0;
   const layout =
-    records && chanId
-      ? (records.find((r) => r.typeName === "layout" && (r as { nodeId?: unknown }).nodeId === chanId) as
+    records && threadId
+      ? (records.find((r) => r.typeName === "layout" && (r as { nodeId?: unknown }).nodeId === threadId) as
           | { x?: number; y?: number; w?: number }
           | undefined)
       : undefined;
@@ -1866,7 +1875,7 @@ async function handleSessionSpawn(
   boardId: string,
   origin: string,
 ): Promise<void> {
-  let body: { prompt?: unknown; roleId?: unknown; channel?: unknown; card?: unknown } = {};
+  let body: { prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown } = {};
   try {
     const raw = await readBody(req);
     if (raw) body = JSON.parse(raw);
@@ -1888,20 +1897,23 @@ async function handleSessionSpawn(
     roleName = role.name;
     roleColour = role.colour;
   }
-  const chanId = typeof body.channel === "string" && body.channel ? body.channel : null;
+  // `thread` is the canonical spawn-into scope since §8 step 2; `channel` stays a working alias so live
+  // agents and old recipes don't break mid-transition.
+  const scope = typeof body.thread === "string" && body.thread ? body.thread : body.channel;
+  const threadId = typeof scope === "string" && scope ? scope : null;
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, chanId);
+    ensureLiveSession(id, repoPath, false, origin, roleId, threadId);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }
   // A worker spawned into a channel starts its inbox at the channel's TAIL (history:"future"), seeded HERE —
   // not via the snapshot-racing member:open onboarding — so its first read is its assignment, not the whole
   // backlog (the replay-burial failure mode that made a returning session dismiss its task as old history).
-  if (chanId) {
-    pendingHistoryMode.set(historyKey(chanId, id), "future");
+  if (threadId) {
+    pendingHistoryMode.set(historyKey(threadId, id), "future");
     const live = liveSessions.get(id);
-    if (live) live.read[chanId] = seedCursor("future", channelLogs.get(chanId) ?? []);
+    if (live) live.read[threadId] = seedCursor("future", threadLogs.get(threadId) ?? []);
   }
   // Optionally drop the session's canvas card (and, with `channel`, its member:open edge) HERE on the
   // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
@@ -1911,18 +1923,18 @@ async function handleSessionSpawn(
   // before the snapshot round-trips. `carded` reports whether a live tab applied it. Browser-initiated
   // spawns omit these params and keep placing their own card. `card:true` = a standalone card, no edge.
   let carded = false;
-  if (chanId || body.card === true) {
+  if (threadId || body.card === true) {
     const records = boardSnapshotRecords(boardId);
     const node = `node:live:${id}`;
     const nodePayload: Record<string, unknown> = {
-      id: node, type: "session", title: id, color: roleColour ?? "blue", ...placeWorkerCard(records, chanId),
+      id: node, type: "session", title: id, color: roleColour ?? "blue", ...placeWorkerCard(records, threadId),
     };
     if (roleName) nodePayload.name = `${roleName}.${id.slice(0, 8)}`;
     carded = dispatchBusCommand(boardId, { type: "addNode", actor: "system", payload: nodePayload }, origin) > 0;
-    if (chanId)
+    if (threadId)
       dispatchBusCommand(
         boardId,
-        { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${chanId}`, from: node, to: chanId, type: "member:open" } },
+        { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${threadId}`, from: node, to: threadId, type: "member:open" } },
         origin,
       );
   }
@@ -2335,8 +2347,9 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   startGitHeadFeed(boardId, repoPath);
   startSessionsFeed(boardId, sessionsDir(repoPath));
   startWorktreesFeed(boardId, repoPath);
-  seedChannelLogs(repoPath); // restore channel conversations from `.canvas/channels/` (cold-restart fix)
-  startChannelsFeed(boardId, repoPath); // live-push the channels-list rail as channels gain activity
+  migrateChannelLedger(repoPath); // one-time §8 step 2 rename: `.canvas/channels/` → `.canvas/threads/`
+  seedThreadLogs(repoPath); // restore thread conversations from `.canvas/threads/` (cold-restart fix)
+  startThreadsFeed(boardId, repoPath); // live-push the list rail as threads gain activity
   seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
   startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
@@ -2590,30 +2603,31 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
   res.end(blob);
 }
 
-// ── channels (Phase 4: the reified attention-graph) ───────────────────────────────────────────────
-// agent-to-agent-messaging.md §9, evolved: instead of a typed edge BETWEEN two session cards, the
-// relationship is REIFIED as a channel NODE (a card). Its `text` is the CHARTER — editable like any card,
-// not a write-once modal. A session joins by a `member:open` edge (session→channel); a post to the channel
-// fans out to every other open member. 1:1 chat is just a 2-member channel. The whole lifecycle rides the
-// EXISTING addEdge/removeEdge bus commands (each a logged, undoable channel-3 act, §12); only the MESSAGE
-// fan-out is server-side and OFF-LOG (no IntentEvent — it lands in each recipient's transcript, §4).
+// ── threads (threads-as-cards.md — the per-task container; renamed from channels at §8 step 2) ──────
+// A THREAD is a task with a conversation attached, reified as a NODE (a card): its `title` is the task,
+// its `text` the BRIEF — editable like any card. A session joins by a `member:open` edge (session→thread);
+// a post to the thread fans out to every other open member. The whole lifecycle rides the EXISTING
+// addEdge/removeEdge bus commands (each a logged, undoable channel-3 act); only the MESSAGE fan-out is
+// server-side and OFF-LOG (no IntentEvent — it lands in each recipient's transcript). Everything below is
+// served under BOTH /api/thread/… (canonical) and /api/channel/… (transition alias — live agents and old
+// recipes keep working; carried-over {type:"channel"} nodes are threads too, see threadNode).
 //
-//   POST /api/channel/<chanId>/message ?board=  { from, text } — fan out to all other open members
-//   POST /api/channel/<chanId>/join    ?board=  { from, history? } — open membership/accept (history: full|future)
-//   POST /api/channel/<chanId>/leave   ?board=  { from }       — drop the membership (sever)
-//   POST /api/channel/<chanId>/invite  ?board=  { from, target, history? } — propose membership for another session
-//   POST /api/channel/<chanId>/history ?board=  { target, mode } — set a member's backlog visibility (full|future)
-//   POST /api/channel/<chanId>/intent  ?board=  { from, intent, note? } — declare work-intent (card-only typed act)
-//   GET  /api/inbox ?session=<sid>                            — read this session's unread channel messages
+//   POST /api/thread/<threadId>/message ?board=  { from, text } — fan out to all other open members
+//   POST /api/thread/<threadId>/join    ?board=  { from, history? } — open membership/accept (history: full|future)
+//   POST /api/thread/<threadId>/leave   ?board=  { from }       — drop the membership (sever)
+//   POST /api/thread/<threadId>/invite  ?board=  { from, target, history? } — propose membership for another session
+//   POST /api/thread/<threadId>/history ?board=  { target, mode } — set a member's backlog visibility (full|future)
+//   POST /api/thread/<threadId>/intent  ?board=  { from, intent, note? } — declare work-intent (card-only typed act)
+//   GET  /api/inbox ?session=<sid>                            — read this session's unread thread messages
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
-// never has to construct node/edge ids — it works in channel ids + its own sid only.
+// never has to construct node/edge ids — it works in thread ids + its own sid only.
 
 interface SnapNode {
   typeName: "node";
   id: string;
   type: string;
   title: string;
-  text?: string; // a channel node's `text` is its (optional) description
+  text?: string; // a thread node's `text` is its (optional) task brief
 }
 
 // The records of a board's last pushed snapshot ({ snapshot:{ records:[…] } }), or null if no tab of that
@@ -2647,9 +2661,11 @@ function sessionNodeForSid(records: Array<Record<string, unknown>>, sid: string)
 }
 
 // The channel card by id (or null if that id isn't a channel node).
-function channelNode(records: Array<Record<string, unknown>>, chanId: string): SnapNode | null {
-  const n = records.find((r) => r.typeName === "node" && r.id === chanId) as SnapNode | undefined;
-  return n && n.type === "channel" ? n : null;
+function threadNode(records: Array<Record<string, unknown>>, threadId: string): SnapNode | null {
+  const n = records.find((r) => r.typeName === "node" && r.id === threadId) as SnapNode | undefined;
+  // "thread" is the node type since §8 step 2; "channel" is the carried-over legacy type (existing
+  // channels live on as long-lived threads — same card, same machinery).
+  return n && (n.type === "thread" || n.type === "channel") ? n : null;
 }
 
 // A session card's display NAME (the new `name` field a role-spawned card carries, `<RoleName>.<short-sid>`),
@@ -2663,15 +2679,15 @@ function sessionNameForSid(records: Array<Record<string, unknown>>, sid: string)
 }
 
 // The session ids of a channel's OPEN members (from each member:open edge session→channel).
-function channelMemberSids(records: Array<Record<string, unknown>>, chanId: string): string[] {
+function threadMemberSids(records: Array<Record<string, unknown>>, threadId: string): string[] {
   const out: string[] = [];
   for (const r of records) {
-    if (r.typeName === "edge" && r.to === chanId && String(r.type) === "member:open") {
+    if (r.typeName === "edge" && r.to === threadId && String(r.type) === "member:open") {
       const sid = nodeSessionId(records, String(r.from));
       if (sid && !out.includes(sid)) out.push(sid);
     }
   }
-  for (const m of liveEmittedMembers()) if (m.chan === chanId && !out.includes(m.sid)) out.push(m.sid);
+  for (const m of liveEmittedMembers()) if (m.thread === threadId && !out.includes(m.sid)) out.push(m.sid);
   return out;
 }
 
@@ -2712,23 +2728,24 @@ function dispatchBusCommand(
 const announcedMemberships = new Set<string>();
 const announceKey = (id: string, type: string): string => `${id}|${type}`;
 
-// How much of the backlog a not-yet-onboarded member should see, keyed `<chanId>|<sid>`. Set by an
+// How much of the backlog a not-yet-onboarded member should see, keyed `<threadId>|<sid>`. Set by an
 // invite/join (or the /history action) that names a mode; consumed + cleared when member:open onboarding
 // seeds the read cursor. ABSENT ⇒ the default, FULL history — a new member replays the whole backlog on
 // their first inbox read (Slack public-channel style). "future" is the opt-out (start at the tail).
 const pendingHistoryMode = new Map<string, "full" | "future">();
-const historyKey = (chanId: string, sid: string): string => `${chanId}|${sid}`;
+const historyKey = (threadId: string, sid: string): string => `${threadId}|${sid}`;
 const historyMode = (v: unknown): "full" | "future" | undefined => (v === "full" || v === "future" ? v : undefined);
 // The read cursor that gives `sid` the chosen visibility of `log`: full ⇒ 0 (everything is unread), future
 // ⇒ the current tail (only messages from here on). The single source of "how much backlog replays".
-const seedCursor = (mode: "full" | "future", log: ChannelMsg[]): number =>
+const seedCursor = (mode: "full" | "future", log: ThreadMsg[]): number =>
   mode === "future" && log.length ? log[log.length - 1]!.seq : 0;
 
 // When a membership edge crosses the bus, ONBOARD the affected session. Onboarding (and only onboarding) is
 // a user-text push — the one allowed content injection, since it IS the wake, not a peer message. The
 // actual conversation never lands here. member:pending → invite the target; member:open → welcome the
-// joiner (description + roster + post/read recipes) and log "X joined" into the channel (a system line the
-// card shows) + nudge the existing members. Best-effort: if the snapshot can't resolve the nodes, skip.
+// joiner (brief + roster + post/read recipes), log "X joined" into the thread (a system line the card
+// shows) + nudge the existing members, and FILL THE SEAT (§5) when the joiner carries a role. Best-effort:
+// if the snapshot can't resolve the nodes, skip.
 function maybeAnnounceMembership(
   boardId: string,
   cmd: { type: string; payload?: Record<string, unknown> },
@@ -2747,61 +2764,71 @@ function maybeAnnounceMembership(
   if (!type.startsWith("member:")) return;
   const records = boardSnapshotRecords(boardId);
   if (!records) return;
-  const chan = channelNode(records, String(p.to));
+  const thread = threadNode(records, String(p.to));
   const sid = nodeSessionId(records, String(p.from));
-  if (!chan || !sid) return;
+  if (!thread || !sid) return;
   const base = `http://${origin}`;
-  const title = chan.title || "(untitled)";
-  const description = descriptionOf(chan);
-  const descLine = description ? `description: ${description}\n` : ""; // optional — omit when blank
+  const title = thread.title || "(untitled)";
+  const description = descriptionOf(thread);
+  const descLine = description ? `brief: ${description}\n` : ""; // optional — omit when blank
 
   if (type === "member:pending") {
     if (announcedMemberships.has(announceKey(String(p.id), type))) return;
     announcedMemberships.add(announceKey(String(p.id), type));
     sendSessionInput(
       sid,
-      `[canvas] You're invited to channel ${chan.id} "${title}".\n${descLine}` +
-        `to accept: POST ${base}/api/channel/${chan.id}/join {"from":"${sid}"}  ` +
+      `[canvas] You're invited to thread ${thread.id} "${title}".\n${descLine}` +
+        `to accept: POST ${base}/api/thread/${thread.id}/join {"from":"${sid}"}  ` +
         `(add "history":"future" to skip the backlog and start at the latest)\n` +
-        `to decline: POST ${base}/api/channel/${chan.id}/leave {"from":"${sid}"}`,
+        `to decline: POST ${base}/api/thread/${thread.id}/leave {"from":"${sid}"}`,
     );
     return;
   }
   if (type === "member:open") {
     if (announcedMemberships.has(announceKey(String(p.id), type))) return;
     announcedMemberships.add(announceKey(String(p.id), type));
-    const others = channelMemberSids(records, chan.id).filter((m) => m !== sid);
+    const others = threadMemberSids(records, thread.id).filter((m) => m !== sid);
     const roster = [sid, ...others].join(", ");
     // full (the default) → the joiner's first inbox read replays the whole backlog; future → only new ones.
-    const mode = pendingHistoryMode.get(historyKey(chan.id, sid)) ?? "full";
-    pendingHistoryMode.delete(historyKey(chan.id, sid));
-    const log = channelLogs.get(chan.id) ?? [];
+    const mode = pendingHistoryMode.get(historyKey(thread.id, sid)) ?? "full";
+    pendingHistoryMode.delete(historyKey(thread.id, sid));
+    const log = threadLogs.get(thread.id) ?? [];
     const backlog =
       log.length && mode === "full"
         ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read${log.length > 60 ? "; for a long backlog window the tail with ?bytes=20000 or ?limit=40" : ""})`
         : "";
     sendSessionInput(
       sid,
-      `[canvas] You joined channel ${chan.id} "${title}".\n${descLine}members: ${roster}\n` +
-        `post: POST ${base}/api/channel/${chan.id}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
-        `consult one member and block for the answer: POST ${base}/api/channel/${chan.id}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
-        `declare your work-intent (card-only, wakes no one): POST ${base}/api/channel/${chan.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished\n` +
+      `[canvas] You joined thread ${thread.id} "${title}".\n${descLine}members: ${roster}\n` +
+        `post: POST ${base}/api/thread/${thread.id}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
+        `consult one member and block for the answer: POST ${base}/api/thread/${thread.id}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
+        `declare your work-intent (card-only, wakes no one): POST ${base}/api/thread/${thread.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished\n` +
         `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
     );
     if (others.length) {
-      appendChannelMsg(boardId, chan.id, "system", `${sid} joined the channel. members now: ${roster}.`);
-      wakeChannelMembers(boardId, chan.id, sid, null); // a join is a room event — broadcast it to all members
+      appendThreadMsg(boardId, thread.id, "system", `${sid} joined the thread. members now: ${roster}.`);
+      wakeThreadMembers(boardId, thread.id, sid, null); // a join is a room event — broadcast it to all members
     }
     const js = liveSessions.get(sid);
-    if (js) js.read[chan.id] = seedCursor(mode, log);
+    if (js) js.read[thread.id] = seedCursor(mode, log);
+    // Seat (§5): a role-spawned joiner FILLS its role's seat on this thread — created on first join,
+    // re-occupied (same seat, new sid) when a fresh session of the role arrives. The role rides the
+    // session card's `name` ("RoleName.<short-sid>"); a plain unnamed session takes no seat (it stays a
+    // sid-identified participant). 1:1 with roles until labelled multiplicity ships.
+    const name = sessionNameForSid(records, sid);
+    if (name) {
+      const role = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
+      const repoPath = boards.get(boardId)?.repoPath;
+      if (role && repoPath) fillSeat(repoPath, thread.id, role, sid, Date.now());
+    }
   }
 }
 
-async function handleChannelMessage(
+async function handleThreadMessage(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
 ): Promise<void> {
   let body: { from?: unknown; text?: unknown };
   try {
@@ -2813,10 +2840,10 @@ async function handleChannelMessage(
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
 
   const from = body.from;
-  const members = channelMemberSids(records, chanId);
+  const members = threadMemberSids(records, threadId);
   // Consent: a SESSION must have joined to post (symmetry with receiving). A non-session `from` (the human
   // at the channel card) is the board owner and may post to any channel — §7, legibility not authz.
   if (sessionNodeForSid(records, from) && !members.includes(from))
@@ -2824,7 +2851,7 @@ async function handleChannelMessage(
 
   // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
   // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
-  const msg = appendChannelMsg(boardId, chanId, from, body.text);
+  const msg = appendThreadMsg(boardId, threadId, from, body.text);
   // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
   // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
   // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
@@ -2833,7 +2860,7 @@ async function handleChannelMessage(
   const wakeSids = wakeAll ? null : new Set(tagged);
   const ss = liveSessions.get(from);
   if (ss) {
-    ss.read[chanId] = msg.seq;
+    ss.read[threadId] = msg.seq;
     // Blue "waiting on an agent": the sender named a specific peer (not @all, not the human) and will idle
     // after this turn waiting on them. Inferred from the tag — no self-report. Each of the sender's posts
     // OVERWRITES this: tagging a peer sets it; a broadcast / human-directed / untagged post clears it (the
@@ -2853,8 +2880,8 @@ async function handleChannelMessage(
       publishSession(w);
     }
   }
-  const notified = wakeChannelMembers(boardId, chanId, from, wakeSids);
-  sendJson(res, 200, { ok: true, channel: chanId, from, seq: msg.seq, members: members.length, notified });
+  const notified = wakeThreadMembers(boardId, threadId, from, wakeSids);
+  sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified });
 }
 
 // Resolve a channel id + a session sid to the membership edge between them (any member:* phase), so join
@@ -2862,19 +2889,19 @@ async function handleChannelMessage(
 function memberEdge(
   records: Array<Record<string, unknown>>,
   sessionNode: string,
-  chanId: string,
+  threadId: string,
 ): string | null {
   const e = records.find(
-    (r) => r.typeName === "edge" && r.from === sessionNode && r.to === chanId && String(r.type).startsWith("member:"),
+    (r) => r.typeName === "edge" && r.from === sessionNode && r.to === threadId && String(r.type).startsWith("member:"),
   );
   return e ? String(e.id) : null;
 }
 
-async function handleChannelMembership(
+async function handleThreadMembership(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
   action: "join" | "leave" | "invite",
   origin: string,
 ): Promise<void> {
@@ -2887,7 +2914,7 @@ async function handleChannelMembership(
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
 
   // For join/leave the actor is the joining session; for invite it's the target being proposed.
   const subjectSid = action === "invite" ? (typeof body.target === "string" ? body.target : "") : body.from;
@@ -2899,34 +2926,34 @@ async function handleChannelMembership(
   // when it seeds the cursor (a pending invite carries it through to the eventual accept). Absent ⇒ default.
   if (action !== "leave") {
     const mode = historyMode(body.history);
-    if (mode) pendingHistoryMode.set(historyKey(chanId, subjectSid), mode);
+    if (mode) pendingHistoryMode.set(historyKey(threadId, subjectSid), mode);
   }
 
   let cmd: { type: string; payload: Record<string, unknown>; actor: string };
   if (action === "leave") {
-    const id = memberEdge(records, sessionNode, chanId);
+    const id = memberEdge(records, sessionNode, threadId);
     if (!id) return sendJson(res, 404, { error: "not a member of this channel" });
     cmd = { type: "removeEdge", actor: body.from, payload: { id } };
   } else {
-    const id = memberEdge(records, sessionNode, chanId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
+    const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
     const type = action === "join" ? "member:open" : "member:pending";
-    cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: chanId, type } };
+    cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
   }
   const delivered = dispatchBusCommand(boardId, cmd, origin);
   if (delivered === 0) return sendJson(res, 503, { error: "no tab of this board is live to apply it", delivered: 0 });
-  sendJson(res, 200, { ok: true, channel: chanId, action, subject: subjectSid });
+  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid });
 }
 
-// POST /api/channel/<id>/history { target, mode:"full"|"future" } — set how much of the backlog a member
+// POST /api/thread/<id>/history { target, mode:"full"|"future" } — set how much of the backlog a member
 // sees. For a LIVE open member it re-seeds the read cursor now (full ⇒ the backlog is unread again, replayed
 // on the next inbox read, and we nudge them; future ⇒ jump past it to the tail). For a not-yet-onboarded
 // invitee it stashes the choice for join time. This is the human's per-member control on the channel card;
 // agents get the same at join time via the /join,/invite body. Returns where it applied (now | on-join).
-async function handleChannelHistory(
+async function handleThreadHistory(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
 ): Promise<void> {
   let body: { target?: unknown; mode?: unknown };
   try {
@@ -2939,22 +2966,22 @@ async function handleChannelHistory(
   if (typeof body.target !== "string" || !body.target) return sendJson(res, 400, { error: "missing target" });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
 
   const sid = body.target;
   const live = liveSessions.get(sid);
-  if (live && live.status !== "exited" && channelMemberSids(records, chanId).includes(sid)) {
-    live.read[chanId] = seedCursor(mode, channelLogs.get(chanId) ?? []);
+  if (live && live.status !== "exited" && threadMemberSids(records, threadId).includes(sid)) {
+    live.read[threadId] = seedCursor(mode, threadLogs.get(threadId) ?? []);
     let notified = 0;
     if (mode === "full") {
       live.nudge = true; // the backlog is unread for them again — wake them to (re-)read it
       if (live.status === "idle") flushNudge(live);
       notified = 1;
     }
-    return sendJson(res, 200, { ok: true, channel: chanId, target: sid, mode, applied: "now", notified });
+    return sendJson(res, 200, { ok: true, channel: threadId, target: sid, mode, applied: "now", notified });
   }
-  pendingHistoryMode.set(historyKey(chanId, sid), mode); // not onboarded yet — apply when they go open
-  sendJson(res, 200, { ok: true, channel: chanId, target: sid, mode, applied: "on-join" });
+  pendingHistoryMode.set(historyKey(threadId, sid), mode); // not onboarded yet — apply when they go open
+  sendJson(res, 200, { ok: true, channel: threadId, target: sid, mode, applied: "on-join" });
 }
 
 // ── §16 ask/reply: synchronous consultation over channel membership ───────────────────────────────────
@@ -2974,14 +3001,14 @@ function settleAsk(askId: string, payload: Record<string, unknown>): void {
   }
 }
 
-// POST /api/channel/<id>/ask { from, to, text, timeoutMs? } — a binary consultation: BOTH must be members
-// (consent, mirroring handleChannelMessage), the answerer is nudged, and the asker's connection is HELD
-// until /reply or timeout. Never touches channelLogs — the broadcast log stays untouched (§16).
-async function handleChannelAsk(
+// POST /api/thread/<id>/ask { from, to, text, timeoutMs? } — a binary consultation: BOTH must be members
+// (consent, mirroring handleThreadMessage), the answerer is nudged, and the asker's connection is HELD
+// until /reply or timeout. Never touches threadLogs — the broadcast log stays untouched (§16).
+async function handleThreadAsk(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
 ): Promise<void> {
   let body: { from?: unknown; to?: unknown; text?: unknown; timeoutMs?: unknown };
   try {
@@ -2995,8 +3022,8 @@ async function handleChannelAsk(
   if (body.to === body.from) return sendJson(res, 400, { error: "cannot ask yourself" });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
-  const members = channelMemberSids(records, chanId);
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
+  const members = threadMemberSids(records, threadId);
   if (!members.includes(body.from)) return sendJson(res, 403, { error: "asker is not a member of this channel" });
   if (!members.includes(body.to)) return sendJson(res, 403, { error: "answerer is not a member of this channel" });
   const answerer = liveSessions.get(body.to);
@@ -3007,7 +3034,7 @@ async function handleChannelAsk(
   const wanted = Number(body.timeoutMs);
   const timeoutMs = Math.min(Number.isFinite(wanted) && wanted > 0 ? wanted : ASK_TIMEOUT_DEFAULT, ASK_TIMEOUT_MAX);
   const timer = setTimeout(() => settleAsk(askId, { askId, timedOut: true }), timeoutMs);
-  pendingAsks.set(askId, { askId, chanId, from: body.from, to: body.to, text: body.text, ts: Date.now(), res, timer });
+  pendingAsks.set(askId, { askId, threadId, from: body.from, to: body.to, text: body.text, ts: Date.now(), res, timer });
   // Nudge ONLY the answerer (reuse the §15 coalescing): idle → wake now; busy → fire at the result boundary.
   answerer.nudge = true;
   if (answerer.status === "idle") flushNudge(answerer);
@@ -3020,18 +3047,18 @@ function handleAsksRead(res: ServerResponse, sid: string | null): void {
   if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
   const asks = [...pendingAsks.values()]
     .filter((a) => a.to === sid)
-    .map((a) => ({ askId: a.askId, channel: a.chanId, from: a.from, text: a.text, ts: a.ts }));
+    .map((a) => ({ askId: a.askId, channel: a.threadId, from: a.from, text: a.text, ts: a.ts }));
   sendJson(res, 200, { asks, count: asks.length });
 }
 
-// POST /api/channel/<id>/reply { from, askId, text } — ONLY the addressee answers. Resolves the asker's
+// POST /api/thread/<id>/reply { from, askId, text } — ONLY the addressee answers. Resolves the asker's
 // held connection and echoes a card-only Q→A summary (kind:"ask") so the channel card stays legible
 // without waking the other members (§16 seam).
-async function handleChannelReply(
+async function handleThreadReply(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
 ): Promise<void> {
   let body: { from?: unknown; askId?: unknown; text?: unknown };
   try {
@@ -3044,30 +3071,30 @@ async function handleChannelReply(
   if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
   const ask = pendingAsks.get(body.askId);
   if (!ask) return sendJson(res, 404, { error: "no such pending ask (already answered or timed out)" });
-  if (ask.chanId !== chanId) return sendJson(res, 400, { error: "askId belongs to a different channel" });
+  if (ask.threadId !== threadId) return sendJson(res, 400, { error: "askId belongs to a different channel" });
   if (ask.from === body.from) return sendJson(res, 403, { error: "the asker cannot answer its own ask" });
   if (ask.to !== body.from) return sendJson(res, 403, { error: "only the addressee may answer this ask" });
 
   settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
   // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  appendChannelMsg(boardId, chanId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
-  sendJson(res, 200, { ok: true, askId: ask.askId, channel: chanId, delivered: true });
+  appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
+  sendJson(res, 200, { ok: true, askId: ask.askId, channel: threadId, delivered: true });
 }
 
-// POST /api/channel/<id>/intent { from, intent, note? } — the work-intent typed act (threads-as-cards §6,
+// POST /api/thread/<id>/intent { from, intent, note? } — the work-intent typed act (threads-as-cards §6,
 // migration §8 step 1). `idle+working`, `idle+blocked:human`, and `idle+done` are indistinguishable at the
 // process layer, so the agent DECLARES which it is: a structured entry in the channel's log, card-only
 // (rendered as a small status line; inbox/nudge skip it — an agent's own bookkeeping must not wake the
 // room). The latest declaration per member also rides the channel's meta marker (`intents`, keyed by sid —
 // the seat record's forerunner; step 2 moves the key to the seat so it survives an occupant respawn), which
-// is what /api/channels serves and what the step-3 thread-state projection will range over. `done` doubles
+// is what /api/threads serves and what the step-3 thread-state projection will range over. `done` doubles
 // as the cooperative-yield signal — for now it informs slot management (a PM/human can see who is safe to
 // terminate); the reflex scheduler acting on it comes with the projection.
-async function handleChannelIntent(
+async function handleThreadIntent(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
-  chanId: string,
+  threadId: string,
 ): Promise<void> {
   let body: { from?: unknown; intent?: unknown; note?: unknown };
   try {
@@ -3082,30 +3109,39 @@ async function handleChannelIntent(
     return sendJson(res, 400, { error: "note must be a string" });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!channelNode(records, chanId)) return sendJson(res, 404, { error: "channel not found" });
-  // Consent mirrors handleChannelMessage: a session must have joined to declare; a non-session `from`
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
+  // Consent mirrors handleThreadMessage: a session must have joined to declare; a non-session `from`
   // (the human at the card) is the board owner and may mark any channel.
-  if (sessionNodeForSid(records, body.from) && !channelMemberSids(records, chanId).includes(body.from))
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
     return sendJson(res, 403, { error: "sender is not a member of this channel" });
 
   const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
-  const msg = appendChannelMsg(boardId, chanId, body.from, intentLine(body.intent, note), {
+  const msg = appendThreadMsg(boardId, threadId, body.from, intentLine(body.intent, note), {
     kind: "intent",
     intent: body.intent,
   });
-  // The latest-per-member index: full-object replace onto the meta marker (appendChannelMsg's own meta
+  // The latest-per-participant index: full-object replace onto the meta marker (appendThreadMsg's own meta
   // upsert shallow-merges around it, so activity bumps never clobber it — pinned by the ledger test).
+  // Keyed by the declarer's SEAT when it holds one (§5: the declared state must survive an occupant
+  // respawn — the fresh session re-fills the seat and inherits/overwrites the same slot), else by sid;
+  // `sid` inside the record says which occupant actually spoke.
   const repoPath = boards.get(boardId)?.repoPath;
+  let seat: string | null = null;
   if (repoPath) {
-    const prior = readChannelMeta(repoPath, chanId)?.intents ?? {};
-    upsertChannelMeta(repoPath, chanId, {
-      intents: { ...prior, [body.from]: { intent: body.intent, ts: msg.ts, ...(note ? { note } : {}) } },
+    const meta = readThreadMeta(repoPath, threadId);
+    seat = seatForSid(meta?.seats, body.from);
+    const prior = meta?.intents ?? {};
+    upsertThreadMeta(repoPath, threadId, {
+      intents: {
+        ...prior,
+        [seat ?? body.from]: { intent: body.intent, ts: msg.ts, sid: body.from, ...(note ? { note } : {}) },
+      },
     });
   }
-  sendJson(res, 200, { ok: true, channel: chanId, from: body.from, intent: body.intent, seq: msg.seq });
+  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
 }
 
-// The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ChannelMsg. Two
+// The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ThreadMsg. Two
 // changes vs the raw record: `from` is a short HANDLE not a 36-char UUID (see inboxHandle), and `ts` (an
 // opaque 13-digit epoch-ms) becomes `t`, a compact local `MM-DD HH:MM` (see fmtTs) — which is both readable
 // AND fewer bytes than the epoch it replaces, while still carrying date + time so timing conflicts and
@@ -3143,11 +3179,11 @@ function fmtTs(ts: number): string {
 // drop). Applies a max message COUNT (`limit`) and/or a max TEXT-BYTE budget (`bytes`) to `fresh`, keeping
 // the most recent. Always keeps ≥1 message (a budget smaller than the last message still yields it, flagged).
 // Returns the kept tail + how many older messages were omitted (0 ⇒ nothing trimmed).
-function windowTail(fresh: ChannelMsg[], limit: number | null, bytes: number | null): { kept: ChannelMsg[]; omitted: number } {
+function windowTail(fresh: ThreadMsg[], limit: number | null, bytes: number | null): { kept: ThreadMsg[]; omitted: number } {
   if (limit == null && bytes == null) return { kept: fresh, omitted: 0 };
   let kept = limit != null && fresh.length > limit ? fresh.slice(fresh.length - limit) : fresh.slice();
   if (bytes != null) {
-    const out: ChannelMsg[] = [];
+    const out: ThreadMsg[] = [];
     let used = 0;
     for (let i = kept.length - 1; i >= 0; i--) {
       const size = Buffer.byteLength(kept[i]!.text, "utf8");
@@ -3172,9 +3208,9 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
   type OutChan = { channel: string; title: string; messages: InboxMsg[]; truncated?: { omitted: number; hint: string } };
   const channels: OutChan[] = [];
   if (records) {
-    for (const chanId of sessionChannels(records, sid)) {
-      const log = channelLogs.get(chanId) ?? [];
-      const since = s.read[chanId] ?? 0;
+    for (const threadId of sessionThreads(records, sid)) {
+      const log = threadLogs.get(threadId) ?? [];
+      const since = s.read[threadId] ?? 0;
       const fresh = log.filter((mng) => mng.seq > since && !cardOnly(mng)); // ask-echoes / intent acts are card-only
       // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
       // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
@@ -3182,15 +3218,15 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
       const { kept, omitted } = windowTail(fresh, limit, bytes);
       if (kept.length) {
         const out: OutChan = {
-          channel: chanId,
-          title: channelNode(records, chanId)?.title || "",
+          channel: threadId,
+          title: threadNode(records, threadId)?.title || "",
           messages: kept.map((m) => ({ seq: m.seq, t: fmtTs(m.ts), from: inboxHandle(records, m.from), text: m.text })),
         };
         if (omitted > 0)
           out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
         channels.push(out);
       }
-      if (log.length) s.read[chanId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
+      if (log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
     }
   }
   const count = channels.reduce((n, c) => n + c.messages.length, 0);
@@ -3256,20 +3292,22 @@ export function fsApi(): Plugin {
         // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
         if (url.pathname === "/api/asks" && req.method === "GET")
           return handleAsksRead(res, url.searchParams.get("session"));
-        // Channels (Phase 4). The channel id is a node id carrying a colon (node:chan:<short>), so the
-        // client percent-encodes it — match any non-slash segment and decode before the snapshot lookup.
-        const chanMatch = /^\/api\/channel\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent)$/.exec(url.pathname);
-        if (chanMatch && req.method === "POST") {
+        // Threads (§8 step 2 — /api/thread/… is canonical; /api/channel/… stays a working alias so live
+        // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
+        // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
+        // non-slash segment and decode before the snapshot lookup.
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent)$/.exec(url.pathname);
+        if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
-          const chanId = decodeURIComponent(chanMatch[1]!);
-          const action = chanMatch[2]!;
-          if (action === "message") return void handleChannelMessage(req, res, b.boardId, chanId);
-          if (action === "history") return void handleChannelHistory(req, res, b.boardId, chanId);
-          if (action === "ask") return void handleChannelAsk(req, res, b.boardId, chanId);
-          if (action === "reply") return void handleChannelReply(req, res, b.boardId, chanId);
-          if (action === "intent") return void handleChannelIntent(req, res, b.boardId, chanId);
-          return void handleChannelMembership(req, res, b.boardId, chanId, action as "join" | "leave" | "invite", originOf(req));
+          const threadId = decodeURIComponent(threadMatch[1]!);
+          const action = threadMatch[2]!;
+          if (action === "message") return void handleThreadMessage(req, res, b.boardId, threadId);
+          if (action === "history") return void handleThreadHistory(req, res, b.boardId, threadId);
+          if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
+          if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
+          if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
+          return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
         }
         if (url.pathname === "/api/session") {
           const b = reqBoard(url);
@@ -3281,10 +3319,10 @@ export function fsApi(): Plugin {
           if (!b) return sendJson(res, 400, { error: "unknown board" });
           return handleSessions(res, sessionsDir(b.repoPath), b.repoPath);
         }
-        if (url.pathname === "/api/channels") {
+        if (url.pathname === "/api/threads" || url.pathname === "/api/channels") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleChannels(res, b.repoPath);
+          return handleThreads(res, b.repoPath);
         }
         if (url.pathname === "/api/roles") {
           const b = reqBoard(url);

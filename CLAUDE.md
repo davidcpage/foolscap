@@ -107,15 +107,16 @@ canvas session card is just a *view* over its stdout feed. These endpoints contr
 ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need no `?board=`; `spawn`/`resume`/
 `session`/`sessions` do (they pick the cwd / transcripts dir).
 
-- **Spawn:** `POST /api/session/spawn?board=<id> {prompt?, roleId?, channel?, card?}` → `{id, carded}`. Mints a
-  UUID, spawns the child with the collab brief appended to its system prompt, sends `prompt` as the first turn
-  if given. Optional `channel` (a chanId) makes the SERVER drop the worker's session card + `member:open` edge
-  and POSITION it next to the channel card (server-side cascade — agents place cards badly); `card:true` makes a
-  standalone card with no edge; `carded` reports whether a live tab applied it. Prefer the `scripts/canvas spawn`
-  wrapper (it's the allow-listed path; raw spawn is permission-gated). **429** when the live-session cap
-  (`MAX_LIVE_SESSIONS=12`, concurrent, all boards) is hit — `terminate` one to free a slot.
+- **Spawn:** `POST /api/session/spawn?board=<id> {prompt?, roleId?, thread?, card?}` → `{id, carded}` (`channel`
+  is the pre-rename alias for `thread`). Mints a UUID, spawns the child with the collab brief appended to its
+  system prompt, sends `prompt` as the first turn if given. Optional `thread` (a thread id) makes the SERVER
+  drop the worker's session card + `member:open` edge and POSITION it next to the thread card (server-side
+  cascade — agents place cards badly); `card:true` makes a standalone card with no edge; `carded` reports
+  whether a live tab applied it. Prefer the `scripts/canvas spawn` wrapper (it's the allow-listed path; raw
+  spawn is permission-gated). **429** when the live-session cap (`MAX_LIVE_SESSIONS=12`, concurrent, all
+  boards) is hit — `terminate` one to free a slot.
 - **Prompt:** `POST /api/session/<id>/input {text}` writes to stdin — this **reads AS the human** (interrupts
-  the turn, full trust). **409** if not live. (Channel messages do NOT use this — see below.)
+  the turn, full trust). **409** if not live. (Thread messages do NOT use this — see below.)
 - **Resume:** `POST /api/session/<id>/resume?board=<id>` respawns a historical session in place (`--resume`),
   same card/id. **404** if no transcript.
 - **Interrupt vs terminate vs done:** `…/interrupt` halts the *current turn* (process stays live; **409** if
@@ -132,50 +133,61 @@ ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need n
 
 Gotchas:
 - **A bare curl spawn leaves NO canvas card.** The *browser tab* that calls spawn is what drops the
-  `node:live:<sid>` card; a shell spawn registers the process only. The clean fix is to pass `channel` (or
-  `card:true`) so the SERVER drops the card + `member:open` edge for you, positioned by the channel card. Only
+  `node:live:<sid>` card; a shell spawn registers the process only. The clean fix is to pass `thread` (or
+  `card:true`) so the SERVER drops the card + `member:open` edge for you, positioned by the thread card. Only
   if you spawn without those must you `addNode {id:"node:live:<sid>", type:"session", title:"<sid>"}` + the
   `member:open` edge yourself over `/api/command`. (Session card id = `node:live:<sid>`, title = the full sid.)
 - **Spawned children die only with the server** (`killAll` on exit) or via `terminate`. A leaked curl-spawn
   with no terminate lingers until the dev server stops.
 
-## Agent session coordination (channels, inbox, ask/reply)
+## Agent session coordination (threads, inbox, ask/reply)
 
-How live sessions talk to each other. Full design: `docs/agent-to-agent-messaging.md` (§15 channels/inbox,
-§16 ask/reply). A **channel** is a node `{type:"channel"}` whose `text` is an optional description; a session
-**joins** via a `member:open` edge (session node → channel node). All of this is **off-log** (server memory,
-pinned across hot re-eval, **lost on a COLD restart** — which also kills the sessions). Agents work in
-**channel ids + their own sid**; the server resolves nodes/edges. The channel id carries a colon, so
-**percent-encode it** in the URL path.
+How live sessions talk to each other. Full design: `docs/threads-as-cards.md` (threads/seats; transport
+detail in `docs/agent-to-agent-messaging.md` §15/§16). A **thread** is a per-task card — a node
+`{type:"thread"}` (legacy `{type:"channel"}` nodes are threads too — carried over, same machinery) whose
+`title` is the task and `text` the optional brief; a session **joins** via a `member:open` edge (session
+node → thread node). Conversation state is **off-log** but **durable** (`.canvas/threads/` jsonl+meta,
+replayed at boot; read cursors are server memory and reset on a COLD restart — which also kills the
+sessions). Agents work in **thread ids + their own sid**; the server resolves nodes/edges. The thread id
+carries a colon, so **percent-encode it** in the URL path. Everything below is served under BOTH
+`/api/thread/…` (canonical) and `/api/channel/…` (transition alias); `GET /api/threads` (alias
+`/api/channels`) lists the markers, each with its `intents` and `seats`.
 
-- **Broadcast:** `POST /api/channel/<id>/message {from, text}` records the message in the channel's off-log
-  log (the `channel:<id>` feed the card renders) and **fans out to every other member's inbox**. `from` is a
+- **Broadcast:** `POST /api/thread/<id>/message {from, text}` records the message in the thread's off-log
+  log (the `thread:<id>` feed the card renders) and **fans out to every other member's inbox**. `from` is a
   member sid, or `"human"` (the card's post box). Members are nudged; they are **not** sent the content.
 - **Read (the wake model):** message content **never** enters stdin. A member gets a **content-free nudge**
-  (`[canvas] new channel messages: …`) pushed to stdin (idle-immediate or at the turn boundary, coalesced —
+  (`[canvas] new thread messages: …`) pushed to stdin (idle-immediate or at the turn boundary, coalesced —
   an ignored nudge isn't re-fired until new traffic), then **pulls** the content with `GET /api/inbox?session=
-  <sid>` → unread grouped by channel, advancing a read cursor. Content lands in **tool output, never a user
-  turn** — the whole point. Call it when nudged or proactively.
+  <sid>` → unread grouped by thread (the response's `channels`/`channel` field names keep their pre-rename
+  spelling), advancing a read cursor. Content lands in **tool output, never a user turn** — the whole point.
+  Call it when nudged or proactively.
 - **Membership:** `join {from, history?}` / `leave {from}` / `invite {from, target, history?}` /
-  `history {target, mode:"full"|"future"}` — all under `/api/channel/<id>/`. Server-fulfilled by *emitting*
+  `history {target, mode:"full"|"future"}` — all under `/api/thread/<id>/`. Server-fulfilled by *emitting*
   addEdge/removeEdge over the bus (so they need `delivered>0`). `history` (default `full`) sets how much
   backlog a joiner replays.
-- **Consult one peer and BLOCK for the answer (§16):** `POST /api/channel/<id>/ask {from, to, text,
+- **Seats (`threads-as-cards.md` §5):** when a **role-spawned** session joins a thread, the server fills the
+  role's **seat** on that thread's marker (`seats: {<Role>: {role, sid, createdAt, filledAt, fills}}`) — the
+  durable per-thread participant that survives its occupant's respawn (a fresh session of the same role
+  RE-FILLS the same seat). 1:1 with roles until labelled multiplicity ships. Plain unnamed sessions take no
+  seat and stay sid-identified.
+- **Consult one peer and BLOCK for the answer (§16):** `POST /api/thread/<id>/ask {from, to, text,
   timeoutMs?}` — both must be members, `to` must be live; the call **holds open** until the answerer replies
   or it times out (default 30s, cap 60s — under the Bash tool timeout). Returns `{reply:{from,text,ts}}` or
   `{timedOut:true}`. **400** self-ask, **403** non-member, **409** answerer not live. This is the oracle
   pattern (ask a session that answers in `file:line`); use `message` for fire-and-forget.
 - **Answer side:** an answerer is nudged (`N pending question(s)`), reads `GET /api/asks?session=<sid>` (its
-  pending queue), and answers with `POST /api/channel/<id>/reply {from, askId, text}` (only the addressee
-  may; resolves the asker's held call). The Q→A is echoed into the channel log as a **card-only** entry
+  pending queue), and answers with `POST /api/thread/<id>/reply {from, askId, text}` (only the addressee
+  may; resolves the asker's held call). The Q→A is echoed into the thread log as a **card-only** entry
   (`kind:"ask"`) — it shows on the card but is **skipped** by `inbox`/nudges, so the other members aren't woken.
-- **Work-intent (typed act; `threads-as-cards.md` §6, migration step 1):** `POST /api/channel/<id>/intent
+- **Work-intent (typed act; `threads-as-cards.md` §6):** `POST /api/thread/<id>/intent
   {from, intent:"working"|"blocked:human"|"blocked:peer"|"done", note?}` — a member declares its stance
-  toward the channel's work, because `idle+working` / `idle+blocked:human` / `idle+done` are identical at
+  toward the thread's work, because `idle+working` / `idle+blocked:human` / `idle+done` are identical at
   the process layer and only the agent knows which. Card-only like the ask echo (`kind:"intent"` — rendered
-  as a status line, skipped by `inbox`/nudges, wakes no one). The latest declaration per member rides the
-  channel's meta marker and `GET /api/channels` (`intents`, sid-keyed until seats land at step 2); the
-  step-3 thread-state projection (active/waiting/dormant) derives from it. Enum lives in `app/work-intent.js`.
+  as a status line, skipped by `inbox`/nudges, wakes no one). The latest declaration per participant rides
+  the thread's meta marker and `GET /api/threads` (`intents` — keyed by the declarer's SEAT handle when it
+  holds one, so the state survives a respawn; else by sid); the step-3 thread-state projection
+  (active/waiting/dormant) derives from it. Enum lives in `app/work-intent.js`.
 
 Gotchas:
 - **Membership must be in the pushed snapshot before `ask`/`message` will accept it.** Membership is read from

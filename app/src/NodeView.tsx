@@ -8,7 +8,7 @@ import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { scrollableFromTarget } from "./interior";
-import { MEMBER_OPEN, postToChannel, setChannelHistory } from "./channels";
+import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../channel-tags.js";
 import { intentGlyph } from "../work-intent.js";
@@ -67,8 +67,10 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
     card = <ComputedView m={m} id={id} box={box} selected={selected} />;
   } else if (node.type === "provenance") {
     card = <ProvenanceView m={m} box={box} selected={selected} />;
-  } else if (node.type === "channel") {
-    card = <ChannelView m={m} id={id} node={node} box={box} selected={selected} />;
+  } else if (node.type === "thread" || node.type === "channel") {
+    // "thread" is the node type since threads-as-cards §8 step 2; "channel" is the carried-over legacy
+    // type — the same card, so old boards render unchanged.
+    card = <ThreadView m={m} id={id} node={node} box={box} selected={selected} />;
   } else {
     // Lenient fallback (design-note cost #4): a typed card whose template hasn't loaded — or failed
     // to — renders a placeholder shell, never crashes and never hard-fails the card. Note and file
@@ -290,15 +292,16 @@ function ProvenanceView({
   );
 }
 
-// The channel card (agent-to-agent-messaging.md §9, reified): a coordination space whose conversation is
-// the focus. Its `text` is an optional DESCRIPTION (Slack-topic style, blank by default — the first message
-// carries the framing). It lists its members (the member:* edges pointing at it), lets the human post to the
-// fan-out, set a member's history visibility, and edits the description/title inline. Membership is drawn (alt-drag a session onto it) or
-// proposed by an agent; accept/leave live on the edge popover. This is a hardcoded React view (like the
-// feed cards), so — unlike a template card — it must contain its own interior interactions: native
-// listeners stop an input's pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan /
-// Backspace→delete) from reaching the canvas. Mirrors TemplateCard's seam.
-type ChannelMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
+// The thread card (threads-as-cards.md — renamed from the channel card at §8 step 2): a task with a
+// conversation attached; the conversation is the focus. Its `title` is the task; its `text` an optional
+// BRIEF (blank by default — the first message can carry the framing). It lists its members (the member:*
+// edges pointing at it), lets the human post to the fan-out, set a member's history visibility, and edits
+// the brief/title inline. Membership is drawn (alt-drag a session onto it) or proposed by an agent;
+// accept/leave live on the edge popover. This is a hardcoded React view (like the feed cards), so — unlike
+// a template card — it must contain its own interior interactions: native listeners stop an input's
+// pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan / Backspace→delete) from
+// reaching the canvas. Mirrors TemplateCard's seam.
+type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
 // A member's readable display handle: a role-spawned session carries a `.name` ("PM.97acc4bc"); show it as
 // "PM.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
@@ -310,7 +313,7 @@ function displayHandle(name: string | null | undefined, sid: string): string {
 const senderLabel = (from: string, name?: string | null) =>
   from === "human" || from === "system" ? from : displayHandle(name, from);
 
-function ChannelView({
+function ThreadView({
   m,
   id,
   node,
@@ -331,9 +334,9 @@ function ChannelView({
   );
   const edges = useSignal(edgeQuery);
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
-  // The conversation lives off-log in the server's channel log, streamed on the channel:<id> feed (the same
+  // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ChannelMsg[]; truncated?: boolean }>("channel:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean }>("thread:" + id));
   const msgs = feed?.messages ?? [];
 
   const [description, setDescription] = useState(node.text);
@@ -429,18 +432,18 @@ function ChannelView({
   const toggleHistory = async (sid: string) => {
     const next = (histMode[sid] ?? "full") === "full" ? "future" : "full";
     setHistMode((h) => ({ ...h, [sid]: next }));
-    const r = await setChannelHistory(id, sid, next);
+    const r = await setThreadHistory(id, sid, next);
     setStatus(r.ok ? `${sid.slice(0, 8)}: ${next === "full" ? "full history" : "future only"}` : (r.error ?? "failed"));
   };
   const commitTitle = () => {
-    const t = title.trim() || "channel";
+    const t = title.trim() || "thread";
     if (t !== node.title) m.editor.commit({ type: "setTitle", actor: "user", payload: { id, title: t } });
   };
   const send = async () => {
     const t = post.trim();
     if (!t) return;
     setStatus("sending…");
-    const r = await postToChannel(id, "human", t);
+    const r = await postToThread(id, "human", t);
     if (r.ok) { setPost(""); setStatus("posted"); }
     else setStatus(r.error ?? "failed");
   };
@@ -455,13 +458,13 @@ function ChannelView({
           onBlur={commitTitle}
           onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
         />
-        <span className="file-ext">channel</span>
+        <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
         <textarea
           ref={descRef}
           className="chan-description"
-          placeholder="add a charter (markdown — links open canvas cards)"
+          placeholder="add a brief (markdown — links open canvas cards)"
           value={description}
           onChange={(e) => { setDescription(e.target.value); autosizeDesc(e.target); }}
           onBlur={finishDescEdit}
@@ -470,14 +473,14 @@ function ChannelView({
       ) : (
         <div
           className="chan-description chan-description-view"
-          title="click to edit the charter"
+          title="click to edit the brief"
           data-interactive
           onClick={() => setEditingDesc(true)}
         >
           {description.trim() ? (
             <MarkdownInline text={description} m={m} />
           ) : (
-            <span className="chan-desc-empty">add a charter (markdown — links open canvas cards)</span>
+            <span className="chan-desc-empty">add a brief (markdown — links open canvas cards)</span>
           )}
         </div>
       )}

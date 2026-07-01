@@ -8,12 +8,13 @@
 # verbs instead of raw curl. Per the session permission model, this is a UNIFORM baseline capability for
 # every session, not a role permission.
 #
-# Channel verbs (message/join/invite/ask) are NOT gated and stay plain curl per the collaboration brief —
-# only the session-process verbs need this wrapper.
+# Thread verbs (message/join/invite/ask/intent) are NOT gated and stay plain curl per the collaboration
+# brief — only the session-process verbs need this wrapper.
 #
-# NOTE: a wrapper-spawned (like a curl-spawned) session leaves NO canvas card. To make it a channel
+# NOTE: a wrapper-spawned (like a curl-spawned) session leaves NO canvas card. To make it a thread
 # member, the spawner must still addNode {id:"node:live:<sid>",type:"session",title:"<sid>"} + a
-# member:open edge over /api/command (see CLAUDE.md "Driving sessions headlessly").
+# member:open edge over /api/command (see CLAUDE.md "Driving sessions headlessly") — or just pass
+# --thread and let the server do all of it.
 set -euo pipefail
 
 BOARD="${CANVAS_BOARD:-foolscap-a9921027}"
@@ -22,11 +23,12 @@ SERVER="${CANVAS_SERVER:-http://127.0.0.1:5173}"
 usage() {
   cat <<USAGE
 canvas — session/coordination verbs over the agent bus
-  scripts/canvas spawn [--channel CHAN] [--role ROLE] [--card] [--prompt TEXT] [--board ID]
-        spawn a new session; prints {"id":...,"carded":bool}. With --channel the SERVER cards it, joins
-        it, positions the card next to the channel, and onboards it to AWAIT its task on the channel —
-        then POST the task as a channel message tagging it (do NOT put the task in --prompt; --prompt is
+  scripts/canvas spawn [--thread THREAD] [--role ROLE] [--card] [--prompt TEXT] [--board ID]
+        spawn a new session; prints {"id":...,"carded":bool}. With --thread the SERVER cards it, joins
+        it, positions the card next to the thread, and onboards it to AWAIT its task on the thread —
+        then POST the task as a thread message tagging it (do NOT put the task in --prompt; --prompt is
         only a generic first turn). --role spawns under a role. --card = standalone card, no membership.
+        (--channel is the pre-rename alias for --thread and keeps working.)
   scripts/canvas input <sid> <text>                   send a turn to a live session's stdin (reads AS the human)
   scripts/canvas done <sid>                            mark a session done + terminate it
   scripts/canvas terminate <sid>                       kill a live session, free its slot
@@ -41,25 +43,26 @@ post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' -d "$2"; }
 cmd="${1:-}"; shift || true
 case "$cmd" in
   spawn)
-    prompt=""; channel=""; role=""; card=""
+    prompt=""; thread=""; role=""; card=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --prompt)  prompt="${2:-}"; shift 2 ;;
-        --channel) channel="${2:-}"; shift 2 ;;
+        --thread)  thread="${2:-}"; shift 2 ;;
+        --channel) thread="${2:-}"; shift 2 ;; # pre-rename alias
         --role)    role="${2:-}"; shift 2 ;;
         --card)    card="1"; shift ;;
         --board)   BOARD="${2:-}"; shift 2 ;;
         *) echo "spawn: unexpected arg '$1'" >&2; exit 2 ;;
       esac
     done
-    body=$(python3 - "$prompt" "$channel" "$role" "$card" <<'PY'
+    body=$(python3 - "$prompt" "$thread" "$role" "$card" <<'PY'
 import json, sys
-prompt, channel, role, card = sys.argv[1:5]
+prompt, thread, role, card = sys.argv[1:5]
 o = {}
-if prompt:  o["prompt"] = prompt
-if channel: o["channel"] = channel
-if role:    o["roleId"] = role
-if card:    o["card"] = True
+if prompt: o["prompt"] = prompt
+if thread: o["thread"] = thread
+if role:   o["roleId"] = role
+if card:   o["card"] = True
 print(json.dumps(o))
 PY
 )
