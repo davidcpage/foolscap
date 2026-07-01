@@ -639,7 +639,8 @@ function sessionSummary(
 // (blue, "waiting on an agent, not you"); an ended one reads its recorded reason — `done` / `crashed` / a
 // neutral `ended` (terminate or unknown). One server-side source so every view (the sessions list bar, the
 // minimap dot, the heads-up) agrees with the card instead of re-deriving it.
-type SessionBand = "working" | "waiting" | "waiting-agent" | "done" | "crashed" | "ended";
+type SessionBand =
+  | "working" | "waiting" | "waiting-agent" | "scheduled" | "done" | "crashed" | "ended";
 function endReasonBand(reason: string | undefined): SessionBand {
   return reason === "done" ? "done" : reason === "crashed" ? "crashed" : "ended";
 }
@@ -647,7 +648,11 @@ function sessionStatus(repoPath: string, id: string): SessionBand {
   const live = liveSessions.get(id);
   if (live) {
     if (live.status === "running") return "working";
-    if (live.status === "idle") return live.waitingOn?.length ? "waiting-agent" : "waiting";
+    // Idle: blocked on a peer (blue) > asleep on the loop heartbeat (calm teal `scheduled`, a looping role
+    // between ticks — no human demand) > the default loud amber "your turn".
+    if (live.status === "idle") {
+      return live.waitingOn?.length ? "waiting-agent" : live.loops ? "scheduled" : "waiting";
+    }
     if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
   }
   // not live (or exited with no in-memory reason) → the durable marker is the only surviving source
@@ -1043,6 +1048,23 @@ function stopSessionFeed(id: string): void {
 // (text only) or up to "bypassPermissions" (skip every check) here if that balance ever changes.
 const SESSION_PERMISSION_MODE = "auto";
 
+// BASELINE permission allow-list, ADDED to every spawn on top of `--permission-mode auto`. Allow-rules
+// are ADDITIVE: we only ever grant explicit allows; anything without a rule still flows through the
+// classifier exactly as before, so routine session changes never need hand-permissioning. The principle
+// (see docs/agent-roles.md): capability is a UNIFORM baseline, NOT a second axis of role identity — a
+// role is knowledge + memory + charter, not a permission set. So self-commit and spawning are normal for
+// ANY session (ad-hoc sessions are the norm); only the RED LINE stays gated by the classifier — `git
+// push`, destructive ops, out-of-scope or large/costly fan-out. `git commit` is decoupled from `push`.
+// (A role may NARROW this in the rare case via a role.md override — deferred; not how roles normally
+// differ.) Spawning rides the `scripts/canvas` wrapper so the gated /api/session/spawn curl is reachable
+// without allowing `Bash(curl:*)` wholesale.
+const BASELINE_ALLOWED_TOOLS = [
+  "Bash(git add:*)",
+  "Bash(git commit:*)",
+  "Bash(scripts/canvas:*)",
+  "Bash(./scripts/canvas:*)",
+].join(",");
+
 // AskUserQuestion is auto-cancelled in `-p` headless mode (VERIFIED: the CLI synthesises an
 // is_error="Answer questions?" tool_result and continues — it never waits for an answer on stdin, so
 // there's no tool_result loop to hook). So we DISALLOW it (below) and steer the session to a convention
@@ -1129,14 +1151,19 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "WINDING DOWN. Every idle session is treated as WAITING-FOR-A-HUMAN by default (its card glows a loud",
     "amber \"waiting\" band), so when your work is genuinely finished and you don't need the human again, end",
     "your OWN session — its card then settles into a calm \"✓ done\" instead of nagging for attention:",
-    `  POST ${base}/api/session/${sessionId}/done   → records this session done and terminates it (resumable).`,
+    `  POST ${base}/api/session/${sessionId}/done   → records this session done and terminates it.`,
     "  Do this only AFTER you've reported your result / posted any handoff to the channel — it ends the turn.",
+    "  A session is EPHEMERAL: its durable trace is the channel log + any handoff/wiki you leave, NOT the process.",
+    "  To continue this work later, a FRESH session is spawned with the task as its first turn — don't rely on",
+    "  being resumed; a revived session can't tell new instructions from replayed backlog and will just re-finish.",
     "",
-    "NORMS. Your job on the board is to COORDINATE: read it, talk in channels, propose changes, claim work",
-    "before racing a peer on the same file. Stay within the channel's description/intent. Do NOT carry out large or",
-    "irreversible work — broad refactors, deletions, commits/pushes, anything with external side effects —",
-    "without a human nod: surface a short plan and wait. Coordinating and proposing is always in bounds;",
-    "executing big changes unattended is not.",
+    "NORMS. Read the board, talk in channels, and claim work before racing a peer on the same file. Stay within",
+    "your channel's scope/intent. Doing the work you were spawned for — editing files, running tests, and",
+    "COMMITTING your work to the local repo — is in bounds and needs no nod: a local commit is a normal act, and",
+    "it is NOT a push (they are separate — committing never reaches a remote). What DOES need a human nod first is",
+    "the RED LINE: pushing to a remote, anything externally-visible or hard to reverse, deleting another agent's",
+    "work, changing a channel's scope, or spawning a large/costly fan-out of sessions. When one of those is",
+    "warranted, surface a short plan and wait — otherwise just do the work.",
   ].join("\n");
 }
 
@@ -1182,6 +1209,17 @@ interface LiveSession {
   // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleChannelMessage
   // + sendSessionInput). Not a per-turn flag — it tracks an actual outstanding wait.
   waitingOn: string[] | null;
+  // Operating-loop heartbeat (agent-roles.md): a looping ROLE (e.g. the PM) has its idle sessions woken on a
+  // server cadence so they sweep the board for stalls even when nobody @-tags them — built-in self-scheduling
+  // does NOT fire in a `claude -p` child, so the wake must come from here. `loops` is stamped from the role at
+  // spawn. The scheduler (loopTick) keeps the live cadence per session: `loopIntervalMs` is the current gap
+  // (BASE while work is active, ×2-backoff up to the ceiling when the channel is quiet), `loopNextAt` is when
+  // the next heartbeat is due, and `loopSig` is the last world-signature (channel activity + member statuses)
+  // used to detect new activity and reset the cadence to BASE. All inert unless `loops`.
+  loops: boolean;
+  loopIntervalMs: number;
+  loopNextAt: number;
+  loopSig: string;
   origin: string;
   // Shadow-git attribution (doc §6): an Edit/Write tool_use claims its target path on the shadow watcher;
   // the matching tool_result commits it attributed. Maps tool_use_id → {shadow-root key, path rel to root}.
@@ -1216,6 +1254,7 @@ function publishSession(s: LiveSession): void {
     usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
+    loops: s.loops || undefined, // looping role: idle + no waitingOn ⇒ calm teal "scheduled", not amber
   });
 }
 
@@ -1340,12 +1379,29 @@ function seedFromTranscript(s: LiveSession): void {
 // Spawn (or, when `resume`, continue) a Claude Code process under id and wire its stdout to the feed.
 // Idempotent per id: a second call returns the existing live session. The process owns its own
 // `.jsonl`; we only read its stdout — never write the transcript ourselves (the agent authors it, §5).
+// Appended when a session is spawned INTO a channel as a worker. Its task is NOT carried in the spawn
+// prompt — that would be an invisible stdin DM, off the legible channel and special-casing the first
+// instruction. Instead the assignment arrives as a normal, logged channel message tagged to it. This block
+// tells the worker to expect that and — crucially — NOT to wind down before it arrives (the failure mode
+// that made a stood-down session re-finish on nothing). Its inbox cursor is seeded to the channel tail at
+// spawn (handleSessionSpawn), so the first thing it reads is its assignment, not the backlog.
+function workerBrief(channel: string): string {
+  return [
+    `YOUR ASSIGNMENT. You were spawned as a worker for channel ${channel}. Your task is NOT in this prompt —`,
+    "it arrives as a CHANNEL MESSAGE tagged to you. Read it with GET /api/inbox (the most recent message",
+    "addressed to you is your assignment); if your inbox is empty it is on its way — stay idle and you'll be",
+    "nudged when it lands. Do NOT wind down (/done) until you have received AND completed a task. Read the",
+    "channel's wiki/charter for context, claim files before editing, and report back in the channel.",
+  ].join("\n");
+}
+
 function ensureLiveSession(
   id: string,
   repoPath: string,
   resume = false,
   origin = "localhost:5173",
   roleId: string | null = null,
+  channel: string | null = null,
 ): LiveSession {
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
@@ -1358,11 +1414,12 @@ function ensureLiveSession(
   const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
 
   // Appended system prompt = the ```ask convention + the canvas collaboration brief (env + protocol +
-  // norms) + the role charter if this session has one, with this session's own identity baked in. One
-  // --append-system-prompt flag, all blocks.
+  // norms) + the role charter if this session has one + a worker brief if spawned into a channel, with this
+  // session's own identity baked in. One --append-system-prompt flag, all blocks.
   const appendPrompt =
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
-    (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "");
+    (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
+    (channel ? "\n\n" + workerBrief(channel) : "");
   const args = [
     "-p",
     resume ? "--resume" : "--session-id",
@@ -1372,6 +1429,7 @@ function ensureLiveSession(
     "--include-partial-messages",
     "--verbose",
     "--permission-mode", SESSION_PERMISSION_MODE,
+    "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
     "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
     "--append-system-prompt", appendPrompt,
   ];
@@ -1380,13 +1438,19 @@ function ensureLiveSession(
     stdio: ["pipe", "pipe", "pipe"],
   }) as ChildProcessByStdio<Writable, Readable, Readable>;
 
+  // Does this session's role run an operating loop? Then its idle sessions are woken on the server heartbeat
+  // (loopTick), and read calm "scheduled" rather than amber "waiting" between ticks. First heartbeat is one
+  // BASE interval out — the spawn's own first-turn prompt is the session's opening tick.
+  const loops = !!role?.loops;
   const s: LiveSession = {
     // Start IDLE, not running: a freshly-spawned process is waiting on stdin (it emits `system/init`, never
     // a `result`, until it's first prompted), so "running" would be a turn that never ends — and the inbox,
     // which flushes idle-immediately / at a turn boundary, would queue forever with no boundary to drain at.
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
     id, repoPath, child, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
-    read: {}, nudge: false, waitingOn: null, origin, pendingEdits: new Map(),
+    read: {}, nudge: false, waitingOn: null,
+    loops, loopIntervalMs: LOOP_BASE_MS, loopNextAt: Date.now() + LOOP_BASE_MS, loopSig: "",
+    origin, pendingEdits: new Map(),
   };
   if (resume) seedFromTranscript(s);
   liveSessions.set(id, s);
@@ -1397,7 +1461,12 @@ function ensureLiveSession(
     spawnedAt: Date.now(),
     origin,
     ...(effectiveRoleId
-      ? { roleId: effectiveRoleId, roleName: role?.name ?? effectiveRoleId, roleColour: role?.colour ?? null }
+      ? {
+          roleId: effectiveRoleId,
+          roleName: role?.name ?? effectiveRoleId,
+          roleColour: role?.colour ?? null,
+          ...(loops ? { loops: true } : {}), // durable note that this session's role loops (legibility)
+        }
       : {}),
   });
   stopSessionFeed(id); // the registry now owns this feed — drop any out-of-band file-tail for it
@@ -1535,13 +1604,48 @@ function seedChannelLogs(repoPath: string): void {
 }
 
 // The channel ids a session is an OPEN member of (the reverse of channelMemberSids), for nudge/read.
+// Memberships the SERVER has just emitted (a member:open over the bus), so wake / inbox / message logic
+// counts a new member IMMEDIATELY — before the browser's snapshot round-trips back (the ~500ms-to-seconds
+// window the CLAUDE.md "membership must be in the pushed snapshot" gotcha warns about, and what made a task
+// posted right after a spawn miss the new worker). Keyed edgeId → {chan, sid, ts}; channelMemberSids and
+// sessionChannels UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
+// human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
+const emittedMembers = new Map<string, { chan: string; sid: string; ts: number }>();
+const EMITTED_MEMBER_TTL = 60_000;
+const sidFromSessionNode = (node: string): string | null =>
+  node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
+// Non-expired emitted memberships, pruning stale ones in passing.
+function liveEmittedMembers(): Array<{ chan: string; sid: string }> {
+  const now = Date.now();
+  const out: Array<{ chan: string; sid: string }> = [];
+  for (const [edgeId, m] of emittedMembers) {
+    if (now - m.ts > EMITTED_MEMBER_TTL) emittedMembers.delete(edgeId);
+    else out.push({ chan: m.chan, sid: m.sid });
+  }
+  return out;
+}
+// Record/forget a server-emitted membership for the immediate-membership window. Called from
+// dispatchBusCommand for every member:open / removeEdge it sends (spawn, join, invite).
+function trackEmittedMembership(cmd: { type: string; payload?: Record<string, unknown> }): void {
+  const p = cmd.payload ?? {};
+  if (cmd.type === "removeEdge") {
+    if (typeof p.id === "string") emittedMembers.delete(p.id);
+    return;
+  }
+  if (cmd.type !== "addEdge" || String(p.type ?? "") !== "member:open") return;
+  const sid = typeof p.from === "string" ? sidFromSessionNode(p.from) : null;
+  if (typeof p.id === "string" && typeof p.to === "string" && sid)
+    emittedMembers.set(p.id, { chan: p.to, sid, ts: Date.now() });
+}
+
 function sessionChannels(records: Array<Record<string, unknown>>, sid: string): string[] {
-  const node = sessionNodeForSid(records, sid);
-  if (!node) return [];
   const out: string[] = [];
-  for (const r of records)
-    if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && channelNode(records, String(r.to)))
-      out.push(String(r.to));
+  const node = sessionNodeForSid(records, sid);
+  if (node)
+    for (const r of records)
+      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && channelNode(records, String(r.to)))
+        out.push(String(r.to));
+  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.chan)) out.push(m.chan);
   return out;
 }
 
@@ -1596,6 +1700,79 @@ function flushNudge(s: LiveSession): void {
   sendSessionInput(s.id, `[canvas] ${lines.join("; ")}`, { keepWaitingOn: true });
 }
 
+// ── operating-loop heartbeat (agent-roles.md) ────────────────────────────────────────────────────
+// A looping ROLE (the PM) needs to sweep the board for STALLS — but nothing emits an event when an agent
+// goes silent, so a purely reactive session would never wake to notice. And built-in self-scheduling does
+// NOT fire in a `claude -p` child (tested), so the wake can't come from inside the agent. So the SERVER
+// wakes looping-role sessions on a cadence, reusing the exact content-free nudge path a channel message
+// uses (sendSessionInput): the woken session reads its inbox + the board, sweeps, and acts or sleeps.
+//
+// CADENCE is adaptive and self-tuning per session (all tunable below): tight (~BASE) while work is active,
+// exponential ×BACKOFF up to CEIL when the channel is quiet, snapped back to BASE the moment anything
+// changes (a new message or a member's status flips). Floor keeps cost/cache sane; the @-tag / ask path is
+// the unchanged immediate INTERRUPT for anything urgent, so the heartbeat only has to catch the silent.
+const LOOP_BASE_MS = 75_000; // active cadence — a looping session sweeps about this often while work moves
+const LOOP_FLOOR_MS = 60_000; // never wake a looping session more often than this (cost / prompt-cache TTL)
+const LOOP_CEIL_MS = 600_000; // quiet cadence ceiling (10 min) — the longest gap between sweeps when idle
+const LOOP_BACKOFF = 2; // each quiet beat multiplies the interval by this, up to the ceiling
+const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due/activity (≤ FLOOR)
+
+// A cheap signature of everything a looping session would react to: per member-channel last-seq (new
+// messages) and each live member's status (a working→waiting flip etc.). When it changes between ticks the
+// world moved, so the cadence resets to BASE. Sorted+joined so it's order-stable across snapshot churn.
+function loopWorldSig(s: LiveSession): string {
+  const boardId = boardIdentity(s.repoPath).boardId;
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return s.loopSig; // no snapshot to read → treat as unchanged, don't thrash the cadence
+  const parts: string[] = [];
+  for (const chanId of sessionChannels(records, s.id)) {
+    const log = channelLogs.get(chanId) ?? [];
+    parts.push(chanId + ":" + (log.length ? log[log.length - 1]!.seq : 0));
+    for (const sid of channelMemberSids(records, chanId)) {
+      const m = liveSessions.get(sid);
+      parts.push(sid + "=" + (m ? m.status + (m.waitingOn?.length ? "/wa" : "") : "off"));
+    }
+  }
+  return parts.sort().join("|");
+}
+
+// One scheduler tick across every board's live sessions: wake the looping ones that are idle and due, and
+// keep each session's adaptive cadence. Never wakes a RUNNING session (that would interrupt its turn — it
+// re-evaluates next tick once idle), so a heartbeat can't talk over a working PM.
+function loopTick(): void {
+  const now = Date.now();
+  for (const s of liveSessions.values()) {
+    if (!s.loops || s.status === "exited") continue;
+    const sig = loopWorldSig(s);
+    if (sig !== s.loopSig) {
+      s.loopSig = sig;
+      s.loopIntervalMs = LOOP_BASE_MS; // the world moved → tighten the cadence back to base
+      if (s.loopNextAt > now + LOOP_BASE_MS) s.loopNextAt = now + LOOP_BASE_MS; // pull a far-out wake in
+    }
+    if (s.status !== "idle") continue; // mid-turn: don't interrupt; re-check next tick when idle
+    if (now < s.loopNextAt) continue; // not due yet
+    sendSessionInput(
+      s.id,
+      "[canvas] ⏱ loop heartbeat — your scheduled tick (not a human message): read your inbox " +
+        `(GET http://${s.origin}/api/inbox?session=${s.id}) and the board (GET /api/canvas, /api/sessions); ` +
+        "sweep for stalled or blocked agents, unanswered asks, and drifting work; then act or go back to sleep.",
+      { keepWaitingOn: true },
+    );
+    // Just woke it on a quiet beat → back the cadence off for next time (a new-activity tick will have reset
+    // it to BASE above). Clamp to the ceiling, and never below the floor.
+    s.loopIntervalMs = Math.min(Math.max(s.loopIntervalMs * LOOP_BACKOFF, LOOP_FLOOR_MS), LOOP_CEIL_MS);
+    s.loopNextAt = now + s.loopIntervalMs;
+  }
+}
+
+// Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
+// one timer instead of stacking a second (mirrors boardFeedsStarted). One timer drives every board.
+function startLoopHeartbeat(): void {
+  const g = globalThis as { __canvasLoopHeartbeat?: ReturnType<typeof setInterval> };
+  if (g.__canvasLoopHeartbeat) clearInterval(g.__canvasLoopHeartbeat);
+  g.__canvasLoopHeartbeat = setInterval(loopTick, LOOP_TICK_MS);
+}
+
 // Interrupt a live session's CURRENT TURN without ending the process. Writes a stream-json control
 // request to its stdin — the same control channel the Claude Code SDK's `interrupt()` uses. The CLI
 
@@ -1628,8 +1805,43 @@ function originOf(req: IncomingMessage): string {
 const MAX_LIVE_SESSIONS = 12;
 const liveSessionCount = (): number => [...liveSessions.values()].filter((s) => s.status !== "exited").length;
 
-async function handleSessionSpawn(req: IncomingMessage, res: ServerResponse, repoPath: string): Promise<void> {
-  let body: { prompt?: unknown; roleId?: unknown } = {};
+// Footprint of a SERVER-created worker card (matches the client's session-card default size).
+const WORKER_CARD_W = 800;
+const WORKER_CARD_H = 520;
+// Where to drop a server-created worker card (see handleSessionSpawn). Anchor it to its channel's card —
+// read from the last snapshot — and CASCADE per existing member so successive workers fan out instead of
+// stacking, and, above all, land CLOSE to the channel. Agent-chosen coordinates have been reliably bad
+// (cards flung far across the canvas); the server knows the channel's real position, so it places the
+// worker right beside it: overlapping the channel card's right edge slightly (channel stays mostly
+// visible), stepping down-right. Falls back to a near-origin cascade when the channel isn't resolvable.
+function placeWorkerCard(
+  records: Array<Record<string, unknown>> | null,
+  chanId: string | null,
+): { x: number; y: number; w: number; h: number } {
+  const OVERLAP_X = 120; // worker's left edge sits this far inside the channel card's right edge
+  const CASCADE = 56; // per-worker down-right step
+  const n = records && chanId ? channelMemberSids(records, chanId).length : 0;
+  const layout =
+    records && chanId
+      ? (records.find((r) => r.typeName === "layout" && (r as { nodeId?: unknown }).nodeId === chanId) as
+          | { x?: number; y?: number; w?: number }
+          | undefined)
+      : undefined;
+  if (layout && typeof layout.x === "number" && typeof layout.y === "number") {
+    const cw = typeof layout.w === "number" ? layout.w : 300;
+    return { x: layout.x + cw - OVERLAP_X + n * CASCADE, y: layout.y + n * CASCADE, w: WORKER_CARD_W, h: WORKER_CARD_H };
+  }
+  return { x: 80 + n * CASCADE, y: 80 + n * CASCADE, w: WORKER_CARD_W, h: WORKER_CARD_H };
+}
+
+async function handleSessionSpawn(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repoPath: string,
+  boardId: string,
+  origin: string,
+): Promise<void> {
+  let body: { prompt?: unknown; roleId?: unknown; channel?: unknown; card?: unknown } = {};
   try {
     const raw = await readBody(req);
     if (raw) body = JSON.parse(raw);
@@ -1651,14 +1863,46 @@ async function handleSessionSpawn(req: IncomingMessage, res: ServerResponse, rep
     roleName = role.name;
     roleColour = role.colour;
   }
+  const chanId = typeof body.channel === "string" && body.channel ? body.channel : null;
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, originOf(req), roleId);
+    ensureLiveSession(id, repoPath, false, origin, roleId, chanId);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }
+  // A worker spawned into a channel starts its inbox at the channel's TAIL (history:"future"), seeded HERE —
+  // not via the snapshot-racing member:open onboarding — so its first read is its assignment, not the whole
+  // backlog (the replay-burial failure mode that made a returning session dismiss its task as old history).
+  if (chanId) {
+    pendingHistoryMode.set(historyKey(chanId, id), "future");
+    const live = liveSessions.get(id);
+    if (live) live.read[chanId] = seedCursor("future", channelLogs.get(chanId) ?? []);
+  }
+  // Optionally drop the session's canvas card (and, with `channel`, its member:open edge) HERE on the
+  // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
+  // reads the channel card's position from the last snapshot and places the worker beside it, vs an agent
+  // guessing coordinates badly) AND robustness: dispatchBusCommand records the member:open in the
+  // immediate-membership registry, so a task the PM posts right after this reliably wakes the worker even
+  // before the snapshot round-trips. `carded` reports whether a live tab applied it. Browser-initiated
+  // spawns omit these params and keep placing their own card. `card:true` = a standalone card, no edge.
+  let carded = false;
+  if (chanId || body.card === true) {
+    const records = boardSnapshotRecords(boardId);
+    const node = `node:live:${id}`;
+    const nodePayload: Record<string, unknown> = {
+      id: node, type: "session", title: id, color: roleColour ?? "blue", ...placeWorkerCard(records, chanId),
+    };
+    if (roleName) nodePayload.name = `${roleName}.${id.slice(0, 8)}`;
+    carded = dispatchBusCommand(boardId, { type: "addNode", actor: "system", payload: nodePayload }, origin) > 0;
+    if (chanId)
+      dispatchBusCommand(
+        boardId,
+        { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${chanId}`, from: node, to: chanId, type: "member:open" } },
+        origin,
+      );
+  }
   if (typeof body.prompt === "string" && body.prompt.trim()) sendSessionInput(id, body.prompt);
-  sendJson(res, 200, { id, roleId, roleName, roleColour });
+  sendJson(res, 200, { id, roleId, roleName, roleColour, carded });
 }
 
 // POST /api/session/<id>/input  { text } → write a prompt into the live process. Session-internal: no
@@ -2071,6 +2315,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
   startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
+  startLoopHeartbeat(); // global, idempotent — wakes looping-role (PM) sessions to sweep for stalls
 }
 
 function startFeeds(): void {
@@ -2400,6 +2645,7 @@ function channelMemberSids(records: Array<Record<string, unknown>>, chanId: stri
       if (sid && !out.includes(sid)) out.push(sid);
     }
   }
+  for (const m of liveEmittedMembers()) if (m.chan === chanId && !out.includes(m.sid)) out.push(m.sid);
   return out;
 }
 
@@ -2424,7 +2670,10 @@ function dispatchBusCommand(
   if (clients) for (const c of clients) c.res.write(frame);
   // Only announce if a tab actually applied it — a command that reached no tab (delivered=0) didn't change
   // the board, so announcing a join/invite that never landed would be a phantom (and double-fire on retry).
-  if (delivered > 0) maybeAnnounceMembership(boardId, cmd, origin);
+  if (delivered > 0) {
+    trackEmittedMembership(cmd); // front-run the snapshot so a post right after a spawn/join wakes the new member
+    maybeAnnounceMembership(boardId, cmd, origin);
+  }
   return delivered;
 }
 
@@ -2907,7 +3156,7 @@ export function fsApi(): Plugin {
         if (url.pathname === "/api/session/spawn" && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return void handleSessionSpawn(req, res, b.repoPath);
+          return void handleSessionSpawn(req, res, b.repoPath, b.boardId, originOf(req));
         }
         const inputMatch = /^\/api\/session\/([\w-]+)\/input$/.exec(url.pathname);
         if (inputMatch && req.method === "POST") return void handleSessionInput(req, res, inputMatch[1]!);

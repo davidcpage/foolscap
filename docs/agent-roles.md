@@ -46,6 +46,20 @@ The instinct is to ask for "expert sessions." That bundles three separable conce
 Keeping them separate is what makes each tractable. The bulk of this doc is the lifecycle that ties
 *identity* to *communication*; knowledge is sketched in §8 and largely reuses the existing memory format.
 
+**Permissions are deliberately NOT a fourth axis.** The tempting next move is "this role may commit, that
+one may not" — but encoding capability into identity makes permission a *second axis of role meaning*:
+you'd get Builder-can-commit vs Builder-can't as distinct roles, cross-multiplying with knowledge and
+duplicating roles. So capability is a **uniform baseline** granted to *every* session at spawn, not a
+role attribute. The baseline (`BASELINE_ALLOWED_TOOLS` in `vite-fs-plugin.ts`) is added on top of
+`--permission-mode auto` — allow-rules are additive, so anything without a rule still flows through the
+classifier. Today the baseline is `git commit` (a local commit is normal for any session — ad-hoc
+sessions are the norm) + the `scripts/canvas` spawn wrapper. The **red line** stays gated by the
+classifier for everyone: `git push`, destructive ops, out-of-scope changes, large/costly fan-out — these
+need a human nod. A role *may* NARROW the baseline in the rare case (e.g. a read-only reviewer that drops
+commit) via a `role.md` override, but that is the exception, never how roles normally differ. The PM is
+the proof: it is a *coordination stance + knowledge*, using the same baseline every session has — heavily
+— not "the session with commit rights."
+
 ## 3. What a role is (and the two files you must not merge)
 
 A role is three things, and collapsing them is a mistake:
@@ -145,6 +159,27 @@ state lives:
   lands in the DM. Stateless between calls. Cheap.
 - **Task shape (a multi-step worker):** `spawn → work → (block on actor) → checkpoint → park →
   re-engage → … → done → promote → die`. Stateful. The interesting one.
+- **Looping shape (the PM):** `spawn → (heartbeat → sweep → act|sleep)* → wind-down → die`. A coordination
+  role that must notice *silence* — a stalled thread emits no event, so a purely reactive session would
+  never wake to catch it. It runs an **operating loop**: each tick, read inbox + board, sweep for stalled /
+  blocked agents and drifting work, then act or sleep.
+
+  The loop is a property of the **role**, declared by `loops: true` in `role.md` frontmatter and stamped on
+  the spawned session (`role-format.js` → `role-ledger.js` → `/api/roles` → the session marker). It is NOT
+  self-scheduled: built-in self-wake (`ScheduleWakeup` / `/loop` dynamic mode) does **not** fire inside a
+  `claude -p` canvas child (tested — accepted but never re-invoked). So the **server** owns the wake: a
+  single global heartbeat (`loopTick` in `vite-fs-plugin.ts`) wakes idle `loops:true` sessions by reusing
+  the exact content-free nudge path a channel message uses (`sendSessionInput`) — never interrupting a
+  running turn. The `@mention`/`ask` path stays the unchanged immediate **interrupt** for anything urgent;
+  the heartbeat only has to catch the silent.
+
+  **Adaptive cadence (all tunable consts):** active base ~75s, exponential ×2 backoff up to a 10-min ceiling
+  when the channel is quiet, snapped back to base the moment a world-signature (channel last-seq + live
+  member statuses) changes; 60s floor for cost / prompt-cache TTL. A looping session asleep between beats
+  reads a calm **`scheduled`** presence band (teal, off `session-status.ts`), not the loud amber
+  "waiting-for-human" — it's on a timer, making no demand on anyone. The loop has a **termination
+  condition** (charter-defined): wind down via `/done` once every thread is settled, every spawned worker
+  closed, and the wiki/memory current.
 
 ### The ownership table (the pin-down)
 

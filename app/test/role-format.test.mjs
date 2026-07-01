@@ -17,6 +17,7 @@ test("render → parse round-trips name/colour/charter", () => {
     roleId: "oracle",
     name: "Oracle",
     colour: "purple",
+    loops: false,
     charter: "Answer in file:line.",
   });
 });
@@ -27,12 +28,26 @@ test("renderRoleFile omits the colour line when there is no colour; parse → co
   assert.equal(parseRoleFile(text, "plain").colour, null);
 });
 
+test("loops round-trips: rendered only when true, parsed to a boolean", () => {
+  const looped = renderRoleFile({ name: "PM", colour: "green", loops: true, charter: "coordinate" });
+  assert.match(looped, /^loops: true$/m);
+  assert.equal(parseRoleFile(looped, "pm").loops, true);
+  // omitted unless true; absent frontmatter ⇒ false (a plain reactive role)
+  const plain = renderRoleFile({ name: "Plain", charter: "hi" });
+  assert.doesNotMatch(plain, /loops:/);
+  assert.equal(parseRoleFile(plain, "plain").loops, false);
+  // tolerant of yes/1 as well as true
+  assert.equal(parseRoleFile("---\nname: X\nloops: yes\n---\nc", "x").loops, true);
+  assert.equal(parseRoleFile("---\nname: X\nloops: false\n---\nc", "x").loops, false);
+});
+
 test("parseRoleFile falls back to roleId when the frontmatter omits name", () => {
   const text = "---\ncolour: blue\n---\n\nbody";
   assert.deepEqual(parseRoleFile(text, "fallback"), {
     roleId: "fallback",
     name: "fallback",
     colour: "blue",
+    loops: false,
     charter: "body",
   });
 });

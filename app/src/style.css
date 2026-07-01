@@ -750,7 +750,7 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   border-radius: 5px;
   cursor: grab;
   /* Lifecycle status rail: a coloured left border per row (transparent by default so every row aligns,
-     status or not). Same five band colours as the card (.ses-frame-*) and session-status.ts, kept in step
+     status or not). Same band colours as the card (.ses-frame-*) and session-status.ts, kept in step
      by hand — change one, change all three. A glance down the list shows which sessions are live/waiting
      vs wound-down. */
   border-left: 3px solid transparent;
@@ -758,6 +758,7 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-row.ses-status-working       { border-left-color: #16a34a; }
 .ses-row.ses-status-waiting       { border-left-color: #f59e0b; }
 .ses-row.ses-status-waiting-agent { border-left-color: #2563eb; }
+.ses-row.ses-status-scheduled     { border-left-color: #0d9488; }
 .ses-row.ses-status-done          { border-left-color: #d4d4d8; }
 .ses-row.ses-status-crashed       { border-left-color: #ef4444; }
 .ses-row.ses-status-ended         { border-left-color: #d4d4d8; }
@@ -1531,6 +1532,12 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   color: #2563eb;
   animation: none;
 }
+/* scheduled: a looping role (the PM) idle between server heartbeats — asleep on a timer, no demand on you.
+   Calm teal, steady, no pulse. */
+.ses-scheduled {
+  color: #0d9488;
+  animation: none;
+}
 
 /* Phase-1 lifecycle band (render.js): a bold status bar across the card's TOP edge, drawn by a template-
    owned overlay so the React host stays type-agnostic. A band, not an inset ring — the host's border +
@@ -1570,6 +1577,11 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-frame-waiting-agent {
   background: #2563eb;
 }
+/* scheduled: a looping role asleep between heartbeats — on a timer, no demand on anyone. Calm teal, steady,
+   no glow/pulse (the amber "waiting" pulse owns "act now"); this is the deliberate opposite of amber. */
+.ses-frame-scheduled {
+  background: #0d9488;
+}
 /* ended: muted grey — the process has wound down (a /done, a clean /terminate, or a status-less historical
    tail); nothing here wants your attention. `done` shares this band — the "✓ done" pill carries the only
    positive-end distinction, the colour does not. */
@@ -1594,6 +1606,9 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 }
 .ses-head[data-ses-state="waiting-agent"] {
   background: #eff6ff;
+}
+.ses-head[data-ses-state="scheduled"] {
+  background: #f0fdfa;
 }
 .ses-head[data-ses-state="ended"] {
   background: #fafafa;

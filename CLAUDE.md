@@ -107,9 +107,13 @@ canvas session card is just a *view* over its stdout feed. These endpoints contr
 ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need no `?board=`; `spawn`/`resume`/
 `session`/`sessions` do (they pick the cwd / transcripts dir).
 
-- **Spawn:** `POST /api/session/spawn?board=<id> {prompt?}` → `{id}`. Mints a UUID, spawns the child with the
-  collab brief appended to its system prompt, sends `prompt` as the first turn if given. **429** when the
-  live-session cap (`MAX_LIVE_SESSIONS=12`, concurrent, all boards) is hit — `terminate` one to free a slot.
+- **Spawn:** `POST /api/session/spawn?board=<id> {prompt?, roleId?, channel?, card?}` → `{id, carded}`. Mints a
+  UUID, spawns the child with the collab brief appended to its system prompt, sends `prompt` as the first turn
+  if given. Optional `channel` (a chanId) makes the SERVER drop the worker's session card + `member:open` edge
+  and POSITION it next to the channel card (server-side cascade — agents place cards badly); `card:true` makes a
+  standalone card with no edge; `carded` reports whether a live tab applied it. Prefer the `scripts/canvas spawn`
+  wrapper (it's the allow-listed path; raw spawn is permission-gated). **429** when the live-session cap
+  (`MAX_LIVE_SESSIONS=12`, concurrent, all boards) is hit — `terminate` one to free a slot.
 - **Prompt:** `POST /api/session/<id>/input {text}` writes to stdin — this **reads AS the human** (interrupts
   the turn, full trust). **409** if not live. (Channel messages do NOT use this — see below.)
 - **Resume:** `POST /api/session/<id>/resume?board=<id>` respawns a historical session in place (`--resume`),
@@ -127,10 +131,11 @@ ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need n
   live, `404` if not.
 
 Gotchas:
-- **Spawning over curl leaves NO canvas card.** The *browser tab* that calls spawn is what drops the
-  `node:live:<sid>` card; a shell spawn registers the process only. To make a curl-spawned session a channel
-  member you must `addNode {id:"node:live:<sid>", type:"session", title:"<sid>"}` + the `member:open` edge
-  yourself over `/api/command`. (Session card id = `node:live:<sid>`, title = the full sid.)
+- **A bare curl spawn leaves NO canvas card.** The *browser tab* that calls spawn is what drops the
+  `node:live:<sid>` card; a shell spawn registers the process only. The clean fix is to pass `channel` (or
+  `card:true`) so the SERVER drops the card + `member:open` edge for you, positioned by the channel card. Only
+  if you spawn without those must you `addNode {id:"node:live:<sid>", type:"session", title:"<sid>"}` + the
+  `member:open` edge yourself over `/api/command`. (Session card id = `node:live:<sid>`, title = the full sid.)
 - **Spawned children die only with the server** (`killAll` on exit) or via `terminate`. A leaked curl-spawn
   with no terminate lingers until the dev server stops.
 

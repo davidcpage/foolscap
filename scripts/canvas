@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# canvas — a thin, allow-listable wrapper over the foolscap agent bus for SESSION-LIFECYCLE verbs.
+#
+# Why this exists: spawning a session is a POST to /api/session/spawn via curl, and the auto-mode
+# permission classifier gates that as "creating an agent". Allowing `Bash(curl:*)` wholesale would be far
+# too broad. Wrapping the gated verbs here lets the spawn path baseline-allow exactly `Bash(scripts/canvas
+# ...)` (see BASELINE_ALLOWED_TOOLS in app/vite-fs-plugin.ts) — auditable, and every session gets legible
+# verbs instead of raw curl. Per the session permission model, this is a UNIFORM baseline capability for
+# every session, not a role permission.
+#
+# Channel verbs (message/join/invite/ask) are NOT gated and stay plain curl per the collaboration brief —
+# only the session-process verbs need this wrapper.
+#
+# NOTE: a wrapper-spawned (like a curl-spawned) session leaves NO canvas card. To make it a channel
+# member, the spawner must still addNode {id:"node:live:<sid>",type:"session",title:"<sid>"} + a
+# member:open edge over /api/command (see CLAUDE.md "Driving sessions headlessly").
+set -euo pipefail
+
+BOARD="${CANVAS_BOARD:-foolscap-a9921027}"
+SERVER="${CANVAS_SERVER:-http://127.0.0.1:5173}"
+
+usage() {
+  cat <<USAGE
+canvas — session/coordination verbs over the agent bus
+  scripts/canvas spawn [--channel CHAN] [--role ROLE] [--card] [--prompt TEXT] [--board ID]
+        spawn a new session; prints {"id":...,"carded":bool}. With --channel the SERVER cards it, joins
+        it, positions the card next to the channel, and onboards it to AWAIT its task on the channel —
+        then POST the task as a channel message tagging it (do NOT put the task in --prompt; --prompt is
+        only a generic first turn). --role spawns under a role. --card = standalone card, no membership.
+  scripts/canvas input <sid> <text>                   send a turn to a live session's stdin (reads AS the human)
+  scripts/canvas done <sid>                            mark a session done + terminate it
+  scripts/canvas terminate <sid>                       kill a live session, free its slot
+env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
+USAGE
+}
+
+# JSON-encode a single string safely (handles quotes/newlines/unicode).
+jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' -d "$2"; }
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  spawn)
+    prompt=""; channel=""; role=""; card=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --prompt)  prompt="${2:-}"; shift 2 ;;
+        --channel) channel="${2:-}"; shift 2 ;;
+        --role)    role="${2:-}"; shift 2 ;;
+        --card)    card="1"; shift ;;
+        --board)   BOARD="${2:-}"; shift 2 ;;
+        *) echo "spawn: unexpected arg '$1'" >&2; exit 2 ;;
+      esac
+    done
+    body=$(python3 - "$prompt" "$channel" "$role" "$card" <<'PY'
+import json, sys
+prompt, channel, role, card = sys.argv[1:5]
+o = {}
+if prompt:  o["prompt"] = prompt
+if channel: o["channel"] = channel
+if role:    o["roleId"] = role
+if card:    o["card"] = True
+print(json.dumps(o))
+PY
+)
+    post "$SERVER/api/session/spawn?board=$BOARD" "$body"; echo ;;
+  input)
+    sid="${1:?usage: canvas input <sid> <text>}"; text="${2:?usage: canvas input <sid> <text>}"
+    post "$SERVER/api/session/$sid/input" "{\"text\":$(jstr "$text")}"; echo ;;
+  done)
+    sid="${1:?usage: canvas done <sid>}"
+    post "$SERVER/api/session/$sid/done" "{}"; echo ;;
+  terminate)
+    sid="${1:?usage: canvas terminate <sid>}"
+    post "$SERVER/api/session/$sid/terminate" "{}"; echo ;;
+  ""|-h|--help|help) usage ;;
+  *) echo "unknown verb: $cmd" >&2; usage >&2; exit 2 ;;
+esac

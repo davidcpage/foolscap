@@ -24,7 +24,7 @@ function tmpRepo() {
 test("createRole writes role.md under .canvas/roles/ and round-trips through readRole", () => {
   const repo = tmpRepo();
   const made = createRole(repo, { name: "Oracle", colour: "purple", charter: "Answer in file:line." });
-  assert.deepEqual(made, { roleId: "oracle", name: "Oracle", colour: "purple", charter: "Answer in file:line." });
+  assert.deepEqual(made, { roleId: "oracle", name: "Oracle", colour: "purple", loops: false, charter: "Answer in file:line." });
   // It lives where the gitignored, shadow-versioned home expects it.
   const f = path.join(canvasRolesDir(repo), "oracle", "role.md");
   assert.ok(fs.existsSync(f), "role.md is under .canvas/roles/<roleId>/");
@@ -32,11 +32,12 @@ test("createRole writes role.md under .canvas/roles/ and round-trips through rea
   const text = fs.readFileSync(f, "utf8");
   assert.match(text, /^---\nname: Oracle\ncolour: purple\n---/);
   assert.doesNotMatch(text, /createdAt|spawnedAt|\d{13}/, "no machine timestamps in the frontmatter");
-  // readRole recovers name/colour/charter (roleId is the lowercased slug).
+  // readRole recovers name/colour/loops/charter (roleId is the lowercased slug).
   assert.deepEqual(readRole(repo, "oracle"), {
     roleId: "oracle",
     name: "Oracle",
     colour: "purple",
+    loops: false,
     charter: "Answer in file:line.",
   });
 });
@@ -84,11 +85,12 @@ test("listRoles returns every role by name; missing dir → [] not a throw", () 
   const repo = tmpRepo();
   assert.deepEqual(listRoles(repo), [], "no roles dir yet → empty, not a throw");
   createRole(repo, { name: "Zebra", colour: "blue", charter: "z" });
-  createRole(repo, { name: "Alpha", charter: "a" });
-  // Sorted by name; the charter is NOT included in the list (read only on instantiation).
+  createRole(repo, { name: "Alpha", charter: "a", loops: true });
+  // Sorted by name; the charter is NOT included in the list (read only on instantiation). `loops` rides
+  // the list (false unless the role opts in) so the heartbeat/picker can tell a looping role at a glance.
   assert.deepEqual(listRoles(repo), [
-    { roleId: "alpha", name: "Alpha", colour: null },
-    { roleId: "zebra", name: "Zebra", colour: "blue" },
+    { roleId: "alpha", name: "Alpha", colour: null, loops: true },
+    { roleId: "zebra", name: "Zebra", colour: "blue", loops: false },
   ]);
 });
 

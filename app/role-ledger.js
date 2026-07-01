@@ -54,18 +54,19 @@ export function readRole(repoPath, roleId) {
  * Create a role: write `.canvas/roles/<roleId>/role.md`. Throws on an invalid name or a clash with an
  * existing role (the caller maps these to 400/409). Returns the created { roleId, name, colour, charter }.
  */
-export function createRole(repoPath, { name, charter, colour } = {}) {
+export function createRole(repoPath, { name, charter, colour, loops } = {}) {
   if (!isValidRoleName(name)) throw new Error("invalid role name (use letters, digits, hyphens)");
   const roleId = roleIdFor(name);
   if (fs.existsSync(rolePath(repoPath, roleId))) throw new Error(`role "${roleId}" already exists`);
   fs.mkdirSync(roleDir(repoPath, roleId), { recursive: true });
-  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter }));
-  return { roleId, name, colour: colour ?? null, charter: (charter ?? "").trim() };
+  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter, loops }));
+  return { roleId, name, colour: colour ?? null, loops: !!loops, charter: (charter ?? "").trim() };
 }
 
 /**
  * List every role this board has on disk, by name. The source for the role-picker on "new session".
- * Each entry is { roleId, name, colour } — the charter is read only when a role is actually instantiated.
+ * Each entry is { roleId, name, colour, loops } — the charter is read only when a role is actually
+ * instantiated. `loops` rides the list so the heartbeat / picker can tell a looping role at a glance.
  */
 export function listRoles(repoPath) {
   let entries;
@@ -78,7 +79,7 @@ export function listRoles(repoPath) {
     .filter((e) => e.isDirectory())
     .map((e) => readRole(repoPath, e.name))
     .filter((r) => r && r.name)
-    .map(({ roleId, name, colour }) => ({ roleId, name, colour }))
+    .map(({ roleId, name, colour, loops }) => ({ roleId, name, colour, loops: !!loops }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 

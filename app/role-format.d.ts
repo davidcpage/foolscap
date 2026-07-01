@@ -4,8 +4,13 @@
 export const ROLE_NAME_RE: RegExp;
 export function isValidRoleName(name: unknown): boolean;
 export function roleIdFor(name: string): string;
-export function renderRoleFile(role: { name: string; colour?: string | null; charter?: string }): string;
+export function renderRoleFile(role: {
+  name: string;
+  colour?: string | null;
+  loops?: boolean;
+  charter?: string;
+}): string;
 export function parseRoleFile(
   text: string,
   roleId: string,
-): { roleId: string; name: string; colour: string | null; charter: string };
+): { roleId: string; name: string; colour: string | null; loops: boolean; charter: string };

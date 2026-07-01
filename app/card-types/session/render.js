@@ -562,11 +562,15 @@ export default {
     // the loud amber "your turn" band is wrong. An idle session with an empty feed has never run a turn →
     // it stays bandless (neutral) until it produces output and goes idle again, which IS your turn.
     const neverRun = status === "idle" && raw.trim() === "";
+    // A looping ROLE (the PM) idle between server heartbeats isn't waiting on YOU — it's asleep on a timer.
+    // The feed carries `loops`; render it calm teal "scheduled", not the loud amber "your turn". Ranks below
+    // waiting-on-agent (a named peer-wait is the more specific signal) and never overrides neverRun.
+    const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.loops);
     const frameState =
       status === "running"
         ? "working"
         : status === "idle"
-          ? neverRun ? null : waitingOnAgent ? "waiting-agent" : "waiting"
+          ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
           : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
@@ -589,7 +593,9 @@ export default {
             ? html`<span class="ses-live">● live</span>`
             : waitingOnAgent
               ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
-              : html`<span class="ses-live ses-idle">○ waiting</span>`
+              : scheduled
+                ? html`<span class="ses-live ses-scheduled">◷ scheduled</span>`
+                : html`<span class="ses-live ses-idle">○ waiting</span>`
           : status === "exited"
             ? endPill("✕ exited", "ses-exited")
             : inactive

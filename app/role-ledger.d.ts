@@ -5,6 +5,7 @@ export interface Role {
   roleId: string;
   name: string;
   colour: string | null;
+  loops: boolean;
   charter: string;
 }
 
@@ -14,7 +15,9 @@ export function roleIdFor(name: string): string;
 export function readRole(repoPath: string, roleId: string): Role | null;
 export function createRole(
   repoPath: string,
-  role: { name: string; charter?: string; colour?: string },
+  role: { name: string; charter?: string; colour?: string; loops?: boolean },
 ): Role;
-export function listRoles(repoPath: string): Array<{ roleId: string; name: string; colour: string | null }>;
+export function listRoles(
+  repoPath: string,
+): Array<{ roleId: string; name: string; colour: string | null; loops: boolean }>;
 export function seedDefaultRole(repoPath: string): void;
