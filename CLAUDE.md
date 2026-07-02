@@ -84,9 +84,11 @@ read back on X's id.
 - **Read:** `GET /api/canvas?board=<id>` → `{ ts, snapshot, recentIntent }`, the last snapshot a tab *of that
   board* pushed (debounced ~500ms after a change; stale if nothing changed, and overwritten by *whichever*
   tab of that board pushed last). `snapshot.records` are the nodes/edges/layouts.
-- **Write:** `POST /api/command?board=<id> {type, actor, payload}` → broadcast over SSE to that board's
-  connected tabs, where it runs through the same `editor.commit` a gesture uses — validated, diffed, logged,
-  attributed, persisted. E.g. remove a card: `{type:"removeNode", actor:"user", payload:{id}}`.
+- **Write:** `POST /api/command?board=<id> {type, actor, payload}` → broadcast to that board's connected
+  tabs (over each tab's `/api/ws` WebSocket — one socket per tab carries feeds + bus + file-watch, because
+  standing SSE streams starved the browser's 6-per-host connection pool), where it runs through the same
+  `editor.commit` a gesture uses — validated, diffed, logged, attributed, persisted. E.g. remove a card:
+  `{type:"removeNode", actor:"user", payload:{id}}`.
 
 Gotchas (learned the hard way):
 - **No connected tab *for that board* → the command goes nowhere:** `POST /api/command` returns **HTTP 503

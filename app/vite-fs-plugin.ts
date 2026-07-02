@@ -14,6 +14,7 @@ import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import chokidar from "chokidar";
+import { WebSocketServer } from "ws";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -791,20 +792,11 @@ function startRolesFeed(boardId: string, repoPath: string): void {
   });
 }
 
-// Server-Sent Events: hold the connection open and forward chokidar add/change/unlink as JSON frames.
-// This is the reactive ingest path — an out-of-band edit (your editor, an agent, git pull) becomes a
-// live event the canvas turns into a card update, with no polling.
-function handleWatch(req: IncomingMessage, res: ServerResponse, root: string): void {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  res.write(`retry: 2000\n\n`);
-
-  const emit = (type: string) => (abs: string) =>
-    res.write(`data: ${JSON.stringify({ type, path: path.relative(root, abs) })}\n\n`);
-
+// The chokidar watcher one watch subscription rides — shared by the SSE endpoint (handleWatch, the
+// compat path) and a WebSocket `{sub:"watch"}` subscription. Forwards add/change/unlink as {type, path}
+// events until the returned close fn runs.
+function openRootWatcher(root: string, send: (ev: { type: string; path: string }) => void): () => void {
+  const emit = (type: string) => (abs: string) => send({ type, path: path.relative(root, abs) });
   const watcher = chokidar.watch(root, {
     ignoreInitial: true,
     // Rule B (docs/canvas-home.md §5): watch `.canvas/` CONTENT (so a dropped image / file-backed body
@@ -821,11 +813,27 @@ function handleWatch(req: IncomingMessage, res: ServerResponse, root: string): v
     .on("change", emit("change"))
     .on("unlink", emit("unlink"))
     .on("unlinkDir", emit("unlink"));
+  return () => void watcher.close();
+}
 
+// Server-Sent Events: hold the connection open and forward chokidar add/change/unlink as JSON frames.
+// This is the reactive ingest path — an out-of-band edit (your editor, an agent, git pull) becomes a
+// live event the canvas turns into a card update, with no polling. COMPAT path since the WS transport
+// landed: the app subscribes over /api/ws (a standing SSE stream eats one of the browser's six
+// per-host HTTP/1.1 connection slots — the pool-starvation bug), but the endpoint stays for external
+// consumers and old tabs.
+function handleWatch(req: IncomingMessage, res: ServerResponse, root: string): void {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+  res.write(`retry: 2000\n\n`);
+  const close = openRootWatcher(root, (ev) => res.write(`data: ${JSON.stringify(ev)}\n\n`));
   const ping = setInterval(() => res.write(`: ping\n\n`), 25000); // keep proxies from closing the stream
   req.on("close", () => {
     clearInterval(ping);
-    void watcher.close();
+    close();
   });
 }
 
@@ -882,6 +890,16 @@ interface PendingAsk {
   res: ServerResponse; // the asker's parked connection, resolved on reply/timeout
   timer: ReturnType<typeof setTimeout>;
 }
+// One tab's WebSocket connection (/api/ws) — the single transport that replaced the tab's standing SSE
+// streams (feeds + bus + one watch per root), because each of those held one of the browser's SIX
+// per-host HTTP/1.1 connection slots: ~3 tabs starved the pool and every further request (the document
+// itself, the template registry's fetches) queued forever with no error. A WebSocket lives in a separate,
+// much larger browser budget, so tabs no longer compete with real request/response traffic.
+interface WsClient {
+  boardId: string; // fixed at connect (?board=) — bus commands fan out per board
+  watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
+  send(msg: unknown): void;
+}
 interface CanvasFsState {
   feedClients: Set<SseClient>;
   feedValues: Map<string, unknown>;
@@ -892,6 +910,7 @@ interface CanvasFsState {
   shuttingDown?: boolean; // set by killAll so the exit handler tells a clean server shutdown from a real crash
   threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
   pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (added via ??= for old pinned state)
+  wsClients?: Set<WsClient>; // connected /api/ws tabs (added via ??= for old pinned state)
 }
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
   feedClients: new Set<SseClient>(),
@@ -912,11 +931,13 @@ const sessionWatchers = fsState.sessionWatchers;
 // than reading `undefined` and crashing — the object initializer above only runs when fsState is absent.
 const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
 const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
+const wsClients = (fsState.wsClients ??= new Set<WsClient>());
 
 function publishFeed(feed: string, value: unknown): void {
   feedValues.set(feed, value);
   const frame = `data: ${JSON.stringify({ feed, value })}\n\n`;
   for (const c of feedClients) c.res.write(frame);
+  for (const c of wsClients) c.send({ ch: "feed", feed, value });
 }
 
 // Open an SSE stream and add it to a client set, with the keep-alive ping + close bookkeeping all
@@ -941,6 +962,77 @@ function openSse(req: IncomingMessage, res: ServerResponse, clients: Set<SseClie
 function handleFeeds(req: IncomingMessage, res: ServerResponse): void {
   openSse(req, res, feedClients);
   for (const [feed, value] of feedValues) res.write(`data: ${JSON.stringify({ feed, value })}\n\n`);
+}
+
+// ── the tab transport (/api/ws) ──────────────────────────────────────────────────────────────────
+// ONE WebSocket per tab carries everything the server pushes: feed frames (replayed on connect, like
+// the SSE stream), the board's bus commands, and per-root file-watch events (client-subscribed with
+// {sub:"watch", root}). Rationale on WsClient above: standing SSE streams ate the browser's six-per-host
+// HTTP/1.1 pool — three tabs starved every later fetch into a silent forever-queue. The SSE endpoints
+// (/api/feeds, /api/bus, /api/watch) stay as compat aliases; agents keep using plain HTTP.
+//
+// Attached per http server (WeakSet-guarded): a plugin edit re-evals this module in the same process,
+// and a full server restart brings a NEW httpServer — attach once to each. Vite's own HMR socket has
+// its own upgrade listener; ours ignores every pathname but /api/ws, so the two coexist.
+const wsAttachedServers: WeakSet<object> = ((globalThis as { __canvasWsAttached?: WeakSet<object> })
+  .__canvasWsAttached ??= new WeakSet());
+
+function attachWs(server: ViteDevServer): void {
+  const http = server.httpServer;
+  if (!http || wsAttachedServers.has(http)) return;
+  wsAttachedServers.add(http);
+  const wss = new WebSocketServer({ noServer: true });
+  http.on("upgrade", (req, socket, head) => {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? "", "http://localhost");
+    } catch {
+      return;
+    }
+    if (url.pathname !== "/api/ws") return; // not ours — Vite's HMR listener handles its own upgrades
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      const b = reqBoard(url);
+      if (!b) return void ws.close(4400, "unknown board");
+      const client: WsClient = {
+        boardId: b.boardId,
+        watches: new Map(),
+        send(msg) {
+          if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
+        },
+      };
+      wsClients.add(client);
+      for (const [feed, value] of feedValues) client.send({ ch: "feed", feed, value }); // replay, like handleFeeds
+      const ping = setInterval(() => {
+        if (ws.readyState === ws.OPEN) ws.ping();
+      }, 25000);
+      ws.on("message", (data) => {
+        let msg: { sub?: unknown; unsub?: unknown; root?: unknown };
+        try {
+          msg = JSON.parse(String(data));
+        } catch {
+          return;
+        }
+        const root = typeof msg.root === "string" ? msg.root : null;
+        if (msg.sub === "watch" && root && !client.watches.has(root)) {
+          // Same confinement as GET /api/watch: the root must be one of this BOARD's known roots.
+          const dir = rootDir(client.boardId, root);
+          if (!dir) return;
+          client.watches.set(root, openRootWatcher(dir, (ev) => client.send({ ch: "watch", root, ev })));
+        } else if (msg.unsub === "watch" && root) {
+          client.watches.get(root)?.();
+          client.watches.delete(root);
+        }
+      });
+      ws.on("error", () => {
+        /* close follows; the close handler is the one teardown */
+      });
+      ws.on("close", () => {
+        clearInterval(ping);
+        for (const close of client.watches.values()) close();
+        wsClients.delete(client);
+      });
+    });
+  });
 }
 
 // Feed: the repo's HEAD commit. chokidar on .git/HEAD (branch switches) + .git/logs/HEAD (every
@@ -2706,10 +2798,12 @@ function dispatchBusCommand(
   cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
   origin: string,
 ): number {
-  const clients = busClients.get(boardId);
-  const delivered = clients?.size ?? 0;
+  const clients = busClients.get(boardId); // SSE compat path — the app's tabs ride /api/ws now
+  const sockets = [...wsClients].filter((c) => c.boardId === boardId);
+  const delivered = (clients?.size ?? 0) + sockets.length;
   const frame = `data: ${JSON.stringify(cmd)}\n\n`;
   if (clients) for (const c of clients) c.res.write(frame);
+  for (const c of sockets) c.send({ ch: "bus", cmd });
   // Only announce if a tab actually applied it — a command that reached no tab (delivered=0) didn't change
   // the board, so announcing a join/invite that never landed would be a phantom (and double-fire on retry).
   if (delivered > 0) {
@@ -3256,7 +3350,25 @@ export function fsApi(): Plugin {
     },
     configureServer(server: ViteDevServer) {
       startFeeds();
+      attachWs(server); // the tabs' one-socket transport (feeds + bus + watch)
       server.middlewares.use((req, res, next) => {
+        // ONE canonical browser origin (127.0.0.1). `localhost` and `127.0.0.1` are different origins to
+        // the browser, so each holds its OWN IndexedDB — a tab opened on the other spelling sees a
+        // different (usually empty) copy of every board, which reads as "where did my board go". Redirect
+        // page NAVIGATIONS (GET asking for text/html) to the canonical host and let everything else —
+        // curl recipes, API calls, module fetches — pass untouched on either spelling. 127.0.0.1 is
+        // canonical (not localhost) because the boards people already have live there.
+        const host = req.headers.host ?? "";
+        if (
+          req.method === "GET" &&
+          host.startsWith("localhost") &&
+          (req.headers.accept ?? "").includes("text/html") &&
+          !(req.url ?? "").startsWith("/api/") &&
+          !(req.url ?? "").startsWith("/card-types/")
+        ) {
+          res.writeHead(302, { Location: `http://${host.replace(/^localhost/, "127.0.0.1")}${req.url ?? "/"}` });
+          return void res.end();
+        }
         if (!req.url || !(req.url.startsWith("/api/") || req.url.startsWith("/card-types/")))
           return next();
         const url = new URL(req.url, "http://localhost");

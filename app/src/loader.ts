@@ -12,6 +12,7 @@ import {
 import { fileKind } from "./fileTypes";
 import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce } from "./content";
 import { activeBoardId } from "./board";
+import { subscribeWatch } from "./feeds";
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
@@ -1029,34 +1030,38 @@ export function watchDataset(
   root: RootId,
   onEvent?: (e: WatchEvent) => void,
 ): () => void {
-  const es = new EventSource(`/api/watch?board=${activeBoardId()}&root=${encodeURIComponent(root)}`);
+  // Rides the tab's shared WebSocket (feeds.subscribeWatch) rather than its own EventSource — a standing
+  // SSE stream per root was one of the three per-tab streams that starved the browser's six-per-host
+  // connection pool. Reconnect + re-subscribe live in feeds.ts; the server closes its watcher with the sub.
+  return subscribeWatch(root, (ev) => void onWatchEvent(m, root, ev as WatchEvent, onEvent));
+}
 
-  es.onmessage = async (ev) => {
-    const msg = JSON.parse(ev.data) as WatchEvent;
+async function onWatchEvent(
+  m: InteractionManager,
+  root: RootId,
+  msg: WatchEvent,
+  onEvent?: (e: WatchEvent) => void,
+): Promise<void> {
+  // Keep the in-card directory tree live FIRST, independent of whether a card exists for this path: an
+  // add/unlink changes the PARENT folder's children, so re-pull that one cached listing (no-op unless
+  // the folder was actually loaded). A `change` only touches file content, not membership, so skip it.
+  if (msg.type !== "change") refreshListing(root, parentDir(msg.path));
 
-    // Keep the in-card directory tree live FIRST, independent of whether a card exists for this path: an
-    // add/unlink changes the PARENT folder's children, so re-pull that one cached listing (no-op unless
-    // the folder was actually loaded). A `change` only touches file content, not membership, so skip it.
-    if (msg.type !== "change") refreshListing(root, parentDir(msg.path));
+  const id = fileNodeId(root, msg.path);
+  if (!m.editor.store.get<"node">(id)) return; // no card for this (root, path) → no card-level effect
 
-    const id = fileNodeId(root, msg.path);
-    if (!m.editor.store.get<"node">(id)) return; // no card for this (root, path) → no card-level effect
-
-    if (msg.type === "unlink") {
-      // TOMBSTONE, don't remove (slice D): a pinned card is the user's spatial memory — silently
-      // deleting it on a disk unlink is the "where did my content go?" failure. Mark it gone so the
-      // template shows a tombstone the user dismisses deliberately; a re-add (below) clears it.
-      setGone(root, msg.path, true);
-    } else {
-      setGone(root, msg.path, false); // re-created on disk → clear any tombstone
-      const r = await fetch(
-        `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(msg.path)}`,
-      );
-      if (!r.ok) return; // a directory event (no file body) or transient — its listing refreshes on re-subscribe
-      setFileContent(root, msg.path, filePreview((await r.json()) as TreeFile));
-    }
-    onEvent?.(msg);
-  };
-
-  return () => es.close();
+  if (msg.type === "unlink") {
+    // TOMBSTONE, don't remove (slice D): a pinned card is the user's spatial memory — silently
+    // deleting it on a disk unlink is the "where did my content go?" failure. Mark it gone so the
+    // template shows a tombstone the user dismisses deliberately; a re-add (below) clears it.
+    setGone(root, msg.path, true);
+  } else {
+    setGone(root, msg.path, false); // re-created on disk → clear any tombstone
+    const r = await fetch(
+      `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(msg.path)}`,
+    );
+    if (!r.ok) return; // a directory event (no file body) or transient — its listing refreshes on re-subscribe
+    setFileContent(root, msg.path, filePreview((await r.json()) as TreeFile));
+  }
+  onEvent?.(msg);
 }
