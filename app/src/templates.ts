@@ -1,7 +1,7 @@
 import { nothing, render as litRender } from "../vendor/lit-html.js";
 import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
-import { feedSignal } from "./feeds";
+import { feedSignal, onFeedsReconnect } from "./feeds";
 import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
 import { openSession, openChannel, openRole, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
 // The role.md codec — the ONE source for `role.md text <-> {name,colour,charter}`, shared with the server
@@ -664,7 +664,9 @@ function setType(type: string, tpl: CardTemplate | null): void {
 // load must never clobber a newer one, so each completion checks it's still the latest for its type.
 const loadGen = new Map<string, number>();
 
-async function loadType(type: string, yaml: string): Promise<void> {
+// Resolves false when the import failed (so loadAll can RETRY the type — a restart race nulls every
+// type at once and a one-shot null was permanent); a load superseded by a newer one is not a failure.
+async function loadType(type: string, yaml: string): Promise<boolean> {
   const gen = (loadGen.get(type) ?? 0) + 1;
   loadGen.set(type, gen);
   const { contract, capabilities, chrome, aspect, aspectAuto } = parseTypeYaml(yaml);
@@ -673,14 +675,16 @@ async function loadType(type: string, yaml: string): Promise<void> {
       await import(/* @vite-ignore */ `/card-types/${type}/render.js?t=${Date.now()}-${gen}`)
     ).default as CardTemplateModule;
     if (typeof mod?.render !== "function") throw new Error("template has no render()");
-    if (loadGen.get(type) !== gen) return;
+    if (loadGen.get(type) !== gen) return true;
     setType(type, { type, contract, capabilities, chrome, aspect, aspectAuto, module: mod });
+    return true;
   } catch (err) {
-    if (loadGen.get(type) !== gen) return;
+    if (loadGen.get(type) !== gen) return true;
     // A broken template must never take the canvas down — drop the type, card falls back to the
-    // host's placeholder (design-note cost #4: never hard-fail a card).
+    // host's placeholder (design-note cost #4: never hard-fail a card) while the retry loop runs.
     console.warn(`card-types/${type}: load failed`, err);
     setType(type, null);
+    return false;
   }
 }
 
@@ -688,21 +692,56 @@ async function loadType(type: string, yaml: string): Promise<void> {
 // socket answers, which can be a beat before the API middleware is serving — and this load runs exactly
 // once per page. A one-shot failure here left EVERY template card on the "no template for type …"
 // placeholder until a manual reload, with only an unhandled-rejection warning to show for it (nothing
-// re-triggers the load except a template edit on disk). So retry with a short linear backoff — bounded,
-// so a genuinely dead server doesn't poll forever, and loud when it gives up.
+// re-triggers the load except a template edit on disk). So: retry with a short linear backoff — bounded,
+// so a genuinely dead server doesn't poll forever, and loud when it gives up — where a failed per-type
+// IMPORT counts as a failure too (only the types that failed re-import, so healthy types' template
+// objects keep their identity and their cards don't churn). startRegistry also re-runs the load when
+// the server socket RECONNECTS, so a tab that lived through a dead-server window heals itself.
 const LOAD_ALL_RETRIES = 5;
-async function loadAll(attempt = 0): Promise<void> {
+
+// A fetch stuck in the browser's request QUEUE neither resolves nor rejects, so no retry/error path can
+// even fire — the 2026-07-02 connection-pool starvation was invisible precisely because nothing anywhere
+// reported anything. One honest tripwire: if the registry is still empty 10s after a load cycle began,
+// say so, loudly and specifically. Disarmed when a cycle finishes (success or give-up), re-armed by the
+// next cycle.
+let loadWatchdog: ReturnType<typeof setTimeout> | null = null;
+function armLoadWatchdog(): void {
+  loadWatchdog ??= setTimeout(() => {
+    if (templates.size === 0)
+      console.error(
+        "card-types: registry load still pending after 10s — requests may be queueing (connection-pool " +
+          "starvation — too many tabs on this origin?) or the dev server is unreachable; template cards " +
+          "show the placeholder until it resolves",
+      );
+  }, 10_000);
+}
+function disarmLoadWatchdog(): void {
+  if (loadWatchdog) clearTimeout(loadWatchdog);
+  loadWatchdog = null;
+}
+
+// `only` scopes a retry cycle to the types whose imports failed; absent ⇒ the whole registry.
+async function loadAll(attempt = 0, only?: ReadonlySet<string>): Promise<void> {
+  armLoadWatchdog();
+  let failedTypes: Set<string> | undefined;
   try {
     const res = await fetch("/api/card-types");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const { types } = (await res.json()) as { types: { type: string; yaml: string }[] };
-    await Promise.all(types.map((t) => loadType(t.type, t.yaml)));
+    const wanted = only ? types.filter((t) => only.has(t.type)) : types;
+    const results = await Promise.all(wanted.map(async (t) => ({ type: t.type, ok: await loadType(t.type, t.yaml) })));
+    const failed = results.filter((r) => !r.ok).map((r) => r.type);
+    if (!failed.length) return disarmLoadWatchdog();
+    failedTypes = new Set(failed);
+    throw new Error(`template import failed: ${failed.join(", ")}`);
   } catch (err) {
     if (attempt >= LOAD_ALL_RETRIES) {
+      disarmLoadWatchdog();
       console.error("card-types: registry load failed after retries — cards will show the placeholder", err);
       return;
     }
-    setTimeout(() => void loadAll(attempt + 1), 1000 * (attempt + 1));
+    // A list-fetch failure keeps the incoming scope (`only`); a partial import failure narrows to it.
+    setTimeout(() => void loadAll(attempt + 1, failedTypes ?? only), 1000 * (attempt + 1));
   }
 }
 
@@ -715,6 +754,10 @@ function startRegistry(): void {
   if (started) return;
   started = true;
   void loadAll();
+  // A server socket RECONNECT means the server was unreachable for a while — exactly the window where a
+  // bounded retry loop can have given up. Re-pull the whole registry (fresh attempt budget), the same
+  // re-arm App.tsx does for session feeds; a superseded in-flight load can't clobber it (loadGen).
+  onFeedsReconnect(() => void loadAll());
   let lastTs = 0;
   feedSignal<{ path: string; ts: number }>("cardtypes").subscribe(() => {
     const ev = feedSignal<{ path: string; ts: number }>("cardtypes").get();
