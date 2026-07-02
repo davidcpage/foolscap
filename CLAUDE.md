@@ -153,7 +153,10 @@ replayed at boot; read cursors are server memory and reset on a COLD restart —
 sessions). Agents work in **thread ids + their own sid**; the server resolves nodes/edges. The thread id
 carries a colon, so **percent-encode it** in the URL path. Everything below is served under BOTH
 `/api/thread/…` (canonical) and `/api/channel/…` (transition alias); `GET /api/threads` (alias
-`/api/channels`) lists the markers, each with its `intents` and `seats`.
+`/api/channels`) lists the markers, each with its `intents`, `seats`, and the DERIVED `state` +
+`participants` (`thread-state.js`: **active** — someone running or live+working; **waiting** — nobody
+active, ≥1 declared `blocked:human` (survives its declarer's exit via the seat); **dormant** — everyone
+done/exited, none blocked:human; unstaffed threads are dormant; computed at read time, never stored).
 
 - **Broadcast:** `POST /api/thread/<id>/message {from, text}` records the message in the thread's off-log
   log (the `thread:<id>` feed the card renders) and **fans out to every other member's inbox**. `from` is a
@@ -188,8 +191,8 @@ carries a colon, so **percent-encode it** in the URL path. Everything below is s
   the process layer and only the agent knows which. Card-only like the ask echo (`kind:"intent"` — rendered
   as a status line, skipped by `inbox`/nudges, wakes no one). The latest declaration per participant rides
   the thread's meta marker and `GET /api/threads` (`intents` — keyed by the declarer's SEAT handle when it
-  holds one, so the state survives a respawn; else by sid); the step-3 thread-state projection
-  (active/waiting/dormant) derives from it. Enum lives in `app/work-intent.js`.
+  holds one, so the state survives a respawn; else by sid); the derived thread `state` (see above) ranges
+  over it. Enum lives in `app/work-intent.js`.
 
 Gotchas:
 - **Membership must be in the pushed snapshot before `ask`/`message` will accept it.** Membership is read from

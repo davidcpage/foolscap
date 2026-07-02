@@ -9,9 +9,10 @@ import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
-import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta } from "./thread-ledger.js";
+import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
+import { deriveThreadState } from "./thread-state.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -703,6 +704,41 @@ function startSessionsFeed(boardId: string, dir: string): void {
   });
 }
 
+// The PARTICIPANTS a thread's state derives from (§8 step 3): the union of the current member:open
+// roster (snapshot edges + the emitted-membership registry) and the seats' current occupants — seats
+// are the DURABLE participants, so a thread whose card (and edges) were removed, or a board whose tab
+// hasn't pushed a snapshot yet (a cold server), still projects from its seat records. Each participant
+// pairs what the canvas OBSERVES (its process-state, from the live-session registry; absent = exited)
+// with what only the agent could SAY (its latest work-intent off the marker, seat-keyed where it holds
+// one so the declaration survives a respawn). Intent keys that name no agent (the human's own mark at
+// the card) annotate the log but are not participants — humans emit no work-intent (lifecycle §6);
+// the close verb (§8 step 6) is the human's tool.
+interface ThreadParticipantOut {
+  sid: string;
+  seat: string | null; // the seat handle it occupies (§5), null for a plain unnamed session
+  role: string | null; // the seat's role name (= handle until labelled multiplicity ships)
+  processState: "running" | "idle" | "exited";
+  intent: string | null; // latest declared work-intent, null if never declared
+}
+function threadParticipants(boardId: string, threadId: string, marker: ThreadMetaMarker): ThreadParticipantOut[] {
+  const records = boardSnapshotRecords(boardId) ?? [];
+  const seats = marker.seats ?? {};
+  const intents = marker.intents ?? {};
+  const sids = new Set<string>(threadMemberSids(records, threadId));
+  for (const s of Object.values(seats)) if (s.sid) sids.add(s.sid);
+  return [...sids].map((sid) => {
+    const live = liveSessions.get(sid);
+    const seat = seatForSid(seats, sid);
+    return {
+      sid,
+      seat,
+      role: seat ? (seats[seat]?.role ?? seat) : null,
+      processState: live?.status ?? "exited",
+      intent: intents[seat ?? sid]?.intent ?? null,
+    };
+  });
+}
+
 // GET /api/threads (alias: /api/channels) → every thread this board has on disk (newest activity first),
 // for the list rail (the threads browser card, the sessions card's twin). Mirrors handleSessions: a cheap
 // readdir of the `.canvas/threads/` markers, NOT the message logs — the rail wants title/brief/activity,
@@ -711,20 +747,28 @@ function startSessionsFeed(boardId: string, dir: string): void {
 // "reopen it later" needs no canvas persistence — the marker is the source of truth (the sessions list's
 // .jsonl rationale). Each entry carries the id under BOTH `threadId` (canonical) and `chanId` (what the
 // pre-rename rail card reads), and the response under both `threads` and `channels` — transition aliases.
-function handleThreads(res: ServerResponse, repoPath: string): void {
-  const threads = listThreads(repoPath).map((m) => ({
-    threadId: m.threadId,
-    chanId: m.threadId,
-    title: typeof m.title === "string" ? m.title : "",
-    text: typeof m.text === "string" ? m.text : "",
-    messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
-    mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
-    // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
-    // declarer holds one, else sid) — the raw material the step-3 thread-state projection derives from.
-    intents: m.intents ?? {},
-    // The §5 seat records: the durable per-thread participants (role posts), 1:1 with roles until labels.
-    seats: m.seats ?? {},
-  }));
+// `state` + `participants` are the §8 step-3 DERIVED projection (thread-state.js — active/waiting/dormant
+// the way `status` rides /api/sessions): computed at read time from marker × roster × live registry,
+// never stored — the marker keeps only what was declared, the projection is always current.
+function handleThreads(res: ServerResponse, boardId: string, repoPath: string): void {
+  const threads = listThreads(repoPath).map((m) => {
+    const participants = threadParticipants(boardId, m.threadId, m);
+    return {
+      threadId: m.threadId,
+      chanId: m.threadId,
+      title: typeof m.title === "string" ? m.title : "",
+      text: typeof m.text === "string" ? m.text : "",
+      messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
+      mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
+      // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
+      // declarer holds one, else sid) — the raw material the state projection derives from.
+      intents: m.intents ?? {},
+      // The §5 seat records: the durable per-thread participants (role posts), 1:1 with roles until labels.
+      seats: m.seats ?? {},
+      state: deriveThreadState(participants),
+      participants,
+    };
+  });
   sendJson(res, 200, { threads, channels: threads });
 }
 
@@ -3181,7 +3225,7 @@ async function handleThreadReply(
 // (rendered as a small status line; inbox/nudge skip it — an agent's own bookkeeping must not wake the
 // room). The latest declaration per member also rides the channel's meta marker (`intents`, keyed by sid —
 // the seat record's forerunner; step 2 moves the key to the seat so it survives an occupant respawn), which
-// is what /api/threads serves and what the step-3 thread-state projection will range over. `done` doubles
+// is what /api/threads serves and what the thread-state projection (thread-state.js) ranges over. `done` doubles
 // as the cooperative-yield signal — for now it informs slot management (a PM/human can see who is safe to
 // terminate); the reflex scheduler acting on it comes with the projection.
 async function handleThreadIntent(
@@ -3434,7 +3478,7 @@ export function fsApi(): Plugin {
         if (url.pathname === "/api/threads" || url.pathname === "/api/channels") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleThreads(res, b.repoPath);
+          return handleThreads(res, b.boardId, b.repoPath);
         }
         if (url.pathname === "/api/roles") {
           const b = reqBoard(url);

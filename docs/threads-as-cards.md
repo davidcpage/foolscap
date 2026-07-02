@@ -247,8 +247,16 @@ Rename, don't rebuild — in dependency order:
    type `"thread"` with `"channel"` accepted as the carried-over legacy type; seats filled at
    member:open onboarding for role-spawned joiners, work-intents re-keyed to seats; spawn takes
    `thread` with `channel` aliased; CLAUDE.md rewritten.)
-3. **Derived thread state** — the reflex projection (`session-thread-lifecycle.md` §4) computed
-   server-side, exposed on `/api/threads` the way `status` rides `/api/sessions`.
+3. ~~**Derived thread state** — the reflex projection (`session-thread-lifecycle.md` §4) computed
+   server-side, exposed on `/api/threads` the way `status` rides `/api/sessions`.~~ (committed —
+   `thread-state.js` (pure, node-tested) derives active/waiting/dormant from participants =
+   (member roster ∪ seat occupants) × live process-state × seat-keyed intents; `/api/threads`
+   entries carry `state` + `participants`. Two resolved judgement calls: an UNSTAFFED thread is
+   dormant, not waiting — §4's archive predicate holds vacuously, waiting stays hard to enter, and
+   the carried-over channels would otherwise be permanently loud; live all-`blocked:peer` threads
+   read active — the §4 table's gap, resolved to the honest bucket (inter-agent work in flight,
+   not the human's turn, not archivable). The §6 trailing-question INFERENCE of a provisional
+   blocked:human stays future work on the emit side — the machine only reads declared intents.)
 4. **Threads rail card** (§3) — list + waiting-first sort + drag-out; retire the channels rail.
 5. **@Role spawn-on-mention** (§4) — the tag parser already resolves member prefixes; teach it roles, and
    wire the miss-path to the existing spawn cascade (fills-or-creates the first seat). Labelled seats +
