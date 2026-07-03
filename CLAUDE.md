@@ -71,9 +71,10 @@ trusting one:
 
 ## Driving the board from outside (the agent bus)
 
-The live board lives in the **browser** (the signia store + IndexedDB). The dev server holds no board — only
-the last snapshot a browser pushed. So to read or mutate canvas state from a shell/agent, go through the
-agent bus (`app/src/agentBus.ts`, `vite-fs-plugin.ts`), never the filesystem.
+The live board lives in the **browser** (the signia store); the durable copy lives in the repo's
+`.canvas/board/` (see "Board records persist SERVER-SIDE" below). To read or mutate canvas state from a
+shell/agent, go through the agent bus (`app/src/agentBus.ts`, `vite-fs-plugin.ts`) — reads are served
+from the durable store, never read the files directly (they lag and their layout is private).
 
 **The bus is PER BOARD** (one server now hosts many boards — `?board=<boardId>`). Every bus endpoint takes
 `?board=<id>` and defaults to the dev repo's board (`foolscap-a9921027`) when omitted, so the dev-repo
@@ -96,12 +97,15 @@ right-click menu's **Board** section — it lists the registry (plus "Open repo�
 stores are HTTP clients (`src/remote-store.ts`), so a board hydrates the same in any browser/machine
 and its records travel with the repo. IndexedDB is a read-once adoption source for pre-existing
 boards, not a durable tier. Don't curl-write a real board's persist endpoints: junk server state
-blocks that one-time adoption. (The camera pose stays per-browser in localStorage; `GET /api/canvas`
-remains the agents' read — a separate, debounced push.)
+blocks that one-time adoption. (The camera pose stays per-browser in localStorage.) This store also
+serves `GET /api/canvas` and every server-side membership/node lookup — the browser no longer pushes a
+second snapshot for those.
 
-- **Read:** `GET /api/canvas?board=<id>` → `{ ts, snapshot, recentIntent }`, the last snapshot a tab *of that
-  board* pushed (debounced ~500ms after a change; stale if nothing changed, and overwritten by *whichever*
-  tab of that board pushed last). `snapshot.records` are the nodes/edges/layouts.
+- **Read:** `GET /api/canvas?board=<id>` → `{ ts, tabs, snapshot, recentIntent }` from the DURABLE store
+  (the browser's debounced ~400ms persistence save; `recentIntent` derives from the event log).
+  `snapshot.records` are the nodes/edges/layouts. **A read works with NO tab live** — `tabs` is the
+  liveness signal (0 = nobody can act on this board; don't treat a successful read as "board is live").
+  404 only for a board that has never persisted anything.
 - **Write:** `POST /api/command?board=<id> {type, actor, payload}` → broadcast to that board's connected
   tabs (over each tab's `/api/ws` WebSocket — one socket per tab carries feeds + bus + file-watch, because
   standing SSE streams starved the browser's 6-per-host connection pool), where it runs through the same
@@ -111,7 +115,8 @@ remains the agents' read — a separate, debounced push.)
 Gotchas (learned the hard way):
 - **No connected tab *for that board* → the command goes nowhere:** `POST /api/command` returns **HTTP 503
   `{delivered:0}`** judged against that board's tabs only. Confirm `delivered>0` before trusting a broadcast;
-  there is no shell path to a board if no browser is live on it. An unknown `?board=` is **400**.
+  there is no shell path to *mutate* a board if no browser is live on it (reads still work — see above).
+  An unknown `?board=` is **400**.
 - **The port is always 5173** (`strictPort` in `vite.config.ts`): a second `npm run dev` now **fails
   loudly** instead of silently binding 5174. Deliberate — IndexedDB is per-ORIGIN (port included), so the
   old silent port slide made every board look empty. If the server won't start, stop the process holding
@@ -238,8 +243,8 @@ done/exited, none blocked:human; unstaffed threads are dormant; computed at read
   over it. Enum lives in `app/work-intent.js`.
 
 Gotchas:
-- **Membership must be in the pushed snapshot before `ask`/`message` will accept it.** Membership is read from
-  the last snapshot a tab pushed (debounced ~500ms after the `addEdge`); fire too soon and you get a
+- **Membership must be in the saved snapshot before `ask`/`message` will accept it.** Membership is read
+  from the durable snapshot (saved debounced ~400ms after the `addEdge`); fire too soon and you get a
   spurious **403**. Poll `/api/canvas` for the `member:open` edge before posting.
 - **`ask`/`reply` never touch the broadcast log/cursor** — they're a separate in-memory RPC keyed by `askId`;
   only the final `kind:"ask"` echo lands in the log. Don't add a `to` field to messages (see §16 for why).

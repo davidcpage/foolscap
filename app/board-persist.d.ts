@@ -10,6 +10,9 @@ export function readBoardPersist(repoPath: string): {
   snapshot: PersistedBoardSnapshot | null;
 };
 export function hasBoardPersist(repoPath: string): boolean;
+export function readBoardSnapshot(repoPath: string): PersistedBoardSnapshot | null;
+export function boardPersistMtime(repoPath: string): number;
+export function describeBoardEvents(events: PersistedEvent[], n?: number): string;
 export function appendBoardEvent(repoPath: string, event: PersistedEvent): void;
 export function writeBoardSnapshot(repoPath: string, snapshot: PersistedBoardSnapshot): void;
 export function importBoardPersist(

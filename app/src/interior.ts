@@ -33,11 +33,32 @@ export function claimWheelGesture(): void {
   claimed = true;
 }
 
-// True when a wheel gesture is mid-flight and its first event fell through to the canvas: an
-// interior scroller finding itself under the cursor NOW got there by being panned, not pointed at,
-// so it must let the event through.
-export function wheelGestureLatchedToCanvas(): boolean {
-  return !firstOfGesture && !claimed;
+// ── Aim vs. arrival ─────────────────────────────────────────────────────────
+// The latch scopes ONE gesture; this scopes the moment between gestures. After a camera move (a peek
+// dive, a pan, a fit) the cursor is routinely left sitting over a card — the board moved, the pointer
+// didn't — and the user's next wheel is almost always "nudge the view", not "scroll that card". So a
+// card may open a FRESH claim only if the pointer has actually been aimed (moved or pressed) since
+// the camera last moved: hover you earned by pointing scrolls the card, hover the board delivered to
+// you pans the canvas. App.tsx feeds both clocks (pointer listeners + a camera signal subscription).
+// Starts card-permissive (aim > camera) so cold boot behaves as before.
+let lastAimTs = 0;
+let lastCameraTs = -1;
+
+export function notePointerAim(): void {
+  lastAimTs = performance.now();
+}
+
+export function noteCameraMoved(): void {
+  lastCameraTs = performance.now();
+}
+
+// The one question an interior wheel handler asks before containing an event. A continuing gesture
+// belongs to whoever claimed its first event — a pan stays a pan when a card slides under the cursor,
+// and a card scroll stays a card scroll even if the camera moves concurrently (an agent-driven fly).
+// A fresh gesture is claimable only from earned hover (aim since the last camera move, above).
+export function wheelClaimableByCard(): boolean {
+  if (!firstOfGesture) return claimed;
+  return lastAimTs > lastCameraTs;
 }
 
 function isScrollable(el: Element): boolean {

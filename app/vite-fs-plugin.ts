@@ -16,7 +16,7 @@ import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
-import { appendBoardEvent, clearBoardPersist, compactBoardEvents, importBoardPersist, readBoardPersist, writeBoardSnapshot } from "./board-persist.js";
+import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 
@@ -356,8 +356,18 @@ async function handleBoardPersistWrite(
     if (kind === "snapshot") {
       if (typeof body.snapshot !== "object" || body.snapshot === null)
         return sendJson(res, 400, { error: "missing snapshot" });
-      writeBoardSnapshot(repoPath, body.snapshot as Record<string, unknown>);
-      return sendJson(res, 200, { ok: true });
+      const snap = body.snapshot as { records?: Array<Record<string, unknown>> };
+      // Capture the snapshot being replaced FIRST: the before↔after membership diff below is how a
+      // human-drawn thread join/leave (a local commit that never crosses the bus) reaches onboarding.
+      const before = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
+      writeBoardSnapshot(repoPath, snap as Record<string, unknown>);
+      sendJson(res, 200, { ok: true });
+      try {
+        announceNewMemberships(boardId, before ? (before.records ?? []) : null, snap.records ?? [], originOf(req));
+      } catch (err) {
+        console.warn("[threads] membership announce from snapshot diff failed:", err);
+      }
+      return;
     }
     // import: the one-time IndexedDB adoption. Refused (imported:false) once any server state exists.
     const events = Array.isArray(body.events) ? (body.events as Record<string, unknown>[]) : [];
@@ -3027,23 +3037,24 @@ function startCardTypesFeed(): void {
 // ── agent bus (demo §10 step 4: the MCP server's dress rehearsal) ───────────────────────────────
 // In-band agent interaction over plain HTTP. An agent POSTs a Command to /api/command; the server
 // forwards it over SSE (/api/bus) to the browser, which runs it through editor.commit — the SAME
-// validated mutation surface a gesture uses, attributed by `actor`. The browser pushes its snapshot
-// + recent intent back to POST /api/canvas (debounced), so GET /api/canvas is the agent's read side.
-// The server is a dumb relay: it holds no canvas state of its own, just the browser's last push.
+// validated mutation surface a gesture uses, attributed by `actor`. The READ side is served from the
+// durable board store (`.canvas/board/` — board-persist.js): the browser's debounced persistence save
+// is the one snapshot write path, and GET /api/canvas reads it back with the recent intent derived
+// from the event log. (The old second pipe — agentBus pushing a near-identical snapshot to POST
+// /api/canvas just for this read — is retired; reads now work with NO tab live, so the response
+// carries `tabs` as the liveness signal instead of the old 404.)
 //
 // PER BOARD (Phase 3): every endpoint takes ?board=<boardId> (default board if omitted). Each board is
 // its own bus — a command for board X reaches only the tabs showing X, and X's snapshot is read back
-// independently. So `busClients` is a Set PER board and `lastCanvasPush` is a String PER board; 503
-// (delivered=0) is judged against THAT board's connected tabs, not all of them. The browser tags its
-// /api/bus + /api/canvas calls with its own activeBoardId (agentBus.ts).
+// independently. So `busClients` is a Set PER board; 503 (delivered=0) is judged against THAT board's
+// connected tabs, not all of them.
 //
 //   GET  /api/bus?board=     → text/event-stream of Command frames (a board's tabs subscribe)
 //   POST /api/command?board= → { type, payload?, actor? } forwarded to that board's connected tabs
-//   POST /api/canvas?board=  → that board's { snapshot, recentIntent, ts } (stored verbatim)
-//   GET  /api/canvas?board=  → that board's last push, or 404 until one of its tabs has connected
+//   GET  /api/canvas?board=  → { ts, tabs, snapshot, recentIntent } from the durable store; 404 only
+//                              when the board has never persisted anything
 
 const busClients: Map<string, Set<SseClient>> = new Map();
-const lastCanvasPush: Map<string, string> = new Map();
 
 // The bus-client set for a board, created on first subscribe. (The SSE close handler in openSse deletes
 // the client from the set but leaves the empty set in the map — harmless; one entry per ever-seen board.)
@@ -3097,18 +3108,11 @@ async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId:
   sendJson(res, delivered > 0 ? 200 : 503, { ok: delivered > 0, delivered, board: boardId });
 }
 
-// The member:* edges of a snapshot blob, id → {from,to,type}. The diff source for announceNewMemberships,
-// with the same tolerant parse as boardSnapshotRecords (a torn mid-write push yields an empty map — read as
-// "no membership edges", the safe direction: a real change re-pushes a whole blob ~500ms later).
-function memberEdgesOf(raw: string | undefined): Map<string, { from: string; to: string; type: string }> {
+// The member:* edges of a snapshot's records, id → {from,to,type}. The diff source for
+// announceNewMemberships (null/absent records → empty map — read as "no membership edges", the safe
+// direction: a real change re-saves a whole snapshot ~400ms later).
+function memberEdgesOf(records: Array<Record<string, unknown>> | null | undefined): Map<string, { from: string; to: string; type: string }> {
   const out = new Map<string, { from: string; to: string; type: string }>();
-  if (raw == null) return out;
-  let records: Array<Record<string, unknown>> | undefined;
-  try {
-    records = (JSON.parse(raw) as { snapshot?: { records?: Array<Record<string, unknown>> } }).snapshot?.records;
-  } catch {
-    return out;
-  }
   for (const r of records ?? [])
     if (r.typeName === "edge" && typeof r.type === "string" && r.type.startsWith("member:") && typeof r.id === "string")
       out.set(r.id, { from: String(r.from), to: String(r.to), type: r.type });
@@ -3117,55 +3121,52 @@ function memberEdgesOf(raw: string | undefined): Map<string, { from: string; to:
 
 // Onboarding's SECOND trigger. The first is dispatchBusCommand, which fires for an agent-initiated POST
 // join/invite. But a HUMAN-drawn join/accept/leave (connect = join, the edge popover) is a LOCAL
-// editor.commit that never crosses the bus — it reaches the server only as this debounced snapshot push.
-// So diff the membership edges before↔after and replay each transition through maybeAnnounceMembership
-// exactly as the matching bus addEdge/removeEdge would. The per-(edge,phase) dedup makes the overlap with
-// the bus path harmless: an agent POST also re-pushes the snapshot moments later, and that second sighting
-// no-ops. lastCanvasPush is ALREADY set to `after` here, so roster/cursor-seed resolve against the fresh
-// board. The FIRST push after a (re)start (beforeRaw == null) is a BASELINE, not a wave of joins: record
-// the existing edges as already-announced without onboarding — the pre-restart sessions are gone and
-// replaying their "joined" lines would be noise; a genuine join after the baseline diffs normally.
-function announceNewMemberships(boardId: string, beforeRaw: string | undefined, origin: string): void {
-  const afterRaw = lastCanvasPush.get(boardId);
-  // Fast path: a string scan is far cheaper than parsing the whole board, and membership rarely changes.
-  if (!afterRaw?.includes('"member:') && !beforeRaw?.includes('"member:')) return;
-  const after = memberEdgesOf(afterRaw);
-  if (beforeRaw == null) {
-    for (const [id, e] of after) announcedMemberships.add(announceKey(id, e.type));
+// editor.commit that never crosses the bus — it reaches the server only as the debounced durable
+// snapshot save (remote-store.ts → /api/board/persist/snapshot, which calls this with the snapshot it
+// just replaced and the one it wrote). So diff the membership edges before↔after and replay each
+// transition through maybeAnnounceMembership exactly as the matching bus addEdge/removeEdge would. The
+// per-(edge,phase) dedup makes the overlap with the bus path harmless: an agent POST also re-saves the
+// snapshot moments later, and that second sighting no-ops. `before == null` means the board's FIRST
+// ever snapshot (brand-new or just-imported board) — a BASELINE, not a wave of joins: record its edges
+// as already-announced without onboarding. A server restart needs no such special case any more: the
+// durable before-snapshot survives it, so the first post-restart save diffs against real state.
+function announceNewMemberships(
+  boardId: string,
+  before: Array<Record<string, unknown>> | null,
+  after: Array<Record<string, unknown>> | null,
+  origin: string,
+): void {
+  const afterEdges = memberEdgesOf(after);
+  if (before == null) {
+    for (const [id, e] of afterEdges) announcedMemberships.add(announceKey(id, e.type));
     return;
   }
-  const before = memberEdgesOf(beforeRaw);
-  for (const [id, e] of after) {
-    if (before.get(id)?.type === e.type) continue; // unchanged phase — already onboarded (or baseline-seeded)
+  const beforeEdges = memberEdgesOf(before);
+  for (const [id, e] of afterEdges) {
+    if (beforeEdges.get(id)?.type === e.type) continue; // unchanged phase — already onboarded (or baseline-seeded)
     maybeAnnounceMembership(boardId, { type: "addEdge", payload: { id, from: e.from, to: e.to, type: e.type } }, origin);
   }
-  for (const [id] of before)
-    if (!after.has(id)) maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
+  for (const [id] of beforeEdges)
+    if (!afterEdges.has(id)) maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
 }
 
-async function handleCanvasPush(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  origin: string,
-): Promise<void> {
-  const body = await readBody(req);
-  const beforeRaw = lastCanvasPush.get(boardId); // captured synchronously with the set — no interleave window
-  lastCanvasPush.set(boardId, body);
-  sendJson(res, 200, { ok: true });
-  try {
-    announceNewMemberships(boardId, beforeRaw, origin);
-  } catch (err) {
-    console.warn("[channels] membership announce from snapshot diff failed:", err);
-  }
-}
-
+// The agents' board read, served from the DURABLE store (unification: the browser used to push a
+// second, near-identical snapshot here just for this read — retired; remote-store.ts's persistence
+// save is the one write path now). `tabs` is the liveness signal: a successful read no longer implies
+// a live tab (that was the old 404's meaning), and a WRITE still needs one — check `tabs`/`delivered`
+// before treating the board as actionable. 404 only for a board with nothing persisted yet.
 function handleCanvasGet(res: ServerResponse, boardId: string): void {
-  const push = lastCanvasPush.get(boardId);
-  if (push == null) return sendJson(res, 404, { error: "no canvas has pushed state yet" });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(push);
+  const b = boards.get(boardId);
+  if (!b) return sendJson(res, 400, { error: "unknown board" });
+  const { events, snapshot } = readBoardPersist(b.repoPath);
+  if (!snapshot && events.length === 0)
+    return sendJson(res, 404, { error: "no board state persisted yet" });
+  sendJson(res, 200, {
+    ts: boardPersistMtime(b.repoPath),
+    tabs: busClientsFor(boardId).size,
+    snapshot: snapshot ?? { records: [], version: 0 },
+    recentIntent: describeBoardEvents(events),
+  });
 }
 
 // ── notebook outputs (docs/notebook-card.md §7, step-3 agent-legibility) ───────────────────────────
@@ -3230,17 +3231,16 @@ interface SnapNode {
   text?: string; // a thread node's `text` is its (optional) task brief
 }
 
-// The records of a board's last pushed snapshot ({ snapshot:{ records:[…] } }), or null if no tab of that
-// board has pushed yet (or the blob is unparseable — a torn mid-write push, treated the same).
+// The records of a board's DURABLE snapshot (`.canvas/board/snapshot.json` — the same one hydrate
+// serves), or null if the board has never saved one. Used for all server-side node/edge resolution
+// (thread membership, session-card lookup, spawn positioning); it no longer needs a live tab, only a
+// board that has persisted at least once. Lags a just-committed change by the ~400ms save debounce —
+// the same window the old tab-push had.
 function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> | null {
-  const raw = lastCanvasPush.get(boardId);
-  if (raw == null) return null;
-  try {
-    const parsed = JSON.parse(raw) as { snapshot?: { records?: Array<Record<string, unknown>> } };
-    return parsed.snapshot?.records ?? null;
-  } catch {
-    return null;
-  }
+  const b = boards.get(boardId);
+  if (!b) return null;
+  const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
+  return snap?.records ?? null;
 }
 
 // A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /
@@ -4002,11 +4002,6 @@ export function fsApi(): Plugin {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
           return void handleCommand(req, res, b.boardId, originOf(req));
-        }
-        if (url.pathname === "/api/canvas" && req.method === "POST") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return void handleCanvasPush(req, res, b.boardId, originOf(req));
         }
         if (url.pathname === "/api/canvas") {
           const b = reqBoard(url);

@@ -69,6 +69,51 @@ export function hasBoardPersist(repoPath) {
   return events.length > 0 || snapshot !== null;
 }
 
+/** Just the snapshot (null when absent/torn) — for callers on a hot path (the per-save membership
+ *  diff, the agents' board read) that must not pay the whole event log per call. */
+export function readBoardSnapshot(repoPath) {
+  try {
+    return JSON.parse(fs.readFileSync(snapshotFile(repoPath), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** When the board state last changed (snapshot.json mtime, falling back to the log's), ms epoch;
+ *  0 when nothing is persisted. The `ts` of the agents' GET /api/canvas read. */
+export function boardPersistMtime(repoPath) {
+  for (const f of [snapshotFile(repoPath), eventsFile(repoPath)]) {
+    try {
+      return Math.round(fs.statSync(f).mtimeMs);
+    } catch {
+      /* try the next */
+    }
+  }
+  return 0;
+}
+
+/**
+ * The last-n events as the human-readable intent trail — same line format as core's
+ * MemoryIntentLog.describe / summarizeDiff (`<ts> <actor> <type> [+a ~u -r]`), reproduced here so the
+ * agents' GET /api/canvas `recentIntent` survives the retirement of the browser push that used to
+ * carry it.
+ */
+export function describeBoardEvents(events, n = 20) {
+  const recent = events.slice(-n);
+  if (recent.length === 0) return "(no intent yet)";
+  const count = (o) => (o && typeof o === "object" ? Object.keys(o).length : 0);
+  return recent
+    .map((e) => {
+      const d = e.diff ?? {};
+      const parts = [];
+      if (count(d.added)) parts.push(`+${count(d.added)}`);
+      if (count(d.updated)) parts.push(`~${count(d.updated)}`);
+      if (count(d.removed)) parts.push(`-${count(d.removed)}`);
+      return `${e.ts} ${e.actor} ${e.type} [${parts.length ? parts.join(" ") : "no-op"}]`;
+    })
+    .join("\n");
+}
+
 /**
  * Append one intent event to the authoritative log. Throws on failure — the caller must surface it.
  * If a crash left a torn tail (no trailing newline), open a fresh line first: otherwise the next

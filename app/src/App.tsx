@@ -57,7 +57,7 @@ import {
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
-import { applyScrollKey, observeWheelGesture, scrollableIn } from "./interior";
+import { applyScrollKey, noteCameraMoved, notePointerAim, observeWheelGesture, scrollableIn } from "./interior";
 import { bindPeek } from "./peek";
 import { preserveViewState } from "./viewstate";
 
@@ -360,6 +360,14 @@ function Board({ m, undo, persistence }: Engine) {
     // subtree BEFORE any card's claim handler, which is what lets those handlers ask "is this event
     // continuing a gesture the canvas already owns?" when a pan slides their scroller under the cursor.
     el.addEventListener("wheel", observeWheelGesture, { capture: true, passive: true });
+    // The aim-vs-arrival clocks (interior.ts): real pointer input marks hover as EARNED; any camera
+    // motion (pan, dive, fit, agent fly) marks it as merely delivered. Cards only claim a fresh wheel
+    // gesture from earned hover — so the nudge-pan right after a peek dive pans instead of scrolling
+    // whatever card the dive landed the cursor on.
+    const aim = () => notePointerAim();
+    el.addEventListener("pointermove", aim, { capture: true, passive: true });
+    el.addEventListener("pointerdown", aim, { capture: true, passive: true });
+    const offCameraClock = m.camera.signal.subscribe(() => noteCameraMoved());
     // Hold-to-peek (peek.ts): hold z → fit-all, point the cursor at the target, release → dive back in
     // there at the zoom you left. A committed dive lands the pre-peek pose on the unwind stack, so `
     // steps back across it.
@@ -371,7 +379,10 @@ function Board({ m, undo, persistence }: Engine) {
     return () => {
       off();
       offPeek();
+      offCameraClock();
       el.removeEventListener("wheel", observeWheelGesture, { capture: true });
+      el.removeEventListener("pointermove", aim, { capture: true });
+      el.removeEventListener("pointerdown", aim, { capture: true });
       ro.disconnect();
     };
   }, [m, views]);

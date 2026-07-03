@@ -16,6 +16,9 @@ import {
   importBoardPersist,
   clearBoardPersist,
   compactBoardEvents,
+  readBoardSnapshot,
+  boardPersistMtime,
+  describeBoardEvents,
 } from "../board-persist.js";
 
 function tmpRepo() {
@@ -124,6 +127,31 @@ test("compaction is a no-op without a watermark, below minDrop, and for seq-less
   writeBoardSnapshot(legacy, { records: [], version: 2, seq: 100 });
   assert.deepEqual(compactBoardEvents(legacy, { keepTail: 0, minDrop: 1 }), { dropped: 1 });
   assert.deepEqual(readBoardPersist(legacy).events, [{ parent: 0 }]);
+});
+
+test("readBoardSnapshot reads only the snapshot; mtime reflects persisted state", () => {
+  const repo = tmpRepo();
+  assert.equal(readBoardSnapshot(repo), null);
+  assert.equal(boardPersistMtime(repo), 0);
+  appendBoardEvent(repo, { seq: 1 });
+  assert.equal(readBoardSnapshot(repo), null); // events alone are not a snapshot
+  assert.ok(boardPersistMtime(repo) > 0); // …but they are persisted state (falls back to the log)
+  writeBoardSnapshot(repo, { records: [], version: 1, seq: 1 });
+  assert.deepEqual(readBoardSnapshot(repo), { records: [], version: 1, seq: 1 });
+});
+
+test("describeBoardEvents matches core's describe line format", () => {
+  assert.equal(describeBoardEvents([]), "(no intent yet)");
+  const events = [
+    { ts: 100, actor: "user", type: "addNode", diff: { added: { a: {}, b: {} }, updated: {}, removed: {} } },
+    { ts: 200, actor: "claude", type: "moveNode", diff: { added: {}, updated: { a: {} }, removed: {} } },
+    { ts: 300, actor: "system", type: "tick", diff: { added: {}, updated: {}, removed: {} } },
+  ];
+  assert.equal(
+    describeBoardEvents(events),
+    "100 user addNode [+2]\n200 claude moveNode [~1]\n300 system tick [no-op]",
+  );
+  assert.equal(describeBoardEvents(events, 1), "300 system tick [no-op]"); // last-n window
 });
 
 test("clear drops both files", () => {

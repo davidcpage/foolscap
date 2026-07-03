@@ -7,7 +7,7 @@ import { activeBoardId } from "./board";
 import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
-import { claimWheelGesture, scrollableFromTarget, wheelGestureLatchedToCanvas } from "./interior";
+import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../channel-tags.js";
@@ -378,9 +378,9 @@ function ThreadView({
       if (e.target instanceof Element && e.target.closest("input, textarea")) e.stopPropagation();
     };
     // Wheel over the scrollable conversation log scrolls it, not the canvas (the same seam TemplateCard
-    // uses) — unless a pan gesture already owns the wheel and merely slid this card under the cursor.
+    // uses) — unless the canvas owns the gesture, or the hover wasn't earned by pointing (interior.ts).
     const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || wheelGestureLatchedToCanvas()) return;
+      if (e.ctrlKey || !wheelClaimableByCard()) return;
       if (scrollableFromTarget(e.target, host)) {
         claimWheelGesture();
         e.stopPropagation();
@@ -774,10 +774,11 @@ function TemplateCard({
     const host = hostRef.current;
     if (!host) return;
     const onWheel = (e: WheelEvent) => {
-      // ctrl+wheel is pinch-zoom — leave it for the canvas even over a scrollable card. A gesture the
-      // canvas already owns also passes through: a pan that slides this card under the cursor must
-      // stay a pan, not flip to scrolling the card mid-gesture (the latch in interior.ts).
-      if (e.ctrlKey || wheelGestureLatchedToCanvas()) return;
+      // ctrl+wheel is pinch-zoom — leave it for the canvas even over a scrollable card. Also pass
+      // through when the gesture isn't this card's to claim (interior.ts): a pan that slides the card
+      // under the cursor stays a pan mid-gesture, and hover the camera delivered (a peek dive landing
+      // the cursor on a card) doesn't turn the follow-up nudge-pan into a card scroll.
+      if (e.ctrlKey || !wheelClaimableByCard()) return;
       if (scrollableFromTarget(e.target, host)) {
         claimWheelGesture();
         e.stopPropagation();
