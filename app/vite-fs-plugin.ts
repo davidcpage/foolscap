@@ -1708,12 +1708,14 @@ function ensureLiveSession(
   return s;
 }
 
-// ── CANVAS_SESSION_HOST mode: session processes live in a sidecar and survive dev-server restarts ──
-// Opt-in (`CANVAS_SESSION_HOST=1 npm run dev`, or `npm run dev:host`). The sidecar (session-host.js) is
-// auto-started on first attach and OWNS the `claude -p` children; this server is a client. Restarting the
-// dev server no longer kills the very sessions implementing/testing the change being tested — on boot we
-// re-attach and ADOPT whatever is still running. Stopping the SIDECAR is the explicit stop-everything.
-const REMOTE_SESSIONS = process.env.CANVAS_SESSION_HOST === "1";
+// ── Session-host mode (the DEFAULT): session processes live in a sidecar, survive dev-server restarts ──
+// The sidecar (session-host.js) is auto-started on first attach and OWNS the `claude -p` children; this
+// server is a client. Restarting the dev server no longer kills the very sessions implementing/testing
+// the change being tested — on boot we re-attach and ADOPT whatever is still running. Stopping the
+// SIDECAR is the explicit stop-everything (`npm run session-host:stop`). Opt OUT with
+// `CANVAS_SESSION_HOST=0` (`npm run dev:local`) for the old in-process, die-with-the-server model —
+// and an unreachable/busy sidecar degrades to that model by itself (see attachSessionHost).
+const REMOTE_SESSIONS = process.env.CANVAS_SESSION_HOST !== "0";
 
 // Connect to (auto-starting if needed) the session host, adopt its live sessions, stamp its dead ones.
 // Once per process; a hot re-eval keeps the pinned client. A "busy" rejection (another dev server holds

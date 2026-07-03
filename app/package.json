@@ -7,8 +7,9 @@
   "description": "The canvas app: the live React renderer over the core + interaction engines. File-backed cards (a real folder's files as cards, updated live on disk change), runtime-loaded card-type templates, and the agent-sessions work — create/open/delete Claude Code sessions on an infinite canvas. A Node dev-server middleware (vite-fs-plugin.ts) serves the file tree + a chokidar watch stream; the board persists to IndexedDB behind core's Persistence seam.",
   "scripts": {
     "dev": "vite",
-    "dev:host": "CANVAS_SESSION_HOST=1 vite",
+    "dev:local": "CANVAS_SESSION_HOST=0 vite",
     "session-host": "node session-host.js",
+    "session-host:stop": "node session-host.js --stop",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test test/*.test.mjs",

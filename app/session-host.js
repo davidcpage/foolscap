@@ -174,6 +174,16 @@ export async function createHost({ socketPath, logPath }) {
         for (let i = exits.length - 1; i >= 0; i--) if (ids.has(exits[i].id)) exits.splice(i, 1);
         return reply({ ok: true });
       }
+      case "shutdown": {
+        // The remote stop-everything verb (`session-host.js --stop`): any conn may ask — it's the same
+        // authority as SIGTERM on a local dev box, and it must work while a dev server holds the hello slot.
+        // No process.exit: once the server closes and the children are gone the event loop drains and a
+        // CLI host exits on its own (and an in-process test host must NOT take the test runner with it).
+        log(`shutdown requested over the socket`);
+        reply({ ok: true });
+        void shutdown();
+        return;
+      }
       default:
         return reply({ ok: false, error: `unknown op ${JSON.stringify(msg.op)}` });
     }
@@ -211,8 +221,11 @@ export async function createHost({ socketPath, logPath }) {
   });
   log(`listening on ${socketPath} pid=${process.pid}`);
 
-  /** Kill every child as reason:"shutdown" and stop listening. The explicit stop-everything verb. */
-  const shutdown = async () => {
+  /** Kill every child as reason:"shutdown" and stop listening. The explicit stop-everything verb.
+   *  Idempotent — the socket `shutdown` op and a signal/test teardown may both arrive. */
+  let shutdownRun = null;
+  const shutdown = () => (shutdownRun ??= doShutdown());
+  const doShutdown = async () => {
     shuttingDown = true;
     const waits = [...children.values()].map(
       (e) =>
@@ -236,21 +249,51 @@ export async function createHost({ socketPath, logPath }) {
   return { shutdown, socketPath, pid: process.pid };
 }
 
-// CLI: `node session-host.js` (or `npm run session-host`). Socket/log live next to this file — one host
-// per app checkout, matching one dev server per checkout.
+// CLI: `node session-host.js` runs a host (or `npm run session-host`); `--stop` tells the running host to
+// kill every session and exit (`npm run session-host:stop`) — the stop-everything verb now that the
+// sidecar, not the dev server, owns the children. Socket path is keyed off this file's dir — one host per
+// app checkout, matching one dev server per checkout.
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
   const appDir = new URL(".", import.meta.url).pathname;
-  const host = await createHost({
-    socketPath: sessionHostSocketPath(appDir),
-    logPath: sessionHostLogPath(appDir),
-  });
-  let stopping = false;
-  const stop = () => {
-    if (stopping) return;
-    stopping = true;
-    host.shutdown().then(() => process.exit(0));
-  };
-  process.on("SIGINT", stop);
-  process.on("SIGTERM", stop);
+  const socketPath = sessionHostSocketPath(appDir);
+  if (process.argv.includes("--stop")) {
+    const conn = net.connect(socketPath);
+    conn.once("connect", () => conn.write(JSON.stringify({ op: "shutdown", req: 1 }) + "\n"));
+    conn.once("error", () => {
+      console.log("no session host running");
+      process.exit(0);
+    });
+    conn.setEncoding("utf8");
+    conn.once("data", (data) => {
+      // Check the reply — a host still running PRE-shutdown-op code answers "unknown op", and claiming
+      // "stopping" on any bytes at all is how that bug slipped past a live test once already.
+      let ok = false;
+      let error = "";
+      try {
+        const m = JSON.parse(String(data));
+        ok = !!m.ok;
+        error = typeof m.error === "string" ? m.error : "";
+      } catch {
+        /* not a frame — fall through to the refusal path */
+      }
+      if (ok) {
+        console.log("session host stopping (all sessions ending)");
+      } else {
+        console.log(`session host refused --stop (${error || "bad reply"}) — an old-code host? kill its pid instead`);
+        process.exitCode = 1;
+      }
+      conn.destroy();
+    });
+  } else {
+    const host = await createHost({ socketPath, logPath: sessionHostLogPath(appDir) });
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      host.shutdown().then(() => process.exit(0));
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
+  }
 }

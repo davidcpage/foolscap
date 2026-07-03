@@ -67,6 +67,7 @@ function connect(socketPath) {
         }),
       close: () =>
         new Promise((res) => {
+          if (conn.destroyed) return res(); // the host may have dropped us already (its shutdown sweep)
           conn.once("close", res);
           conn.destroy();
         }),
@@ -231,6 +232,23 @@ test("host shutdown kills the children as reason:'shutdown' (not a crash) and un
   assert.equal((await done).reason, "shutdown", "the remote-mode shuttingDown guard");
   assert.ok(!fs.existsSync(socketPath), "socket removed on clean shutdown");
   await c.close();
+});
+
+test("the socket 'shutdown' op stops everything — even while another client holds the hello slot", async () => {
+  const { socketPath, logPath } = tmpSock();
+  const host = await createHost({ socketPath, logPath });
+  const devServer = await connect(socketPath);
+  await devServer.request({ op: "hello", ver: 1 });
+  await devServer.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
+  const exited = devServer.waitEvent((e) => e.op === "exit" && e.id === "s1");
+
+  const stopper = await connect(socketPath); // `--stop` — a second conn, no hello needed
+  assert.equal((await stopper.request({ op: "shutdown" })).ok, true);
+  assert.equal((await exited).reason, "shutdown", "children end as a clean stop, not a crash");
+  await host.shutdown(); // idempotent — the op already ran it
+  assert.ok(!fs.existsSync(socketPath));
+  await devServer.close();
+  await stopper.close();
 });
 
 test("a stale socket file is reclaimed; a LIVE host's socket is not", async () => {

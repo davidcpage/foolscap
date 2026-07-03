@@ -133,22 +133,26 @@ ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need n
   `GET /api/sessions?board=<id>` lists them. **Liveness probe:** `GET /api/inbox?session=<sid>` is `200` if
   live, `404` if not.
 
-### Session-host mode (sessions survive dev-server restarts)
+### Session-host mode (the default: sessions survive dev-server restarts)
 
-`CANVAS_SESSION_HOST=1 npm run dev` (or `npm run dev:host`) puts the session processes in a **sidecar**
-(`app/session-host.js`, auto-started on first attach; socket in tmpdir keyed by checkout, log at
-`app/.session-host.log`). The dev server is then a *client*: restarting it no longer kills the sessions —
-on boot it re-attaches and **adopts** whatever is still running (history re-seeded from the transcript;
-running/idle taken from the sidecar's busy bit, so a mid-turn session isn't nudge-interrupted). Read
-cursors/waitingOn revive from the `.canvas/sessions/` marker (persisted in both modes). What to know:
+`npm run dev` puts the session processes in a **sidecar** (`app/session-host.js`, auto-started on first
+attach; socket in tmpdir keyed by checkout, log at `app/.session-host.log`). The dev server is a *client*:
+restarting it no longer kills the sessions — on boot it re-attaches and **adopts** whatever is still
+running (history re-seeded from the transcript; running/idle taken from the sidecar's busy bit, so a
+mid-turn session isn't nudge-interrupted). Read cursors/waitingOn revive from the `.canvas/sessions/`
+marker (persisted in both modes). What to know:
 
-- **Stopping the SIDECAR is the explicit stop-everything** (SIGTERM → children end clean, not "crashed";
-  a `kill -9` of it *does* read as crashed). The sidecar survives any number of dev-server restarts.
-- **One attached dev server.** A second host-mode server (the 5174 case) is rejected `busy`, warns, and
-  runs its spawns in-process — it never touches the first server's sessions.
-- **Don't mix modes casually:** a plain `npm run dev` while the sidecar holds sessions won't adopt them —
-  they keep running invisibly (and its own spawns die with it, as always).
-- Default (no env var) behavior is exactly the old model: in-process children, killed on server exit.
+- **Stopping the SIDECAR is the explicit stop-everything**: `npm run session-host:stop` (or SIGTERM it) —
+  children end clean ("ended", not "crashed"); a `kill -9` of it *does* read as crashed. Ctrl-C on the dev
+  server no longer reaps leaked sessions — the stop verb (or per-session `terminate`) is how you clean up.
+  (While a dev server is attached, a fresh *empty* sidecar respawns right after — stop kills the sessions,
+  not the mode. And a long-running sidecar keeps its OLD code across upgrades: `--stop` detects this and
+  tells you to kill the pid.)
+- **One attached dev server.** A second server (the 5174 case) is rejected `busy`, warns, and runs its
+  spawns in-process — it never touches the first server's sessions.
+- **Opt out** with `npm run dev:local` (`CANVAS_SESSION_HOST=0`): the old model — in-process children,
+  killed on server exit. An unreachable sidecar degrades to this by itself (with a warning). Don't mix
+  modes casually: a local-mode server won't adopt the sidecar's sessions — they keep running invisibly.
 
 Gotchas:
 - **A bare curl spawn leaves NO canvas card.** The *browser tab* that calls spawn is what drops the
@@ -167,8 +171,9 @@ detail in `docs/agent-to-agent-messaging.md` §15/§16). A **thread** is a per-t
 `{type:"thread"}` (legacy `{type:"channel"}` nodes are threads too — carried over, same machinery) whose
 `title` is the task and `text` the optional brief; a session **joins** via a `member:open` edge (session
 node → thread node). Conversation state is **off-log** but **durable** (`.canvas/threads/` jsonl+meta,
-replayed at boot; read cursors are server memory and reset on a COLD restart — which also kills the
-sessions). Agents work in **thread ids + their own sid**; the server resolves nodes/edges. The thread id
+replayed at boot; read cursors persist on the session's `.canvas/sessions/` marker, so they survive
+restarts — and in session-host mode the sessions themselves do too). Agents work in **thread ids + their
+own sid**; the server resolves nodes/edges. The thread id
 carries a colon, so **percent-encode it** in the URL path. Everything below is served under BOTH
 `/api/thread/…` (canonical) and `/api/channel/…` (transition alias); `GET /api/threads` (alias
 `/api/channels`) lists the markers, each with its `intents`, `seats`, and the DERIVED `state` +
