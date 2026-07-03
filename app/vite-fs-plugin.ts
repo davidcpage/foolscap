@@ -16,6 +16,7 @@ import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
+import { appendBoardEvent, clearBoardPersist, importBoardPersist, readBoardPersist, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 
@@ -313,6 +314,49 @@ async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Prom
   sendJson(res, 200, boardJson(id.boardId, boards.get(id.boardId)!));
 }
 
+// ── the durable board store (external-repo boards step 4: records live with the repo) ─────────────
+// The browser's EventStore/SnapshotStore (core's persistence seam) are now HTTP clients over these
+// endpoints (app/src/remote-store.ts); board-persist.js owns the files under `<repo>/.canvas/board/`.
+// IndexedDB is retired as the durable tier — a board opened in any browser/profile/machine hydrates
+// from the repo's own `.canvas/`, and `import` adopts a board's pre-existing IndexedDB state once.
+// Writes THROW on failure and 500 here — the client store retries; a swallowed event is data loss.
+async function handleBoardPersistWrite(
+  req: IncomingMessage,
+  res: ServerResponse,
+  repoPath: string,
+  kind: "event" | "snapshot" | "import",
+): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  try {
+    if (kind === "event") {
+      if (typeof body.event !== "object" || body.event === null)
+        return sendJson(res, 400, { error: "missing event" });
+      appendBoardEvent(repoPath, body.event as Record<string, unknown>);
+      return sendJson(res, 200, { ok: true });
+    }
+    if (kind === "snapshot") {
+      if (typeof body.snapshot !== "object" || body.snapshot === null)
+        return sendJson(res, 400, { error: "missing snapshot" });
+      writeBoardSnapshot(repoPath, body.snapshot as Record<string, unknown>);
+      return sendJson(res, 200, { ok: true });
+    }
+    // import: the one-time IndexedDB adoption. Refused (imported:false) once any server state exists.
+    const events = Array.isArray(body.events) ? (body.events as Record<string, unknown>[]) : [];
+    const snapshot =
+      typeof body.snapshot === "object" && body.snapshot !== null
+        ? (body.snapshot as Record<string, unknown>)
+        : null;
+    return sendJson(res, 200, { imported: importBoardPersist(repoPath, events, snapshot) });
+  } catch (e) {
+    return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
 // Claude Code's transcripts live in ~/.claude/projects/<slug> — resolved PER BOARD by sessionsDir(repoPath)
 // above (the session handlers thread the board's dir), so the cards serve the right repo's history.
 const MAX_SESSION_BYTES = 4 * 1024 * 1024; // whole sessions, bounded against a pathological one. The
@@ -341,6 +385,12 @@ function isInternalPath(p: string): boolean {
     const s = segs[i];
     if (s === ".canvas") {
       if (segs[i + 1] === "roots") return true; // the shadow object store — never watched/served
+      // The board record store (board-persist.js): an event append per GESTURE + a snapshot rewrite
+      // per edit burst. No card reads these via the file endpoints (they have their own
+      // /api/board/persist API), so watching them would only spam every tab with watch events and
+      // TRIGGER a shadow commit per gesture. They still ride ALONG in shadow commits fired by real
+      // content edits (commitRoot force-adds `.canvas` minus only `roots`) — versioned, not churning.
+      if (segs[i + 1] === "board") return true;
       continue; // every other `.canvas/<content>` is reachable
     }
     if (EXCLUDE_DIRS.has(s)) return true;
@@ -3896,6 +3946,23 @@ export function fsApi(): Plugin {
         if (url.pathname === "/api/boards" && req.method === "POST")
           return void handleBoardMount(req, res);
         if (url.pathname === "/api/boards") return handleBoards(res);
+        // The durable board store (step 4): the browser's persistence backends live here now.
+        if (url.pathname.startsWith("/api/board/persist")) {
+          const b = reqBoard(url);
+          if (!b) return sendJson(res, 400, { error: "unknown board" });
+          if (url.pathname === "/api/board/persist" && req.method === "GET")
+            return sendJson(res, 200, readBoardPersist(b.repoPath));
+          if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
+            clearBoardPersist(b.repoPath);
+            return sendJson(res, 200, { ok: true });
+          }
+          if (req.method === "POST") {
+            const kind = url.pathname.slice("/api/board/persist/".length);
+            if (kind === "event" || kind === "snapshot" || kind === "import")
+              return void handleBoardPersistWrite(req, res, b.repoPath, kind);
+          }
+          return sendJson(res, 404, { error: "unknown board-persist endpoint" });
+        }
         // The agent bus IS board-scoped now (Phase 3): ?board=<id> picks which board's tabs a command
         // reaches and which board's snapshot is read back (default board if omitted).
         if (url.pathname === "/api/bus") {

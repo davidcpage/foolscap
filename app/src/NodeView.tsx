@@ -7,7 +7,7 @@ import { activeBoardId } from "./board";
 import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
-import { scrollableFromTarget } from "./interior";
+import { claimWheelGesture, scrollableFromTarget, wheelGestureLatchedToCanvas } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../channel-tags.js";
@@ -377,8 +377,15 @@ function ThreadView({
     const onKD = (e: KeyboardEvent) => {
       if (e.target instanceof Element && e.target.closest("input, textarea")) e.stopPropagation();
     };
-    // Wheel over the scrollable conversation log scrolls it, not the canvas (the same seam TemplateCard uses).
-    const onWheel = (e: WheelEvent) => { if (!e.ctrlKey && scrollableFromTarget(e.target, host)) e.stopPropagation(); };
+    // Wheel over the scrollable conversation log scrolls it, not the canvas (the same seam TemplateCard
+    // uses) — unless a pan gesture already owns the wheel and merely slid this card under the cursor.
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || wheelGestureLatchedToCanvas()) return;
+      if (scrollableFromTarget(e.target, host)) {
+        claimWheelGesture();
+        e.stopPropagation();
+      }
+    };
     host.addEventListener("pointerdown", onPD);
     host.addEventListener("keydown", onKD);
     host.addEventListener("wheel", onWheel, { passive: false });
@@ -767,8 +774,14 @@ function TemplateCard({
     const host = hostRef.current;
     if (!host) return;
     const onWheel = (e: WheelEvent) => {
-      // ctrl+wheel is pinch-zoom — leave it for the canvas even over a scrollable card.
-      if (!e.ctrlKey && scrollableFromTarget(e.target, host)) e.stopPropagation();
+      // ctrl+wheel is pinch-zoom — leave it for the canvas even over a scrollable card. A gesture the
+      // canvas already owns also passes through: a pan that slides this card under the cursor must
+      // stay a pan, not flip to scrolling the card mid-gesture (the latch in interior.ts).
+      if (e.ctrlKey || wheelGestureLatchedToCanvas()) return;
+      if (scrollableFromTarget(e.target, host)) {
+        claimWheelGesture();
+        e.stopPropagation();
+      }
     };
     // keydown: when focus is in an interior text control (a notebook cell's <textarea>, a future input),
     // contain it so the canvas's keyboard shortcuts never fire mid-type — otherwise Delete/Backspace would

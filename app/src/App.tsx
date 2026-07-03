@@ -12,6 +12,7 @@ import {
   type LayoutRecord,
 } from "./lib";
 import { IdbEventStore, IdbSnapshotStore, boardDbName, migrateLegacyBoard } from "./idb";
+import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, importBoardPersist } from "./remote-store";
 import { activeBoard, activeBoardId, boardHref, listBoards, resolveBoard, type BoardListing } from "./board";
 import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
@@ -56,7 +57,7 @@ import {
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
-import { applyScrollKey, scrollableIn } from "./interior";
+import { applyScrollKey, observeWheelGesture, scrollableIn } from "./interior";
 import { preserveViewState } from "./viewstate";
 
 const SCROLL_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"]);
@@ -66,8 +67,8 @@ const SCROLL_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home
 const isFloating = (l: LayoutRecord): boolean => l.anchor === "screen";
 
 // The app. The engine is the UNCHANGED core + interaction, now DURABLY BACKED: its log is core's
-// Persistence (IndexedDB backends in idb.ts) instead of the in-memory default, so the board you arrange
-// survives a reload. Spatial state (positions, selection, which cards) is the canvas's and persists;
+// Persistence (server backends in remote-store.ts — the repo's own `.canvas/board/`) instead of the
+// in-memory default, so the board you arrange survives a reload, in any browser. Spatial state (positions, selection, which cards) is the canvas's and persists;
 // file/session CONTENT is a projection re-derived from disk on boot and kept live by the watch stream.
 // That split is the whole experiment.
 //
@@ -88,14 +89,29 @@ interface Engine {
 //   5. restore the camera pose, attach the snapshot half (debounced channel-2 saves), write a baseline;
 //   6. wire undo last, so the hydrated board isn't undoable.
 async function createEngine(boardId: string, isDefault: boolean): Promise<Engine> {
-  // This board's own IndexedDB (canvas-notes:<boardId>). Migrate the legacy global DB into it on first
-  // boot of the DEFAULT board only, so the existing canvas survives the move to per-board storage — a
-  // freshly-mounted repo must not inherit the dev repo's log.
-  const dbName = boardDbName(boardId);
-  if (isDefault) await migrateLegacyBoard(dbName);
+  // The durable tier is the SERVER now (step 4: `<repo>/.canvas/board/` via remote-store.ts), so the
+  // board travels with the repo and hydrates the same in any browser. IndexedDB is read exactly once
+  // more per board — the adoption below — and left intact as a fallback, never written again.
+  let boot = await fetchBoardPersist(boardId);
+  if (boot.events.length === 0 && !boot.snapshot) {
+    // Nothing server-side yet: adopt this browser's pre-step-4 state for the board, if any. The old
+    // migration chain still applies first (legacy global DB → per-board DB, DEFAULT board only), so a
+    // board last touched before per-board DBs existed adopts through both hops. The server refuses the
+    // import once ANY state exists (another tab may have won the race) — re-fetch and trust it.
+    const dbName = boardDbName(boardId);
+    if (isDefault) await migrateLegacyBoard(dbName);
+    const [events, snapshot] = await Promise.all([
+      new IdbEventStore(dbName).loadAll(),
+      new IdbSnapshotStore(dbName).load(),
+    ]);
+    if (events.length > 0 || snapshot) {
+      await importBoardPersist(boardId, events, snapshot);
+      boot = await fetchBoardPersist(boardId);
+    }
+  }
   const persistence = new Persistence({
-    events: new IdbEventStore(dbName),
-    snapshots: new IdbSnapshotStore(dbName),
+    events: new RemoteEventStore(boardId, boot.events),
+    snapshots: new RemoteSnapshotStore(boardId, boot.snapshot),
     onError: (e) => console.error("[persistence]", e),
   });
   const editor = new Editor({ log: persistence });
@@ -339,12 +355,17 @@ function Board({ m, undo, persistence }: Engine) {
     if (!el) return;
     el.focus();
     const off = bindDom(el, (e: InputEvent) => m.dispatch(e));
+    // The wheel-gesture latch's observer (interior.ts): capture phase sees every wheel in the canvas
+    // subtree BEFORE any card's claim handler, which is what lets those handlers ask "is this event
+    // continuing a gesture the canvas already owns?" when a pan slides their scroller under the cursor.
+    el.addEventListener("wheel", observeWheelGesture, { capture: true, passive: true });
     const sync = () => m.setViewport(el.clientWidth, el.clientHeight);
     sync();
     const ro = new ResizeObserver(sync);
     ro.observe(el);
     return () => {
       off();
+      el.removeEventListener("wheel", observeWheelGesture, { capture: true });
       ro.disconnect();
     };
   }, [m]);

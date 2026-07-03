@@ -358,13 +358,20 @@ function EdgeActions({ m, edgeId, onClose }: { m: InteractionManager; edgeId: st
     const el = rootRef.current;
     if (!el) return;
     const stop = (e: Event) => e.stopPropagation();
+    // Wheel is contained like the rest — except when a pan gesture already owns the wheel and the
+    // popover (which re-projects with the camera) merely slid under the cursor (interior.ts latch).
+    const stopWheel = (e: WheelEvent) => {
+      if (wheelGestureLatchedToCanvas()) return;
+      claimWheelGesture();
+      e.stopPropagation();
+    };
     el.addEventListener("pointerdown", stop);
     el.addEventListener("keydown", stop);
-    el.addEventListener("wheel", stop, { passive: false });
+    el.addEventListener("wheel", stopWheel, { passive: false });
     return () => {
       el.removeEventListener("pointerdown", stop);
       el.removeEventListener("keydown", stop);
-      el.removeEventListener("wheel", stop);
+      el.removeEventListener("wheel", stopWheel);
     };
   }, [edgeId]);
 

@@ -91,6 +91,14 @@ stay lazy until a tab actually mounts). Mounting also appends `.canvas/` to the 
 right-click menu's **Board** section — it lists the registry (plus "Open repo…"); rows navigate with
 `?repo=` so switching re-mounts, self-healing a forgotten board.
 
+**Board records persist SERVER-SIDE** (`<repo>/.canvas/board/` — `events.jsonl` intent log +
+`snapshot.json` cache, via `board-persist.js` and `/api/board/persist`): the browser's persistence
+stores are HTTP clients (`src/remote-store.ts`), so a board hydrates the same in any browser/machine
+and its records travel with the repo. IndexedDB is a read-once adoption source for pre-existing
+boards, not a durable tier. Don't curl-write a real board's persist endpoints: junk server state
+blocks that one-time adoption. (The camera pose stays per-browser in localStorage; `GET /api/canvas`
+remains the agents' read — a separate, debounced push.)
+
 - **Read:** `GET /api/canvas?board=<id>` → `{ ts, snapshot, recentIntent }`, the last snapshot a tab *of that
   board* pushed (debounced ~500ms after a change; stale if nothing changed, and overwritten by *whichever*
   tab of that board pushed last). `snapshot.records` are the nodes/edges/layouts.

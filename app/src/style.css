@@ -8,6 +8,11 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* Two-finger horizontal swipes over non-canvas chrome chain to the (unscrollable) viewport, which
+     Chrome reads as back/forward navigation — losing the board mid-pan. The root never scrolls, so
+     killing viewport overscroll costs nothing. (The canvas preventDefaults its own wheel events, and
+     inner scrollers use overscroll-behavior: contain; this closes the gap between them.) */
+  overscroll-behavior-x: none;
 }
 body {
   font: 13px/1.4 ui-sans-serif, system-ui, sans-serif;
