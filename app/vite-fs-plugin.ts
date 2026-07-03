@@ -3,12 +3,14 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFile, execFileSync, spawn, type ChildProcessByStdio } from "node:child_process";
-import type { Readable, Writable } from "node:stream";
+import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
-import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
+import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
+import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
+import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
+import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
@@ -955,6 +957,11 @@ interface CanvasFsState {
   threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
   pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (added via ??= for old pinned state)
   wsClients?: Set<WsClient>; // connected /api/ws tabs (added via ??= for old pinned state)
+  // CANVAS_SESSION_HOST mode: the one client to the session-host sidecar. Pinned so an in-process re-eval
+  // reuses the attached socket instead of a second `hello` bouncing off its own busy guard. `null` after a
+  // busy rejection (another dev server holds the slot) → spawns fall back to in-process ownership.
+  hostClient?: SessionHostClient | null;
+  hostAttachStarted?: boolean; // attachSessionHost runs once per process, like the cleanup hook
 }
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
   feedClients: new Set<SseClient>(),
@@ -976,6 +983,28 @@ const sessionWatchers = fsState.sessionWatchers;
 const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
 const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
 const wsClients = (fsState.wsClients ??= new Set<WsClient>());
+
+// One-time shape migration for a HOT RE-EVAL over a pre-SessionProc registry: entries pinned by the old
+// module carry a raw `child` (its stdout/exit handlers — old closures — still publish fine); wrap it so
+// THIS module's proc.write/kill reach the surviving process. Same spirit as the `??=` guards above.
+for (const s of liveSessions.values()) {
+  const legacy = (s as unknown as { child?: { stdin: { write(d: string): void }; kill(): void } }).child;
+  const shape = s as unknown as { proc?: SessionProc; status: string };
+  if (legacy && !shape.proc) {
+    shape.proc = {
+      kind: "local",
+      get alive() {
+        return shape.status !== "exited";
+      },
+      write: (l: string) => {
+        if (shape.status === "exited") return false;
+        legacy.stdin.write(l + "\n");
+        return true;
+      },
+      kill: () => legacy.kill(),
+    };
+  }
+}
 
 function publishFeed(feed: string, value: unknown): void {
   feedValues.set(feed, value);
@@ -1345,7 +1374,9 @@ interface ContentBlock {
 interface LiveSession {
   id: string;
   repoPath: string; // the board's repo — the process's cwd, and how seedFromTranscript finds its .jsonl
-  child: ChildProcessByStdio<Writable, Readable, Readable>;
+  // The process, behind the SessionProc seam (session-proc.js): local = we spawned and own it (dies with
+  // the dev server), remote = the session-host sidecar owns it (survives a dev-server restart).
+  proc: SessionProc;
   lines: string[]; // completed transcript-shaped events (codec-ready: {type:"user"|"assistant",message})
   inflight: ContentBlock[] | null; // the assistant message being built from partial deltas, or null
   status: "running" | "idle" | "exited";
@@ -1392,6 +1423,23 @@ interface LiveSession {
 // liveSessions lives on fsState (aliased at the top) so spawned children survive a server reload and
 // stay reachable; sessionCleanupHooked is read/written through fsState so the process-exit kill hook
 // is installed exactly once across reloads, not stacked.
+
+// Persist the live-registry state that must survive a restart — the thread read cursors and waitingOn —
+// onto the session's durable marker. Without this, a restart that keeps the SESSION alive (a --resume, or
+// the session-host sidecar) still resets its cursors to 0 and the next inbox read re-delivers every joined
+// thread's whole backlog as "unread". Debounced per session (reads/posts come in bursts); the timer reads
+// s.read at fire time, so it always writes the latest cursors. Best-effort like every marker write.
+const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+function persistSessionState(s: LiveSession): void {
+  if (persistTimers.has(s.id)) return;
+  persistTimers.set(
+    s.id,
+    setTimeout(() => {
+      persistTimers.delete(s.id);
+      updateCanvasSession(s.repoPath, s.id, { read: s.read, waitingOn: s.waitingOn });
+    }, 500),
+  );
+}
 
 // Publish the session's buffer (completed lines + the in-flight synthetic turn) on its feed. Bounded
 // from the tail; `truncated` mirrors the codec's existing cap signal so the card flags a clipped view.
@@ -1596,22 +1644,33 @@ function ensureLiveSession(
     "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
     "--append-system-prompt", appendPrompt,
   ];
-  const child = spawn("claude", args, {
-    cwd: repoPath,
-    stdio: ["pipe", "pipe", "pipe"],
-  }) as ChildProcessByStdio<Writable, Readable, Readable>;
-
   // Does this session's role run an operating loop? Then its idle sessions are woken on the server heartbeat
   // (loopTick), and read calm "scheduled" rather than amber "waiting" between ticks. First heartbeat is one
   // BASE interval out — the spawn's own first-turn prompt is the session's opening tick.
   const loops = !!role?.loops;
+  // Who owns the process? In CANVAS_SESSION_HOST mode the sidecar does (the child survives a dev-server
+  // restart); otherwise we spawn in-process, exactly as before. Remote mode with the host UNREACHABLE
+  // (crashed mid-flight, still reconnecting) throws — a loud 500 beats silently spawning a child under
+  // in-process ownership that the next restart would kill. (hostClient === null means the slot was busy —
+  // another dev server owns the host — and THAT falls back to local on purpose.)
+  // The hooks close over `s` (declared just below) — they only fire async, well after it's assigned.
+  if (REMOTE_SESSIONS && fsState.hostClient && !fsState.hostClient.connected)
+    throw new Error("session host unreachable (reconnecting) — retry in a moment");
+  const spawnSpec = { cmd: "claude", args, cwd: repoPath };
+  const proc =
+    REMOTE_SESSIONS && fsState.hostClient
+      ? remoteProc(fsState.hostClient, id, wireSessionHooks(() => s), { spawn: spawnSpec })
+      : localProc(spawnSpec, wireSessionHooks(() => s));
   const s: LiveSession = {
     // Start IDLE, not running: a freshly-spawned process is waiting on stdin (it emits `system/init`, never
     // a `result`, until it's first prompted), so "running" would be a turn that never ends — and the inbox,
     // which flushes idle-immediately / at a turn boundary, would queue forever with no boundary to drain at.
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
-    id, repoPath, child, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
-    read: {}, nudge: false, waitingOn: null,
+    id, repoPath, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
+    // Cursors revive from the marker (persistSessionState) so a --resume / sidecar adoption doesn't reset
+    // them to 0 and re-deliver every joined thread's backlog as unread.
+    read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
+    nudge: false, waitingOn: null,
     loops, loopIntervalMs: LOOP_BASE_MS, loopNextAt: Date.now() + LOOP_BASE_MS, loopSig: "",
     origin, pendingEdits: new Map(),
   };
@@ -1634,49 +1693,12 @@ function ensureLiveSession(
   });
   stopSessionFeed(id); // the registry now owns this feed — drop any out-of-band file-tail for it
 
-  let buf = "";
-  let pub: ReturnType<typeof setTimeout> | null = null;
-  const schedulePublish = () => {
-    if (pub) return;
-    pub = setTimeout(() => { pub = null; publishSession(s); }, 50); // coalesce a delta burst to one frame
-  };
-  child.stdout.setEncoding("utf8");
-  child.stdout.on("data", (chunk: string) => {
-    buf += chunk;
-    let nl: number;
-    while ((nl = buf.indexOf("\n")) >= 0) {
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
-      if (!line.trim()) continue;
-      try {
-        foldSessionEvent(s, JSON.parse(line));
-      } catch {
-        // a partial/non-JSON framing line — skip, keep streaming
-      }
-    }
-    schedulePublish();
-  });
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", () => {}); // drained so the pipe never blocks; not shown on the canvas
-  child.on("exit", () => {
-    s.status = "exited";
-    s.inflight = null;
-    s.verb = null;
-    // Phase 2: a process that exits while we're NOT shutting the server down and we never asked it to stop
-    // (no /done or /terminate set s.endReason) died on its own — record it as a crash. The shuttingDown
-    // guard is what keeps a clean server restart (killAll) from being mislabelled a crash on every session.
-    if (!s.endReason && !fsState.shuttingDown) { s.endReason = "crashed"; recordSessionEnd(s.repoPath, s.id, "crashed"); }
-    publishSession(s);
-  });
-  child.on("error", () => {
-    s.status = "exited";
-    if (!s.endReason) { s.endReason = "crashed"; recordSessionEnd(s.repoPath, s.id, "crashed"); }
-    publishSession(s);
-  });
-
   if (!fsState.sessionCleanupHooked) {
     fsState.sessionCleanupHooked = true;
-    const killAll = () => { fsState.shuttingDown = true; for (const live of liveSessions.values()) live.child.kill(); };
+    // Local children die with the dev server (they'd be orphaned pipes otherwise). Remote children are
+    // the entire point of the sidecar: leave them running — the socket just closes, the host sees a
+    // detach, and the next dev server adopts them.
+    const killAll = () => { fsState.shuttingDown = true; for (const live of liveSessions.values()) if (live.proc.kind === "local") live.proc.kill(); };
     process.once("exit", killAll);
     process.once("SIGINT", () => { killAll(); process.exit(0); });
     process.once("SIGTERM", () => { killAll(); process.exit(0); });
@@ -1684,6 +1706,115 @@ function ensureLiveSession(
 
   publishSession(s); // seed the feed (empty) so the card renders the live shell immediately
   return s;
+}
+
+// ── CANVAS_SESSION_HOST mode: session processes live in a sidecar and survive dev-server restarts ──
+// Opt-in (`CANVAS_SESSION_HOST=1 npm run dev`, or `npm run dev:host`). The sidecar (session-host.js) is
+// auto-started on first attach and OWNS the `claude -p` children; this server is a client. Restarting the
+// dev server no longer kills the very sessions implementing/testing the change being tested — on boot we
+// re-attach and ADOPT whatever is still running. Stopping the SIDECAR is the explicit stop-everything.
+const REMOTE_SESSIONS = process.env.CANVAS_SESSION_HOST === "1";
+
+// Connect to (auto-starting if needed) the session host, adopt its live sessions, stamp its dead ones.
+// Once per process; a hot re-eval keeps the pinned client. A "busy" rejection (another dev server holds
+// the client slot — the 5173/5174 footgun) leaves hostClient null: this server warns and runs its own
+// spawns in-process, and does NOT touch the other server's sessions.
+async function attachSessionHost(): Promise<void> {
+  if (!REMOTE_SESSIONS || fsState.hostAttachStarted) return;
+  fsState.hostAttachStarted = true;
+  const appDir = process.cwd(); // `npm run dev` runs in app/ — same dir the session-host CLI resolves
+  let client: SessionHostClient;
+  try {
+    client = await connectSessionHost({
+      socketPath: sessionHostSocketPath(appDir),
+      hostScript: path.join(appDir, "session-host.js"),
+      clientPid: process.pid,
+    });
+  } catch (err) {
+    fsState.hostClient = null;
+    console.warn(`[session-host] ${String(err)} — sessions will run in-process (they die with this server)`);
+    return;
+  }
+  fsState.hostClient = client;
+  const { sessions, exits } = await client.list();
+  for (const info of sessions) adoptSession(client, info);
+  // Deaths while no dev server was attached: stamp them so the cards read crashed/ended, not status-less.
+  for (const ex of exits) {
+    if (!readCanvasSession(ex.cwd, ex.id)?.endReason)
+      recordSessionEnd(ex.cwd, ex.id, ex.reason === "self" ? "crashed" : "terminated");
+  }
+  await client.ackExits(exits.map((e) => e.id));
+  if (sessions.length || exits.length)
+    console.log(`[session-host] adopted ${sessions.length} live session(s), stamped ${exits.length} exit(s)`);
+}
+
+// Rebuild a LiveSession around a child that survived our restart. History = seedFromTranscript (the same
+// tail a --resume shows — completed turns; in-flight partials are gone until the next consolidated event).
+// Status comes from the host's busy bit, never guessed: a wrong "idle" would let the nudge machinery
+// inject stdin MID-TURN and interrupt it. Cursors/waitingOn/loops/origin revive from the marker
+// (persistSessionState). Hooks attach FIRST, buffering, so a turn completing during the seed isn't lost
+// (a rare duplicate of the newest turn is cosmetic and self-heals on the next resume).
+function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
+  if (liveSessions.has(info.id)) return; // pinned across a re-eval — already ours
+  const marker = readCanvasSession(info.cwd, info.id) ?? {};
+  const hooks = wireSessionHooks(() => s);
+  const pending: string[] = [];
+  let buffering = true;
+  const proc = remoteProc(client, info.id, {
+    onLine: (line) => (buffering ? void pending.push(line) : hooks.onLine(line)),
+    onExit: (x) => hooks.onExit(x),
+  });
+  const s: LiveSession = {
+    id: info.id, repoPath: info.cwd, proc, lines: [], inflight: null,
+    status: info.busy ? "running" : "idle", skills: null, verb: info.busy ? "Working" : null,
+    usage: null, turnOut: 0,
+    read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
+    nudge: false,
+    waitingOn: Array.isArray(marker.waitingOn) ? (marker.waitingOn as string[]) : null,
+    loops: !!marker.loops, loopIntervalMs: LOOP_BASE_MS, loopNextAt: Date.now() + LOOP_BASE_MS, loopSig: "",
+    origin: typeof marker.origin === "string" ? marker.origin : "localhost:5173",
+    pendingEdits: new Map(), // an Edit claimed pre-restart commits unattributed — accepted loss
+  };
+  seedFromTranscript(s);
+  liveSessions.set(info.id, s);
+  buffering = false;
+  for (const line of pending) hooks.onLine(line);
+  stopSessionFeed(info.id); // the registry owns this feed again — drop any out-of-band file-tail
+  publishSession(s);
+}
+
+// The ProcHooks for a live session: fold each stdout line into the buffer/status, coalesce publishes,
+// and stamp how the process ended. Takes a getter because the hooks are wired before the LiveSession
+// literal exists (they only fire async, after it does). Shared by spawn (local or remote) and adoption.
+function wireSessionHooks(get: () => LiveSession): ProcHooks {
+  let pub: ReturnType<typeof setTimeout> | null = null;
+  return {
+    onLine(line) {
+      const s = get();
+      try {
+        foldSessionEvent(s, JSON.parse(line));
+      } catch {
+        // a partial/non-JSON framing line — skip, keep streaming
+      }
+      if (pub) return;
+      pub = setTimeout(() => { pub = null; publishSession(get()); }, 50); // coalesce a delta burst to one frame
+    },
+    onExit({ reason }) {
+      const s = get();
+      if (s.status === "exited") return; // endSession already tore it down (kill → this hook still fires)
+      s.status = "exited";
+      s.inflight = null;
+      s.verb = null;
+      // Phase 2: only a child that died ON ITS OWN is a crash — not one we killed (endSession sets the
+      // reason before its kill lands here as "killed"), not a host shutdown ("shutdown" — the remote twin
+      // of the old shuttingDown guard, which still covers local killAll on the way out).
+      if (reason === "self" && !s.endReason && !fsState.shuttingDown) {
+        s.endReason = "crashed";
+        recordSessionEnd(s.repoPath, s.id, "crashed");
+      }
+      publishSession(s);
+    },
+  };
 }
 
 // Write a user prompt into a live session's stdin as a stream-json message. The prompt is echoed into
@@ -1704,9 +1835,7 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
   // (the bug that made it un-observable). The wait is ended deliberately — by the awaited peer posting (see
   // handleThreadMessage) or by the session itself posting something new — not by a passing wake.
   if (!opts?.keepWaitingOn) s.waitingOn = null;
-  s.child.stdin.write(
-    JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }) + "\n",
-  );
+  s.proc.write(JSON.stringify({ type: "user", message: { role: "user", content: [{ type: "text", text }] } }));
   publishSession(s);
   return true;
 }
@@ -1945,17 +2074,13 @@ function startLoopHeartbeat(): void {
 
 // Interrupt a live session's CURRENT TURN without ending the process. Writes a stream-json control
 // request to its stdin — the same control channel the Claude Code SDK's `interrupt()` uses. The CLI
-
-// Interrupt a live session's CURRENT TURN without ending the process. Writes a stream-json control
-// request to its stdin — the same control channel the Claude Code SDK's `interrupt()` uses. The CLI
 // halts the in-flight turn at a safe boundary and emits a `result`, which folds the card back to idle
 // (foldSessionEvent), leaving the process alive for the next prompt. No-op (false) once exited.
 function sendSessionInterrupt(id: string): boolean {
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
-  s.child.stdin.write(
-    JSON.stringify({ type: "control_request", request_id: crypto.randomUUID(), request: { subtype: "interrupt" } }) +
-      "\n",
+  s.proc.write(
+    JSON.stringify({ type: "control_request", request_id: crypto.randomUUID(), request: { subtype: "interrupt" } }),
   );
   return true;
 }
@@ -2049,7 +2174,10 @@ async function handleSessionSpawn(
   if (threadId) {
     pendingHistoryMode.set(historyKey(threadId, id), "future");
     const live = liveSessions.get(id);
-    if (live) live.read[threadId] = seedCursor("future", threadLogs.get(threadId) ?? []);
+    if (live) {
+      live.read[threadId] = seedCursor("future", threadLogs.get(threadId) ?? []);
+      persistSessionState(live);
+    }
   }
   // Optionally drop the session's canvas card (and, with `channel`, its member:open edge) HERE on the
   // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
@@ -2148,7 +2276,7 @@ function endSession(id: string, endReason: "done" | "terminated"): boolean {
   if (!s || s.status === "exited") return false;
   s.endReason = endReason;
   recordSessionEnd(s.repoPath, id, endReason);
-  s.child.kill();
+  s.proc.kill();
   s.status = "exited";
   s.inflight = null;
   s.verb = null;
@@ -2948,7 +3076,10 @@ function maybeAnnounceMembership(
       wakeThreadMembers(boardId, thread.id, sid, null); // a join is a room event — broadcast it to all members
     }
     const js = liveSessions.get(sid);
-    if (js) js.read[thread.id] = seedCursor(mode, log);
+    if (js) {
+      js.read[thread.id] = seedCursor(mode, log);
+      persistSessionState(js);
+    }
     // Seat (§5): a role-spawned joiner FILLS its role's seat on this thread — created on first join,
     // re-occupied (same seat, new sid) when a fresh session of the role arrives. The role rides the
     // session card's `name` ("RoleName.<short-sid>"); a plain unnamed session takes no seat (it stays a
@@ -3006,6 +3137,7 @@ async function handleThreadMessage(
     // awaited peer replies (below) — so the blue holds instead of evaporating on the next bit of traffic.
     const peers = tagged.filter((sid) => sid !== from);
     ss.waitingOn = !wakeAll && !human && peers.length ? peers : null;
+    persistSessionState(ss);
   }
   // The awaited peer just spoke: anyone waiting on `from` has had their wait answered — drop `from` from
   // their waitingOn (→ null when empty) and republish so their card/surfaces fall out of blue. This is the
@@ -3015,6 +3147,7 @@ async function handleThreadMessage(
     if (w.waitingOn?.includes(from)) {
       const rest = w.waitingOn.filter((sid) => sid !== from);
       w.waitingOn = rest.length ? rest : null;
+      persistSessionState(w);
       publishSession(w);
     }
   }
@@ -3366,6 +3499,7 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
       }
       if (log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
     }
+    persistSessionState(s);
   }
   const count = channels.reduce((n, c) => n + c.messages.length, 0);
   sendJson(res, 200, { channels, count });
@@ -3395,6 +3529,7 @@ export function fsApi(): Plugin {
     configureServer(server: ViteDevServer) {
       startFeeds();
       attachWs(server); // the tabs' one-socket transport (feeds + bus + watch)
+      void attachSessionHost(); // CANVAS_SESSION_HOST mode: adopt the sidecar's surviving sessions
       server.middlewares.use((req, res, next) => {
         // ONE canonical browser origin (127.0.0.1). `localhost` and `127.0.0.1` are different origins to
         // the browser, so each holds its OWN IndexedDB — a tab opened on the other spelling sees a

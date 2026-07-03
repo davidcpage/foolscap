@@ -13,6 +13,7 @@ import {
   listSessions,
   readCanvasSession,
   recordSessionEnd,
+  updateCanvasSession,
 } from "../session-ledger.js";
 
 function tmpRepo() {
@@ -106,4 +107,30 @@ test("recordSessionEnd can be re-applied — a later reason overwrites an earlie
   recordSessionEnd(repo, "s", "terminated", 1);
   recordSessionEnd(repo, "s", "done", 2);
   assert.deepEqual(readCanvasSession(repo, "s"), { endReason: "done", endedAt: 2 });
+});
+
+test("updateCanvasSession merges a patch without clobbering spawn identity or end state", () => {
+  const repo = tmpRepo();
+  markCanvasSession(repo, "s", { spawnedAt: 7, origin: "x", roleId: "pm" });
+  updateCanvasSession(repo, "s", { read: { "node:thread:a": 4 }, waitingOn: null });
+  // Spawn fields survive the patch — this is what markCanvasSession (a clobber) could not do.
+  assert.deepEqual(readCanvasSession(repo, "s"), {
+    spawnedAt: 7,
+    origin: "x",
+    roleId: "pm",
+    read: { "node:thread:a": 4 },
+    waitingOn: null,
+  });
+  // A later patch advances the cursor map wholesale and leaves everything else alone.
+  updateCanvasSession(repo, "s", { read: { "node:thread:a": 9, "node:thread:b": 2 } });
+  const m = readCanvasSession(repo, "s");
+  assert.deepEqual(m.read, { "node:thread:a": 9, "node:thread:b": 2 });
+  assert.equal(m.roleId, "pm");
+});
+
+test("updateCanvasSession writes even with no prior marker, and interleaves with recordSessionEnd", () => {
+  const repo = tmpRepo();
+  updateCanvasSession(repo, "s", { read: { t: 1 } });
+  recordSessionEnd(repo, "s", "crashed", 5);
+  assert.deepEqual(readCanvasSession(repo, "s"), { read: { t: 1 }, endReason: "crashed", endedAt: 5 });
 });

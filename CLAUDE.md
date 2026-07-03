@@ -133,6 +133,23 @@ ids are global UUIDs**, so `input`/`interrupt`/`terminate`/`done`/`inbox` need n
   `GET /api/sessions?board=<id>` lists them. **Liveness probe:** `GET /api/inbox?session=<sid>` is `200` if
   live, `404` if not.
 
+### Session-host mode (sessions survive dev-server restarts)
+
+`CANVAS_SESSION_HOST=1 npm run dev` (or `npm run dev:host`) puts the session processes in a **sidecar**
+(`app/session-host.js`, auto-started on first attach; socket in tmpdir keyed by checkout, log at
+`app/.session-host.log`). The dev server is then a *client*: restarting it no longer kills the sessions —
+on boot it re-attaches and **adopts** whatever is still running (history re-seeded from the transcript;
+running/idle taken from the sidecar's busy bit, so a mid-turn session isn't nudge-interrupted). Read
+cursors/waitingOn revive from the `.canvas/sessions/` marker (persisted in both modes). What to know:
+
+- **Stopping the SIDECAR is the explicit stop-everything** (SIGTERM → children end clean, not "crashed";
+  a `kill -9` of it *does* read as crashed). The sidecar survives any number of dev-server restarts.
+- **One attached dev server.** A second host-mode server (the 5174 case) is rejected `busy`, warns, and
+  runs its spawns in-process — it never touches the first server's sessions.
+- **Don't mix modes casually:** a plain `npm run dev` while the sidecar holds sessions won't adopt them —
+  they keep running invisibly (and its own spawns die with it, as always).
+- Default (no env var) behavior is exactly the old model: in-process children, killed on server exit.
+
 Gotchas:
 - **A bare curl spawn leaves NO canvas card.** The *browser tab* that calls spawn is what drops the
   `node:live:<sid>` card; a shell spawn registers the process only. The clean fix is to pass `thread` (or
@@ -140,7 +157,8 @@ Gotchas:
   if you spawn without those must you `addNode {id:"node:live:<sid>", type:"session", title:"<sid>"}` + the
   `member:open` edge yourself over `/api/command`. (Session card id = `node:live:<sid>`, title = the full sid.)
 - **Spawned children die only with the server** (`killAll` on exit) or via `terminate`. A leaked curl-spawn
-  with no terminate lingers until the dev server stops.
+  with no terminate lingers until the dev server stops. **Exception:** in session-host mode (below) children
+  belong to the sidecar — they survive dev-server restarts, and a leak lingers until the *sidecar* stops.
 
 ## Agent session coordination (threads, inbox, ask/reply)
 

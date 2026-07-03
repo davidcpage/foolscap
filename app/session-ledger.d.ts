@@ -11,6 +11,7 @@ export function recordSessionEnd(
   endReason: "done" | "terminated" | "crashed",
   endedAt?: number,
 ): void;
+export function updateCanvasSession(repoPath: string, id: string, patch: Record<string, unknown>): void;
 export function listSessions(
   dir: string,
   repoPath: string,

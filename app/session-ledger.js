@@ -61,6 +61,17 @@ export function recordSessionEnd(repoPath, id, endReason, endedAt = Date.now()) 
 }
 
 /**
+ * Merge a partial patch onto a session's marker (read-merge-write, like recordSessionEnd — markCanvasSession
+ * clobbers). The durable home for the bits of live-registry state that must survive a restart — thread read
+ * cursors, waitingOn — without erasing spawn identity (roleId/origin/endReason). Best-effort like every
+ * ledger write.
+ */
+export function updateCanvasSession(repoPath, id, patch) {
+  const prior = readCanvasSession(repoPath, id) ?? {};
+  markCanvasSession(repoPath, id, { ...prior, ...patch });
+}
+
+/**
  * List the canvas-owned transcripts in `dir` (the shared projects dir), newest first. Externals — terminal
  * `claude` runs nobody has placed on the board — are filtered out by the marker check.
  */
