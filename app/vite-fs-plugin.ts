@@ -323,6 +323,7 @@ async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Prom
 async function handleBoardPersistWrite(
   req: IncomingMessage,
   res: ServerResponse,
+  boardId: string,
   repoPath: string,
   kind: "event" | "snapshot" | "import",
 ): Promise<void> {
@@ -351,7 +352,16 @@ async function handleBoardPersistWrite(
       typeof body.snapshot === "object" && body.snapshot !== null
         ? (body.snapshot as Record<string, unknown>)
         : null;
-    return sendJson(res, 200, { imported: importBoardPersist(repoPath, events, snapshot) });
+    const imported = importBoardPersist(repoPath, events, snapshot);
+    // ALWAYS log adoptions: whichever tab wins this race seeds the board's durable state forever, and
+    // the wrong winner is invisible after the fact. The user-agent is what tells a leaked HEADLESS
+    // probe tab (this exact incident: a stale HeadlessChrome's near-empty IndexedDB beat the real
+    // browser to the import and "reset" the board) apart from the browser the human is actually in.
+    console.log(
+      `[boards] persist import ${imported ? "ACCEPTED" : "refused (state exists)"} for ${boardId}: ` +
+        `${events.length} events, snapshot=${snapshot ? "yes" : "no"} — ua: ${req.headers["user-agent"] ?? "?"}`,
+    );
+    return sendJson(res, 200, { imported });
   } catch (e) {
     return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
   }
@@ -3959,7 +3969,7 @@ export function fsApi(): Plugin {
           if (req.method === "POST") {
             const kind = url.pathname.slice("/api/board/persist/".length);
             if (kind === "event" || kind === "snapshot" || kind === "import")
-              return void handleBoardPersistWrite(req, res, b.repoPath, kind);
+              return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind);
           }
           return sendJson(res, 404, { error: "unknown board-persist endpoint" });
         }

@@ -3,6 +3,7 @@ import { layoutId, selectionBounds, type Box, type CameraState, type Id, type In
 import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
+import { claimWheelGesture, wheelGestureLatchedToCanvas } from "./interior";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
