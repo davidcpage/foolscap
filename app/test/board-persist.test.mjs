@@ -15,6 +15,7 @@ import {
   writeBoardSnapshot,
   importBoardPersist,
   clearBoardPersist,
+  compactBoardEvents,
 } from "../board-persist.js";
 
 function tmpRepo() {
@@ -88,6 +89,41 @@ test("import with events only / snapshot only", () => {
   const b = tmpRepo();
   assert.equal(importBoardPersist(b, [], { records: [], version: 0 }), true);
   assert.deepEqual(readBoardPersist(b), { events: [], snapshot: { records: [], version: 0 } });
+});
+
+test("compaction drops only events well below the watermark, keeps the tail", () => {
+  const repo = tmpRepo();
+  for (let seq = 1; seq <= 30; seq++) appendBoardEvent(repo, { seq });
+  writeBoardSnapshot(repo, { records: [], version: 30, seq: 25 });
+  // keepTail 10 → cut at seq ≤ 15; minDrop 1 forces the rewrite
+  const { dropped } = compactBoardEvents(repo, { keepTail: 10, minDrop: 1 });
+  assert.equal(dropped, 15);
+  const { events } = readBoardPersist(repo);
+  assert.equal(events.length, 15);
+  assert.equal(events[0].seq, 16); // tail below the watermark survives…
+  assert.equal(events.at(-1).seq, 30); // …and everything past the watermark is untouchable
+  // and the log still appends normally afterwards
+  appendBoardEvent(repo, { seq: 31 });
+  assert.equal(readBoardPersist(repo).events.at(-1).seq, 31);
+});
+
+test("compaction is a no-op without a watermark, below minDrop, and for seq-less events", () => {
+  const noSnap = tmpRepo();
+  appendBoardEvent(noSnap, { seq: 1 });
+  assert.deepEqual(compactBoardEvents(noSnap, { keepTail: 0, minDrop: 1 }), { dropped: 0 });
+
+  const few = tmpRepo();
+  for (let seq = 1; seq <= 10; seq++) appendBoardEvent(few, { seq });
+  writeBoardSnapshot(few, { records: [], version: 10, seq: 10 });
+  assert.deepEqual(compactBoardEvents(few, { keepTail: 0, minDrop: 500 }), { dropped: 0 });
+  assert.equal(readBoardPersist(few).events.length, 10);
+
+  const legacy = tmpRepo();
+  appendBoardEvent(legacy, { parent: 0 }); // pre-watermark event, no seq — never safely droppable
+  appendBoardEvent(legacy, { seq: 1 });
+  writeBoardSnapshot(legacy, { records: [], version: 2, seq: 100 });
+  assert.deepEqual(compactBoardEvents(legacy, { keepTail: 0, minDrop: 1 }), { dropped: 1 });
+  assert.deepEqual(readBoardPersist(legacy).events, [{ parent: 0 }]);
 });
 
 test("clear drops both files", () => {

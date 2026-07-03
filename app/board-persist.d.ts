@@ -18,3 +18,9 @@ export function importBoardPersist(
   snapshot: PersistedBoardSnapshot | null,
 ): boolean;
 export function clearBoardPersist(repoPath: string): void;
+export const COMPACT_KEEP_TAIL: number;
+export const COMPACT_MIN_DROP: number;
+export function compactBoardEvents(
+  repoPath: string,
+  opts?: { keepTail?: number; minDrop?: number },
+): { dropped: number };

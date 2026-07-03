@@ -124,3 +124,37 @@ export function clearBoardPersist(repoPath) {
   fs.rmSync(eventsFile(repoPath), { force: true });
   fs.rmSync(snapshotFile(repoPath), { force: true });
 }
+
+// ── compaction ────────────────────────────────────────────────────────────────────────────────────
+// The log is append-only and would grow forever (as it did in IndexedDB). Everything with
+// seq ≤ the snapshot's watermark is already baked into snapshot.json, so it's not needed for
+// CORRECTNESS — but the recent past below the watermark still feeds the history/provenance surfaces
+// (the in-memory log mirror hydrate seeds) and the undo-scrubbing future, so a generous TAIL of it is
+// kept. (⌘Z undo is NOT at stake: the undo stack is in-memory per tab and never reads the log.)
+/** How many events below the watermark survive compaction — the readable recent past. Generous on
+ *  purpose (this app's stingy caps have all cost more than they saved). */
+export const COMPACT_KEEP_TAIL = 2000;
+/** Don't bother rewriting the file for fewer droppable events than this — compaction runs on every
+ *  board GET (once per page load), and a rewrite per reload for a handful of lines is churn. */
+export const COMPACT_MIN_DROP = 500;
+
+/**
+ * Drop events the snapshot has fully absorbed, beyond a generous tail: an event goes only when its
+ * seq ≤ watermark − keepTail (events with no numeric seq predate the watermark scheme — never
+ * droppable safely, always kept). Atomic (tmp + rename), and safe against a concurrent append: every
+ * fs op here is sync, so the whole read→rewrite runs in one event-loop turn — no POST can interleave.
+ * Returns `{ dropped }` (0 = nothing done, including the no-snapshot and below-minDrop cases).
+ */
+export function compactBoardEvents(repoPath, { keepTail = COMPACT_KEEP_TAIL, minDrop = COMPACT_MIN_DROP } = {}) {
+  const { events, snapshot } = readBoardPersist(repoPath);
+  const watermark = snapshot && typeof snapshot.seq === "number" ? snapshot.seq : undefined;
+  if (watermark === undefined) return { dropped: 0 };
+  const cut = watermark - keepTail;
+  const keep = events.filter((e) => !(typeof e.seq === "number" && e.seq <= cut));
+  const dropped = events.length - keep.length;
+  if (dropped < minDrop) return { dropped: 0 };
+  const tmp = eventsFile(repoPath) + ".tmp";
+  fs.writeFileSync(tmp, keep.map((e) => JSON.stringify(e) + "\n").join(""));
+  fs.renameSync(tmp, eventsFile(repoPath));
+  return { dropped };
+}

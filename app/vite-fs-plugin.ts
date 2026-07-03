@@ -16,7 +16,7 @@ import { resolveTags } from "./channel-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
-import { appendBoardEvent, clearBoardPersist, importBoardPersist, readBoardPersist, writeBoardSnapshot } from "./board-persist.js";
+import { appendBoardEvent, clearBoardPersist, compactBoardEvents, importBoardPersist, readBoardPersist, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 
@@ -3960,8 +3960,13 @@ export function fsApi(): Plugin {
         if (url.pathname.startsWith("/api/board/persist")) {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
-          if (url.pathname === "/api/board/persist" && req.method === "GET")
+          if (url.pathname === "/api/board/persist" && req.method === "GET") {
+            // Compact on the boot read (once per page load): drop events the snapshot absorbed,
+            // beyond a generous tail — see board-persist.js. Never silent when it bites.
+            const { dropped } = compactBoardEvents(b.repoPath);
+            if (dropped > 0) console.log(`[boards] compacted ${b.boardId}: dropped ${dropped} events below the snapshot watermark tail`);
             return sendJson(res, 200, readBoardPersist(b.repoPath));
+          }
           if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
             clearBoardPersist(b.repoPath);
             return sendJson(res, 200, { ok: true });

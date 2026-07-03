@@ -58,6 +58,7 @@ import {
 } from "./loader";
 import { baseName } from "./fileTypes";
 import { applyScrollKey, observeWheelGesture, scrollableIn } from "./interior";
+import { bindPeek } from "./peek";
 import { preserveViewState } from "./viewstate";
 
 const SCROLL_KEYS = new Set(["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End"]);
@@ -359,16 +360,20 @@ function Board({ m, undo, persistence }: Engine) {
     // subtree BEFORE any card's claim handler, which is what lets those handlers ask "is this event
     // continuing a gesture the canvas already owns?" when a pan slides their scroller under the cursor.
     el.addEventListener("wheel", observeWheelGesture, { capture: true, passive: true });
+    // Hold-to-peek (peek.ts): hold z → fit-all, release → dive to the cursor at the zoom you left.
+    // A committed dive lands the pre-peek pose on the unwind stack, so ` steps back across it.
+    const offPeek = bindPeek(el, m, { skipLayout: isFloating, onDive: (from) => views.pushHistory(from) });
     const sync = () => m.setViewport(el.clientWidth, el.clientHeight);
     sync();
     const ro = new ResizeObserver(sync);
     ro.observe(el);
     return () => {
       off();
+      offPeek();
       el.removeEventListener("wheel", observeWheelGesture, { capture: true });
       ro.disconnect();
     };
-  }, [m]);
+  }, [m, views]);
 
   // Bracket the manager's channel-2 subscriptions (spatial index) with the component lifecycle.
   useEffect(() => {
