@@ -81,6 +81,16 @@ examples below work unchanged. `GET /api/boards` lists the mounted boards and th
 repo subscribes/pushes under *its* board, so a command for board X reaches only X's tabs and X's snapshot is
 read back on X's id.
 
+**Mounting an EXTERNAL repo as a board:** open `http://localhost:5173/?repo=<abs-path>` — the tab POSTs
+`/api/boards {repoPath}` (idempotent; boardId = `<slug(basename)>-<sha256(realpath)[:8]>`, stable across
+restarts) and that board gets its own served root, `.canvas/` home, session spawn cwd, and per-board
+IndexedDB. Every mount is recorded in the DEV repo's `.canvas/boards.json` registry (`lastOpened` recency)
+and re-registered at boot, so a known `?board=` id resolves right after a server restart (per-board feeds
+stay lazy until a tab actually mounts). Mounting also appends `.canvas/` to the target repo's
+`.git/info/exclude` (idempotent), keeping its `git status` clean. In the browser, switch boards via the
+right-click menu's **Board** section — it lists the registry (plus "Open repo…"); rows navigate with
+`?repo=` so switching re-mounts, self-healing a forgotten board.
+
 - **Read:** `GET /api/canvas?board=<id>` → `{ ts, snapshot, recentIntent }`, the last snapshot a tab *of that
   board* pushed (debounced ~500ms after a change; stale if nothing changed, and overwritten by *whichever*
   tab of that board pushed last). `snapshot.records` are the nodes/edges/layouts.
@@ -94,9 +104,10 @@ Gotchas (learned the hard way):
 - **No connected tab *for that board* → the command goes nowhere:** `POST /api/command` returns **HTTP 503
   `{delivered:0}`** judged against that board's tabs only. Confirm `delivered>0` before trusting a broadcast;
   there is no shell path to a board if no browser is live on it. An unknown `?board=` is **400**.
-- **Target the right port.** The app runs on whatever port Vite bound. If you `npm run dev` while the
-  user's server is already up, yours grabs **5174** and theirs stays **5173** — point the API at the port
-  the user's browser is actually on (`lsof -ti tcp:5173`).
+- **The port is always 5173** (`strictPort` in `vite.config.ts`): a second `npm run dev` now **fails
+  loudly** instead of silently binding 5174. Deliberate — IndexedDB is per-ORIGIN (port included), so the
+  old silent port slide made every board look empty. If the server won't start, stop the process holding
+  the port (`lsof -ti tcp:5173`); don't override the port.
 - **Removing cards:** edges before nodes (no dangling wires); file-card ids are deterministic
   `node:repo:<path>`, so a set to remove can be derived without reading the board.
 - **Attribution & undo:** bus commits land under their `actor`; selective undo means the user's ⌘Z only
@@ -148,7 +159,8 @@ marker (persisted in both modes). What to know:
   (While a dev server is attached, a fresh *empty* sidecar respawns right after — stop kills the sessions,
   not the mode. And a long-running sidecar keeps its OLD code across upgrades: `--stop` detects this and
   tells you to kill the pid.)
-- **One attached dev server.** A second server (the 5174 case) is rejected `busy`, warns, and runs its
+- **One attached dev server.** A second server (only possible with the port explicitly overridden —
+  strictPort makes the accidental 5174 twin fail at startup) is rejected `busy`, warns, and runs its
   spawns in-process — it never touches the first server's sessions.
 - **Opt out** with `npm run dev:local` (`CANVAS_SESSION_HOST=0`): the old model — in-process children,
   killed on server exit. An unreachable sidecar degrades to this by itself (with a warning). Don't mix
