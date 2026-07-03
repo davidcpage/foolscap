@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { layoutId, selectionBounds, type Box, type CameraState, type Id, type InteractionManager, type Vec } from "./lib";
 import { NodeView } from "./NodeView";
-import { useSignal } from "./reactive";
+import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
@@ -17,40 +17,60 @@ function edgeColor(type: string): string {
         : "#c4b5fd";
 }
 
+// Stable selector for the zoom-only camera subscription (useSignalValue) — the layers that inverse-
+// scale widths/handles by z but sit in page space don't need to wake on pan at all.
+const camZ = (c: CameraState) => c.z;
+
 // The page-space render layer — mirrored from app/src/CanvasView.tsx (the camera transform, dot grid,
 // selection box, marquee, and the smooth-during/crisp-at-rest zoom hint are all engine-agnostic plumbing).
 // The only change is that it maps file-card NodeViews. Pan/zoom re-renders this one container's transform;
 // a drag re-renders the dragged NodeView alone; a filesystem change re-renders just the changed card.
+//
+// CanvasView itself does NOT subscribe to the camera. It used to — which meant every camera tick
+// re-executed the nodes.map and handed React the entire card/edge/overlay tree to reconcile, an
+// O(cards) pass per pan frame that changed nothing but the transform. The camera subscription lives
+// in the leaf `Page` below instead: when only Page re-renders, its `children` prop is the SAME element
+// array from CanvasView's last render, so React bails out of the whole subtree by identity.
 export function CanvasView({ m }: { m: InteractionManager }) {
-  const cam = useSignal(m.camera.signal);
   const nodeQuery = useMemo(() => m.editor.store.query({ typeName: "node" }), [m]);
   const nodes = useSignal(nodeQuery);
-  const zooming = useZooming(cam.z);
   // Which agent attention-edge is selected for actions (accept / sever / send). App-local state, not the
   // engine's node Selection — these edges live in the same store but their action UI is a renderer concern.
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
 
   return (
     <>
-      <GridLayer cam={cam} />
-      <div
-        className={zooming ? "page zooming" : "page"}
-        style={{ transform: `translate(${cam.x}px, ${cam.y}px) scale(${cam.z})` }}
-        // A press that reaches the page background (empty canvas, or bubbling up from a card) clears the
-        // edge selection; the edge hit-line stops its own press from bubbling here, so selecting an edge
-        // doesn't immediately deselect it.
-        onPointerDown={() => setSelectedEdge(null)}
-      >
+      <GridLayer m={m} />
+      <Page m={m} onPointerDown={() => setSelectedEdge(null)}>
         <EdgeLayer m={m} selectedEdge={selectedEdge} onSelectEdge={setSelectedEdge} />
         {nodes.map((n) => (
           <NodeView key={n.id} m={m} id={n.id} />
         ))}
         <SelectionOverlay m={m} />
         <MarqueeOverlay m={m} />
-      </div>
+      </Page>
       <ScreenLayer m={m} />
       <EdgeActions m={m} edgeId={selectedEdge} onClose={() => setSelectedEdge(null)} />
     </>
+  );
+}
+
+// The ONE camera-subscribed wrapper: owns the pan/zoom transform and nothing else. A press that
+// reaches the page background (empty canvas, or bubbling up from a card) clears the edge selection;
+// the edge hit-line stops its own press from bubbling here, so selecting an edge doesn't immediately
+// deselect it. The `zooming` promotion is ZOOM-only on purpose — extending it to pan forced a full
+// re-raster of the (huge) page layer at every gesture start/settle, which read as a lock-up.
+function Page({ m, onPointerDown, children }: { m: InteractionManager; onPointerDown: () => void; children: React.ReactNode }) {
+  const cam = useSignal(m.camera.signal);
+  const zooming = useZooming(cam.z);
+  return (
+    <div
+      className={zooming ? "page zooming" : "page"}
+      style={{ transform: `translate(${cam.x}px, ${cam.y}px) scale(${cam.z})` }}
+      onPointerDown={onPointerDown}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -91,15 +111,25 @@ function useZooming(z: number): boolean {
   return zooming;
 }
 
+// The dot grid. Panning used to slide it via background-position — a FULL-VIEWPORT repaint every
+// frame. Instead the div is oversized by one tile on each side and translated by the camera offset
+// MODULO the tile size (same visible phase, since the pattern repeats every `step`), so a pan is a
+// composited transform on a static raster; only zoom (which changes the tile size) still repaints.
 const BASE = 24;
-function GridLayer({ cam }: { cam: CameraState }) {
+function GridLayer({ m }: { m: InteractionManager }) {
+  const cam = useSignal(m.camera.signal);
   let step = BASE * cam.z;
   while (step < 18) step *= 4;
   while (step > 120) step /= 2;
+  const mod = (v: number) => ((v % step) + step) % step;
   return (
     <div
       className="grid"
-      style={{ backgroundSize: `${step}px ${step}px`, backgroundPosition: `${cam.x}px ${cam.y}px` }}
+      style={{
+        inset: -step,
+        backgroundSize: `${step}px ${step}px`,
+        transform: `translate(${mod(cam.x)}px, ${mod(cam.y)}px)`,
+      }}
     />
   );
 }
@@ -124,11 +154,14 @@ function EdgeLayer({
   const edges = useSignal(edgeQuery);
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   useSignal(layoutQuery);
-  const cam = useSignal(m.camera.signal);
+  // Only ZOOM affects this layer (stroke widths, below); positions are page-space under .page's
+  // transform. Subscribing to the z projection alone lets every pan frame skip the layer entirely —
+  // it used to re-render (and re-reconcile) every edge on every pan tick for no visual change.
+  const z = useSignalValue(m.camera.signal, camZ);
   const connect = useSignal(m.connectDraw);
   // Stroke widths are in page space (drawn under .page's scale(z)); divide by z so each renders at a
   // constant screen px, the same trick ResizeHandles use — otherwise a thin connector vanishes zoomed out.
-  const k = 1 / cam.z;
+  const k = 1 / z;
 
   const previewA = connect && store.get<"layout">(layoutId(connect.from as Id<"node">));
   return (
@@ -143,6 +176,7 @@ function EdgeLayer({
         return (
           <EdgeLine
             key={e.id}
+            id={e.id}
             x1={a.x + a.w / 2}
             y1={a.y + a.h / 2}
             x2={b.x + b.w / 2}
@@ -152,7 +186,7 @@ function EdgeLayer({
             dash={e.type === MEMBER_OPEN ? undefined : `${6 * k} ${4 * k}`}
             glow={selected ? 3 * k : 0}
             hitWidth={attention ? 16 * k : 0}
-            onSelect={attention ? () => onSelectEdge(e.id) : undefined}
+            onSelect={attention ? onSelectEdge : undefined}
           />
         );
       })}
@@ -178,7 +212,10 @@ function EdgeLayer({
 // the lines stay hit-testable but never show; that was the invisible-connector bug). Here the svg box is
 // the line's bounding box padded by the (screen-constant) stroke/hit half-widths, so the line always sits
 // inside a non-zero viewport. Positioned in page space (left/top), so it pans/zooms with .page like a card.
-function EdgeLine({
+// Memoized (with the STABLE onSelectEdge setter + the edge id, never a per-render closure), so a layout
+// commit — one card dragged, N-1 edges untouched — reconciles only the lines whose endpoints moved.
+const EdgeLine = memo(function EdgeLine({
+  id,
   x1,
   y1,
   x2,
@@ -190,6 +227,7 @@ function EdgeLine({
   hitWidth,
   onSelect,
 }: {
+  id?: string;
   x1: number;
   y1: number;
   x2: number;
@@ -199,7 +237,7 @@ function EdgeLine({
   dash: string | undefined;
   glow: number;
   hitWidth: number;
-  onSelect?: () => void;
+  onSelect?: (id: string) => void;
 }) {
   const pad = Math.max(width, hitWidth) / 2 + glow + 2;
   const left = Math.min(x1, x2) - pad;
@@ -222,7 +260,7 @@ function EdgeLine({
           filter: glow ? `drop-shadow(0 0 ${glow}px ${color})` : undefined,
         }}
       />
-      {hitWidth > 0 && onSelect && (
+      {hitWidth > 0 && onSelect && id != null && (
         <line
           x1={x1 - left}
           y1={y1 - top}
@@ -231,13 +269,13 @@ function EdgeLine({
           style={{ stroke: "transparent", strokeWidth: hitWidth, pointerEvents: "stroke", cursor: "pointer" }}
           onPointerDown={(ev) => {
             ev.stopPropagation();
-            onSelect();
+            onSelect(id);
           }}
         />
       )}
     </svg>
   );
-}
+})
 
 // Channel-1 selection chrome. A MULTI-selection draws its group-extent box (no handles — the select
 // tool only resizes a lone node). A SINGLE selection draws corner resize handles on its box: the node
@@ -246,7 +284,7 @@ function EdgeLine({
 // frame re-fires it and the handles track the box) + the camera (handles are sized in screen px).
 function SelectionOverlay({ m }: { m: InteractionManager }) {
   const ids = useSignal(m.selection.signal);
-  const cam = useSignal(m.camera.signal);
+  const z = useSignalValue(m.camera.signal, camZ); // handles are sized by zoom; pan never moves them
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   useSignal(layoutQuery);
@@ -260,7 +298,7 @@ function SelectionOverlay({ m }: { m: InteractionManager }) {
   const bounds = selectionBounds(store, worldIds);
   if (!bounds) return null;
   if (worldIds.length >= 2) return <div className="selection-box" style={rectStyle(bounds)} />;
-  return <ResizeHandles box={bounds} z={cam.z} />;
+  return <ResizeHandles box={bounds} z={z} />;
 }
 
 // The four corner grab dots. Drawn in page space (inside .page, so they pan/zoom with the card), but

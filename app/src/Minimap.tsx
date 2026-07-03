@@ -20,6 +20,34 @@ const FRAME_HUES = ["#ef4444", "#22c55e", "#3b82f6", "#f97316", "#a855f7", "#14b
 const hue = (n: number): string => FRAME_HUES[(n - 1) % FRAME_HUES.length] ?? "#64748b";
 
 export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: ViewStore; mode: 0 | 1 | 2 }) {
+  // Visibility is purely the explicit cycle (no auto-show/fade). The SHELL stays mounted so the CSS
+  // opacity transition runs both ways; the BODY — which subscribes to the camera and rebuilds an SVG
+  // rect per card on every pan/zoom frame — unmounts once the fade-out completes. It used to stay
+  // mounted at opacity 0, paying that O(cards) render every camera tick with the map off.
+  const shown = mode !== 0;
+  const [renderBody, setRenderBody] = useState(shown);
+  useEffect(() => {
+    if (shown) {
+      setRenderBody(true);
+      return;
+    }
+    const t = setTimeout(() => setRenderBody(false), 220); // ~ the CSS opacity transition
+    return () => clearTimeout(t);
+  }, [shown]);
+
+  return (
+    <div
+      className={`minimap-hud${shown ? " show" : ""}`}
+      // Keep keyboard focus on the canvas (where the number keys are handled) — a mousedown on chrome
+      // would otherwise blur it and the digit shortcuts would go dead until you clicked the canvas again.
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      {renderBody && <MinimapBody m={m} views={views} mode={mode} />}
+    </div>
+  );
+}
+
+function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewStore; mode: 0 | 1 | 2 }) {
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
@@ -33,9 +61,6 @@ export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: V
   const [, force] = useReducer((x: number) => x + 1, 0);
   useEffect(() => views.subscribe(force), [views]);
 
-  // Visibility is purely the explicit cycle (no auto-show/fade). `useSignal(m.camera.signal)` above
-  // already re-renders the frustum live as the canvas pans/zooms.
-  const shown = mode !== 0;
   // Keep the frames PAINTED through the panel's fade-out when leaving Frames mode, so Frames→Off is one
   // transition (frames fade WITH the panel) rather than the frames vanishing a beat before it hides.
   const [renderFrames, setRenderFrames] = useState(mode === 2);
@@ -71,7 +96,24 @@ export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: V
     return map;
   }, [sessions, nodes]);
 
-  const world = layouts.filter((l) => l.anchor !== "screen");
+  const world = useMemo(() => layouts.filter((l) => l.anchor !== "screen"), [layouts]);
+  // The plain card rects don't move with the camera (page-space coords; only the frustum re-projects),
+  // so keep the element array stable across camera ticks — React bails per-rect by identity instead of
+  // reconciling one rect per card per pan frame.
+  const cardRects = useMemo(
+    () =>
+      world.map((l) => (
+        <rect
+          key={l.nodeId}
+          className={`minimap-card c-${colorOf.get(l.nodeId) ?? "blue"}`}
+          x={l.x}
+          y={l.y}
+          width={l.w}
+          height={l.h}
+        />
+      )),
+    [world, colorOf],
+  );
   const wb = worldBounds(store, (l) => l.anchor === "screen");
   const view = m.visibleBox();
   // Drawn extent = content ∪ current viewport (so the frustum stays in frame even parked in empty
@@ -120,34 +162,19 @@ export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: V
   };
 
   return (
-    <div
-      className={`minimap-hud${shown ? " show" : ""}`}
-      // Keep keyboard focus on the canvas (where the number keys are handled) — a mousedown on chrome
-      // would otherwise blur it and the digit shortcuts would go dead until you clicked the canvas again.
-      onMouseDown={(e) => e.preventDefault()}
-    >
-      <div className="minimap">
-        <div className="minimap-head">minimap</div>
-        <svg
-          ref={svgRef}
-          className="minimap-svg"
-          viewBox={`${ext.x} ${ext.y} ${ext.w} ${ext.h}`}
-          preserveAspectRatio="xMidYMid meet"
-          onPointerDown={onDown}
-          onPointerMove={onMove}
-          onPointerUp={onUp}
-        >
-          {world.map((l) => (
-            <rect
-              key={l.nodeId}
-              className={`minimap-card c-${colorOf.get(l.nodeId) ?? "blue"}`}
-              x={l.x}
-              y={l.y}
-              width={l.w}
-              height={l.h}
-            />
-          ))}
-          {world.map((l) => {
+    <div className="minimap">
+      <div className="minimap-head">minimap</div>
+      <svg
+        ref={svgRef}
+        className="minimap-svg"
+        viewBox={`${ext.x} ${ext.y} ${ext.w} ${ext.h}`}
+        preserveAspectRatio="xMidYMid meet"
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+      >
+        {cardRects}
+        {world.map((l) => {
             const st = statusOf.get(l.nodeId);
             if (!st) return null;
             // A status strip across the card's top edge — sized to a fraction of the card but floored to
@@ -167,24 +194,23 @@ export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: V
               />
             );
           })}
-          {view && <rect className="minimap-frustum" x={view.x} y={view.y} width={view.w} height={view.h} />}
-          {frames.map(({ n, box }) => (
-            <g
-              key={n}
-              className="minimap-view"
-              onPointerDown={(e) => {
-                e.stopPropagation(); // a frame click jumps; it must not also recenter
-                jump(n);
-              }}
-            >
-              <rect x={box.x} y={box.y} width={box.w} height={box.h} fill={hue(n)} fillOpacity={0.08} stroke={hue(n)} strokeWidth={2} vectorEffect="non-scaling-stroke" />
-              <text x={box.x + labelSize * 0.35} y={box.y + labelSize * 1.05} fontSize={labelSize} fill={hue(n)} fontWeight={700}>
-                {n}
-              </text>
-            </g>
-          ))}
-        </svg>
-      </div>
+        {view && <rect className="minimap-frustum" x={view.x} y={view.y} width={view.w} height={view.h} />}
+        {frames.map(({ n, box }) => (
+          <g
+            key={n}
+            className="minimap-view"
+            onPointerDown={(e) => {
+              e.stopPropagation(); // a frame click jumps; it must not also recenter
+              jump(n);
+            }}
+          >
+            <rect x={box.x} y={box.y} width={box.w} height={box.h} fill={hue(n)} fillOpacity={0.08} stroke={hue(n)} strokeWidth={2} vectorEffect="non-scaling-stroke" />
+            <text x={box.x + labelSize * 0.35} y={box.y + labelSize * 1.05} fontSize={labelSize} fill={hue(n)} fontWeight={700}>
+              {n}
+            </text>
+          </g>
+        ))}
+      </svg>
     </div>
   );
 }

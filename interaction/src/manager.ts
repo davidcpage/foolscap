@@ -165,8 +165,11 @@ export class InteractionManager implements InteractionContext {
           break;
         }
         this.lastPointer = e;
-        // hover is tool-independent affordance state, kept fresh on the manager
-        this.hovered.set(this.index.hitPoint(this.camera.screenToPage(e.point)) ?? null);
+        // hover is tool-independent affordance state, kept fresh on the manager — but the hit-test is
+        // a linear scan over every layout, so only pay it when someone is actually subscribed (today's
+        // renderer isn't; an O(N) scan per pointermove for an unread value was pure drag on busy boards)
+        if (this.hovered.hasListeners)
+          this.hovered.set(this.index.hitPoint(this.camera.screenToPage(e.point)) ?? null);
         this.active.onPointerMove?.(e);
         this.updateEdgeScroll(); // pointer may have entered/left an edge band
         break;
@@ -288,6 +291,7 @@ export class InteractionManager implements InteractionContext {
   private flyRaf: number | null = null;
   flyTo(target: CameraState, opts: { animate?: boolean; durationMs?: number } = {}): void {
     this.cancelFly();
+    this.dropPendingWheel(); // a stale frame's wheel deltas must not land on top of the flight
     const animate = opts.animate ?? true;
     if (!animate || typeof requestAnimationFrame !== "function" || this.viewportW <= 0 || this.viewportH <= 0) {
       this.camera.set(target);
@@ -391,18 +395,56 @@ export class InteractionManager implements InteractionContext {
   }
 
   // ctrl/⌘ + wheel = zoom about the pointer; plain wheel = two-finger pan (trackpad scroll deltas).
+  //
+  // COALESCED to one camera write per animation frame: unlike pointermove, wheel events are NOT
+  // vsync-aligned by the browser — a trackpad/precision wheel can deliver several per frame, and each
+  // camera.set fires every subscriber synchronously (a full render pass). So a wheel event only
+  // ACCUMULATES (pan deltas sum; zoom factors multiply, anchored at the latest pointer position — the
+  // pointer moves sub-pixel within one frame, so folding the anchors is invisible), and one rAF applies
+  // the lot. Without rAF (the Node tests) it applies inline, so synchronous dispatch→assert still holds.
+  private wheelRaf: number | null = null;
+  private wheelPanX = 0;
+  private wheelPanY = 0;
+  private wheelZoom = 1;
+  private wheelZoomAnchor: Vec | null = null;
+
   private onWheel(e: Extract<InputEvent, { type: "wheel" }>): void {
     this.cancelFly(); // a manual zoom/pan takes over any in-flight fly-to
     if (e.ctrlKey || e.metaKey) {
-      const factor = Math.exp((-e.deltaY / 100) * this.zoomSpeed);
-      this.camera.zoomBy(factor, e.point);
+      this.wheelZoom *= Math.exp((-e.deltaY / 100) * this.zoomSpeed);
+      this.wheelZoomAnchor = e.point;
     } else {
-      this.camera.panBy(-e.deltaX, -e.deltaY);
+      this.wheelPanX -= e.deltaX;
+      this.wheelPanY -= e.deltaY;
     }
+    if (typeof requestAnimationFrame !== "function") return this.flushWheel();
+    if (this.wheelRaf == null) this.wheelRaf = requestAnimationFrame(() => this.flushWheel());
+  }
+
+  private flushWheel(): void {
+    this.wheelRaf = null;
+    if (this.wheelZoom !== 1 && this.wheelZoomAnchor) this.camera.zoomBy(this.wheelZoom, this.wheelZoomAnchor);
+    if (this.wheelPanX !== 0 || this.wheelPanY !== 0) this.camera.panBy(this.wheelPanX, this.wheelPanY);
+    this.wheelZoom = 1;
+    this.wheelZoomAnchor = null;
+    this.wheelPanX = 0;
+    this.wheelPanY = 0;
+  }
+
+  // Discard accumulated-but-unapplied wheel input (a fly-to starting, or teardown) so a stale frame's
+  // deltas don't land on top of the new camera motion.
+  private dropPendingWheel(): void {
+    if (this.wheelRaf != null && typeof cancelAnimationFrame === "function") cancelAnimationFrame(this.wheelRaf);
+    this.wheelRaf = null;
+    this.wheelZoom = 1;
+    this.wheelZoomAnchor = null;
+    this.wheelPanX = 0;
+    this.wheelPanY = 0;
   }
 
   dispose(): void {
     this.stopEdgeScroll();
+    this.dropPendingWheel();
     this.stop();
     this.active.onExit?.();
   }

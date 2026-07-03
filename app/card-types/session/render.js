@@ -209,7 +209,7 @@ function eventsFor(card, raw) {
   let st = parseCache.get(card);
   const sig = raw.slice(0, 64);
   if (!st || raw.length < st.consumed || sig !== st.sig) {
-    st = { sig, consumed: 0, events: [], truncated: false, turnsCache: null };
+    st = { sig, consumed: 0, events: [], truncated: false, turnsCache: null, mdPrev: new Map(), mdNext: new Map(), derivedTurns: null };
     parseCache.set(card, st);
   }
   if (raw.length > st.consumed) {
@@ -261,6 +261,25 @@ function turnsFor(st, events, hasTransient) {
   const cache = { len: events.length, turns: built.turns, tools: built.tools };
   if (!hasTransient) st.turnsCache = cache;
   return cache;
+}
+
+// The rendered-markdown memo. buildTurns rebuilds every turn/block object whenever an event lands, so
+// a streaming session used to re-run renderMd (and hand lit a fresh DOM description) for EVERY text
+// block in the transcript on every delta burst — the markdown parse of the whole visible history,
+// ~20×/s. Block TEXT, though, is a stable string once written, so the memo keys on it. Two-generation
+// maps (look up last pass's, insert into this pass's, swap after the render) so entries not used this
+// pass — a superseded transient tail, cleared history — drop instead of accruing per-delta garbage.
+// Only ANSWER-LESS text blocks are cached: the last live claude turn (the one whose ```ask widget is
+// interactive, and the one still streaming) renders fresh each pass.
+function memoTextBlock(st, b) {
+  let t = st.mdNext.get(b.text) ?? st.mdPrev.get(b.text);
+  if (t === undefined) t = renderBlock(b, null);
+  st.mdNext.set(b.text, t);
+  return t;
+}
+function swapMdGenerations(st) {
+  st.mdPrev = st.mdNext;
+  st.mdNext = new Map();
 }
 
 // ── interactive questions (the ```ask convention) ────────────────────────────────────────────────
@@ -510,6 +529,12 @@ export default {
     // Incremental parse (eventsFor): only newly-appended lines are JSON.parsed each render, so a
     // streaming session no longer re-walks its whole transcript every frame.
     const st = eventsFor(card, raw);
+    // A card mounted before a template hot-swap carries a pre-memo cache entry — backfill the fields.
+    if (!st.mdPrev) {
+      st.mdPrev = new Map();
+      st.mdNext = new Map();
+      st.derivedTurns = null;
+    }
     const tail = trailing(st, raw);
     const events = tail.event ? [...st.events, tail.event] : st.events;
     const { turns, tools } = turnsFor(st, events, !!tail.event);
@@ -762,7 +787,14 @@ export default {
     // open state survives streamed re-renders for the same reason the tool/thinking rows' do — lit never
     // binds `open`, so the user's toggle is left alone. Summary = recency-decaying dots + a count; open =
     // the path list (most-recent-first). Empty (no file tools yet) → nothing rendered.
-    const touched = touchedFiles(turns);
+    // touchedFiles/taskList each fold over every turn; memoized on the turns array identity (turnsFor
+    // keeps it stable across event-free re-renders), recomputed only when the turns actually rebuilt.
+    if (st.derivedTurns !== turns) {
+      st.derivedTurns = turns;
+      st.touched = touchedFiles(turns);
+      st.tasks = taskList(turns);
+    }
+    const touched = st.touched;
     const recent = touched.slice(0, 8);
     // The board's roots (canonical + worktrees), each with a colour — for tinting the dots by worktree.
     // Guarded: a card without the `roots` capability (or a test mock) sees [], i.e. the neutral default.
@@ -804,7 +836,7 @@ export default {
     // survives streamed re-renders, like the activity/tool/thinking disclosures. Empty (no task calls yet)
     // → nothing rendered. A completed task dims + strikes through; the in_progress one shows its activeForm
     // ("Running tests") when given, else its subject.
-    const tasks = taskList(turns);
+    const tasks = st.tasks;
     const tasksDone = tasks.filter((t) => t.status === "completed").length;
     const taskGlyph = (s) => (s === "completed" ? "✓" : s === "in_progress" ? "◐" : "○");
     const taskPanel = tasks.length
@@ -838,6 +870,28 @@ export default {
       });
     };
 
+    // Built BEFORE the outer template so the md-memo generation swap below sees every lookup this
+    // pass made. Historical text blocks come from the memo (renderMd once per text, not per delta);
+    // the last live claude turn — the streaming one, and the one whose ```ask may be interactive —
+    // renders fresh.
+    const turnRows = turns.map((t, i) => {
+      // Task-mutation rows are hidden inline (the task panel above carries that state). A turn left with
+      // no visible blocks — e.g. one whose only act was a TaskUpdate — contributes nothing, so the role
+      // chrome doesn't render onto an empty turn.
+      const blocks = t.blocks.filter((b) => !(b.kind === "tool" && TASK_PANEL_TOOLS.has(b.name)));
+      if (blocks.length === 0) return nothing;
+      // The last claude turn of a LIVE session is the one that may hold a pending ```ask block —
+      // grant its blocks the answer fn so its options are clickable; all others render read-only.
+      const onAnswer = i === turns.length - 1 && active && t.role === "claude" ? answerAsk : null;
+      return html`
+        <div class="ses-turn ses-${t.role}">
+          <div class="ses-role">${t.role}</div>
+          ${blocks.map((b) => (b.kind === "text" && !onAnswer ? memoTextBlock(st, b) : renderBlock(b, onAnswer)))}
+        </div>
+      `;
+    });
+    swapMdGenerations(st);
+
     return html`
       ${frame}
       <div class="ses-head" data-ses-state=${frameState ?? "none"}>
@@ -852,22 +906,7 @@ export default {
       </div>
       ${activity}${taskPanel}
       <div class="ses-body" data-autoscroll data-text>
-        ${turns.map((t, i) => {
-          // Task-mutation rows are hidden inline (the task panel above carries that state). A turn left with
-          // no visible blocks — e.g. one whose only act was a TaskUpdate — contributes nothing, so the role
-          // chrome doesn't render onto an empty turn.
-          const blocks = t.blocks.filter((b) => !(b.kind === "tool" && TASK_PANEL_TOOLS.has(b.name)));
-          if (blocks.length === 0) return nothing;
-          // The last claude turn of a LIVE session is the one that may hold a pending ```ask block —
-          // grant its blocks the answer fn so its options are clickable; all others render read-only.
-          const onAnswer = i === turns.length - 1 && active && t.role === "claude" ? answerAsk : null;
-          return html`
-            <div class="ses-turn ses-${t.role}">
-              <div class="ses-role">${t.role}</div>
-              ${blocks.map((b) => renderBlock(b, onAnswer))}
-            </div>
-          `;
-        })}
+        ${turnRows}
         ${turns.length === 0 ? html`<div class="ses-empty">no turns</div>` : ""}
       </div>
       ${inputRow}${resumeRow}

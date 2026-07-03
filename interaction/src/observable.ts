@@ -28,6 +28,11 @@ export class Observable<T> implements Subscribable<T> {
     this.set(fn(this.value));
   }
 
+  /** Whether anyone is subscribed — lets a producer skip computing a value nobody would see. */
+  get hasListeners(): boolean {
+    return this.listeners.size > 0;
+  }
+
   subscribe(onChange: () => void): () => void {
     this.listeners.add(onChange);
     return () => this.listeners.delete(onChange);

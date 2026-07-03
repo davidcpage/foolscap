@@ -37,12 +37,16 @@ body {
   cursor: grabbing;
 }
 
+/* The dot grid pans via a composited transform (GridLayer translates it modulo the tile size — the
+   inset/backgroundSize/transform are inline). will-change keeps it a layer so a pan never repaints the
+   full-viewport pattern; only zoom (a tile-size change) re-rasters it. */
 .grid {
   position: absolute;
   inset: 0;
   pointer-events: none;
   background-image: radial-gradient(circle, #d4d4d8 1px, transparent 1.4px);
   background-repeat: repeat;
+  will-change: transform;
 }
 
 /* ── page (camera-transformed) ───────────────────────────── */
@@ -52,6 +56,9 @@ body {
   left: 0;
   transform-origin: 0 0;
 }
+/* Promoted during ZOOM only (smooth while scaling, dropped at rest so text re-rasterizes crisp).
+   Deliberately NOT during pan — promoting the page's huge layer at pan-start forces a full
+   re-raster (tried, felt like a hitch/lock on a busy board, reverted). */
 .page.zooming {
   will-change: transform;
 }
@@ -73,6 +80,10 @@ body {
   user-select: none;
   display: flex;
   flex-direction: column;
+  /* NO content-visibility here. It was tried as unmount-free viewport culling and REVERTED: unskipping
+     a card entering the viewport forces a synchronous layout of its whole interior — for a session card
+     that's megabytes of transcript DOM, a main-thread stall that froze the canvas mid-pan. If off-screen
+     cost ever needs cutting, virtualize interiors; don't re-add the blanket hint. */
 }
 .node.file {
   /* a thin coloured rail on the left keys the card to its file kind without flooding the whole card */

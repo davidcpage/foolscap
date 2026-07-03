@@ -48,10 +48,21 @@ const mods = (e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean; altKey
  * Returns a cleanup that removes every listener.
  */
 export function bindDom(el: HTMLElement, dispatch: (e: InputEvent) => void): () => void {
-  const toLocal = (clientX: number, clientY: number): Vec => {
-    const r = el.getBoundingClientRect();
-    return vec(clientX - r.left, clientY - r.top);
+  // The element's client rect, CACHED. getBoundingClientRect on every pointermove/wheel forces a
+  // layout flush right after the previous event's DOM mutation (the .page transform) — classic
+  // read-after-write thrashing on the two hottest events. The rect only changes when the canvas
+  // element moves or resizes, so read it lazily once and invalidate on the things that move it
+  // (resize, any ancestor scroll) plus every gesture start as a cheap catch-all.
+  let rect: DOMRect | null = null;
+  const invalidateRect = () => {
+    rect = null;
   };
+  const toLocal = (clientX: number, clientY: number): Vec => {
+    if (!rect) rect = el.getBoundingClientRect();
+    return vec(clientX - rect.left, clientY - rect.top);
+  };
+  const ro = typeof ResizeObserver !== "undefined" ? new ResizeObserver(invalidateRect) : null;
+  ro?.observe(el);
 
   // Track ONE active pointer through a gesture. A second pointer (a stray trackpad/touch contact
   // during a drag) is ignored entirely — otherwise its pointerdown would re-enter the active tool
@@ -62,6 +73,7 @@ export function bindDom(el: HTMLElement, dispatch: (e: InputEvent) => void): () 
 
   const onPointerDown = (e: PointerEvent) => {
     if (activeId !== null) return; // already mid-gesture with another pointer → ignore this one
+    invalidateRect(); // one fresh rect per gesture — catches layout moves no listener below saw
     activeId = e.pointerId;
     el.setPointerCapture?.(e.pointerId);
     lastPoint = toLocal(e.clientX, e.clientY);
@@ -122,8 +134,13 @@ export function bindDom(el: HTMLElement, dispatch: (e: InputEvent) => void): () 
   el.addEventListener("mousedown", onMouseDown);
   el.addEventListener("keydown", onKeyDown);
   el.addEventListener("keyup", onKeyUp);
+  window.addEventListener("resize", invalidateRect);
+  window.addEventListener("scroll", invalidateRect, { capture: true, passive: true });
 
   return () => {
+    ro?.disconnect();
+    window.removeEventListener("resize", invalidateRect);
+    window.removeEventListener("scroll", invalidateRect, { capture: true });
     el.removeEventListener("mousedown", onMouseDown);
     el.removeEventListener("pointerdown", onPointerDown);
     el.removeEventListener("pointermove", onPointerMove);

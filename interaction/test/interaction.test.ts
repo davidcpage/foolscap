@@ -290,12 +290,17 @@ test("ctrl+wheel zooms about the pointer; plain wheel pans", () => {
   assert.deepEqual(m.camera.state, { x: -30, y: -20, z: 1 }, "plain wheel pans opposite the scroll");
 });
 
-test("hover tracks the node under the pointer", () => {
+test("hover tracks the node under the pointer (when subscribed)", () => {
   const { m } = setup();
+  // The O(N) hover hit-test only runs when someone is listening — an unsubscribed board pays nothing.
+  m.dispatch(move(vec(50, 50)));
+  assert.equal(m.hovered.get(), null, "no subscriber → no hit-test");
+  const off = m.hovered.subscribe(() => {});
   m.dispatch(move(vec(50, 50)));
   assert.equal(m.hovered.get(), "node:a");
   m.dispatch(move(vec(150, 50)));
   assert.equal(m.hovered.get(), null);
+  off();
 });
 
 // Regression: a stop()/start() cycle (what React StrictMode's setup→cleanup→setup probe drives, and
