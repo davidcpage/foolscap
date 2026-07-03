@@ -131,6 +131,19 @@ for (const e of readBoardRegistry()) {
   }
   boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath });
 }
+// …and the reverse: PRUNE pinned entries the registry no longer records (the file is the durable
+// truth — deleting an entry there is how a scratch/test board is retired without bouncing the whole
+// process; the pinned map otherwise outlives every re-eval by design). A pruned board's requests 400
+// until a tab re-mounts it via ?repo= (board.ts navigation self-heals exactly that way). Its feeds, if
+// started, keep idling until a real restart — harmless, and not worth a teardown path here.
+{
+  const registered = new Set(readBoardRegistry().map((e) => e.boardId));
+  for (const id of [...boards.keys()])
+    if (id !== DEFAULT_BOARD.boardId && !registered.has(id)) {
+      boards.delete(id);
+      console.log(`[boards] pruned ${id} (no longer in the registry)`);
+    }
+}
 
 // A board's Claude Code transcripts dir: ~/.claude/projects/<repoPath with / → ->. Per board now (was a
 // single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev repo's.
