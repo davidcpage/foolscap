@@ -279,13 +279,21 @@ export class InteractionManager implements InteractionContext {
 
   // ── animated camera moves ────────────────────────────────────────────────────────────────
   // flyTo eases the camera to a target pose so a jump (fit, recall a saved view, step back) preserves
-  // spatial orientation instead of teleporting. The point that ends up centred (cEnd) is driven along a
-  // STRAIGHT LINE in SCREEN space from where it sits now to the viewport centre, while zoom eases in
-  // log space. That straight-screen path is the key: a naive lerp of the focal point in PAGE space,
-  // with zoom changing underneath it, makes a peripheral target drift and only snap to centre at the
-  // very end (its screen distance scales as (1-k)·z(t), and z grows as you zoom in) — the "curved,
-  // centres late" feel. Interpolating the centred point's screen position instead sends it directly to
-  // the middle on schedule. Endpoints are exact by construction (k=0 → current pose, k=1 → target).
+  // spatial orientation instead of teleporting. One ANCHOR page point is driven along a STRAIGHT LINE
+  // in SCREEN space between its start and end positions, while zoom eases in log space; each frame
+  // solves the offset that puts the anchor on that path. The straight-screen path is the key: a naive
+  // lerp of the focal point in PAGE space, with zoom changing underneath it, makes a peripheral target
+  // drift and only snap to centre at the very end (its screen distance scales as (1-k)·z(t), and z
+  // grows as you zoom in) — the "curved, centres late" feel.
+  //
+  // WHICH point anchors depends on zoom direction — it must be the point the eye follows:
+  //   zooming IN  → the destination (the target pose's centre point), driven to the middle.
+  //   zooming OUT → the content being LEFT (the current centre point), driven out to where it lands
+  //     in the wider view. Anchoring the destination here instead looks broken from near a board
+  //     edge: the target centre starts far OFF-screen, and pinning its path makes the content you're
+  //     actually looking at swing past the middle and settle back (its position follows
+  //     k − 1 + z(k)/z₀ scaled by that huge off-screen distance, which dips negative mid-flight).
+  // Endpoints are exact by construction either way (k=0 → current pose, k=1 → target).
   // Any manual pan/zoom cancels an in-flight tween (cancelFly in onWheel / pointerdown). Falls back to
   // an instant set when animation can't run (no rAF — Node tests — or the viewport size isn't known).
   private flyRaf: number | null = null;
@@ -300,8 +308,10 @@ export class InteractionManager implements InteractionContext {
     const dur = Math.max(1, opts.durationMs ?? 300);
     const vc: Vec = { x: this.viewportW / 2, y: this.viewportH / 2 };
     const start = this.camera.state;
-    const cEnd = screenToPage(target, vc); // the page point that ends up centred
-    const s0 = pageToScreen(start, cEnd); // where that point sits on screen right now
+    const zoomingIn = target.z >= start.z; // pure pans anchor like zoom-in (either anchor is on-screen)
+    const anchor = zoomingIn ? screenToPage(target, vc) : screenToPage(start, vc);
+    const s0 = zoomingIn ? pageToScreen(start, anchor) : vc; // anchor's screen position at k=0…
+    const s1 = zoomingIn ? vc : pageToScreen(target, anchor); // …and at k=1
     const zStart = start.z;
     const zEnd = target.z;
     const lerp = (a: number, b: number, t: number): number => a + (b - a) * t;
@@ -317,10 +327,10 @@ export class InteractionManager implements InteractionContext {
       }
       const k = ease(t);
       const z = Math.exp(lerp(Math.log(zStart), Math.log(zEnd), k));
-      // cEnd should appear at this screen point on this frame; solve the offset that puts it there.
-      const sx = lerp(s0.x, vc.x, k);
-      const sy = lerp(s0.y, vc.y, k);
-      this.camera.set({ x: sx - cEnd.x * z, y: sy - cEnd.y * z, z });
+      // The anchor should appear at this screen point on this frame; solve the offset for that.
+      const sx = lerp(s0.x, s1.x, k);
+      const sy = lerp(s0.y, s1.y, k);
+      this.camera.set({ x: sx - anchor.x * z, y: sy - anchor.y * z, z });
       this.flyRaf = requestAnimationFrame(tick);
     };
     this.flyRaf = requestAnimationFrame(tick);

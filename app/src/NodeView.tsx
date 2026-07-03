@@ -45,9 +45,19 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
 
   // World box positions in PAGE space (inside `.page`'s pan/zoom transform). A floating card fills its
   // FloatingFrame, which carries the screen-pixel position; the card itself just stretches to it.
+  // The peek-lens vars are inert (scale 1, offset 0) except while `z` is held (style.css / peek.ts):
+  // the hovered card magnifies via --peek-hover-scale, and every OTHER card slides outward via
+  // --peek-dx/dy (the insertion field — the canvas parts around the pop; set imperatively by peek.ts
+  // on hover change). Folded into this one transform so lens, displacement and position never fight;
+  // the displacement translate sits before the scale so it's never magnified along with the card.
   const box: React.CSSProperties = screen
     ? { position: "absolute", inset: 0, zIndex: layout.z }
-    : { transform: `translate(${layout.x}px, ${layout.y}px)`, width: layout.w, height: layout.h, zIndex: layout.z };
+    : {
+        transform: `translate(${layout.x}px, ${layout.y}px) translate(var(--peek-dx, 0px), var(--peek-dy, 0px)) scale(var(--peek-hover-scale, 1))`,
+        width: layout.w,
+        height: layout.h,
+        zIndex: layout.z,
+      };
 
   // Runtime-loaded card types (card-types-as-data.md §7) take precedence over the hardcoded views
   // below: if card-types/{type}/ defines a template, the host renders the box (SAME layout
@@ -60,13 +70,13 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
   if (template) {
     card = <TemplateCard m={m} id={id} template={template} box={box} selected={selected} />;
   } else if (node.type === "githead") {
-    card = <GitHeadView box={box} selected={selected} />; // feed cards: logged box, off-log body (feeds.ts)
+    card = <GitHeadView id={id} box={box} selected={selected} />; // feed cards: logged box, off-log body (feeds.ts)
   } else if (node.type === "hn") {
-    card = <HnView box={box} selected={selected} />;
+    card = <HnView id={id} box={box} selected={selected} />;
   } else if (node.type === "computed") {
     card = <ComputedView m={m} id={id} box={box} selected={selected} />;
   } else if (node.type === "provenance") {
-    card = <ProvenanceView m={m} box={box} selected={selected} />;
+    card = <ProvenanceView m={m} id={id} box={box} selected={selected} />;
   } else if (node.type === "thread" || node.type === "channel") {
     // "thread" is the node type since threads-as-cards §8 step 2; "channel" is the carried-over legacy
     // type — the same card, so old boards render unchanged.
@@ -77,7 +87,7 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
     // cards land here for the beat between mount and the registry's first load, then swap to their
     // templates.
     card = (
-      <div className={`node feed c-${node.color}${selected ? " selected" : ""}`} style={box}>
+      <div data-node-id={id} className={`node feed c-${node.color}${selected ? " selected" : ""}`} style={box}>
         <div className="file-head">
           <span className="file-name">{node.title}</span>
           <span className="file-ext">{node.type}</span>
@@ -156,11 +166,11 @@ function FloatingFrame({
 
 // The repo's HEAD commit, live off the githead feed. The meta line re-renders each minute-ish via the
 // clock signal so "Xm ago" stays honest without the feed having to re-publish.
-function GitHeadView({ box, selected }: { box: React.CSSProperties; selected: boolean }) {
+function GitHeadView({ id, box, selected }: { id: Id<"node">; box: React.CSSProperties; selected: boolean }) {
   const head = useSignal(feedSignal<GitHead>("githead:" + activeBoardId()));
   useSignal(nowSignal); // keep the relative timestamp ticking
   return (
-    <div className={`node feed c-green${selected ? " selected" : ""}`} style={box}>
+    <div data-node-id={id} className={`node feed c-green${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <span className="file-name">git HEAD</span>
         <span className="file-ext">off-log feed</span>
@@ -181,10 +191,10 @@ function GitHeadView({ box, selected }: { box: React.CSSProperties; selected: bo
 }
 
 // The current HN #1 — the one true-internet feed, for flavour. Identical plumbing to the HEAD card.
-function HnView({ box, selected }: { box: React.CSSProperties; selected: boolean }) {
+function HnView({ id, box, selected }: { id: Id<"node">; box: React.CSSProperties; selected: boolean }) {
   const story = useSignal(feedSignal<HnStory>("hn"));
   return (
-    <div className={`node feed c-orange${selected ? " selected" : ""}`} style={box}>
+    <div data-node-id={id} className={`node feed c-orange${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <span className="file-name">HN top story</span>
         <span className="file-ext">off-log feed</span>
@@ -248,7 +258,7 @@ function ComputedView({
     );
   }
   return (
-    <div className={`node feed c-pink${selected ? " selected" : ""}`} style={box}>
+    <div data-node-id={id} className={`node feed c-pink${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <span className="file-name">time since last commit</span>
         <span className="file-ext">computed</span>
@@ -263,16 +273,18 @@ function ComputedView({
 // check): the channel discipline demos itself by standing still. Newest first, actor badged.
 function ProvenanceView({
   m,
+  id,
   box,
   selected,
 }: {
   m: InteractionManager;
+  id: Id<"node">;
   box: React.CSSProperties;
   selected: boolean;
 }) {
   const { events, total } = useSignal(logSignal(m.editor));
   return (
-    <div className={`node feed c-purple${selected ? " selected" : ""}`} style={box}>
+    <div data-node-id={id} className={`node feed c-purple${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <span className="file-name">intent log</span>
         <span className="file-ext">channel 3</span>
@@ -456,7 +468,7 @@ function ThreadView({
   };
 
   return (
-    <div ref={ref} className={`node channel c-${node.color}${selected ? " selected" : ""}`} style={box}>
+    <div ref={ref} data-node-id={id} className={`node channel c-${node.color}${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <input
           className="chan-title"

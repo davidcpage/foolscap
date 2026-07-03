@@ -52,11 +52,21 @@ export function noteCameraMoved(): void {
   lastCameraTs = performance.now();
 }
 
+// While the hold-to-peek overview is up (peek.ts flags it), the wheel is pure navigation: hovering a
+// card magnifies it (the lens), which would otherwise put a scrollable interior under every aiming
+// pan. No card claims anything until the key is released.
+let peekNavigationActive = false;
+export function setPeekNavigationActive(on: boolean): void {
+  peekNavigationActive = on;
+}
+
 // The one question an interior wheel handler asks before containing an event. A continuing gesture
 // belongs to whoever claimed its first event — a pan stays a pan when a card slides under the cursor,
 // and a card scroll stays a card scroll even if the camera moves concurrently (an agent-driven fly).
-// A fresh gesture is claimable only from earned hover (aim since the last camera move, above).
+// A fresh gesture is claimable only from earned hover (aim since the last camera move, above), and
+// never while the peek overview is held.
 export function wheelClaimableByCard(): boolean {
+  if (peekNavigationActive) return false;
   if (!firstOfGesture) return claimed;
   return lastAimTs > lastCameraTs;
 }
