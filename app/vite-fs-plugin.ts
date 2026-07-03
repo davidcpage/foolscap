@@ -3064,6 +3064,13 @@ function busClientsFor(boardId: string): Set<SseClient> {
   return set;
 }
 
+// How many tabs can ACT on this board right now — the same census dispatchBusCommand's `delivered` is
+// judged against (the app's tabs ride /api/ws; the SSE set is the compat path). The `tabs` liveness
+// signal on GET /api/canvas.
+function tabCountFor(boardId: string): number {
+  return (busClients.get(boardId)?.size ?? 0) + [...wsClients].filter((c) => c.boardId === boardId).length;
+}
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -3163,7 +3170,7 @@ function handleCanvasGet(res: ServerResponse, boardId: string): void {
     return sendJson(res, 404, { error: "no board state persisted yet" });
   sendJson(res, 200, {
     ts: boardPersistMtime(b.repoPath),
-    tabs: busClientsFor(boardId).size,
+    tabs: tabCountFor(boardId),
     snapshot: snapshot ?? { records: [], version: 0 },
     recentIntent: describeBoardEvents(events),
   });
