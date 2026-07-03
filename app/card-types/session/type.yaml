@@ -23,9 +23,13 @@
 #     session (terminate the process AND record `endReason:"done"` on the durable `.canvas/` marker), so
 #     the card settles into the calm "✓ done" band rather than a neutral exit. Session-internal like the
 #     others — a POST, never editor.commit, never a canvas-log entry.
+#   • `sessionPermission` — the answer half of the permission-prompt relay: a bound fn that POSTs the
+#     human's allow/deny for one held permission prompt (the feed's `permissions` entries — tool calls
+#     the CLI routed to the card instead of headless auto-deny). Session-internal like the others; the
+#     card is the acting session's own approval surface, which is the whole point (no channel relay).
 name: session
 contract: 1
 #   • `roots` — the board's roots (canonical checkout + git worktrees), each with a stable colour. Used
 #     ONLY to tint the touched-files activity strip by worktree (render.js maps the session's absolute
 #     tool-call paths onto these roots). Board-global + read-only — never a scope the session is bound to.
-capabilities: [session, sessionInput, sessionResume, sessionDone, roots]
+capabilities: [session, sessionInput, sessionResume, sessionDone, sessionPermission, roots]

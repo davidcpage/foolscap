@@ -17,8 +17,10 @@ import { makeLineSplitter } from "./session-host-protocol.js";
  * once with the reason: "killed" when our own kill() asked for it, else "self" (the child died on its
  * own — a spawn error surfaces the same way, matching how the remote host reports a failed spawn).
  */
-export function localProc({ cmd, args, cwd }, hooks) {
-  const child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+export function localProc({ cmd, args, cwd, env }, hooks) {
+  // `env` EXTENDS our environment (never replaces it — the child still needs PATH/HOME); used for
+  // per-spawn knobs like MCP_TOOL_TIMEOUT (the permission relay's hold margin).
+  const child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env: env ? { ...process.env, ...env } : undefined });
   let alive = true;
   let killedByUs = false;
   let exited = false; // exit + error can both fire — the hook is once

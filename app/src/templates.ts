@@ -449,6 +449,23 @@ export function buildCard(
         );
       continue;
     }
+    // `sessionPermission` is the answer half of the permission-prompt relay (permission-prompt-tool):
+    // a per-card ACTION that POSTs the human's allow/deny for one held permission prompt — the entries
+    // the session feed carries as `permissions`. Session-internal like input/resume/done: a plain POST,
+    // never editor.commit, never a canvas-log entry (a permission decision is a session act). The
+    // decision id is a global UUID, so no ?board=.
+    if (name === "sessionPermission") {
+      signals.sessionPermission = (permId: string, behavior: "allow" | "deny"): Promise<boolean> =>
+        fetch(`/api/permission/${encodeURIComponent(permId)}/decision`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ behavior }),
+        }).then(
+          (r) => r.ok,
+          () => false,
+        );
+      continue;
+    }
     // `sessionRefresh` is the sessions browser card's one ACTION (Phase C): re-pull the off-log session
     // list (content.ts) and notify its subscribers. Not a signal — a bound fn the refresh button calls;
     // there's no disk-watch push for the sessions dir, so this is how a long-open card picks up newly-

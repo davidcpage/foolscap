@@ -16,14 +16,19 @@ export interface ProcHooks {
   onExit(info: { code: number | null; reason: ExitReason }): void;
 }
 
-export function localProc(
-  opts: { cmd: string; args: string[]; cwd: string },
-  hooks: ProcHooks,
-): SessionProc;
+/** `env` EXTENDS the owner's environment for this child (per-spawn knobs), never replaces it. */
+export interface SpawnSpec {
+  cmd: string;
+  args: string[];
+  cwd: string;
+  env?: Record<string, string>;
+}
+
+export function localProc(opts: SpawnSpec, hooks: ProcHooks): SessionProc;
 
 export function remoteProc(
   client: import("./session-host-client.js").SessionHostClient,
   id: string,
   hooks: ProcHooks,
-  opts?: { spawn?: { cmd: string; args: string[]; cwd: string } },
+  opts?: { spawn?: SpawnSpec },
 ): SessionProc;

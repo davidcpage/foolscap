@@ -129,6 +129,27 @@ test("busy bit: a user write sets it, a hung turn holds it, an interrupt-style w
   }
 });
 
+test("spawn env EXTENDS the host's environment for that child (per-spawn knobs like MCP_TOOL_TIMEOUT)", async () => {
+  const { socketPath, logPath } = tmpSock();
+  const host = await createHost({ socketPath, logPath });
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: 1 });
+    // The child prints one env var and idles; PATH must survive (extend, never replace).
+    const probe = 'console.log(JSON.stringify({v: process.env.CANVAS_TEST_KNOB ?? null, path: !!process.env.PATH})); setInterval(() => {}, 1000);';
+    await c.request({ op: "spawn", id: "e1", cmd: process.execPath, args: ["-e", probe], cwd: os.tmpdir(), env: { CANVAS_TEST_KNOB: "660000" } });
+    const line = await c.waitEvent((e) => e.op === "line" && e.id === "e1");
+    assert.deepEqual(JSON.parse(line.line), { v: "660000", path: true });
+    // And a spawn WITHOUT env keeps the plain inherited environment (the pre-env wire shape).
+    await c.request({ op: "spawn", id: "e2", cmd: process.execPath, args: ["-e", probe], cwd: os.tmpdir() });
+    const bare = await c.waitEvent((e) => e.op === "line" && e.id === "e2");
+    assert.deepEqual(JSON.parse(bare.line), { v: null, path: true });
+    await c.close();
+  } finally {
+    await host.shutdown();
+  }
+});
+
 test("children survive client detach; a reattaching client lists them with a correct busy bit", async () => {
   const { socketPath, logPath } = tmpSock();
   const host = await createHost({ socketPath, logPath });

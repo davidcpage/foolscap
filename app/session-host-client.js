@@ -146,7 +146,9 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
       if (!connected || !conn) throw new Error("session host not connected");
       // Fire-and-forget: a spawn failure comes back as an exit event (the host reports a failed spawn the
       // same way a self-death reads), keeping ensureLiveSession synchronous.
-      void request({ op: "spawn", id, cmd: spec.cmd, args: spec.args, cwd: spec.cwd }).then((r) => {
+      // `env` extends the HOST's environment for this child (an old host ignores the field — the spawn
+      // still lands, just without the knobs; degrade, don't reject).
+      void request({ op: "spawn", id, cmd: spec.cmd, args: spec.args, cwd: spec.cwd, env: spec.env }).then((r) => {
         if (!r.ok) {
           const h = hooks.get(id);
           hooks.delete(id);

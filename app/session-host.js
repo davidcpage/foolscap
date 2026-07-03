@@ -6,7 +6,7 @@
 // The dev server attaches as a client over a unix socket (ndjson, session-host-protocol.js) and speaks:
 //
 //   client → host   {op:"hello", req, ver, pid}       → reply {ok,pid,ver} | {ok:false,error:"busy",clientPid}
-//                   {op:"spawn", req, id, cmd, args, cwd} → reply {ok,pid} | {ok:false,error}
+//                   {op:"spawn", req, id, cmd, args, cwd, env?} → reply {ok,pid} | {ok:false,error}
 //                   {op:"write", req?, id, data}      → reply {ok:false,error:"not-alive"} only on a dead id
 //                   {op:"kill",  req, id}             → SIGTERM; the exit records reason:"killed"
 //                   {op:"list",  req}                 → reply {ok, sessions:[{id,cwd,busy,spawnedAt,pid}],
@@ -103,11 +103,12 @@ export async function createHost({ socketPath, logPath }) {
     log(`exit ${id} code=${code} signal=${signal ?? "-"} reason=${reason}`);
   };
 
-  const doSpawn = (id, cmd, args, cwd) => {
+  const doSpawn = (id, cmd, args, cwd, env) => {
     if (children.has(id)) return { ok: false, error: "id already live" };
     let child;
     try {
-      child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"] });
+      // `env` EXTENDS the host's environment (per-spawn knobs like MCP_TOOL_TIMEOUT), never replaces it.
+      child = spawn(cmd, args, { cwd, stdio: ["pipe", "pipe", "pipe"], env: env ? { ...process.env, ...env } : undefined });
     } catch (err) {
       return { ok: false, error: String(err) };
     }
@@ -142,7 +143,7 @@ export async function createHost({ socketPath, logPath }) {
         return reply({ ok: true, pid: process.pid, ver: PROTOCOL_VERSION });
       }
       case "spawn":
-        return reply(doSpawn(msg.id, msg.cmd, msg.args ?? [], msg.cwd));
+        return reply(doSpawn(msg.id, msg.cmd, msg.args ?? [], msg.cwd, msg.env));
       case "write": {
         const entry = children.get(msg.id);
         if (!entry) return msg.req != null ? reply({ ok: false, error: "not-alive" }) : undefined;

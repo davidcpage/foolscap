@@ -83,6 +83,54 @@ if (!boards.has(DEFAULT_BOARD.boardId))
 const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Set<string> })
   .__canvasBoardFeeds ??= new Set());
 
+// ── durable board registry (multi-canvas: mounted boards survive a server restart) ────────────────
+// The in-memory `boards` map dies with the process, which used to mean every non-default board was
+// forgotten on restart: a tab had to re-mount via ?repo=, and until it did that board's ?board= requests
+// 400'd (sidecar-surviving sessions included). The registry is the durable twin: one JSON file in the DEV
+// repo's `.canvas/` (the server's own home — git-ignored, shadow-versioned like the rest of canvas-home)
+// recording every repo ever mounted, with a lastOpened stamp for the picker's recency sort. On boot each
+// remembered path that still exists is re-registered — map entry only; the per-board feeds/watchers stay
+// LAZY (started when a tab actually mounts), so a long registry doesn't fan out watchers for boards
+// nobody opens. The default board is implicit and never recorded.
+const BOARDS_FILE = path.join(ROOTS.repo!, ".canvas", "boards.json");
+interface BoardRegistryEntry {
+  boardId: string;
+  name: string;
+  repoPath: string;
+  lastOpened: number; // ms epoch of the latest mount POST
+}
+function readBoardRegistry(): BoardRegistryEntry[] {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(BOARDS_FILE, "utf8")) as { boards?: BoardRegistryEntry[] };
+    return Array.isArray(parsed.boards) ? parsed.boards : [];
+  } catch {
+    return []; // absent/corrupt → empty registry (the next mount rewrites it)
+  }
+}
+// Upsert on every mount POST — read-modify-write against the FILE, not a cached copy (the module hot
+// re-evals; cheap correctness beats a stale mirror at this call rate).
+function recordBoardOpened(boardId: string, name: string, repoPath: string): void {
+  const entries = readBoardRegistry().filter((e) => e.boardId !== boardId);
+  entries.push({ boardId, name, repoPath, lastOpened: Date.now() });
+  try {
+    fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
+    fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: entries }, null, 2) + "\n");
+  } catch (e) {
+    console.error("[boards] registry write failed:", e instanceof Error ? e.message : e);
+  }
+}
+// Boot remount: re-register every remembered board whose repo still exists. Entries for vanished paths
+// are KEPT in the file (a repo on an unmounted volume isn't gone forever) but not served this run.
+for (const e of readBoardRegistry()) {
+  if (boards.has(e.boardId)) continue;
+  try {
+    if (!fs.statSync(e.repoPath).isDirectory()) continue;
+  } catch {
+    continue;
+  }
+  boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath });
+}
+
 // A board's Claude Code transcripts dir: ~/.claude/projects/<repoPath with / → ->. Per board now (was a
 // single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev repo's.
 function sessionsDir(repoPath: string): string {
@@ -106,7 +154,12 @@ function boardJson(boardId: string, b: { name: string; repoPath: string }): {
 }
 
 function handleBoards(res: ServerResponse): void {
-  sendJson(res, 200, { boards: [...boards.entries()].map(([id, b]) => boardJson(id, b)) });
+  // lastOpened rides along from the registry (0 for the default board / anything unrecorded) so the
+  // picker can sort by recency without a second endpoint.
+  const opened = new Map(readBoardRegistry().map((e) => [e.boardId, e.lastOpened]));
+  sendJson(res, 200, {
+    boards: [...boards.entries()].map(([id, b]) => ({ ...boardJson(id, b), lastOpened: opened.get(id) ?? 0 })),
+  });
 }
 
 // ── worktrees as ROOTS (worktree-activity slice B) ────────────────────────────────────────────────
@@ -201,6 +254,32 @@ function rootDir(boardId: string, rootId: string | null): string | null {
   return r ? r.path : null;
 }
 
+// Mounting seeds `.canvas/` into the target repo (roles, threads, session markers — canvas-home), which
+// an EXTERNAL repo's .gitignore won't cover: its `git status` gets noisy and the canvas-home force-add
+// gates assume the dir is ignored. Fix it at the mount, in `.git/info/exclude` — the repo-local ignore
+// file git keeps OUTSIDE the working tree, so the repo's tracked files are never touched. check-ignore
+// first: exit 0 = already ignored (the dev repo's own case) → no-op; exit 1 = not ignored → append;
+// anything else (128 = not a git repo at all) → nothing to do. Best-effort throughout — a repo we can't
+// write to just keeps its noisy status.
+function ensureCanvasExcluded(repoPath: string): void {
+  try {
+    execFileSync("git", ["check-ignore", "-q", ".canvas/"], { cwd: repoPath, stdio: "ignore" });
+    return; // already ignored
+  } catch (e) {
+    if ((e as { status?: unknown }).status !== 1) return; // not "unignored" — not a git repo, or git absent
+  }
+  try {
+    // --git-path resolves the right location even for a worktree checkout (info/ lives in the common dir).
+    const rel = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], { cwd: repoPath, encoding: "utf8" }).trim();
+    const excludeFile = path.resolve(repoPath, rel);
+    fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
+    fs.appendFileSync(excludeFile, "\n# foolscap: the canvas home (auto-added on board mount)\n.canvas/\n");
+    console.log(`[boards] excluded .canvas/ via ${excludeFile}`);
+  } catch (e) {
+    console.error("[boards] could not exclude .canvas/:", e instanceof Error ? e.message : e);
+  }
+}
+
 // Mount a target repo as a board (POST /api/boards { repoPath }). Idempotent: the boardId is a pure
 // function of the realpath, so re-mounting the same repo returns the same id without duplicating. The dev
 // server runs with full fs privileges and is 127.0.0.1-only, but we still validate the path exists and is
@@ -226,6 +305,10 @@ async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Prom
     boards.set(id.boardId, { root: real, name: id.name, repoPath: id.repoPath });
     console.log(`[boards] mounted ${id.boardId} → ${real}`);
   }
+  // Every mount POST (a tab opening ?repo=, including a re-open) bumps the registry's lastOpened; the
+  // default board is implicit and stays out of the file.
+  if (id.boardId !== DEFAULT_BOARD.boardId) recordBoardOpened(id.boardId, id.name, id.repoPath);
+  ensureCanvasExcluded(id.repoPath); // keep the target repo's git status clean of `.canvas/`
   startBoardFeeds(id.boardId, id.repoPath); // git HEAD + sessions-list feeds for this repo
   sendJson(res, 200, boardJson(id.boardId, boards.get(id.boardId)!));
 }
@@ -652,6 +735,9 @@ function endReasonBand(reason: string | undefined): SessionBand {
 function sessionStatus(repoPath: string, id: string): SessionBand {
   const live = liveSessions.get(id);
   if (live) {
+    // A held permission prompt outranks everything live: the process is technically mid-turn
+    // ("running"), but it's blocked on a HUMAN click — the one state the loud band exists for.
+    if (live.status !== "exited" && [...pendingPermissions.values()].some((p) => p.sid === id)) return "waiting";
     if (live.status === "running") return "working";
     // Idle: blocked on a peer (blue) > asleep on the loop heartbeat (calm teal `scheduled`, a looping role
     // between ticks — no human demand) > the default loud amber "your turn".
@@ -936,6 +1022,21 @@ interface PendingAsk {
   res: ServerResponse; // the asker's parked connection, resolved on reply/timeout
   timer: ReturnType<typeof setTimeout>;
 }
+// Permission prompts (permission-prompt-tool): a session's Claude Code CLI hit a tool call outside its
+// allow-list and — instead of headless auto-deny — routed it here via the per-session MCP relay
+// (permission-prompt-mcp.js). The relay's POST is PARKED (the §16 held-response pattern) until a human
+// clicks allow/deny on the session card or the hold times out. Same lifetime rules as PendingAsk: pinned
+// in fsState across a hot re-eval; the held `res`/`timer` are process-bound (a restart fails the relay's
+// fetch, which denies fail-closed with an honest "the human never saw this" message).
+interface PendingPermission {
+  permId: string;
+  sid: string; // the session whose tool call is blocked (its card renders the prompt)
+  toolName: string; // e.g. "Bash" — the tool the CLI is asking about
+  input: unknown; // the tool's input object, echoed back on allow (updatedInput)
+  ts: number;
+  res: ServerResponse; // the MCP relay's parked connection, resolved on decision/timeout
+  timer: ReturnType<typeof setTimeout>;
+}
 // One tab's WebSocket connection (/api/ws) — the single transport that replaced the tab's standing SSE
 // streams (feeds + bus + one watch per root), because each of those held one of the browser's SIX
 // per-host HTTP/1.1 connection slots: ~3 tabs starved the pool and every further request (the document
@@ -956,6 +1057,7 @@ interface CanvasFsState {
   shuttingDown?: boolean; // set by killAll so the exit handler tells a clean server shutdown from a real crash
   threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
   pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (added via ??= for old pinned state)
+  pendingPermissions?: Map<string, PendingPermission>; // permId → held permission prompt (??= likewise)
   wsClients?: Set<WsClient>; // connected /api/ws tabs (added via ??= for old pinned state)
   // CANVAS_SESSION_HOST mode: the one client to the session-host sidecar. Pinned so an in-process re-eval
   // reuses the attached socket instead of a second `hello` bouncing off its own busy guard. `null` after a
@@ -982,6 +1084,7 @@ const sessionWatchers = fsState.sessionWatchers;
 // than reading `undefined` and crashing — the object initializer above only runs when fsState is absent.
 const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
 const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
+const pendingPermissions = (fsState.pendingPermissions ??= new Map<string, PendingPermission>());
 const wsClients = (fsState.wsClients ??= new Set<WsClient>());
 
 // One-time shape migration for a HOT RE-EVAL over a pre-SessionProc registry: entries pinned by the old
@@ -1246,6 +1349,20 @@ const BASELINE_ALLOWED_TOOLS = [
   "Bash(./scripts/canvas:*)",
 ].join(",");
 
+// Permission prompts on the card (docs/threads-as-cards follow-on; the fix for the "a nod in the
+// channel can't lift the builder's gate" problem): `--permission-prompt-tool` (documented CLI flag,
+// v2.1.199+) routes every would-prompt permission check to an MCP tool instead of headless auto-deny.
+// Ours is permission-prompt-mcp.js — a per-session stdio relay that POSTs /api/permission/request and
+// waits; the server PARKS that request until a human clicks allow/deny ON THE SESSION CARD (the §16
+// held-response pattern). Approval lands in the acting session's own permission flow — full trust, no
+// channel relay. The RED LINE stays gated exactly as before; what changes is that a gate now surfaces
+// as a clickable prompt instead of a silent denial. Hold is deliberately generous (a human may be away;
+// the blocked turn is blocked on them regardless); the CLI-side MCP tool timeout must outlast it, so
+// it's set a minute above via MCP_TOOL_TIMEOUT on the spawn env (sidecar pass-through — an OLD sidecar
+// ignores env and the CLI's default tool timeout applies: prompts then die early but still fail closed).
+const PERMISSION_HOLD_MS = 10 * 60_000;
+const PERMISSION_TOOL = "mcp__canvas__permission_prompt"; // mcp__<server>__<tool> under --mcp-config's "canvas"
+
 // AskUserQuestion is auto-cancelled in `-p` headless mode (VERIFIED: the CLI synthesises an
 // is_error="Answer questions?" tool_result and continues — it never waits for an answer on stdin, so
 // there's no tool_result loop to hook). So we DISALLOW it (below) and steer the session to a convention
@@ -1441,6 +1558,15 @@ function persistSessionState(s: LiveSession): void {
   );
 }
 
+// The pending permission prompts addressed to one session, in card-render shape (no held internals).
+// Oldest-first so the card shows them in arrival order.
+function permissionsOf(sid: string): Array<{ id: string; toolName: string; input: unknown; ts: number }> {
+  return [...pendingPermissions.values()]
+    .filter((p) => p.sid === sid)
+    .sort((a, b) => a.ts - b.ts)
+    .map((p) => ({ id: p.permId, toolName: p.toolName, input: p.input, ts: p.ts }));
+}
+
 // Publish the session's buffer (completed lines + the in-flight synthetic turn) on its feed. Bounded
 // from the tail; `truncated` mirrors the codec's existing cap signal so the card flags a clipped view.
 function publishSession(s: LiveSession): void {
@@ -1466,6 +1592,9 @@ function publishSession(s: LiveSession): void {
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
     loops: s.loops || undefined, // looping role: idle + no waitingOn ⇒ calm teal "scheduled", not amber
+    // Held permission prompts: the card renders allow/deny buttons and paints the loud waiting band —
+    // the process is mid-turn ("running") but blocked on a HUMAN, and only the server knows that.
+    permissions: (() => { const p = permissionsOf(s.id); return p.length ? p : undefined; })(),
   });
 }
 
@@ -1631,6 +1760,19 @@ function ensureLiveSession(
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
     (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
     (threadId ? "\n\n" + workerBrief(threadId) : "");
+  // The permission relay (see PERMISSION_HOLD_MS): a per-session stdio MCP server whose one tool the
+  // CLI calls for every would-prompt permission check. Target endpoint + identity ride its env — the
+  // same absolute-URL convention the collab brief bakes in. node = our own execPath (the sidecar's PATH
+  // isn't guaranteed to carry one).
+  const mcpConfig = {
+    mcpServers: {
+      canvas: {
+        command: process.execPath,
+        args: [path.join(process.cwd(), "permission-prompt-mcp.js")],
+        env: { CANVAS_PERMISSION_URL: `http://${origin}/api/permission/request`, CANVAS_SESSION_ID: id },
+      },
+    },
+  };
   const args = [
     "-p",
     resume ? "--resume" : "--session-id",
@@ -1642,6 +1784,8 @@ function ensureLiveSession(
     "--permission-mode", SESSION_PERMISSION_MODE,
     "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
     "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
+    "--mcp-config", JSON.stringify(mcpConfig),
+    "--permission-prompt-tool", PERMISSION_TOOL, // gate hits → the card's allow/deny, not silent denial
     "--append-system-prompt", appendPrompt,
   ];
   // Does this session's role run an operating loop? Then its idle sessions are woken on the server heartbeat
@@ -1656,7 +1800,12 @@ function ensureLiveSession(
   // The hooks close over `s` (declared just below) — they only fire async, well after it's assigned.
   if (REMOTE_SESSIONS && fsState.hostClient && !fsState.hostClient.connected)
     throw new Error("session host unreachable (reconnecting) — retry in a moment");
-  const spawnSpec = { cmd: "claude", args, cwd: repoPath };
+  // MCP_TOOL_TIMEOUT must OUTLAST the server's permission hold, or the CLI gives up on the relay first
+  // and the prompt dies with an opaque client-side error instead of our honest hold-timeout deny.
+  const spawnSpec = {
+    cmd: "claude", args, cwd: repoPath,
+    env: { MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000) },
+  };
   const proc =
     REMOTE_SESSIONS && fsState.hostClient
       ? remoteProc(fsState.hostClient, id, wireSessionHooks(() => s), { spawn: spawnSpec })
@@ -1814,6 +1963,7 @@ function wireSessionHooks(get: () => LiveSession): ProcHooks {
         s.endReason = "crashed";
         recordSessionEnd(s.repoPath, s.id, "crashed");
       }
+      denySessionPermissions(s.id, "the session exited before a human decided");
       publishSession(s);
     },
   };
@@ -2276,6 +2426,7 @@ function handleSessionDone(res: ServerResponse, id: string): void {
 function endSession(id: string, endReason: "done" | "terminated"): boolean {
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
+  denySessionPermissions(id, `the session was ${endReason} before a human decided`);
   s.endReason = endReason;
   recordSessionEnd(s.repoPath, id, endReason);
   s.proc.kill();
@@ -2285,6 +2436,116 @@ function endSession(id: string, endReason: "done" | "terminated"): boolean {
   publishSession(s);
   liveSessions.delete(id);
   return true;
+}
+
+// ── Permission prompts: the relay's held POST + the card's decision buttons ──────────────────────────
+// The server half of --permission-prompt-tool (see PERMISSION_HOLD_MS at the top): the per-session MCP
+// relay POSTs each would-prompt permission check here and the connection PARKS until a human clicks
+// allow/deny on the session card (or the hold times out → an honest fail-closed deny). The pending set
+// rides the session's feed (`permissions`) so the card paints buttons + the loud waiting band, and
+// /api/sessions' status derives "waiting" from it (sessionStatus) so the minimap/list/stack agree.
+
+// Resolve one parked relay POST exactly once (decision, timeout, or teardown), clearing its timer and
+// registry entry and repainting the card (the pending block + waiting band live on the session feed).
+function settlePermission(permId: string, payload: Record<string, unknown>): void {
+  const p = pendingPermissions.get(permId);
+  if (!p) return;
+  clearTimeout(p.timer);
+  pendingPermissions.delete(permId);
+  try {
+    sendJson(p.res, 200, payload);
+  } catch {
+    /* relay disconnected — the CLI already gave up on this prompt; nothing left to answer */
+  }
+  const s = liveSessions.get(p.sid);
+  if (s) publishSession(s);
+}
+
+// Deny every prompt a session still holds — the teardown path (terminate/done/exit). The human can no
+// longer meaningfully answer, and a relay still waiting should hear an honest reason, not a hangup.
+function denySessionPermissions(sid: string, message: string): void {
+  for (const p of [...pendingPermissions.values()])
+    if (p.sid === sid) settlePermission(p.permId, { behavior: "deny", message });
+}
+
+// POST /api/permission/request { session, toolName, input, toolUseId? } — the MCP relay's held call.
+// Only a LIVE registry session may hold a prompt (404 otherwise — the relay turns that into its own
+// fail-closed deny). No sendJson on the success path: the response parks until /decision or timeout.
+async function handlePermissionRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let body: { session?: unknown; toolName?: unknown; input?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.session !== "string" || !body.session) return sendJson(res, 400, { error: "missing session" });
+  if (typeof body.toolName !== "string" || !body.toolName) return sendJson(res, 400, { error: "missing toolName" });
+  const s = liveSessions.get(body.session);
+  if (!s || s.status === "exited") return sendJson(res, 404, { error: "not a live canvas session" });
+  const permId = crypto.randomUUID();
+  const timer = setTimeout(
+    () =>
+      settlePermission(permId, {
+        behavior: "deny",
+        message:
+          `no human decision within ${Math.round(PERMISSION_HOLD_MS / 60_000)} minutes — denied by default. ` +
+          "The human never saw or refused this; retry when they're around, or post in your thread.",
+      }),
+    PERMISSION_HOLD_MS,
+  );
+  pendingPermissions.set(permId, { permId, sid: s.id, toolName: body.toolName, input: body.input ?? {}, ts: Date.now(), res, timer });
+  // The relay side can drop first (claude killed mid-hold, or its MCP tool timeout fired despite our
+  // margin): un-park without answering, so the card doesn't keep offering a decision nobody is owed.
+  // Fires on the success path too (every response's socket eventually closes) — the map guard makes
+  // that a no-op because settlePermission already removed the entry.
+  res.on("close", () => {
+    const gone = pendingPermissions.get(permId);
+    if (!gone || gone.res !== res) return;
+    clearTimeout(gone.timer);
+    pendingPermissions.delete(permId);
+    const live = liveSessions.get(gone.sid);
+    if (live) publishSession(live);
+  });
+  publishSession(s); // paint the prompt (and flip the band to waiting) immediately
+}
+
+// POST /api/permission/<permId>/decision { behavior: "allow"|"deny", message? } — the card's buttons
+// (or a shell twin via /api/permissions). Allow echoes the tool input back unchanged (updatedInput is
+// the CLI's contract); deny carries the human's message when given.
+async function handlePermissionDecision(req: IncomingMessage, res: ServerResponse, permId: string): Promise<void> {
+  let body: { behavior?: unknown; message?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (body.behavior !== "allow" && body.behavior !== "deny")
+    return sendJson(res, 400, { error: 'behavior must be "allow" or "deny"' });
+  const p = pendingPermissions.get(permId);
+  if (!p) return sendJson(res, 404, { error: "no such pending permission (already decided or timed out)" });
+  settlePermission(
+    permId,
+    body.behavior === "allow"
+      ? { behavior: "allow", updatedInput: p.input }
+      : {
+          behavior: "deny",
+          message:
+            typeof body.message === "string" && body.message
+              ? body.message
+              : "denied by the human on the canvas card",
+        },
+  );
+  sendJson(res, 200, { ok: true, id: permId, behavior: body.behavior });
+}
+
+// GET /api/permissions[?session=<sid>] — the pending prompts, board-wide or per session: the headless
+// twin of the card's block, so a shell can see (and answer, via /decision) prompts without a tab.
+function handlePermissionsRead(res: ServerResponse, sid: string | null): void {
+  const permissions = [...pendingPermissions.values()]
+    .filter((p) => !sid || p.sid === sid)
+    .sort((a, b) => a.ts - b.ts)
+    .map((p) => ({ id: p.permId, session: p.sid, toolName: p.toolName, input: p.input, ts: p.ts }));
+  sendJson(res, 200, { permissions, count: permissions.length });
 }
 
 // Feed: one true-internet source for flavour — the current Hacker News #1 story (keyless API).
@@ -3579,6 +3840,14 @@ export function fsApi(): Plugin {
         if (terminateMatch && req.method === "POST") return handleSessionTerminate(res, terminateMatch[1]!);
         const doneMatch = /^\/api\/session\/([\w-]+)\/done$/.exec(url.pathname);
         if (doneMatch && req.method === "POST") return handleSessionDone(res, doneMatch[1]!);
+        // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision
+        // buttons, and the headless list. Ids are global UUIDs — no ?board= anywhere here.
+        if (url.pathname === "/api/permission/request" && req.method === "POST")
+          return void handlePermissionRequest(req, res);
+        const permMatch = /^\/api\/permission\/([\w-]+)\/decision$/.exec(url.pathname);
+        if (permMatch && req.method === "POST") return void handlePermissionDecision(req, res, permMatch[1]!);
+        if (url.pathname === "/api/permissions" && req.method === "GET")
+          return handlePermissionsRead(res, url.searchParams.get("session"));
         // The channel-message read tool (session id is a global UUID, so no ?board= needed).
         if (url.pathname === "/api/inbox" && req.method === "GET")
           return handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes"));

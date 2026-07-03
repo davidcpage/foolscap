@@ -579,6 +579,12 @@ export default {
     // explicitly /done or cleanly torn down. The positive "work wrapped up" distinction survives only in
     // the pill text ("✓ done" vs "✕ ended"), not the band/header colour.
     const endFrame = endReason === "crashed" ? "crashed" : "ended";
+    // Held permission prompts (permission-prompt-tool): tool calls the CLI routed to this card instead
+    // of headless auto-deny, carried on the feed as `permissions` and PARKED server-side until a click
+    // (or the hold's timeout deny). The process is technically mid-turn, but it's blocked on a HUMAN —
+    // so this outranks every live band below and paints the loud amber "your turn".
+    const perms = live && Array.isArray(live.permissions) ? live.permissions : [];
+    const needsPermission = perms.length > 0 && status && status !== "exited";
     // An idle session that named a peer in a channel @-tag is waiting on an AGENT, not you — the server
     // carries that as `waitingOn` (the tagged sids). It reads blue, a quieter "still in flight elsewhere"
     // rather than the loud amber "your turn". Cleared server-side the moment the session next runs.
@@ -592,11 +598,13 @@ export default {
     // waiting-on-agent (a named peer-wait is the more specific signal) and never overrides neverRun.
     const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.loops);
     const frameState =
-      status === "running"
-        ? "working"
-        : status === "idle"
-          ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
-          : ended ? endFrame : null;
+      needsPermission
+        ? "waiting"
+        : status === "running"
+          ? "working"
+          : status === "idle"
+            ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
+            : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
     // Pill mirrors the band so the two never disagree on one card: a live process shows its status (verb
@@ -611,8 +619,10 @@ export default {
             ? html`<span class="ses-live ses-inactive">✕ ended</span>`
             : html`<span class="ses-live ${fallbackClass}">${fallbackLabel}</span>`;
     const pill =
-      status === "running"
-        ? html`<span class="ses-live ses-running">● ${verb}…</span>`
+      needsPermission
+        ? html`<span class="ses-live ses-idle">⚠ permission</span>`
+        : status === "running"
+          ? html`<span class="ses-live ses-running">● ${verb}…</span>`
         : status === "idle"
           ? neverRun
             ? html`<span class="ses-live">● live</span>`
@@ -720,6 +730,46 @@ export default {
     const endBtn = canEnd
       ? html`<button class="ses-end" title="End this session — mark it done and free the slot" @click=${(e) => end(e.currentTarget)}>✓ end</button>`
       : "";
+
+    // The permission prompt rows (one per held prompt, oldest first): tool name + the same one-field
+    // hint the tool rows use, with allow/deny buttons through the `sessionPermission` capability. The
+    // decision resolves the server's parked relay POST — the CLI then runs or refuses the tool call —
+    // and the next feed frame drops the row. Buttons disable in flight (imperative, like resume/end,
+    // so a streamed re-render can't double-fire); on a failed POST (already timed out / decided
+    // elsewhere) they re-enable and the stale row leaves on the next frame anyway.
+    const decidePerm = (permId, behavior, btn) => {
+      if (!card.signals.sessionPermission) return;
+      const row = btn.closest(".ses-perm");
+      const buttons = row ? [...row.querySelectorAll("button")] : [btn];
+      for (const b of buttons) b.disabled = true;
+      btn.textContent = behavior === "allow" ? "allowing…" : "denying…";
+      Promise.resolve(card.signals.sessionPermission(permId, behavior)).then((ok) => {
+        if (!ok)
+          for (const b of buttons) {
+            b.disabled = false;
+            b.textContent = b.classList.contains("ses-perm-allow") ? "allow" : "deny";
+          }
+      });
+    };
+    const permRows =
+      needsPermission && card.signals.sessionPermission
+        ? html`
+            <div class="ses-perms">
+              ${perms.map(
+                (p) => html`
+                  <div class="ses-perm">
+                    <span class="ses-perm-glyph">⚠</span>
+                    <span class="ses-perm-what" title=${clip(toolHint(p.input), 400)}>
+                      <span class="ses-perm-tool">${p.toolName}</span> ${clip(toolHint(p.input), 120)}
+                    </span>
+                    <button class="ses-perm-allow" @click=${(e) => decidePerm(p.id, "allow", e.currentTarget)}>allow</button>
+                    <button class="ses-perm-deny" @click=${(e) => decidePerm(p.id, "deny", e.currentTarget)}>deny</button>
+                  </div>
+                `,
+              )}
+            </div>
+          `
+        : "";
 
     // `/`-completion over the session's advertised skills (slice 2). Empty static menu container; its
     // contents are owned imperatively so they survive streamed re-renders (see the note above).
@@ -909,7 +959,7 @@ export default {
         ${turnRows}
         ${turns.length === 0 ? html`<div class="ses-empty">no turns</div>` : ""}
       </div>
-      ${inputRow}${resumeRow}
+      ${permRows}${inputRow}${resumeRow}
     `;
   },
 };

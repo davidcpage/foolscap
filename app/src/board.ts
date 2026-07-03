@@ -25,6 +25,9 @@ let active: Board = FALLBACK;
 export function activeBoardId(): string {
   return active.boardId;
 }
+export function activeBoard(): Board {
+  return active;
+}
 
 interface BoardResponse {
   boardId: string;
@@ -64,4 +67,38 @@ async function selectBoard(): Promise<Board> {
     /* server unreachable — fall through to the local fallback */
   }
   return FALLBACK;
+}
+
+// ── the board picker's read side ──────────────────────────────────────────────────────────────────
+// Every board the server knows: the in-memory mounts plus the durable registry it remounted on boot
+// (vite-fs-plugin's boards.json), so repos you opened before a restart are still offered. Sorted default
+// first, then most recently opened.
+export interface BoardListing {
+  boardId: string;
+  name: string;
+  repoPath: string;
+  isDefault: boolean;
+  lastOpened: number;
+}
+export async function listBoards(): Promise<BoardListing[]> {
+  const res = await fetch("/api/boards");
+  if (!res.ok) return [];
+  const { boards } = (await res.json()) as {
+    boards: Array<BoardResponse & { repoPath: string; lastOpened?: number }>;
+  };
+  return boards
+    .map((b) => ({
+      boardId: b.boardId,
+      name: b.name,
+      repoPath: b.repoPath,
+      isDefault: !!b.default,
+      lastOpened: b.lastOpened ?? 0,
+    }))
+    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.lastOpened - a.lastOpened);
+}
+
+// Where a tab for this board lives. ?repo= (not ?board=) so the navigation itself re-mounts the repo —
+// self-healing after a server restart that predates the registry, and the same path a first open takes.
+export function boardHref(b: { repoPath: string; isDefault: boolean }): string {
+  return b.isDefault ? location.pathname : `${location.pathname}?repo=${encodeURIComponent(b.repoPath)}`;
 }

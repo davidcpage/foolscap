@@ -23,7 +23,7 @@ export interface SessionHostClient {
   attach(id: string, hooks: ProcHooks): void;
   detach(id: string): void;
   /** Fire-and-forget; a failed spawn surfaces as onExit({reason:"self"}) on the attached hooks. */
-  spawnSession(id: string, spec: { cmd: string; args: string[]; cwd: string }): void;
+  spawnSession(id: string, spec: import("./session-proc.js").SpawnSpec): void;
   writeSession(id: string, data: string): boolean;
   killSession(id: string): void;
   list(): Promise<{ sessions: HostSessionInfo[]; exits: HostExitRecord[] }>;

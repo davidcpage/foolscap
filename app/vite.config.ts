@@ -13,6 +13,12 @@ export default defineConfig({
     // mutation/agent-spawn commands (see vite-fs-plugin.ts), so it must never be reachable off this
     // machine. Pinned here so a stray `--host` or a default-changing Vite upgrade can't expose it.
     host: "127.0.0.1",
+    // ONE canonical port, never a silent fallback. IndexedDB is per-ORIGIN and the origin includes the
+    // port — if Vite slid to 5174 because 5173 was busy, every board would open EMPTY (its data marooned
+    // under the 5173 origin). strictPort turns that silent data-loss mode into a loud startup failure:
+    // a second `npm run dev` now exits with "port is already in use" instead of becoming a 5174 twin.
+    port: 5173,
+    strictPort: true,
     fs: { allow: [".."] },
   },
 });

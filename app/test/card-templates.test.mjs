@@ -1120,6 +1120,44 @@ function flatten(value) {
   return String(value);
 }
 
+// Permission prompts (permission-prompt-tool): a held tool call rides the feed as `permissions`; the
+// card renders allow/deny rows through the `sessionPermission` capability and paints the LOUD waiting
+// band even though the process is mid-turn — blocked on a human is the band's whole reason to exist.
+test("session template surfaces held permission prompts: allow/deny rows + the waiting band", async () => {
+  const mod = await loadTemplate("session");
+  const turn = JSON.stringify({ type: "user", message: { role: "user", content: "go" } });
+  const decided = [];
+  const perm = { id: "p1", toolName: "Bash", input: { command: "git push origin main" }, ts: 1 };
+  const card = {
+    fields: { title: "abcd1234", text: "", color: "blue" },
+    signals: {
+      session: { content: turn, truncated: false, status: "running", permissions: [perm] },
+      sessionInput: () => {},
+      sessionPermission: (id, behavior) => decided.push([id, behavior]),
+    },
+  };
+  const out = flatten(mod.render(card));
+  assert.ok(out.includes("ses-perms"), "the permission block renders");
+  assert.ok(out.includes("Bash"), "the gated tool's name shows");
+  assert.ok(out.includes("git push origin main"), "the tool-hint (command) shows");
+  assert.ok(out.includes("⚠ permission"), "the pill flips to the permission warning");
+  assert.ok(out.includes("ses-frame-waiting"), "the loud waiting band paints despite status=running");
+
+  // The buttons route through the capability with the prompt's id — the server resolves the rest.
+  card.signals.sessionPermission(perm.id, "allow");
+  assert.deepEqual(decided, [["p1", "allow"]]);
+
+  // No `sessionPermission` grant → no actionable rows (a mock/degraded mount can't answer, so don't
+  // offer); a feed frame without `permissions` (prompt resolved) drops back to the plain live pill.
+  const ungranted = flatten(mod.render({ ...card, signals: { ...card.signals, sessionPermission: undefined } }));
+  assert.ok(!ungranted.includes("ses-perms"), "no block without the sessionPermission capability");
+  const cleared = flatten(
+    mod.render({ ...card, signals: { ...card.signals, session: { content: turn, truncated: false, status: "running" } } }),
+  );
+  assert.ok(!cleared.includes("ses-perms"), "a resolved prompt leaves with its feed frame");
+  assert.ok(cleared.includes("● Working…"), "…and the pill returns to the live verb");
+});
+
 // worktree-activity slices A/C: the session card's touched-files activity strip — derived from the same
 // tool_use blocks as the turns — dedupes by path (newest touch wins), marks edited files as written
 // (sticky even after a later read), and colours each dot by the WORKTREE the absolute path falls under.

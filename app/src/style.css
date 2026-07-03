@@ -1512,6 +1512,66 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-ask-warn .ses-ask-submit {
   background: #d97706;
 }
+/* Permission prompt rows (permission-prompt-tool): a held tool call awaiting the human's allow/deny.
+   The amber vocabulary of the waiting band (this IS a waiting-for-you state), row layout echoing the
+   input row so the buttons read as the card's own controls, not transcript content. */
+.ses-perms {
+  border-top: 1px solid #f59e0b55;
+  background: #fffbeb;
+}
+.ses-perm {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+}
+.ses-perm + .ses-perm {
+  border-top: 1px solid #f59e0b22;
+}
+.ses-perm-glyph {
+  color: #d97706;
+  font-size: 12px;
+}
+.ses-perm-what {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: #78350f;
+  font-family: ui-monospace, monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ses-perm-tool {
+  font-weight: 700;
+}
+.ses-perm-allow,
+.ses-perm-deny {
+  font-size: 11px;
+  font-weight: 600;
+  border: none;
+  border-radius: 5px;
+  padding: 3px 10px;
+  cursor: pointer;
+  color: #fff;
+}
+.ses-perm-allow {
+  background: #16a34a;
+}
+.ses-perm-allow:hover {
+  background: #15803d;
+}
+.ses-perm-deny {
+  background: #dc2626;
+}
+.ses-perm-deny:hover {
+  background: #b91c1c;
+}
+.ses-perm-allow:disabled,
+.ses-perm-deny:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 /* Registry-backed status (slice 2): the idle pill reads as a bold amber "waiting" CHIP to match the
    lifecycle band — `idle` means "your turn" (the default-loud model: every idle is treated as waiting-
    for-human until an agent declares otherwise). running keeps its bare pulsing dot; exited stays red. */
@@ -2484,6 +2544,27 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   padding: 4px 8px;
   font-size: 11px;
   color: #a1a1aa;
+}
+
+/* The board switcher (BoardsItem) — shares the role picker's indented-list shell. A row is the board's
+   name with a faint "current"/"dev" tag pushed right; the current board's row is inert. */
+.menu-list .menu-boardopt:disabled {
+  cursor: default;
+  color: #a1a1aa;
+}
+.menu-list .menu-boardopt:disabled:hover {
+  background: transparent;
+}
+.menu-boardname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.menu-boardtag {
+  font-size: 10px;
+  color: #a1a1aa;
+}
+.menu-boardopen {
+  color: #52525b;
 }
 
 /* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left. It fades in, holds, then
