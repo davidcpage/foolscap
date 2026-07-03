@@ -360,9 +360,9 @@ function Board({ m, undo, persistence }: Engine) {
     // subtree BEFORE any card's claim handler, which is what lets those handlers ask "is this event
     // continuing a gesture the canvas already owns?" when a pan slides their scroller under the cursor.
     el.addEventListener("wheel", observeWheelGesture, { capture: true, passive: true });
-    // Hold-to-peek (peek.ts): hold z → fit-all, pan the target to the middle, release → dive in around
-    // the centre at the zoom you left. A committed dive lands the pre-peek pose on the unwind stack,
-    // so ` steps back across it.
+    // Hold-to-peek (peek.ts): hold z → fit-all, point the cursor at the target, release → dive back in
+    // there at the zoom you left. A committed dive lands the pre-peek pose on the unwind stack, so `
+    // steps back across it.
     const offPeek = bindPeek(el, m, { skipLayout: isFloating, onDive: (from) => views.pushHistory(from) });
     const sync = () => m.setViewport(el.clientWidth, el.clientHeight);
     sync();
