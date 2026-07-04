@@ -71,16 +71,26 @@ to it goes nowhere until a human resumes it. We already built
 the durable substrate Tag rebuilds from — the thread ledger (`.canvas/threads/`), the transcript
 (`--resume`), and the seat — we just don't yet *use* it to reconstruct compute on demand.
 
-> **Recommendation R1 — adopt: respawn-on-message for dormant seats.** When a thread message addresses a
-> seat (see §4) whose occupant has exited, the server should respawn the session itself — `--resume` of
-> the seat's last sid where a transcript exists, else a fresh spawn seeded with thread history — rather
-> than dead-lettering the message. This is the single highest-value borrow. It dissolves the cap-pressure
-> problem (idle workers can be *terminated freely*, because termination stops costing anything), it makes
-> the seat the real identity rather than a bookkeeping row, and it completes the keystone we already
-> committed to in `agent-roles.md` §1: liveness ≠ identity. The sidecar and the seat re-fill machinery
-> (`threads-as-cards.md` §5) are the two halves already built; this is the hinge between them. The
-> corollary norm is Tag's, adopted as-is: **an agent must leave the thread (or its memory) holding
-> anything it needs before going idle** — sandbox-only state is legitimately lost.
+> **Recommendation R1 — adopt: respawn-on-message for dormant seats.** A seat is *dormant* when it is
+> still a member of the thread but the session that last filled it has exited — the durable seat row
+> survives on the thread marker, but no live process backs it, so a message addressed to it currently
+> dead-letters. R1: when a thread message addresses a dormant seat, the server **reconstitutes** a live
+> agent for it rather than dropping the message. The default reconstitution is a **fresh spawn seeded
+> from thread history + memory** — which keeps Tag's invariant that the thread (not the sandbox) is the
+> only durable substrate; the prior transcript is an *archive the fresh agent can retrieve on demand*,
+> not authoritative state that silently rides along. `--resume` of the seat's last sid stays available as
+> an **explicit escalation** (human- or agent-invoked) for when you genuinely want to continue the same
+> head; it is not the default, because resume replays the whole transcript and so costs more the longer
+> the session ran. This is the single highest-value borrow. It dissolves the cap-pressure problem: an
+> idle worker can be terminated freely because termination no longer *holds a live slot* — the only cost
+> moves to respawn, paid on demand. And it makes the **seat the thing you actually address**: today a
+> seat is inert data (a role→sid row) once its occupant exits; under R1 addressing it brings a live agent
+> back, with sessions as interchangeable compute behind a durable seat. That is the keystone from
+> `agent-roles.md` §1 — *liveness ≠ identity* — made true in practice: you can address a seat whether or
+> not a process currently backs it. The sidecar and the seat re-fill machinery (`threads-as-cards.md` §5)
+> are the two halves already built; this is the hinge between them. The corollary norm, adopted from Tag
+> verbatim: **before going idle an agent must leave anything it needs in the thread (or its memory)** —
+> state that lived only in the exited process is legitimately lost.
 
 ---
 
@@ -105,20 +115,38 @@ channel as the coordination container. A **thread** is a *task with active worke
 reply from a teammate is signal by default — Tag's model matches the new container better than our
 inherited one does.
 
-> **Recommendation R2 — adapt: default-wake for active participants of a thread.** Within a thread, a
-> new message should nudge every member whose latest work-intent is `working` or `blocked:peer` (they are
-> mid-task; a teammate's message is likely course-correction or the thing they're blocked on) without
-> requiring a tag. Keep the tag for what it does uniquely well: *addressing* — waking a specific seat,
-> waking a `done`/`blocked:human` participant back into the task, or (with R1) resurrecting a dormant
-> one. Members who have declared `done` stay unwoken by untagged traffic, which preserves the
-> noise-protection the old rule was for. This is a change to the nudge fan-out condition only; the
-> content path (inbox pull, cursor, tool-output delivery) is untouched.
+> **Recommendation R2 — adapt: default-wake every member of a thread.** Within a thread, a new message
+> nudges **every member**, no tag required — matching Tag's "once a session is active in a thread it
+> belongs to everyone there." A thread is a *task with active workers*, not a room, so a teammate's reply
+> is signal by default; the noise the old tag-gating guarded against was a property of the long-lived
+> *channel*, which we retired. The `@`-tag keeps the two jobs it does uniquely well, neither of them the
+> everyday wake: **inviting a new member** into the thread, and **addressing** a specific seat — including
+> waking a dormant one back into the task (with R1, that address is what reconstitutes it). This is
+> deliberately simpler than conditioning the fan-out on each member's work-intent: making "does this
+> message wake me?" depend on reasoning about others' declared state is exactly the kind of hidden rule
+> that makes a feature unreliable. The change is to the nudge fan-out condition only; the content path
+> (inbox pull, cursor, tool-output delivery) is untouched. (A member that wants out of the traffic
+> `leave`s the thread — membership, not intent, is the wake boundary.)
 >
-> **Non-recommendation — do not import the head-biased context window.** It is a workaround for Slack's
-> flat threads, where the task statement can scroll out of reach. Our design already solves this
-> properly: the task statement lives on the thread *node* (`title` + `text` brief), permanently
-> addressable outside the message log, and our truncation rule (CLAUDE.md: tail for logs, head for
-> documents) is the right one for each surface. Validation, not a gap.
+> **Non-recommendation — do not import the head-biased context window.** Tag's 50-message head window is
+> a workaround for Slack's flat threads, where the root message is the only home the task statement has,
+> so it must be kept in view as the tail scrolls off. We don't have that constraint, and the better fix
+> is R-PIN below (a pinnable head-context tray) rather than a hard-coded head bias: the task statement,
+> the done-condition, and any framing that must stay in view become *pinned posts*, re-read on every wake
+> regardless of how long the thread grows. Our tail-for-logs / head-for-documents truncation rule
+> (CLAUDE.md) is right for the raw surfaces; pinning is what keeps the load-bearing few messages present.
+>
+> **Recommendation R-PIN — adopt: pinnable thread posts as the head-context tray.** Make any thread
+> message **pinnable**; the pinned set is the thread's *head context*, re-read on every wake ahead of the
+> recent tail. This subsumes three things the doc otherwise scatters: the task statement (the first
+> pinned post, replacing a static `title`+`text` brief that lives in a separate channel from the
+> conversation and can't evolve with the task), the done-condition (R5, a pinned post), and any framing a
+> long thread must keep in view (Tag's head-window problem, solved without a head bias). Pinning must not
+> reorder the log: a pinned post stays in its chronological place, and the card renders a collapsible
+> **pinned tray** at the top that *references* the pinned messages (fold/unfold), so provenance and order
+> are preserved. This is the canvas-native answer to "the task's framing evolves and the brief is a
+> separate channel" — one conversation, with a durable, editable head. (Mechanism overlaps the deferred
+> *pins* idea in the doc-annotations step-4 backlog.)
 
 ---
 
@@ -176,9 +204,15 @@ in fact a *single universal seat* — our seat generalizes their model rather th
   channels keep isolated stores (and a private→public conversion does *not* migrate the private memory).
 - Memory is a **shared, inspectable object**: any channel member can ask "what do you remember about
   this channel?", correct stale entries, and have the correction itself recorded.
-- Teaching the agent has an explicit **hierarchy**, narrowest to widest: channel memory → repo
-  `CLAUDE.md` → standing channel instructions → an org skills repository → org-wide custom instructions.
-  Anyone can *draft* a change to the org layers (as a PR to the skills repo); admins approve.
+- Teaching the agent has an explicit **hierarchy**, ordered by *scope of applicability* from narrowest
+  (this one channel) to widest (the whole org); precedence on conflict runs the other way — the narrower
+  layer wins, like CSS specificity. The five layers: **channel memory** (facts/instructions scoped to
+  this one channel; narrowest, highest precedence) → repo **`CLAUDE.md`** (instructions attached to a
+  specific code repo) → **standing channel instructions** (persistent "always do X here" rules a user
+  sets, distinct from accumulated memory) → an **org skills repository** (shared skills/instructions
+  available org-wide) → **org-wide custom instructions** (global defaults for every channel; widest,
+  lowest precedence). Anyone can *draft* a change to the org layers (as a PR to the skills repo); admins
+  approve.
 
 **Where we stand.** Our memory is **person-scoped**: each role carries its own store via
 `autoMemoryDirectory` (`headless-session-memory`), plus the repo-level `CLAUDE.md`. We have nothing
@@ -188,13 +222,25 @@ store answers "what does the Implementer know?", a place store answers "what has
 settled?". Today the second question is answered only by the thread log (history, not curation) and the
 deprioritised wiki idea.
 
-> **Recommendation R4 — adopt, small: a board-scoped memory file, as a card.** One curated file (e.g.
-> `.canvas/memory.md`, shadow-versioned like the rest of `.canvas/` per `canvas-home.md`), included in
-> every spawned session's brief, rendered as a canvas card so any human or agent can read and edit it —
-> Tag's "memory is a shared, inspectable object" made canvas-native. This gives settled decisions a home
-> that isn't a rotting wiki (it's curated *norms and facts*, not documentation of moving work — the
-> distinction `threads-as-cards.md` §1 drew) and isn't locked inside one role's head. Per-thread memory
-> is *not* needed: the thread brief + closure write-up already cover it. Keep role memory exactly as is.
+> **Recommendation R4 — adopt, small: a board-scoped memory file as a card, and one home per fact.**
+> A single curated file (`.canvas/memory.md`, shadow-versioned like the rest of `.canvas/` per
+> `canvas-home.md`), included in every spawned session's brief and rendered as an ordinary **markdown
+> file card** so any human or agent can read and edit it — Tag's "memory is a shared, inspectable object"
+> made canvas-native, with zero new machinery. Structure ("one fact per line, newest-first, prefer
+> append") is a *convention the brief states*, not an enforced schema; promote it to a custom card type
+> only if per-fact affordances (resolve, pin, provenance, dedup) later earn their keep. This gives
+> settled decisions a home that isn't a rotting wiki (curated *norms and facts*, not documentation of
+> moving work — the distinction `threads-as-cards.md` §1 drew) and isn't locked inside one role's head.
+> **Per-thread memory is *not* needed**: thread-specific facts live as explicit thread comments (a pinned
+> post if they're load-bearing), and the closure write-up covers the rest. **Role memory folds into the
+> role file, not a second store**: rather than today's split (human-authored `role.md` + agent-writable
+> `autoMemoryDirectory`), let agents edit the role file directly under the same convention (structured,
+> observable, prefer-append) — one home per fact. The open wrinkle is scope: a role's *charter* (stance,
+> knowledge, how it works) is plausibly shared across repos, while accumulated role *memory* is often
+> repo-specific. Resolve it by scoping — role **identity** global (the versioned role file), role
+> **notes** place-scoped (an agent-editable notes file under the board's `.canvas/`) — which keeps "one
+> home per fact" *within each scope* while honoring that charter and repo-notes have different lifetimes.
+> (Decide this boundary before R4 lands; it fixes where board-memory ends and role-notes begin.)
 
 ---
 
@@ -219,17 +265,18 @@ enterprise usage, and reads like a peer review of our `channel-coordination-norm
 `threads-as-cards.md` §6) and the derived thread state built on it are our version of "how is the work
 going" — arguably richer, since it distinguishes *why* nothing is happening, which Tag's checklist
 can't. But our `done` is **self-reported and unverifiable**: nothing says what done was supposed to
-mean, so neither the PM nor the derived state can tell a real completion from an agent giving up
+mean, so neither the Coordinator nor the derived state can tell a real completion from an agent giving up
 politely. Tag's discipline fixes exactly that gap. Our open-work norms (`channel-coordination-norms`,
 `pm-spawning-and-engagement`'s assign-in-thread-never-DM rule) already match theirs.
 
-> **Recommendation R5 — adopt: a done-condition on the thread brief, and proof-at-done as a norm.**
-> Convention first, schema later: the thread's `text` brief ends with an explicit `Done when: …` line in
-> one of Tag's three shapes, written by whoever opens the thread; the collab brief instructs agents that
-> a `done` intent must be accompanied by a thread message with evidence against that condition. The PM's
-> review act becomes checking proof against condition instead of trusting the flag. Costs a paragraph in
-> two briefs; no code. (If it earns its keep, `doneWhen` graduates to a field on the thread node and the
-> rail can render unmet-condition threads distinctly.)
+> **Recommendation R5 — adopt: a pinned done-condition, and proof-at-done as a norm.** Convention first,
+> schema later: whoever opens the thread posts an explicit `Done when: …` message in one of Tag's three
+> shapes and **pins it** (R-PIN) — a pinned post, not a line buried in the `text` brief, so the condition
+> is head context on every wake and can be refined mid-task by repinning. The collab brief instructs
+> agents that a `done` intent must be accompanied by a thread message with evidence against that
+> condition. The Coordinator's review act becomes checking proof against condition instead of trusting
+> the flag. Costs a paragraph in two briefs; no code. (If pins prove too loose, `doneWhen` graduates to a
+> field on the thread node and the rail can render unmet-condition threads distinctly.)
 >
 > **Non-recommendation — the in-place checklist.** Solves a Slack rendering constraint we don't have;
 > our thread card + intents + status bands already out-render it. Nothing to borrow.
@@ -253,19 +300,22 @@ politely. Tag's discipline fixes exactly that gap. Our open-work norms (`channel
 
 **Where we stand.** This is independent confirmation of the conclusion we reached empirically:
 `canvas-session-self-wake` established that our `claude -p` sessions *cannot* self-wake (ScheduleWakeup
-timers never fire headless), so a looping PM needs a canvas-native server heartbeat. Anthropic, with
+timers never fire headless), so a looping Coordinator needs a canvas-native server heartbeat. Anthropic, with
 full control of their own runtime, *still* chose platform-side standing jobs over agent self-scheduling
 — which tells us the architecture isn't a workaround, it's the right shape: triggers are declarative
 data owned by the place, and compute appears when they fire (the same "compute is ephemeral, the durable
 substrate is not" principle as §2).
 
 > **Recommendation R6 — adopt the shape: standing jobs on the thread marker, server-fired.** A `watch`
-> entry on a thread's meta (interval + instruction), executed by the server/sidecar: on fire, nudge a
-> named seat with the instruction — or, with R1, respawn it if dormant. First consumer is already queued:
-> the step-4 threads rail wants a ping on process-state changes, and the looping-PM heartbeat becomes
-> "a standing job on the PM's thread" instead of bespoke plumbing. Borrow the two norms wholesale:
-> **"skip days with nothing"** (a firing that finds nothing posts nothing) and **jobs survive their
-> creator** (the job is the thread's, not the spawner's — consistent with seats outliving occupants).
+> entry on the thread's **durable marker** (its `.canvas/threads/` meta record — the same off-log store
+> that already holds the thread's seats, work-intents, and read cursors), carrying an interval +
+> instruction and executed by the server/sidecar: on fire, nudge a named seat with the instruction — or,
+> with R1, reconstitute it if dormant. First consumer is already queued: the step-4 threads rail wants a
+> ping on process-state changes, and the looping-Coordinator heartbeat becomes "a standing job on the
+> Coordinator's thread" instead of bespoke plumbing. Borrow the two norms wholesale: **"skip days with
+> nothing"** — a firing that finds nothing to report posts nothing, so a daily watch never becomes daily
+> noise — and **jobs survive their creator** (the job is the thread's, not the spawner's — consistent
+> with seats outliving occupants).
 
 ---
 
@@ -282,9 +332,10 @@ For balance, the places Tag's public design has nothing to teach us, or is behin
   surface. Our wake model was built to avoid exactly this: message content **never enters stdin as a
   user turn**; it arrives as tool output via the inbox pull, and permission gates don't yield to relayed
   approvals. Keep this; do not "simplify" toward Tag's model.
-- **The task-statement problem: already solved.** Tag's head-biased 50-message window exists because in
-  Slack the root message is the only home the task has. Our task lives on the thread node, outside the
-  log. No change needed (see R2's non-recommendation).
+- **The task-statement problem: better tools available.** Tag's head-biased 50-message window exists
+  because in Slack the root message is the only home the task has. We don't have that constraint — the
+  task already lives outside the log — and R-PIN makes the framing a *pinnable* head-context tray that
+  stays present as the task evolves, without a hard-coded head bias (see R2's non-recommendation).
 - **Live rendering.** Tag fights Slack's medium (edited messages don't notify; threads look frozen). The
   canvas is a live surface — status bands, intents, and feeds already render what Tag has to fake.
 
@@ -292,16 +343,17 @@ For balance, the places Tag's public design has nothing to teach us, or is behin
 
 | # | What | Verdict | Cost | Why |
 |---|---|---|---|---|
-| R1 | Respawn-on-message for dormant seats | **Adopt** | server: message→seat resolution + `--resume` cascade | Completes liveness≠identity; dissolves cap pressure; the sidecar + seat re-fill are the two halves already built |
-| R2 | Default-wake for `working`/`blocked:peer` thread members; tag = addressing | **Adapt** | nudge fan-out condition only | Tag-gating was a channel-era rule; a thread is a task, where teammate replies are signal |
+| R1 | Respawn-on-message for dormant seats (fresh-seed default, transcript-on-demand, resume as explicit escalation) | **Adopt** | server: message→seat resolution + reconstitute cascade | Completes liveness≠identity; dissolves cap pressure; keeps Tag's "thread is the only durable substrate" invariant |
+| R2 | Default-wake **every** thread member; `@`-tag = invite/address only | **Adapt** | nudge fan-out condition only | Tag-gating was a channel-era rule; a thread is a task, where teammate replies are signal. One clear invariant, no work-intent reasoning |
+| R-PIN | Pinnable thread posts as an editable head-context tray | **Adopt** | pin flag on messages + a fold/unfold tray on the card | One durable, editable head for the task statement, the done-condition, and load-bearing framing — replaces the static brief and Tag's head window |
 | R3 | Per-thread spend recorded on the marker | Note for later | small, no enforcement | The mature successor to the blunt session cap; cheap to record now |
-| R4 | Board-scoped memory file as an editable card | **Adopt (small)** | one `.canvas/` file + card + brief line | The place-scoped layer we lack; shared + inspectable, unlike role memory; not a wiki (curated norms, not tracking docs) |
-| R5 | `Done when:` on thread briefs + proof-at-done norm | **Adopt** | two brief paragraphs, no code | Makes `done` verifiable; gives the PM a review act; fixes the one real gap in work-intent |
-| R6 | Standing jobs on thread markers, server-fired | **Adopt the shape** | server timer + nudge/respawn | Confirmed architecture (Anthropic chose it *with* runtime control); unblocks the looping PM and the rail's ping |
+| R4 | Board-scoped memory as a markdown card; role memory folds into one structured role file | **Adopt (small)** | one `.canvas/` file + card + brief line | The place-scoped layer we lack; shared + inspectable; one home per fact (no role.md-vs-store split) |
+| R5 | Pinned `Done when:` + proof-at-done norm | **Adopt** | two brief paragraphs, no code | Makes `done` verifiable; gives the Coordinator a review act; rides R-PIN instead of the brief |
+| R6 | Standing jobs on thread markers, server-fired | **Adopt the shape** | server timer + nudge/reconstitute | Confirmed architecture (Anthropic chose it *with* runtime control); unblocks the looping Coordinator and the rail's ping |
 
-Suggested order: **R5 first** (free, immediately useful), **R2** with the step-4 rail work (same nudge
-code), **R1** next (the structural one), **R6** once R1 exists (respawn is what a firing trigger wants
-to do), **R4** anytime, **R3** ambient.
+Suggested order: **R-PIN + R5 first** (R5 rides the pinning mechanism; both are cheap and immediately
+useful), **R2** with the step-4 rail work (same nudge code), **R1** next (the structural one), **R6**
+once R1 exists (reconstitution is what a firing trigger wants to do), **R4** anytime, **R3** ambient.
 
 ---
 
