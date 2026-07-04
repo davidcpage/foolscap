@@ -173,6 +173,11 @@ What the whole feature is *for* — three interactions, cheapest first:
 3. **Escalation.** A comment that turns into real discussion becomes a **thread** (`ev:"thread"`): the
    annotation card-links to it and further replies happen there, with the anchor as the thread's opening
    context. Threads stay the one conversation substrate.
+4. **Agent asks the human (anchored, async).** The inverse of interaction 1 — a working session raises a
+   *question* on a span and gets it answered later, without hanging a live process. This reuses the
+   annotation as the question's record and (for a blocking ask) a thread as the wake channel; full design
+   in `anchored-async-ask.md`. It's the durable, on-the-doc replacement for the in-session `AskUserQuestion`
+   block for any decision of weight.
 
 No new wake machinery: replies to the human render on the card (and badge it); agents are pulled in by
 prompt or revision convention, not pushed — comments are patient by nature. If push is ever wanted, it's a
