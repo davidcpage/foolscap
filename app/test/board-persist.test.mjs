@@ -140,6 +140,20 @@ test("readBoardSnapshot reads only the snapshot; mtime reflects persisted state"
   assert.deepEqual(readBoardSnapshot(repo), { records: [], version: 1, seq: 1 });
 });
 
+test("readBoardSnapshot memo never serves stale: fresh after write, out-of-band replace, clear", () => {
+  const repo = tmpRepo();
+  writeBoardSnapshot(repo, { records: [], version: 1, seq: 1 });
+  assert.deepEqual(readBoardSnapshot(repo), { records: [], version: 1, seq: 1 });
+  assert.equal(readBoardSnapshot(repo), readBoardSnapshot(repo)); // memo hit — same shared object
+  writeBoardSnapshot(repo, { records: [], version: 2, seq: 5 });
+  assert.deepEqual(readBoardSnapshot(repo), { records: [], version: 2, seq: 5 }); // write refreshed it
+  // Out-of-band replacement (another process): the (mtime,size) key must miss and re-parse.
+  fs.writeFileSync(path.join(repo, ".canvas", "board", "snapshot.json"), JSON.stringify({ records: [], version: 3, seq: 9 }));
+  assert.deepEqual(readBoardSnapshot(repo), { records: [], version: 3, seq: 9 });
+  clearBoardPersist(repo);
+  assert.equal(readBoardSnapshot(repo), null);
+});
+
 test("describeBoardEvents matches core's describe line format", () => {
   assert.equal(describeBoardEvents([]), "(no intent yet)");
   const events = [

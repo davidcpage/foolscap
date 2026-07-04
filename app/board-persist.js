@@ -54,13 +54,7 @@ export function readBoardPersist(repoPath) {
   } catch {
     events = []; // no file yet — a fresh board
   }
-  let snapshot = null;
-  try {
-    snapshot = JSON.parse(fs.readFileSync(snapshotFile(repoPath), "utf8"));
-  } catch {
-    snapshot = null; // absent (fresh) or torn (the atomic rename below makes this near-impossible)
-  }
-  return { events, snapshot };
+  return { events, snapshot: readBoardSnapshot(repoPath) }; // shares the memoized parse
 }
 
 /** Does this board have ANY persisted state? (Gates the one-time IndexedDB import.) */
@@ -69,11 +63,32 @@ export function hasBoardPersist(repoPath) {
   return events.length > 0 || snapshot !== null;
 }
 
+// readBoardSnapshot memo: every server-side board lookup (thread membership, sid↔card resolution,
+// spawn placement, the loop heartbeat's world signature) funnels through this read, and paying a
+// stat is fine where paying a full parse per call is O(callers × snapshot bytes) of sync work on the
+// event loop. Keyed by (mtimeMs, size); writeBoardSnapshot refreshes it in place. Pure
+// recompute-on-miss — a hot re-eval only costs one re-parse. CALLERS MUST TREAT THE RESULT AS
+// READ-ONLY: the same parsed object is handed to everyone.
+const snapshotCache = new Map(); // repoPath → { mtimeMs, size, value }
+
 /** Just the snapshot (null when absent/torn) — for callers on a hot path (the per-save membership
- *  diff, the agents' board read) that must not pay the whole event log per call. */
+ *  diff, the agents' board read) that must not pay the whole event log — or even a re-parse — per
+ *  call. Returns a shared parsed object: read-only by contract (see snapshotCache above). */
 export function readBoardSnapshot(repoPath) {
+  const file = snapshotFile(repoPath);
+  let st;
   try {
-    return JSON.parse(fs.readFileSync(snapshotFile(repoPath), "utf8"));
+    st = fs.statSync(file);
+  } catch {
+    snapshotCache.delete(repoPath);
+    return null;
+  }
+  const hit = snapshotCache.get(repoPath);
+  if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.value;
+  try {
+    const value = JSON.parse(fs.readFileSync(file, "utf8"));
+    snapshotCache.set(repoPath, { mtimeMs: st.mtimeMs, size: st.size, value });
+    return value;
   } catch {
     return null;
   }
@@ -147,6 +162,12 @@ export function writeBoardSnapshot(repoPath, snapshot) {
   const tmp = snapshotFile(repoPath) + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(snapshot));
   fs.renameSync(tmp, snapshotFile(repoPath));
+  try {
+    const st = fs.statSync(snapshotFile(repoPath));
+    snapshotCache.set(repoPath, { mtimeMs: st.mtimeMs, size: st.size, value: snapshot });
+  } catch {
+    snapshotCache.delete(repoPath); // can't stamp the memo — the next read re-parses, never serves stale
+  }
 }
 
 /**
@@ -168,6 +189,7 @@ export function importBoardPersist(repoPath, events, snapshot) {
 export function clearBoardPersist(repoPath) {
   fs.rmSync(eventsFile(repoPath), { force: true });
   fs.rmSync(snapshotFile(repoPath), { force: true });
+  snapshotCache.delete(repoPath);
 }
 
 // ── compaction ────────────────────────────────────────────────────────────────────────────────────
