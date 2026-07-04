@@ -50,7 +50,7 @@ dep) can run in parallel sessions.
 | W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `9e6988a` |
 | W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `addaf14` |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE `addaf14` |
-| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (held: shares thread code w/ W7) |
+| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (unblocked — W7 landed; next up) |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
 | W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
