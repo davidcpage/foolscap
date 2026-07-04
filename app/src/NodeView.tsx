@@ -1034,13 +1034,21 @@ function AnnotationsLayer({
                 if (e.key === "Escape") setOpenId(null);
               }}
             />
-            <button
-              className="anno-btn"
-              title={current.resolved ? "reopen this comment" : "mark this comment resolved"}
-              onClick={() => void toggleResolve(current)}
-            >
-              {current.resolved ? "Reopen" : "✓ Resolve"}
-            </button>
+            {replyText.trim() ? (
+              // Typed text swaps Resolve out for Reply: the send affordance was Enter-only (invisible),
+              // and Resolve here would dismiss the popover and lose the unsent draft.
+              <button className="anno-btn" title="add your comment to this exchange (Enter)" onClick={() => void sendReply()}>
+                Reply
+              </button>
+            ) : (
+              <button
+                className="anno-btn"
+                title={current.resolved ? "reopen this comment" : "mark this comment resolved"}
+                onClick={() => void toggleResolve(current)}
+              >
+                {current.resolved ? "Reopen" : "✓ Resolve"}
+              </button>
+            )}
           </div>
         </div>
       )}
