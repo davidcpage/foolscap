@@ -115,18 +115,32 @@ channel as the coordination container. A **thread** is a *task with active worke
 reply from a teammate is signal by default — Tag's model matches the new container better than our
 inherited one does.
 
-> **Recommendation R2 — adapt: default-wake every member of a thread.** Within a thread, a new message
-> nudges **every member**, no tag required — matching Tag's "once a session is active in a thread it
-> belongs to everyone there." A thread is a *task with active workers*, not a room, so a teammate's reply
-> is signal by default; the noise the old tag-gating guarded against was a property of the long-lived
-> *channel*, which we retired. The `@`-tag keeps the two jobs it does uniquely well, neither of them the
-> everyday wake: **inviting a new member** into the thread, and **addressing** a specific seat — including
-> waking a dormant one back into the task (with R1, that address is what reconstitutes it). This is
-> deliberately simpler than conditioning the fan-out on each member's work-intent: making "does this
-> message wake me?" depend on reasoning about others' declared state is exactly the kind of hidden rule
-> that makes a feature unreliable. The change is to the nudge fan-out condition only; the content path
-> (inbox pull, cursor, tool-output delivery) is untouched. (A member that wants out of the traffic
-> `leave`s the thread — membership, not intent, is the wake boundary.)
+> **Recommendation R2 — adapt: wake is a per-seat notification level, defaulting to wake-all.** Within a
+> thread, the default is that a new message nudges **every member**, no tag required — matching Tag's "once
+> a session is active in a thread it belongs to everyone there." A thread is a *task with active workers*,
+> not a room, so a teammate's reply is signal by default. But that "wake me on everything" is only the
+> **default level of a per-seat setting**, not a fixed rule: each seat carries a **notification level** —
+> `all` (any message wakes it) / `mentions` (only an `@`-address wakes it) / `paused` (nothing auto-wakes;
+> an explicit `@`-mention still overrides) — the Slack-channel choice, owned by the seat. The `@`-tag keeps
+> the two jobs it does uniquely well, neither of them the everyday wake at `all`: **inviting a new member**,
+> and **addressing** a specific seat — reaching a `mentions`/`paused` seat, or waking a dormant one back
+> into the task (with R1, that address is what reconstitutes it).
+>
+> This stays clear of the trap the first draft named: **conditioning the fan-out on each member's work-intent**
+> — making "does this wake me?" depend on reasoning about others' declared, *moving* state — is the hidden
+> rule that makes a feature unreliable. A notification level is different in kind: a **static, self-declared
+> preference**, not a dynamic inference over others' status, so it's the safe way to let a member turn its
+> own traffic down without reintroducing that coupling. (A member that wants fully out `leave`s the thread;
+> `paused` is the softer, still-addressable opt-out.) The change is to the nudge fan-out condition only; the
+> content path (inbox pull, cursor, tool-output delivery) is untouched.
+>
+> **The generalization is the real point.** Wake policy is not thread-specific: thread messages, doc-comment
+> notifications (`anchored-async-ask.md`), and timer / standing-job fires (R6) are **one primitive — a
+> per-seat notification level on a wakeable surface**, where a *seat* is the durable participant slot
+> (§4 / `agent-roles.md`) and a *surface* is anything that generates activity (a thread, a doc, a schedule).
+> A doc's seat is filled by a "watch for comments" affordance, a thread's by membership, a timer's by the
+> standing job — same three levels, same `@`-mention override, everywhere. A member sets "how much does this
+> surface wake me" once, per seat, rather than each surface inventing its own gate.
 >
 > **Non-recommendation — do not import the head-biased context window.** Tag's 50-message head window is
 > a workaround for Slack's flat threads, where the root message is the only home the task statement has,
