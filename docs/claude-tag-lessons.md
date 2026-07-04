@@ -63,8 +63,11 @@ of the doc; each concept is explained fully in the section cited.
 
 **Where we stand.** Our sessions are real long-lived `claude -p` processes. The session-host sidecar
 (shipped 2026-07-03, now the default) made them survive dev-server restarts — the *availability* half of
-this principle. But an idle worker still holds a process and a slot against `MAX_LIVE_SESSIONS=12`, and
-when a session exits, a message addressed to it goes nowhere until a human resumes it. We already built
+this principle: what an agent *is* (its identity, thread history, transcript) now outlives infrastructure
+churn, so there is always something to come back to. The *ephemerality* half we don't have: Tag releases
+compute the moment a thread goes quiet and rebuilds it on the next reply, while our idle worker still
+holds a process and a slot against `MAX_LIVE_SESSIONS=12`, and when a session exits, a message addressed
+to it goes nowhere until a human resumes it. We already built
 the durable substrate Tag rebuilds from — the thread ledger (`.canvas/threads/`), the transcript
 (`--resume`), and the seat — we just don't yet *use* it to reconstruct compute on demand.
 

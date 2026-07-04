@@ -248,3 +248,38 @@ Gotchas:
   spurious **403**. Poll `/api/canvas` for the `member:open` edge before posting.
 - **`ask`/`reply` never touch the broadcast log/cursor** — they're a separate in-memory RPC keyed by `askId`;
   only the final `kind:"ask"` echo lands in the log. Don't add a `to` field to messages (see §16 for why).
+
+## Doc annotations (comment on a file; answer where the question lives)
+
+Standoff, quote-anchored comments on any text file — Notion-style highlight-and-comment on doc cards,
+**without the file's bytes ever changing** (design: `docs/doc-annotations.md`). Anchors are W3C
+TextQuoteSelector quotes (`{exact, prefix?, suffix?, offset?}`, resolved by `app/anchors.js`: offset
+fast-path → exact+context → fuzzy → orphan); storage is an append-only jsonl per annotated file in
+`<board repo>/.canvas/annotations/` (`app/annotations.js`, thread-ledger sibling). Reads/writes are
+server-side and tab-free.
+
+- **Sweep** ("what's awaiting an answer"): `GET /api/annotations?board=<id>` → `{files:[{path, total,
+  open, orphaned}]}`. **Per file:** `…&path=<path>` → `{annotations:[{id, anchor, text, author, ts,
+  resolved, replies, thread?, orphaned, range}]}` — `orphaned`/`range` are derived at read time against
+  the file's current bytes, never stored.
+- **Write:** `POST /api/annotations?board=<id>` `{path, op, …}` — `create {anchor, text, author}` (returns
+  `orphaned` immediately: check it — a mistyped `exact` is an orphan at birth), `reply {id, from, text}`,
+  `resolve`/`reopen {id, by}`, `reanchor {id, anchor, by}`, `thread {id, thread}`. Attribution
+  (`author`/`from`/`by`) is `"human"` or a session sid, the thread convention.
+
+**THE REVISION RULE (the convention that makes standoff anchors work here):** before editing an
+annotated file — and `docs/*.md` especially — read its open annotations first (the per-file GET; cheap,
+usually empty). As part of the same change: **reply** to what you can answer, **resolve** what your edit
+settles, and **re-anchor** any surviving open comment whose quoted text your edit moved (`op:"reanchor"`
+with a fresh selector minted against the new source). A comment you strand shows as a loud orphan strip
+on the card — never silently dropped, but a debt someone must pay. "Answer my comments on `<file>`"
+means: read them, reply per annotation, resolve what's settled, and where the right answer is "fix the
+doc", fix the doc (then re-anchor).
+
+Gotchas:
+- `create` 404s on paths the file endpoints wouldn't serve (blocked/internal/non-text) and needs the file
+  to exist; other ops 404 on an unknown annotation id.
+- Anchors resolve against the same head-capped read the card shows (`MAX_BYTES`, 128KB) — a quote beyond
+  the cap reads as orphaned by design.
+- The card UI (highlights/popover/orphan strip) is host chrome in `app/src/NodeView.tsx` +
+  `app/src/annotations.ts`; canonical root only (worktree copies of a doc share the repo's annotations).
