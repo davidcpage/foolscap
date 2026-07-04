@@ -37,82 +37,104 @@ and let the answer arrive **async**.
 |---|---|---|---|---|
 | **ask/reply RPC** (`docs/agent-to-agent-messaging.md §16`) | agent → *peer* | **synchronous** (blocks ≤60s, both live) | in-memory, echoed card-only | consulting an oracle/peer that answers *now* in `file:line` |
 | **human comment** (`doc-annotations.md`) | *human* → agent | patient | doc annotation | the human highlights a span and asks the agent |
-| **anchored async ask** (this doc) | *agent* → human/peer | **asynchronous** (asker winds down) | doc annotation + optional task thread | the agent needs a decision it can't make alone and won't hold a process for |
+| **anchored async ask** (this doc) | *agent* → human/peer | **asynchronous** (asker winds down) | doc annotation + a doc-watch seat | the agent needs a decision it can't make alone and won't hold a process for |
 
 The anchored async ask is the **inverse of a human comment** (agent asks the human, not the reverse) with
 the **timing of a thread** (patient, pull/push) rather than the RPC (blocking). It reuses the human-comment
-substrate — annotations — for the *record*, and the thread substrate for the *wake*.
+substrate — annotations — for the *record*, and a **watched-surface seat** for the *wake* — the doc itself
+becomes a wakeable surface (§2), rather than minting a thread per question.
 
-## 2. The model: a doc question is an annotation; its wake is a thread
+## 2. The wake model: seats with notification levels on wakeable surfaces
 
-Two artifacts, each doing the one job it's already good at:
+The question itself is an **annotation** (`kind:"question"`) — anchored to its span, authored by the asking
+session, carrying the question text and optional **options** to choose among. This is the *content home*:
+question and answer live on the doc, forever, next to what they concern; it reuses everything
+`doc-annotations.md` built (anchors, ledger, auto-reanchor, the CLI). That half doesn't change.
 
-- **The question is an annotation** (`kind:"question"`) — anchored to the span it's about, authored by the
-  asking session, carrying the question text and (optionally) a set of **options** to choose among. This is
-  the *content home*: the question and its answer live here, on the doc, forever, next to what they concern.
-  It reuses everything `doc-annotations.md` just built — anchors, the ledger, auto-reanchor, the CLI.
-- **The wake is a thread** — the asker's **task thread** (§4 of `threads-as-cards.md`: a task with a
-  conversation). The annotation links to it (`ev:"thread"`, the escalation bridge that already exists). The
-  thread is *only the wake/membership transport*: it carries no copy of the question text (that's on the
-  doc), it exists so that when an answer lands, a nudge — and, via R1, a respawn — can reach a session to
-  continue. A session that is already threadless (spawned by a bare human prompt, like the review session)
-  **promotes its work to a task thread at the moment it asks a blocking question**: the moment the work must
-  outlive the process (because it's now waiting on async human input) is exactly the moment it earns a
-  thread. Non-blocking questions (§5) need no thread — they're pure patient annotations.
+What changes is the **wake** — how compute learns there's something to do. Rather than mint a thread per
+question, generalize the one primitive that already governs thread wakes: a **wakeable surface** — a thread,
+and now a **doc** — carries **seats**, and each seat has a **notification level**, the Slack-channel choice:
 
-Keeping content on the annotation and wake on the thread avoids message-mirroring entirely: there is one
-copy of the question (the doc) and one copy of the answer (the doc), and the thread just decides *who to
-wake*. It also honors "threads are the one conversation substrate" — if the ask turns into real
-back-and-forth, that discussion happens in the linked thread, normally, with the anchor as its opening
-context.
+- **`all`** — any comment activity on the surface wakes the seat's occupant.
+- **`mentions`** — only activity that @-addresses the seat wakes it (a comment tagging its role; an `answer`
+  to a question the seat asked, which is inherently addressed to it).
+- **`paused`** — nothing auto-wakes it, but an explicit @-mention still overrides — a paused watcher can
+  always be summoned by name.
+
+A **seat** is a durable participant slot that outlives its occupant's process (`threads-as-cards.md` §5, here
+generalized off the thread onto any surface): the level and binding persist; the live session is
+interchangeable compute behind it. When qualifying activity lands, the server wakes the occupant — and if the
+seat is **dormant** (no live process, the usual case since workers wind down), this is exactly
+`claude-tag-lessons.md` **R1** *respawn-on-message*, generalized from "a thread message" to "activity on any
+watched surface": the server reconstitutes a fresh session seeded from the durable record (the doc + its
+annotations) to service it. So doc-wake and R1 aren't two mechanisms — they're one, sharing the
+server-spawn-from-a-durable-record primitive.
+
+**A doc's seat is filled by a "watch for comments" affordance** — right-click a doc card → *Watch for
+comments* binds a **role** as a watcher at a chosen level (default `all`): a standing job owned by the *doc*,
+not its creator (Tag's channel-watch, place-scoped). It can be **paused / resumed** — the seat persists,
+armed or not — and **triggered explicitly by @-mention** even while paused. This is the arming policy, and it
+is deliberately *not* a doc-wake special case: it's the same seat/level control a thread uses, one surface up.
+(This refines `claude-tag-lessons.md` **R2**: R2's "default-wake every member" becomes the default *level*
+`all`, with per-seat opt-down to `mentions`/`paused` now available — a static, self-declared preference, not
+the dynamic work-intent conditioning R2 rightly warned against.)
+
+Two things fill a doc's seats, and both fall out of this one primitive rather than needing a thread:
+
+- **A human-armed watcher** (the affordance): a role subscribed at `all`, servicing incoming human comments
+  — the human→agent direction ("someone asks on the doc; the watcher wakes and answers").
+- **An ask-armed watcher** (implicit): when an agent raises a *blocking* question, it takes a seat on the doc
+  at `mentions` level — so the eventual `answer` (addressed to it) wakes a continuation — then winds down.
+  Asking *is* subscribing to the reply; no human setup needed. The seat is scoped to the question and
+  released when it resolves.
+
+**Thread escalation stays the exception**, not the default: a question that branches into real back-and-forth
+escalates to a thread via the existing `ev:"thread"` op, with the anchor as its opening context. That
+restores `doc-annotations.md` §7's original instinct — a thread is for "a comment that turns into real
+discussion" — which the earlier draft's thread-per-question had overridden.
 
 ## 3. Lifecycle
 
 ```
   raise ─────────────► surface ─────────────► answer ─────────────► wake-back ────────► apply/close
-  agent creates a      doc card badges the    human replies on the  server nudges the   woken agent reads
-  kind:"question"      span "awaiting";       doc annotation (or     asker's seat on     the answer, applies
-  annotation on the    threads rail shows     picks an option) —     the linked thread;  it (edits the doc),
-  span; if blocking    the task thread as     awaiting → answered    dormant ⇒ R1        resolves the
-  & threadless, opens  waiting:human          & wakes the thread     respawns a fresh    question, continues
-  a task thread &                                                    session             or asks the next
-  declares blocked:                                                                       thing
-  human; winds down
+  agent creates a      doc badges the span    human answers on the  the answer is         woken worker
+  kind:"question"      "awaiting"; the        doc (reply, or picks  activity ADDRESSED    services the doc's
+  annotation; if       annotation sweep       an option) —          to the asker's seat   whole open queue,
+  blocking, takes a    lists the doc as       awaiting → answered   → wakes it; dormant   applies, resolves
+  doc SEAT @mentions   having a question                            ⇒ R1 respawns a       its own question,
+  & winds down         awaiting a human                             fresh worker          winds down when dry
 ```
 
 **1. Raise.** `canvas anno ask <doc> --anchor <span> --question "…" [--options "A|B|C"] [--blocking]`
-creates the question annotation authored by the session's sid. If `--blocking` and the session has no task
-thread, the server **opens one** (brief = the question, seat filled by the asker, `ev:"thread"` links
-annotation↔thread) and the asker posts a one-line pointer into it. The asker then declares work-intent
-`blocked:human` on the thread and **winds down** (ends its turn / `session/done`) — it does not sit live.
-The durable trace is the doc annotation (question + where) plus the thread (wake channel), exactly the two
-things a fresh session needs to continue.
+creates the question annotation authored by the session's sid. If `--blocking`, the asker **takes a seat on
+the doc at `mentions` level** (arming the wake for its answer — §2), declares itself waiting, and **winds
+down** (ends its turn / `session/done`) — no thread, no held process. The durable trace is just the doc
+annotation (question + where) and the doc seat (who to wake) — exactly what a fresh worker needs to continue.
 
 **2. Surface.** The doc card renders the question as a distinct affordance (not a plain comment) badged
 **awaiting-answer**, with its options if any. The **awaiting-an-answer sweep** (`canvas anno list`, no path)
-distinguishes an agent-raised *awaiting* question from a human comment and from an *answered-but-unapplied*
-one. On the board, the task thread shows `waiting:human` — the derived thread state already computes this
-from the `blocked:human` intent, so "an agent is waiting on my decision" appears in the threads rail's
-waiting-first section with **zero new machinery**. The human is pointed at the span from either surface.
+lists the doc as carrying a question *awaiting a human* — distinct from a human comment and from an
+*answered-but-unapplied* one — so "what's waiting on me" is one glance at the sweep. (The waiting signal now
+lives on the *doc*, where the question is, rather than on a thread marker; the sweep is the board-level
+roll-up, the annotation analogue of the threads rail's waiting-first section.)
 
 **3. Answer.** The human answers **where the question lives — on the doc**: a reply on the annotation, or,
-for a multiple-choice question, selecting an option (with optional elaboration). This is the natural place
-because it's where they're already reading, and it keeps the answer anchored. `canvas anno answer <doc>
-<id> --choice B --text "…"` is the CLI face; the card offers option buttons + a reply box in the popover.
-(The human *may* instead reply in the linked thread — a normal thread message the continuing agent reads
-via inbox — but that answer isn't anchored; the doc is the recommended path.)
+for a multiple-choice question, selecting an option (with optional elaboration). This is the natural place —
+it's where they're already reading, and it keeps the answer anchored. `canvas anno answer <doc> <id> --choice
+B --text "…"` is the CLI face; the card offers option buttons + a reply box in the popover.
 
-**4. Wake-back.** When an `answer` lands on an *awaiting, blocking* question, the server fires a **nudge to
-the linked thread's asker seat**. If a session still occupies the seat, it's nudged and pulls the answer.
-If the seat is **dormant** (the common case — the asker wound down), this is precisely the
-**respawn-on-message** hinge from `claude-tag-lessons.md` **R1**: the server reconstitutes a fresh session
-seeded from the thread history + the doc, which reads the answer (via the sweep / inbox) and continues. The
-nudge carries no answer text — the woken agent pulls the annotation, the one content home.
+**4. Wake-back.** An `answer` on a question is **activity addressed to the seat that asked it**, so it clears
+the `mentions` bar and wakes that seat. If a session still occupies it, it's nudged and pulls the answer; if
+the seat is **dormant** (the common case — the asker wound down), R1 reconstitutes a fresh worker seeded from
+the doc + its annotations. The wake carries no answer text — the woken worker pulls the annotation, the one
+content home. (A human-armed watcher at `all` level wakes the same way on any incoming comment — the
+human→agent direction; the two directions are the same mechanism at two levels.)
 
-**5. Apply & close.** The continuing agent applies the decision (edits the doc, and the surviving comments
-auto-reanchor per `doc-annotations.md` §4), then **resolves its own question** — resolution belongs to the
-asker here, mirroring the author-owns-resolution rule. It then finishes, or raises the next question the
-same way.
+**5. Apply & close.** The woken worker services the doc's **whole open queue** (§5 — not just the one
+question), applies each decision (editing the doc; surviving comments auto-reanchor per `doc-annotations.md`
+§4), **resolves the questions it asked** (resolution belongs to the asker, mirroring the author-owns-
+resolution rule), then **winds down when the queue is dry**. It does not stay resident waiting for the next
+comment — fresh activity re-arms the seat and spawns again.
 
 ## 4. Data model — small, additive extensions to the annotation ledger
 
@@ -123,7 +145,7 @@ surfaced. Additive, no migration.
 
 - **`create` gains** `kind:"note"|"question"` (default `"note"` — a plain comment, today's behavior),
   optional `options:[{label, description?}]` (a multiple-choice ask), and `blocking:true` (the asker is
-  waiting; drives the thread promotion + wake-back). Author is the session sid, as ever.
+  waiting; arms the ask-armed doc seat + wake-back). Author is the session sid, as ever.
 - **New `answer` event:** `{ev:"answer", id, by, choice?, text, ts}` — a distinguished reply that records
   the human's selection (`choice`, an option label) and/or free text. It appends to `replies` like a reply
   *and* marks the question answered. `by` is `"human"` or a sid (a peer may answer too).
@@ -131,24 +153,46 @@ surfaced. Additive, no migration.
   annotation is **`awaiting`** while unresolved with no `answer`, **`answered`** once an `answer` lands (and
   not yet resolved), **`resolved`** once the asker resolves it. The read surfaces this so the sweep and card
   can badge it; the wake-back triggers on the `awaiting → answered` transition of a `blocking` question.
-- **The thread link is the existing `ev:"thread"`** — no new op. Its meaning here: "this question's wake
-  channel is thread T." One task thread can back many questions (each its own annotation on its own span);
-  the thread is per-task, the anchor per-span.
 
-## 5. Blocking vs. ambient — proportional machinery
+**The doc-seat / watch record** (the new durable primitive, seat-shaped so it reuses `threads-as-cards.md`
+§5 machinery). A doc's watchers live on a per-doc marker beside its annotation ledger (`.canvas/annotations/`
+sibling, the `threads` marker convention): `{ role, level:"all"|"mentions"|"paused", state:"active"|"paused",
+by, createdAt, seat? }`. A human-armed watcher (the affordance) is one such record; an ask-armed watcher is a
+short-lived one the `--blocking` create writes and the `resolve` clears. The server's wake trigger reads this
+marker + the derived annotation state — *not* raw appends — so it only wakes on activity that (a) qualifies
+under a watcher's level and (b) isn't already being serviced (§5 single-flight). **Thread escalation stays the
+existing `ev:"thread"`** — no new op, and now the exception (a question that becomes real discussion), not the
+per-question default.
 
-Not every agent question should wake anyone. Two tiers, chosen by `--blocking`:
+## 5. Proportional machinery: the ask tier, and the per-doc worker
 
-- **Blocking** (`--blocking`): the agent is stuck until answered. Gets a thread + `blocked:human` +
-  wake-back. This is the review case (a design fork). Heavier, because a human's turn genuinely gates
+**The tier (chosen by `--blocking`)** decides whether a question wakes anyone:
+
+- **Blocking** (`--blocking`): the agent is stuck until answered. Arms an ask-armed doc seat (`mentions`) so
+  the answer wakes a continuation. This is the review case (a design fork) — a human's turn genuinely gates
   progress and the answer must reliably bring compute back.
 - **Ambient** (default for a question): "flagging this for later — no rush, I'm continuing." A pure patient
-  annotation, no thread, no wake. It shows in the sweep as an open question but nudges no one; whoever next
-  works the doc sees it. This is the cheap, card-frugal path for "I have a doubt but it doesn't block me."
+  annotation, no seat, no wake; it shows in the sweep as an open question but summons no one, and whoever
+  next works the doc (or the standing watcher, if one is armed) sees it. The cheap path for "a doubt that
+  doesn't block me."
 
-The tier is the asker's honest call about whether it's *waiting*, the same judgement the work-intent
-vocabulary already asks for — and it keeps thread cards proportional to genuine blocking decisions rather
-than one-per-doubt.
+The tier is the asker's honest call about whether it's *waiting* — the same judgement work-intent already
+asks for — and it keeps auto-spawns proportional to genuine blocking decisions, not one-per-doubt.
+
+**The per-doc worker (the efficiency dial the wake fires into).** A wake does not spawn one worker per
+comment. The unit of work is **the doc's open-annotation queue**, serviced by **one worker per doc at a
+time** (a single-flight claim on the doc). That worker **loops until the queue is dry** — re-reading after
+each pass, so a comment that lands mid-pass is caught — then winds down. So a burst of five comments is one
+worker, not five; a comment arriving after wind-down re-arms the seat and spawns a fresh one. Two rules keep
+this honest:
+
+- **Batch *within* a wake, don't stay resident *across* wakes.** One spawn drains the current queue and
+  exits; it does not linger waiting for future comments (that would re-introduce the idle-process-holding-a-
+  slot problem R1 exists to kill). Fresh spawn per wake event; loop-until-dry only spans a single burst.
+- **The dial is batching granularity**, if we ever want to turn it: per-comment (max parallelism, max cost)
+  ↔ **per-doc-until-dry** (the default — the doc is the natural context unit, and the sweep already reads the
+  whole set) ↔ per-board (one worker drains every doc). Per-doc is the sweet spot; the others are knobs, not
+  the norm.
 
 ## 6. Surfaces
 
@@ -156,22 +200,29 @@ than one-per-doubt.
 
 - `canvas anno ask <path> --question "…" [--anchor-exact "…" | --anchor-file f] [--options "A|B|C"]
   [--blocking] [--from <sid>]` — create a question. `--options` splits on `|`; anchor given as a quote
-  (like `create`). Prints the id, `orphaned` (a mistyped quote is an orphan at birth), and — if it promoted
-  to a thread — the thread id.
+  (like `create`). Prints the id and `orphaned` (a mistyped quote is an orphan at birth).
 - `canvas anno answer <path> <id> [--choice LABEL] [--text "…" | --stdin | --text-file f] [--by <who>]` —
   answer a question (option and/or prose; `--stdin`/`--text-file` for a long answer, no shell-escaping).
-- `canvas anno list` **grows question states**: the per-file listing marks each question `awaiting` /
-  `answered` / `resolved`; the board sweep counts `awaiting` (needs a human) and `answered` (needs the
-  agent to apply) separately from plain open comments — so "what's blocked on me" is one glance.
+- `canvas anno watch <path> [--role R] [--level all|mentions|paused] [--by <who>]` and
+  `canvas anno watch <path> --pause | --resume` — the CLI face of the "watch for comments" affordance: bind /
+  re-level / pause / resume a watcher on a doc.
+- `canvas anno list` **grows question + watch state**: the per-file listing marks each question `awaiting` /
+  `answered` / `resolved`; the board sweep counts `awaiting` (needs a human) and `answered` (needs an agent
+  to apply) separately from plain open comments, and shows which docs have an active watcher — so "what's
+  waiting on me" and "what's watched" are one glance.
 
 **Card UI** (host chrome, `NodeView.tsx` + `src/annotations.ts`, the annotation layer already there): a
 question paints distinctly from a comment (a "?" affordance on the highlight); the popover shows the
 question, option buttons (if any) + a reply box, and an **awaiting/answered** badge. The card's unresolved
-count already badges the card; questions awaiting a human get the loud treatment, matching the session
-status-band grammar.
+count already badges it; questions awaiting a human get the loud treatment, matching the session status-band
+grammar. The **doc card's right-click menu gains *Watch for comments*** (with the level choice and
+pause/resume), and a watched doc shows a small watcher chip (role + level + active/paused dot) — the seat
+roster, doc-sized.
 
-**Threads rail:** free. A blocking ask's task thread carries `blocked:human`, so it sorts into the
-waiting-for-human section of the rail (`threads-as-cards.md` §3) with no rail-specific work.
+**The waiting surface** is the annotation **sweep**, not the threads rail: since a blocking ask no longer
+mints a thread, "an agent is waiting on my decision" lives on the doc and rolls up in `canvas anno list` /
+the board's awaiting-questions view — the annotation analogue of the rail's waiting-first section. (A
+question that *escalates* to a thread does show in the rail, as before — that's the exception path.)
 
 ## 7. Multiple-choice: the durable, anchored replacement for `AskUserQuestion`
 
@@ -185,8 +236,9 @@ the text it changes, and is visible to the whole board. This is the feature that
 
 ## 8. Dependency & build order
 
-The **record + pull** half works on today's substrate; the **push** half (wake-back for a dormant asker)
-needs R1.
+The **record + pull** half works on today's substrate; the **push** half (a watch that auto-wakes a worker)
+rides one shared primitive — *the server spawning a session seeded from a durable record* — which R1 needs
+too. Build that once and both this and R1 land on it.
 
 1. **Question kind + answer op + derived state** (annotation ledger + read). Small, additive. *Yields:* an
    agent can raise an anchored, awaiting question; a human answers on the doc; the state is legible in the
@@ -196,13 +248,17 @@ needs R1.
 2. **CLI verbs** (`ask`, `answer`, sweep states) + the collab-brief norm ("for a real decision, ask on the
    doc, not the in-session block"). Small.
 3. **Card affordance** (question paint, option buttons, awaiting/answered badge). Medium, host chrome.
-4. **Thread promotion + nudge-on-reply** (blocking ask opens/links a task thread; an `answer` on a blocking
-   question nudges the seat). Medium — the thread link, seats, and nudge plumbing all exist; the new bit is
-   the trigger on the annotation-write path.
-5. **Full push wake-back = R1 (respawn-on-message for dormant seats).** Once R1 lands, step 4's nudge to a
-   dormant seat reconstitutes a fresh session from the thread + doc automatically — the async loop closes
-   with no human re-spawn. Until then, step 4 nudges only a still-live seat and the dormant case falls back
-   to pull (1). **This is the one hard dependency; everything before it is independently useful.**
+4. **Doc seats + notification levels** (the watch record beside the ledger; `watch`/`pause`/`resume` CLI +
+   the right-click affordance; the derived "who to wake" read). Medium, and the reusable core — it
+   generalizes `threads-as-cards.md` §5 seats off the thread onto any surface, so a thread's own wake policy
+   can adopt the same levels (the R2 refinement). No auto-spawn yet: a live occupant is nudged; a dormant
+   seat falls back to pull.
+5. **The server-spawn-from-record primitive + the wake trigger** (single-flight per doc, loop-until-dry
+   worker; the trigger reads the watch marker + derived annotation state, never raw appends). This is R1
+   *respawn-on-message* generalized to "activity on any watched surface" — **the one hard dependency**, and
+   the same code that closes R1's thread-seat loop. Once it lands, an answer (or any qualifying comment)
+   auto-reconstitutes a per-doc worker; until then, everything above degrades cleanly to pull. Everything
+   before step 5 is independently useful.
 
 ## 9. Worked example — the review's three forks, done this way
 
@@ -211,15 +267,16 @@ Instead of a 3-question in-session `ask` block, the reviewing session would have
 1. `canvas anno ask docs/claude-tag-lessons.md --anchor-exact "conditioning the fan-out on each member's
    work-intent" --question "Wake model for R2?" --options "Always-wake members|Keep tag-gating|Hybrid"
    --blocking` — one anchored question per fork, each on the span it concerns (the R2 paragraph, the pinning
-   non-rec, the PM/Coordinator naming). The first blocking ask promotes the threadless review into a task
-   thread; the rest attach to it.
-2. Declares `blocked:human`, winds down. The session card settles to waiting-for-human; the doc shows three
-   awaiting questions on three spans; the threads rail shows the review thread waiting.
-3. The human, reading the doc, clicks an option on each span (or `canvas anno answer …`). Each answer flips
-   the question to `answered` and nudges the review thread's seat.
-4. A fresh session reconstitutes (R1), reads the three answers off the doc, applies them (the R2 rewrite,
-   the new R-PIN, the rename), resolves the questions, commits — the same outcome as the real session, but
-   the decisions and their rationale now live on the doc, the board saw them pending, and no process hung.
+   non-rec, the PM/Coordinator naming). Each `--blocking` ask takes an ask-armed seat on the doc at
+   `mentions` level. No thread.
+2. Declares itself waiting, winds down. The session card settles to waiting-for-human; the doc shows three
+   awaiting questions on three spans; the board's awaiting-questions sweep lists the doc.
+3. The human, reading the doc, clicks an option on each span (or `canvas anno answer …`). Each answer is
+   addressed to the seat that asked it → flips the question to `answered` and wakes that seat.
+4. A per-doc worker reconstitutes (the shared spawn-from-record primitive / R1), services the doc's whole
+   queue — reads the three answers, applies them (the R2 rewrite, the new R-PIN, the rename), resolves the
+   questions, commits — then winds down when the queue is dry. Same outcome as the real session, but the
+   decisions and their rationale now live on the doc, the board saw them pending, and no process hung.
 
 The net: the *only* thing that happened in the ephemeral session was compute; every decision, its options,
 and its answer are durable, anchored, and public — which is the whole philosophy, finally true for the
