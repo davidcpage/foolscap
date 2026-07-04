@@ -39,7 +39,7 @@ export default {
 
     return html`
       <div class="file-head">
-        <span class="file-name">channels</span>
+        <span class="file-name">threads</span>
         ${refresh
           ? html`<button
               class="ses-refresh"
@@ -52,7 +52,7 @@ export default {
       </div>
       <div class="dir-body">
         ${!channels ? html`<div class="dir-empty">loading…</div>` : ""}
-        ${channels && count === 0 ? html`<div class="dir-empty">no channels yet</div>` : ""}
+        ${channels && count === 0 ? html`<div class="dir-empty">no threads yet</div>` : ""}
         ${(channels ?? []).map(
           (ch) => html`
             <div
@@ -60,7 +60,7 @@ export default {
               draggable="true"
               data-interactive="1"
               tabindex="0"
-              title="double-click or drag onto the canvas to open this channel"
+              title="double-click or drag onto the canvas to open this thread"
               @dragstart=${(e) => dragStart(e, ch)}
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
             >
