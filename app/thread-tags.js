@@ -1,4 +1,5 @@
-// Channel @-tag resolution (plain ESM, runs under node --test; imported by vite-fs-plugin.ts).
+// Thread @-tag resolution (plain ESM, runs under node --test; imported by vite-fs-plugin.ts). Né
+// channel-tags.js — renamed with the thread migration (threads-as-cards §8); the grammar is unchanged.
 //
 // A channel post can NAME members with `@<tag>`. A tag gates the WAKE (the content-free nudge), not the
 // content: every post is still logged for every member to read on their own cursor — naming someone only

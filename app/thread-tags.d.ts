@@ -1,5 +1,5 @@
-// Types for channel-tags.js (plain ESM, runs under node --test). Hand-written so vite-fs-plugin.ts can
-// import the resolver without allowJs. Keep in sync with the exports in channel-tags.js.
+// Types for thread-tags.js (plain ESM, runs under node --test). Hand-written so vite-fs-plugin.ts can
+// import the resolver without allowJs. Keep in sync with the exports in thread-tags.js.
 
 export type TagMembers = Array<string | { sid: string; name?: string | null }>;
 

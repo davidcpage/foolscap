@@ -12,7 +12,7 @@ import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./sessi
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
-import { resolveTags } from "./channel-tags.js";
+import { resolveTags } from "./thread-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";

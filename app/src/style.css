@@ -2156,8 +2156,10 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .edge-actions-label {
   color: #94a3b8;
 }
-/* ── channel card (agent-to-agent-messaging.md §9, reified) ──────────────────────────────── */
-.node.channel {
+/* ── thread card (threads-as-cards; né channel — agent-to-agent-messaging.md §9) ───────────
+   ThreadView renders `node thread` for BOTH type:"thread" and legacy type:"channel" nodes, so
+   only this selector exists — the .chan-* interior class names stay (cheap, private to the card). */
+.node.thread {
   border-left: 4px solid #c49bff;
 }
 .chan-title {

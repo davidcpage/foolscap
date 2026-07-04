@@ -10,7 +10,7 @@ import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
-import { matchTagSpans } from "../channel-tags.js";
+import { matchTagSpans } from "../thread-tags.js";
 import { intentGlyph } from "../work-intent.js";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
@@ -405,7 +405,7 @@ function ThreadView({
     })
     .sort((a, b) => Number(b.open) - Number(a.open));
   // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve and
-  // highlight against these entries — by sid OR role name, exactly the set the server (channel-tags.js) wakes.
+  // highlight against these entries — by sid OR role name, exactly the set the server (thread-tags.js) wakes.
   const openMembers = members.filter((mem) => mem.open);
   const openEntries = openMembers.map((mem) => ({ sid: mem.sid, name: mem.name }));
   // The readable handle to show for a message's `from` sid (a current member's role name, else short sid).
@@ -458,7 +458,7 @@ function ThreadView({
   };
 
   return (
-    <div ref={ref} data-node-id={id} className={`node channel c-${node.color}${selected ? " selected" : ""}`} style={box}>
+    <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
         <input
           className="chan-title"
@@ -571,7 +571,7 @@ function ThreadView({
 
 // The shortest unambiguous id-prefix to tag a member by (min 2 chars), e.g. `a9` when no other member
 // shares it — what the member pill drops into the post box so a human never types a full hash. Falls back
-// to the first 8-char segment if even that collides. Mirrors the server's prefix resolution (channel-tags.js).
+// to the first 8-char segment if even that collides. Mirrors the server's prefix resolution (thread-tags.js).
 function shortTag(sid: string, all: string[]): string {
   for (let len = 2; len < 8; len++) {
     const p = sid.slice(0, len).toLowerCase();
@@ -585,7 +585,7 @@ type TagEntry = { sid: string; name?: string | null };
 // What to drop into the post box when a member pill is clicked. Prefer the READABLE role handle (`@PM`) when
 // the member has a name and that role prefix is unambiguous among current members; disambiguate to the full
 // `Role.sid` handle on a role-name collision (two PMs); fall back to the shortest unambiguous sid prefix when
-// the member is unnamed. Every form resolves server-side (channel-tags.js matches sid OR name prefix).
+// the member is unnamed. Every form resolves server-side (thread-tags.js matches sid OR name prefix).
 function tagFor(mem: TagEntry, open: TagEntry[]): string {
   if (mem.name && mem.name.trim()) {
     const dot = mem.name.indexOf(".");
@@ -600,7 +600,7 @@ function tagFor(mem: TagEntry, open: TagEntry[]): string {
 
 // Render channel message text with @-tags highlighted. A token is highlighted only if it would actually
 // resolve — a keyword (@all/@human/…) or a prefix of a current member's sid OR role name — by delegating to
-// the SERVER's own matcher (channel-tags.js `matchTagSpans`), so the highlight set never drifts from who a
+// the SERVER's own matcher (thread-tags.js `matchTagSpans`), so the highlight set never drifts from who a
 // tag actually wakes. Highlight-in-place: the shown text equals the logged text. Returns React nodes.
 function renderTaggedText(text: string, entries: TagEntry[]): React.ReactNode {
   const spans = matchTagSpans(text, entries);

@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseTags, resolveTags, tagHit, matchTagSpans } from "../channel-tags.js";
+import { parseTags, resolveTags, tagHit, matchTagSpans } from "../thread-tags.js";
 
 const MEMBERS = ["a927e694-839d-4aea-b0a4-39353072a4e9", "83adfb9c-73ab-468b-9c4c-4bef636cf997"];
 

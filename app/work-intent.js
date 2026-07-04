@@ -8,7 +8,7 @@
 // (active/waiting/dormant), the rail's waiting-highlight, and slot reclamation on `done` all derive from it.
 //
 // Shared by the server (validation, the stored line) and the channel card (glyph/render), like
-// channel-tags.js — one module so the enum and its rendering can't drift apart.
+// thread-tags.js — one module so the enum and its rendering can't drift apart.
 
 /** The closed set of declarable intents — a session's stance toward its current work-unit. */
 export const WORK_INTENTS = ["working", "blocked:human", "blocked:peer", "done"];
