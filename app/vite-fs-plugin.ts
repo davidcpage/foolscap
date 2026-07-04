@@ -2098,6 +2098,22 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
 // ≤ one wake per idle/result boundary, and an ignored nudge isn't re-fired until NEW traffic arrives.
 const MAX_THREAD_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
 
+// The in-memory log for a thread, lazily seeded from the ledger on first touch. seedThreadLogs
+// (startBoardFeeds) covers a MOUNTED board at boot, but a board can also be merely re-REGISTERED from
+// boards.json with no tab ever mounting it — its endpoints resolve, its logs were never seeded. An
+// append that started from an empty map would mint seq 1 onto a ledger whose real tail may be hundreds
+// of messages on, corrupting order and every member's read cursor. Same tail trim as the boot seed.
+function threadLog(boardId: string, threadId: string): ThreadMsg[] {
+  let log = threadLogs.get(threadId);
+  if (!log) {
+    const repoPath = boards.get(boardId)?.repoPath;
+    log = repoPath ? readThreadLog(repoPath, threadId) : [];
+    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS);
+    threadLogs.set(threadId, log);
+  }
+  return log;
+}
+
 // Append to a channel's log, trim to the tail, republish its feed (the card's conversation view), and
 // PERSIST the message to the board's `.canvas/channels/` ledger so it survives a cold restart (the in-memory
 // `threadLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
@@ -2110,8 +2126,7 @@ function appendThreadMsg(
   text: string,
   extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
 ): ThreadMsg {
-  let log = threadLogs.get(threadId);
-  if (!log) threadLogs.set(threadId, (log = []));
+  const log = threadLog(boardId, threadId); // lazy-seeds from the ledger — never mint seq 1 onto a real tail
   const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
   const msg: ThreadMsg = { seq, ts: Date.now(), from, text, ...extra };
   log.push(msg);
@@ -2424,7 +2439,7 @@ async function handleSessionSpawn(
     pendingHistoryMode.set(historyKey(threadId, id), "future");
     const live = liveSessions.get(id);
     if (live) {
-      live.read[threadId] = seedCursor("future", threadLogs.get(threadId) ?? []);
+      live.read[threadId] = seedCursor("future", threadLog(boardId, threadId));
       persistSessionState(live);
     }
   }
@@ -3417,7 +3432,7 @@ function maybeAnnounceMembership(
     // full (the default) → the joiner's first inbox read replays the whole backlog; future → only new ones.
     const mode = pendingHistoryMode.get(historyKey(thread.id, sid)) ?? "full";
     pendingHistoryMode.delete(historyKey(thread.id, sid));
-    const log = threadLogs.get(thread.id) ?? [];
+    const log = threadLog(boardId, thread.id);
     const backlog =
       log.length && mode === "full"
         ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read${log.length > 60 ? "; for a long backlog window the tail with ?bytes=20000 or ?limit=40" : ""})`
@@ -3601,7 +3616,7 @@ async function handleThreadHistory(
   const sid = body.target;
   const live = liveSessions.get(sid);
   if (live && live.status !== "exited" && threadMemberSids(records, threadId).includes(sid)) {
-    live.read[threadId] = seedCursor(mode, threadLogs.get(threadId) ?? []);
+    live.read[threadId] = seedCursor(mode, threadLog(boardId, threadId));
     let notified = 0;
     if (mode === "full") {
       live.nudge = true; // the backlog is unread for them again — wake them to (re-)read it
@@ -3834,13 +3849,22 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
   if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
   const s = liveSessions.get(sid);
   if (!s) return sendJson(res, 404, { error: "no such live session" });
-  const records = boardSnapshotRecords(boardIdentity(s.repoPath).boardId);
+  const boardId = boardIdentity(s.repoPath).boardId;
+  const records = boardSnapshotRecords(boardId);
   type OutChan = { channel: string; title: string; messages: InboxMsg[]; truncated?: { omitted: number; hint: string } };
   const channels: OutChan[] = [];
   if (records) {
     for (const threadId of sessionThreads(records, sid)) {
-      const log = threadLogs.get(threadId) ?? [];
+      let log = threadLog(boardId, threadId);
       const since = s.read[threadId] ?? 0;
+      if (log.length && log[0]!.seq > since + 1) {
+        // The in-memory tail (MAX_THREAD_MSGS — a feed-republish bound, not a read cap) starts past this
+        // member's cursor: the older unread live only on disk. Serve THIS read from the full ledger
+        // instead of re-dropping content a memory bound already paid for (CLAUDE.md truncation rule —
+        // only the caller's own opt-in ?limit/?bytes window may cut, and it surfaces `truncated`).
+        const full = readThreadLog(s.repoPath, threadId);
+        if (full.length) log = full;
+      }
       const fresh = log.filter((mng) => mng.seq > since && !cardOnly(mng)); // ask-echoes / intent acts are card-only
       // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
       // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
