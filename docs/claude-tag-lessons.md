@@ -79,16 +79,28 @@ the durable substrate Tag rebuilds from — the thread ledger (`.canvas/threads/
 > from thread history + memory** — which keeps Tag's invariant that the thread (not the sandbox) is the
 > only durable substrate; the prior transcript is an *archive the fresh agent can retrieve on demand*,
 > not authoritative state that silently rides along. `--resume` of the seat's last sid stays available as
-> an **explicit escalation** (human- or agent-invoked) for when you genuinely want to continue the same
-> head; it is not the default, because resume replays the whole transcript and so costs more the longer
-> the session ran. This is the single highest-value borrow. It dissolves the cap-pressure problem: an
-> idle worker can be terminated freely because termination no longer *holds a live slot* — the only cost
-> moves to respawn, paid on demand. And it makes the **seat the thing you actually address**: today a
+> an **explicit, assumed-expensive escalation** (human- or agent-invoked) for when you genuinely want to
+> continue the same head — never the efficiency default, because it replays the whole transcript.
+>
+> **The idle lifecycle (decided).** A session is *not* killed the instant it goes idle. It is kept alive
+> for a short grace window (~5 minutes, a server-side idle timer) and only then exits. That window — not
+> `--resume` — is the cheap-continuity path the resume-vs-respawn debate was chasing: a follow-up within it
+> continues the **still-live** session with its context (and prompt cache) already warm, no reconstitution
+> at all; past it, the session exits, the seat goes dormant, and the next addressed message respawns fresh.
+> So the efficiency comes from *briefly keeping the real session alive*, which sidesteps the open empirical
+> (does process-exit evict the cache, does `--resume` reuse it) entirely. **The cap-pressure motivation was
+> overblown:** we have never approached `MAX_LIVE_SESSIONS=12`, and an idle session burns no tokens — the
+> cap is a self-imposed guard, not a real constraint, so there is no urgency to reap idle workers. R1's
+> real value is the keystone, not slot-reclamation: it makes the **seat the thing you address** — today a
 > seat is inert data (a role→sid row) once its occupant exits; under R1 addressing it brings a live agent
-> back, with sessions as interchangeable compute behind a durable seat. That is the keystone from
-> `agent-roles.md` §1 — *liveness ≠ identity* — made true in practice: you can address a seat whether or
-> not a process currently backs it. The sidecar and the seat re-fill machinery (`threads-as-cards.md` §5)
-> are the two halves already built; this is the hinge between them. The corollary norm, adopted from Tag
+> back, sessions being interchangeable compute behind a durable seat. That is `agent-roles.md` §1's
+> *liveness ≠ identity* made true in practice. The sidecar and the seat re-fill machinery
+> (`threads-as-cards.md` §5) are the two halves already built; this is the hinge between them.
+>
+> **The principle underneath** — the invariant the keep-alive / respawn / explicit-resume choice all serve:
+> *never rely on session context that isn't in the thread history, memory, or docs.* Whatever lives only in
+> a live process is disposable, which is exactly what lets those three be interchangeable implementations
+> picked on cost alone. The corollary norm, adopted from Tag
 > verbatim: **before going idle an agent must leave anything it needs in the thread (or its memory)** —
 > state that lived only in the exited process is legitimately lost.
 
@@ -246,15 +258,17 @@ deprioritised wiki idea.
 > settled decisions a home that isn't a rotting wiki (curated *norms and facts*, not documentation of
 > moving work — the distinction `threads-as-cards.md` §1 drew) and isn't locked inside one role's head.
 > **Per-thread memory is *not* needed**: thread-specific facts live as explicit thread comments (a pinned
-> post if they're load-bearing), and the closure write-up covers the rest. **Role memory folds into the
-> role file, not a second store**: rather than today's split (human-authored `role.md` + agent-writable
-> `autoMemoryDirectory`), let agents edit the role file directly under the same convention (structured,
-> observable, prefer-append) — one home per fact. The open wrinkle is scope: a role's *charter* (stance,
-> knowledge, how it works) is plausibly shared across repos, while accumulated role *memory* is often
-> repo-specific. Resolve it by scoping — role **identity** global (the versioned role file), role
-> **notes** place-scoped (an agent-editable notes file under the board's `.canvas/`) — which keeps "one
-> home per fact" *within each scope* while honoring that charter and repo-notes have different lifetimes.
-> (Decide this boundary before R4 lands; it fixes where board-memory ends and role-notes begin.)
+> post if they're load-bearing), and the closure write-up covers the rest. **Role memory hangs off the
+> one `memory.md`, not a second store** (decided): keep `role.md` as the role's shared **charter** — its
+> stance, knowledge, and how it works, versioned with the role and portable across repos — and put
+> accumulated role *memory* in ordinary markdown files **linked from the board's `memory.md`**, pulled into
+> context only when relevant. This reuses the memory index's existing lazy-loading habit (a `memory.md` that
+> links out to per-topic markdown files, loaded on demand) rather than inventing a board-scoped role-notes
+> store — which would just be *another place to look up*, the very thing we're trying to avoid. So there is
+> exactly **one memory home per board** (`memory.md`, the index), the role's identity stays global on
+> `role.md`, and role-specific facts are linked leaves under that one index — "one home per fact" without a
+> second lookup location. This also settles the earlier charter-vs-notes scope wrinkle (identity global on
+> `role.md`, notes place-scoped as linked memories) without a parallel notes file to keep in sync.
 
 ---
 
