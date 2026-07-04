@@ -1005,11 +1005,11 @@ async function handleRolesCreate(req: IncomingMessage, res: ServerResponse, repo
   }
 }
 
-// ── channels-list feed (the channels browser card's live push) ──────────────────────────────────
-// The channels-list mirror of startSessionsFeed: watch `.canvas/channels/` and PING the `channels:<boardId>`
-// feed on any marker add/change (a channel gaining its first message, or a title/activity update); the client
-// re-pulls /api/channels once per ping (content.ts). A bare ping, not the list — handleThreads stays the one
-// place the list is built. mkdir first so chokidar has a directory to watch even before any channel has been
+// ── threads-list feed (the threads browser card's live push) ─────────────────────────────────────
+// The threads-list mirror of startSessionsFeed: watch `.canvas/threads/` and PING the `threads:<boardId>`
+// feed on any marker add/change (a thread gaining its first message, or a title/activity update); the client
+// re-pulls /api/threads once per ping (content.ts). A bare ping, not the list — handleThreads stays the one
+// place the list is built. mkdir first so chokidar has a directory to watch even before any thread has been
 // persisted (a fresh board). Not pinned on fsState — boardFeedsStarted stops a reload from stacking a second.
 function startThreadsFeed(boardId: string, repoPath: string): void {
   const dir = canvasThreadsDir(repoPath);

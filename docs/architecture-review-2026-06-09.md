@@ -28,9 +28,15 @@ the legacy fallback (`core/test/persist.test.ts`).
 diffs — an approximation under non-linear history. Fine while version is only a local optimistic
 token; revisit if version ever travels between peers.
 
-## 2. OPEN — content bytes are in the log (the spike shortcut that can't survive)
+## 2. FIXED (verified 2026-07-04) — content bytes are in the log (the spike shortcut that can't survive)
 
-app funnels whole file contents through `setText`, so every external file save lands full
+**Resolution:** file-card content no longer rides `setText` into the log/snapshot — it travels the
+off-log reactive signals (`app/src/content.ts`), and the durable snapshot carries records only
+(verified: a 30-record live board's `snapshot.json` is ~6.6KB with zero file text). The
+fileRef/SHA design below stays the reference for if content entries ever need to be *in* the log
+(provenance-grade content history); nothing currently requires it.
+
+Original finding: app funnelled whole file contents through `setText`, so every external file save landed full
 bytes in the channel-3 event's diff and in every snapshot. As a spike shortcut (zero engine
 changes) this was right; as a design it violates the note's invariant #2 (content lives in
 files/git, never overlapping bytes). **First change for the real version:** a content entry

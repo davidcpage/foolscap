@@ -18,6 +18,19 @@ import type { EventStore, SnapshotStore, IntentEvent, PersistedSnapshot } from "
 const RETRY_START_MS = 250;
 const RETRY_MAX_MS = 5000;
 
+/** A request the server judged wrong (4xx) — retrying re-sends the same mistake, so it throws
+ *  instead and surfaces via Persistence.onError. Typed so requestRetry's own catch can tell it from
+ *  a network error without string-matching its message. */
+export class PersistClientError extends Error {
+  constructor(
+    url: string,
+    readonly status: number,
+  ) {
+    super(`${url} → ${status}`);
+    this.name = "PersistClientError";
+  }
+}
+
 function persistUrl(boardId: string, sub = ""): string {
   return `/api/board/persist${sub}?board=${encodeURIComponent(boardId)}`;
 }
@@ -28,10 +41,11 @@ async function requestRetry(url: string, init: RequestInit): Promise<Response> {
     try {
       const res = await fetch(url, init);
       if (res.ok) return res;
-      // 4xx is OUR bug (bad board id / malformed body) — retrying re-sends the same mistake forever.
-      if (res.status >= 400 && res.status < 500) throw new Error(`${url} → ${res.status}`);
+      // 4xx is OUR bug (bad board id / malformed body / a stale snapshot save) — retrying re-sends
+      // the same mistake forever.
+      if (res.status >= 400 && res.status < 500) throw new PersistClientError(url, res.status);
     } catch (e) {
-      if (e instanceof Error && e.message.includes(" → 4")) throw e;
+      if (e instanceof PersistClientError) throw e;
       // network error / 5xx: the restart window — fall through and retry
     }
     await new Promise((r) => setTimeout(r, delay));
