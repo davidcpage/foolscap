@@ -47,7 +47,7 @@ dep) can run in parallel sessions.
 
 | # | Item | Implements | Depends | Effort | Status |
 |---|---|---|---|---|---|
-| W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `378a6fb` |
+| W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `9e6988a` |
 | W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | TODO |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | TODO |
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO |
@@ -68,7 +68,7 @@ dep) can run in parallel sessions.
 - **Done when:** an agent raises an anchored question (with options); a human answers on the doc or via CLI;
   the sweep distinguishes awaiting/answered; a fresh session can sweep `answered` questions and apply them.
   Continuation is **pull** (no auto-wake yet) — this alone retires the in-session ask-block anti-pattern.
-- **Shipped** (commit `378a6fb`): `create` gains `kind:"note"|"question"` + `options` + `blocking`;
+- **Shipped** (commit `9e6988a`): `create` gains `kind:"note"|"question"` + `options` + `blocking`;
   new `answer` event (`{ev,id,by,choice?,text}`) rides `replies` and marks the question answered; derived
   `questionState` = awaiting/answered/resolved, read-time only (`annotations.js` + `.d.ts`). The
   `/api/annotations` write handler takes the `answer` op (400 on a note) and the question create fields; the
