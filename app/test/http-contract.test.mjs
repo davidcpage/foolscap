@@ -128,6 +128,78 @@ test("session verbs on an unknown session: input 409/404-class, inbox 404", { sk
   assert.ok([404, 409].includes(input.status)); // not-live is an error, never a silent 200
 });
 
+test("annotations: create → reply → resolve → re-anchor round-trip, orphan derived at read", { skip: !up && "no dev server on 5173" }, async () => {
+  // A clean ledger per run (the scratch dir persists across runs on purpose — stable boardId).
+  fs.rmSync(path.join(scratch, ".canvas", "annotations"), { recursive: true, force: true });
+  const doc = `docs/notes-${runTag}.md`;
+  fs.mkdirSync(path.join(scratch, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(scratch, doc), "# Notes\n\nThe quick brown fox jumps over the lazy dog.\n");
+  const post = (body) => fetch(`${HOST}/api/annotations?board=${boardId}`, j(body));
+  const state = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=${encodeURIComponent(doc)}`)).json());
+
+  // Create: server-side write, no live tab anywhere near this board.
+  const created = await post({
+    path: doc,
+    op: "create",
+    anchor: { exact: "quick brown fox", prefix: "The ", suffix: " jumps", offset: 13 },
+    text: "why a fox?",
+    author: "human",
+  });
+  assert.equal(created.status, 200);
+  const { id, orphaned } = await created.json();
+  assert.match(id, /^anno:/);
+  assert.equal(orphaned, false, "a fresh anchor against the live file resolves");
+
+  // Reply lands on the fold; the read derives a resolved range against the current bytes.
+  assert.equal((await post({ path: doc, op: "reply", id, from: "s1", text: "narrative color" })).status, 200);
+  let s = await state();
+  assert.equal(s.annotations.length, 1);
+  assert.equal(s.annotations[0].replies[0].text, "narrative color");
+  assert.equal(s.annotations[0].orphaned, false);
+  assert.equal(s.annotations[0].range.start, 13);
+
+  // Resolve closes it; the no-path sweep counts opens per file.
+  assert.equal((await post({ path: doc, op: "resolve", id, by: "human" })).status, 200);
+  const sweep = await (await fetch(`${HOST}/api/annotations?board=${boardId}`)).json();
+  const mine = sweep.files.find((f) => f.path === doc);
+  assert.deepEqual(mine, { path: doc, total: 1, open: 0, orphaned: 0 });
+
+  // Edit the quote away: reopened, the annotation reads ORPHANED (quote intact — the payload), never dropped.
+  assert.equal((await post({ path: doc, op: "reopen", id, by: "human" })).status, 200);
+  fs.writeFileSync(path.join(scratch, doc), "# Notes\n\nEntirely rewritten body.\n");
+  s = await state();
+  assert.equal(s.annotations[0].orphaned, true);
+  assert.equal(s.annotations[0].range, null);
+  assert.equal(s.annotations[0].anchor.exact, "quick brown fox");
+
+  // Re-anchor onto the new text (the §4 agent maintenance move) and it resolves again.
+  assert.equal(
+    (await post({ path: doc, op: "reanchor", id, anchor: { exact: "Entirely rewritten" }, by: "s1" })).status,
+    200,
+  );
+  s = await state();
+  assert.equal(s.annotations[0].orphaned, false);
+});
+
+test("annotations: the status codes are the API — 400 bad op/fields, 404 blocked path / unknown id", { skip: !up && "no dev server on 5173" }, async () => {
+  const doc = `docs/notes-${runTag}.md`;
+  const post = (body) => fetch(`${HOST}/api/annotations?board=${boardId}`, j(body));
+  assert.equal((await post({ op: "create" })).status, 400); // no path
+  assert.equal((await post({ path: doc, op: "sideways", id: "anno:x" })).status, 404); // unknown id checked first…
+  assert.equal((await post({ path: doc, op: "create", anchor: { exact: "x" }, text: "q" })).status, 400); // …author missing
+  // A blocked path (no text ext / internal) 404s like the file read — never confirms it exists.
+  const blocked = await post({
+    path: ".env", op: "create", anchor: { exact: "x" }, text: "q", author: "human",
+  });
+  assert.equal(blocked.status, 404);
+  // Ops against an id nobody created: 404, and reply field validation is 400 on a known id.
+  assert.equal((await post({ path: doc, op: "reply", id: "anno:ghost", from: "s1", text: "hi" })).status, 404);
+  // GET of a never-annotated file is an empty list, not an error.
+  const empty = await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=never%2Fwas.md`)).json();
+  assert.deepEqual(empty.annotations, []);
+});
+
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {
   const res = await fetch(`${HOST}/api/board/persist?board=${boardId}`, { method: "DELETE" });
   assert.equal(res.status, 200);

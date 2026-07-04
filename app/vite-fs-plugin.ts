@@ -15,6 +15,8 @@ import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChann
 import { resolveTags } from "./thread-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
+import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
+import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, readAnnotationLog, type AnnotationEvent } from "./annotations.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
@@ -582,6 +584,145 @@ async function handleFileWrite(
     return sendJson(res, 500, { error: String(err) });
   }
   sendJson(res, 200, { path: rel, ok: true });
+}
+
+// ── doc annotations (docs/doc-annotations.md; build-order step 1) ───────────────────────────────
+// Standoff highlight-and-comment on file-backed cards: the annotated file's bytes never change;
+// comments are quote-anchored records in the board repo's `.canvas/annotations/` ledger
+// (annotations.js), anchored by TextQuoteSelector and resolved by anchors.js. READS derive
+// `orphaned` per annotation against the file's CURRENT bytes (derived at read time, never stored —
+// the thread-state principle); WRITES are server-side appends, so commenting/replying needs no live
+// tab (an agent can answer annotations on a board nobody has open). Appends land under
+// `.canvas/annotations/`, which the root watcher already forwards (isInternalPath lets `.canvas/`
+// content through), so a viewing card gets its invalidation ride-along for free — no new feed.
+
+// The annotated file's content, behind the SAME gates as the file read (handleFile): inside the
+// root, not internal, a known text extension — so an annotation op can never probe a path the
+// listing wouldn't show. The MAX_BYTES head-truncation is shared with the card's read on purpose:
+// anchors resolve against exactly what a card can display, and an anchor beyond the preview cap
+// reads as orphaned rather than pointing at text nobody can see.
+function readAnnotatedSource(root: string, rel: string): string | null {
+  const abs = safeResolve(root, rel);
+  const allowed = !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
+  return allowed ? (readText(abs!)?.content ?? null) : null;
+}
+
+// GET /api/annotations?board=<id>&path=<path> → one file's folded annotations, each with `orphaned`
+// and its resolved source `range` (null when orphaned). No ledger → { annotations: [] }, 200 — "no
+// comments" isn't an error. Omitting `path` lists every annotated file with open/orphan counts —
+// the sweep surface ("what's awaiting an answer", doc §7).
+function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: string, rel: string | null): void {
+  if (!rel) {
+    const files = listAnnotatedPaths(repoPath)
+      .map((p) => {
+        const annos = foldAnnotations(readAnnotationLog(repoPath, p));
+        const src = readAnnotatedSource(root, p);
+        const open = annos.filter((a) => !a.resolved);
+        return {
+          path: p,
+          total: annos.length,
+          open: open.length,
+          orphaned: open.filter((a) => src == null || !resolveAnchor(src, a.anchor)).length,
+        };
+      })
+      .filter((f) => f.total > 0);
+    return sendJson(res, 200, { files });
+  }
+  const annos = foldAnnotations(readAnnotationLog(repoPath, rel));
+  const src = readAnnotatedSource(root, rel); // a deleted/blocked file ⇒ every anchor orphans (quotes intact — the payload)
+  const annotations = annos.map((a) => {
+    const range = src == null ? null : resolveAnchor(src, a.anchor);
+    return { ...a, orphaned: !range, range };
+  });
+  sendJson(res, 200, { path: rel, annotations });
+}
+
+// POST /api/annotations?board=<id> { path, op, … } → append one §5 event. Ops and their fields:
+//   create   { path, anchor:{exact, prefix?, suffix?, offset?}, text, author } → { ok, id, ts, orphaned }
+//   reply    { path, id, from, text }
+//   resolve  { path, id, by }        reopen { path, id, by }
+//   reanchor { path, id, anchor, by }
+//   thread   { path, id, thread }
+// 400 on a bad op / missing field; 404 on a blocked/absent target file (create — never confirms a
+// blocked path, like the file read) or an unknown annotation id (every other op); 500 when the
+// append fails (the ledger is a comment's ONLY home — unlike a thread message there is no live
+// in-memory source, so a lost write must be loud). `author`/`from`/`by` is "human" or a session
+// sid — the thread-message attribution convention. A create whose anchor doesn't resolve is still
+// accepted but reported `orphaned:true`, so a curl'd selector with a typo'd quote isn't born a
+// silent orphan.
+async function handleAnnotationsWrite(
+  req: IncomingMessage,
+  res: ServerResponse,
+  root: string,
+  repoPath: string,
+): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+  } catch {
+    return sendJson(res, 400, { error: "bad json" });
+  }
+  const str = (k: string): string | null =>
+    typeof body[k] === "string" && (body[k] as string).length > 0 ? (body[k] as string) : null;
+  const anchorOf = (v: unknown): QuoteAnchor | null => {
+    if (!v || typeof v !== "object") return null;
+    const a = v as Record<string, unknown>;
+    if (typeof a.exact !== "string" || a.exact.length === 0) return null;
+    return {
+      exact: a.exact,
+      ...(typeof a.prefix === "string" ? { prefix: a.prefix } : {}),
+      ...(typeof a.suffix === "string" ? { suffix: a.suffix } : {}),
+      ...(typeof a.offset === "number" ? { offset: a.offset } : {}),
+    };
+  };
+  const rel = str("path");
+  const op = str("op");
+  if (!rel) return sendJson(res, 400, { error: "path required" });
+  const ts = Date.now();
+
+  if (op === "create") {
+    const anchor = anchorOf(body.anchor);
+    const text = str("text");
+    const author = str("author");
+    if (!anchor || !text || !author)
+      return sendJson(res, 400, { error: "create needs anchor.exact, text, author" });
+    const src = readAnnotatedSource(root, rel);
+    if (src == null) return sendJson(res, 404, { error: "not found" });
+    const id = "anno:" + crypto.randomUUID();
+    const ev: AnnotationEvent = { ev: "create", id, path: rel, anchor, text, author, ts };
+    if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
+    return sendJson(res, 200, { ok: true, id, ts, orphaned: !resolveAnchor(src, anchor) });
+  }
+
+  // Every other op targets an existing annotation on an existing ledger.
+  const id = str("id");
+  if (!id) return sendJson(res, 400, { error: "id required" });
+  if (!foldAnnotations(readAnnotationLog(repoPath, rel)).some((a) => a.id === id))
+    return sendJson(res, 404, { error: "unknown annotation" });
+  let ev: AnnotationEvent;
+  if (op === "reply") {
+    const from = str("from");
+    const text = str("text");
+    if (!from || !text) return sendJson(res, 400, { error: "reply needs from, text" });
+    ev = { ev: "reply", id, from, text, ts };
+  } else if (op === "resolve" || op === "reopen") {
+    const by = str("by");
+    if (!by) return sendJson(res, 400, { error: `${op} needs by` });
+    ev = { ev: op, id, by, ts };
+  } else if (op === "reanchor") {
+    const anchor = anchorOf(body.anchor);
+    const by = str("by");
+    if (!anchor || !by) return sendJson(res, 400, { error: "reanchor needs anchor.exact, by" });
+    ev = { ev: "reanchor", id, anchor, by, ts };
+  } else if (op === "thread") {
+    const thread = str("thread");
+    if (!thread) return sendJson(res, 400, { error: "thread needs thread" });
+    ev = { ev: "thread", id, thread, ts };
+  } else {
+    return sendJson(res, 400, { error: "unknown op" });
+  }
+  if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
+  sendJson(res, 200, { ok: true, id, ts });
 }
 
 // Shared confinement gate for IMAGE asset paths — the same envelope as the text read/write (inside the
@@ -4122,6 +4263,16 @@ export function fsApi(): Plugin {
         // file/ls/watch endpoints take `?root=<id>` to pick which (defaulting to canonical); `/api/roots`
         // lists them (the file tree drops one tree card per root, coloured by id).
         if (url.pathname === "/api/roots") return sendJson(res, 200, { roots: boardRoots(boardId) });
+
+        // Doc annotations (docs/doc-annotations.md): quote-anchored standoff comments on this board's
+        // files. Deliberately CANONICAL-root only (no ?root=): the ledger is keyed by repo-relative
+        // path, and a worktree's copy of a doc is the same doc — annotations shouldn't fork per tree.
+        if (url.pathname === "/api/annotations") {
+          const canonical = rootDir(boardId, null);
+          if (!canonical) return sendJson(res, 400, { error: "unknown root" });
+          if (req.method === "POST") return void handleAnnotationsWrite(req, res, canonical, board.repoPath);
+          return handleAnnotationsRead(res, canonical, board.repoPath, url.searchParams.get("path"));
+        }
 
         // `root` is resolved to a confined dir from the board's KNOWN roots (never a caller path), exactly
         // as the single `board.root` was — an unknown rootId is rejected rather than served.
