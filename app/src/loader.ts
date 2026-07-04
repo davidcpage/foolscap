@@ -11,6 +11,7 @@ import {
 } from "./lib";
 import { fileKind } from "./fileTypes";
 import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce } from "./content";
+import { annotationsWatchEvent } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
 
@@ -1046,6 +1047,11 @@ async function onWatchEvent(
   // add/unlink changes the PARENT folder's children, so re-pull that one cached listing (no-op unless
   // the folder was actually loaded). A `change` only touches file content, not membership, so skip it.
   if (msg.type !== "change") refreshListing(root, parentDir(msg.path));
+
+  // Doc annotations ride the same watch (before the card gate — a ledger file under
+  // `.canvas/annotations/` never has a card of its own): a ledger append or an edit to an annotated
+  // file re-pulls that path's annotation projection (no-op unless some card has loaded it).
+  annotationsWatchEvent(root, msg.path);
 
   const id = fileNodeId(root, msg.path);
   if (!m.editor.store.get<"node">(id)) return; // no card for this (root, path) → no card-level effect

@@ -12,6 +12,17 @@ import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { intentGlyph } from "../work-intent.js";
+import { makeAnchor, resolveAnchor } from "../anchors.js";
+import {
+  annotationsSignal,
+  anchorRangeIn,
+  caretPointAt,
+  postAnnotationOp,
+  setCardHighlights,
+  textOffsetOf,
+  type AnnotationInfo,
+} from "./annotations";
+import { fileContentSignal } from "./content";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -700,6 +711,326 @@ function formatSince(ms: number): string {
   return `${sec}s`;
 }
 
+// ── doc annotations (docs/doc-annotations.md §6, build-order step 2) ─────────────────────────────
+// Highlight-and-comment on file cards, as HOST CHROME over the template's interior — the layer needs
+// imperative DOM work over lit's rendered output (Ranges, the CSS Custom Highlight registry, caret
+// hit-testing), which the template contract deliberately can't express, and it must never mutate the
+// interior lit owns. So: an absolutely-positioned React sibling of .tpl-interior, all data through
+// src/annotations.ts. Selection→selector minting is the one rendered-DOM → source mapping (doc §6,
+// "the fiddly bit"), done once at creation: the selection's flat text offsets in [data-text] give a
+// rendered-text quote, which resolveAnchor re-locates in the SOURCE (fuzzy absorbs the markdown
+// syntax delta) so the stored anchor is source-true; if even fuzzy can't place it, the rendered
+// quote is stored as-is and the server honestly reports it orphaned. Painting is the reverse, every
+// render: each open anchor re-resolves against the CURRENT rendered text (annotations.anchorRangeIn).
+
+// A client point → card-local coordinates (the card is CSS-transformed by the camera; the popover is
+// positioned in the card's own pixel space, so divide the on-screen delta by the effective scale).
+function cardLocalPoint(host: HTMLElement, clientX: number, clientY: number): { x: number; y: number } {
+  const r = host.getBoundingClientRect();
+  const scale = host.offsetWidth > 0 ? r.width / host.offsetWidth : 1;
+  return { x: (clientX - r.left) / scale, y: (clientY - r.top) / scale };
+}
+
+const ANNO_POP_W = 260; // popover width (style.css .anno-pop) — used to clamp inside the card
+
+function AnnotationsLayer({
+  id,
+  path,
+  hostRef,
+}: {
+  id: Id<"node">;
+  path: string;
+  hostRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const annos = useSignal(useMemo(() => annotationsSignal(path), [path]));
+  const source = useSignal(useMemo(() => fileContentSignal("repo", path), [path]));
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [popAt, setPopAt] = useState<{ x: number; y: number }>({ x: 12, y: 28 });
+  // The floating "comment" affordance a fresh selection earns, carrying the selection's flat offsets.
+  const [fab, setFab] = useState<{ x: number; y: number; start: number; end: number } | null>(null);
+  // The create popover (fab clicked): same offsets, plus the draft text.
+  const [draft, setDraft] = useState<{ x: number; y: number; start: number; end: number } | null>(null);
+  const [draftText, setDraftText] = useState("");
+  const [replyText, setReplyText] = useState("");
+  const [showResolved, setShowResolved] = useState(false);
+  // What the last paint actually placed, for click hit-testing (range → annotation id).
+  const painted = useRef<{ id: string; range: Range }[]>([]);
+
+  const list = useMemo(() => annos ?? [], [annos]);
+  const openAnnos = useMemo(() => list.filter((a) => !a.resolved), [list]);
+  const orphans = useMemo(() => openAnnos.filter((a) => a.orphaned), [openAnnos]);
+  const current = openId ? (list.find((a) => a.id === openId) ?? null) : null;
+
+  // PAINT: resolve every visible anchor against the rendered text and publish the ranges. Re-runs on
+  // data/toggle changes, and on any interior re-render (lit re-builds the prose DOM on a content
+  // change, stranding the old Ranges) via a MutationObserver scoped to the template's interior —
+  // never to this layer's own DOM, so popover typing doesn't churn paints. rAF-coalesced.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    let raf = 0;
+    const paint = () => {
+      raf = 0;
+      const el = host.querySelector<HTMLElement>("[data-text]");
+      const entries: { id: string; range: Range; resolved: boolean }[] = [];
+      if (el) {
+        for (const a of list) {
+          if (a.orphaned || (a.resolved && !showResolved)) continue;
+          const range = anchorRangeIn(el, a.anchor);
+          if (range) entries.push({ id: a.id, range, resolved: a.resolved });
+        }
+      }
+      painted.current = entries;
+      setCardHighlights(id, {
+        open: entries.filter((e) => !e.resolved && e.id !== openId).map((e) => e.range),
+        resolved: entries.filter((e) => e.resolved && e.id !== openId).map((e) => e.range),
+        active: entries.filter((e) => e.id === openId).map((e) => e.range),
+      });
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(paint);
+    };
+    schedule();
+    const interior = host.querySelector(".tpl-interior");
+    const mo = interior ? new MutationObserver(schedule) : null;
+    if (interior && mo) mo.observe(interior, { childList: true, subtree: true, characterData: true });
+    return () => {
+      mo?.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+      painted.current = [];
+      setCardHighlights(id, null);
+    };
+  }, [hostRef, id, list, openId, showResolved, source]);
+
+  // CLICK a highlight → open its exchange; click prose that isn't one → close whatever is open.
+  // Native listener (the canvas seam is native too); layer chrome handles its own clicks and is
+  // excluded, as is a click that just finished a text selection.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const onClick = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Element) || t.closest(".anno-layer")) return;
+      if (!t.closest("[data-text]")) return;
+      const sel = document.getSelection();
+      if (sel && !sel.isCollapsed) return;
+      const caret = caretPointAt(e.clientX, e.clientY);
+      const hit = caret
+        ? painted.current.find((en) => {
+            try {
+              return en.range.isPointInRange(caret.node, caret.offset);
+            } catch {
+              return false;
+            }
+          })
+        : null;
+      if (hit) {
+        setOpenId(hit.id);
+        setPopAt(cardLocalPoint(host, e.clientX, e.clientY));
+        setFab(null);
+        setDraft(null);
+      } else {
+        setOpenId(null);
+      }
+    };
+    host.addEventListener("click", onClick);
+    return () => host.removeEventListener("click", onClick);
+  }, [hostRef]);
+
+  // SELECTION → the comment affordance. On pointerup (a beat later, so the selection is settled),
+  // if the selection lives inside this card's [data-text], place the 💬 button at its end; any
+  // collapse clears it. Selection is only possible once the card is selected (the [data-text]
+  // pointerdown containment in TemplateCard), so this can't fire from a passing drag.
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const onUp = (e: PointerEvent) => {
+      if (e.target instanceof Element && e.target.closest(".anno-layer")) return;
+      setTimeout(() => {
+        const el = host.querySelector<HTMLElement>("[data-text]");
+        const sel = document.getSelection();
+        if (!el || !sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        const range = sel.getRangeAt(0);
+        if (!el.contains(range.startContainer) || !el.contains(range.endContainer)) return;
+        const start = textOffsetOf(el, range.startContainer, range.startOffset);
+        const end = textOffsetOf(el, range.endContainer, range.endOffset);
+        if (end <= start) return;
+        const rect = range.getBoundingClientRect();
+        const p = cardLocalPoint(host, rect.right, rect.bottom);
+        setFab({ x: p.x, y: p.y, start, end });
+      }, 0);
+    };
+    const onSelChange = () => {
+      const sel = document.getSelection();
+      if (!sel || sel.isCollapsed) setFab(null);
+    };
+    host.addEventListener("pointerup", onUp);
+    document.addEventListener("selectionchange", onSelChange);
+    return () => {
+      host.removeEventListener("pointerup", onUp);
+      document.removeEventListener("selectionchange", onSelChange);
+    };
+  }, [hostRef]);
+
+  // Clamp a card-local anchor point so the popover stays inside the card box (.node clips overflow).
+  const clampPop = (p: { x: number; y: number }): { x: number; y: number } => {
+    const host = hostRef.current;
+    const w = host?.offsetWidth ?? 0;
+    const h = host?.offsetHeight ?? 0;
+    return {
+      x: Math.max(8, Math.min(p.x, Math.max(8, w - ANNO_POP_W - 8))),
+      y: Math.max(24, Math.min(p.y, Math.max(24, h - 120))),
+    };
+  };
+
+  // CREATE: mint the selector from the drafted selection. The rendered-text quote re-resolves
+  // against the SOURCE so the stored anchor is source-true (see the section comment); if the source
+  // isn't loaded or even fuzzy can't place the quote, store the rendered quote — the server will
+  // report it orphaned rather than lose the comment.
+  const submitDraft = async () => {
+    const host = hostRef.current;
+    const el = host?.querySelector<HTMLElement>("[data-text]");
+    const text = draftText.trim();
+    if (!el || !draft || !text) return;
+    const rendered = el.textContent ?? "";
+    const q = {
+      exact: rendered.slice(draft.start, draft.end),
+      prefix: rendered.slice(Math.max(0, draft.start - 32), draft.start),
+      suffix: rendered.slice(draft.end, draft.end + 32),
+    };
+    const hit = source != null ? resolveAnchor(source, q) : null;
+    const anchor = source != null && hit ? makeAnchor(source, hit.start, hit.end) : q;
+    const r = await postAnnotationOp(path, { op: "create", anchor, text, author: "human" });
+    if (r.ok) {
+      setDraft(null);
+      setDraftText("");
+      document.getSelection()?.removeAllRanges();
+    }
+  };
+
+  const sendReply = async () => {
+    const text = replyText.trim();
+    if (!current || !text) return;
+    const r = await postAnnotationOp(path, { op: "reply", id: current.id, from: "human", text });
+    if (r.ok) setReplyText("");
+  };
+
+  const toggleResolve = async (a: AnnotationInfo) => {
+    await postAnnotationOp(path, { op: a.resolved ? "reopen" : "resolve", id: a.id, by: "human" });
+    if (!a.resolved) setOpenId(null); // resolving dismisses the exchange; reopen keeps it up
+  };
+
+  const openFromStrip = (a: AnnotationInfo) => {
+    setOpenId(a.id);
+    setPopAt({ x: 12, y: 28 });
+    setFab(null);
+    setDraft(null);
+  };
+
+  const pop = clampPop(popAt);
+  return (
+    <div className="anno-layer" data-interactive>
+      {list.length > 0 && (
+        <button
+          className={`anno-badge${openAnnos.length === 0 ? " quiet" : ""}`}
+          title={`${openAnnos.length} open comment${openAnnos.length === 1 ? "" : "s"} (${list.length} total) — click to ${showResolved ? "hide" : "show"} resolved`}
+          onClick={() => setShowResolved((v) => !v)}
+        >
+          💬 {openAnnos.length}
+        </button>
+      )}
+      {orphans.length > 0 && (
+        <div className="anno-strip" title="comments whose quoted text no longer matches this file">
+          {orphans.map((a) => (
+            <div key={a.id} className="anno-orphan" onClick={() => openFromStrip(a)}>
+              <span className="anno-orphan-mark">⚠</span>
+              <span className="anno-orphan-quote">“{a.anchor.exact}”</span>
+              <span className="anno-orphan-text">{a.text}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {fab && !draft && (
+        <button
+          className="anno-fab"
+          style={{ left: Math.max(8, Math.min(fab.x, (hostRef.current?.offsetWidth ?? 200) - 40)), top: fab.y + 4 }}
+          title="comment on the selection"
+          onClick={() => {
+            setDraft(fab);
+            setDraftText("");
+            setFab(null);
+            setOpenId(null);
+          }}
+        >
+          💬
+        </button>
+      )}
+      {draft && (
+        <div className="anno-pop" style={{ left: clampPop(draft).x, top: clampPop(draft).y }}>
+          <textarea
+            className="anno-input"
+            placeholder="comment on the selection…"
+            autoFocus
+            value={draftText}
+            onChange={(e) => setDraftText(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                void submitDraft();
+              }
+              if (e.key === "Escape") setDraft(null);
+            }}
+          />
+          <div className="anno-pop-row">
+            <button className="anno-btn" onClick={() => void submitDraft()}>Comment</button>
+            <button className="anno-btn quiet" onClick={() => setDraft(null)}>Cancel</button>
+          </div>
+        </div>
+      )}
+      {current && (
+        <div className="anno-pop" style={{ left: pop.x, top: pop.y }}>
+          <div className="anno-pop-head">
+            <span className="anno-quote">“{current.anchor.exact}”</span>
+            <button className="anno-x" title="close" onClick={() => setOpenId(null)}>✕</button>
+          </div>
+          <div className="anno-msg">
+            <span className="anno-from">{current.author}</span>
+            <span className="anno-time">{formatEventTime(current.ts)}</span>
+            <div className="anno-text">{current.text}</div>
+          </div>
+          {current.replies.map((rep, i) => (
+            <div key={i} className="anno-msg reply">
+              <span className="anno-from">{rep.from === "human" ? "human" : rep.from.slice(0, 8)}</span>
+              <span className="anno-time">{formatEventTime(rep.ts)}</span>
+              <div className="anno-text">{rep.text}</div>
+            </div>
+          ))}
+          {current.thread && <div className="anno-escalated">discussion moved to a thread</div>}
+          <div className="anno-pop-row">
+            <input
+              className="anno-input"
+              placeholder="reply…"
+              value={replyText}
+              onChange={(e) => setReplyText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void sendReply();
+                if (e.key === "Escape") setOpenId(null);
+              }}
+            />
+            <button
+              className="anno-btn"
+              title={current.resolved ? "reopen this comment" : "mark this comment resolved"}
+              onClick={() => void toggleResolve(current)}
+            >
+              {current.resolved ? "Reopen" : "✓ Resolve"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The template host: React renders the BOX (position/size off the layout signal, selection ring,
 // type class for folder-level theming) and hands the template one container div for the interior.
 // The split is the disjoint-state invariant at the component level — a drag updates this
@@ -824,7 +1155,9 @@ function TemplateCard({
     };
   }, []);
   // lit owns .tpl-interior's children and React never reconciles past it (display:contents keeps
-  // them direct flex items of the box).
+  // them direct flex items of the box). The annotations layer is a React SIBLING of the interior
+  // (host chrome, like the selection ring): file cards on the canonical root only — annotations are
+  // keyed by repo-relative path and deliberately don't fork per worktree (the server refuses ?root=).
   return (
     <div
       ref={hostRef}
@@ -833,6 +1166,9 @@ function TemplateCard({
       style={box}
     >
       <div className="tpl-interior" ref={ref} />
+      {template.type === "file" && node && id.startsWith("node:repo:") && (
+        <AnnotationsLayer id={id} path={node.title} hostRef={hostRef} />
+      )}
     </div>
   );
 }
