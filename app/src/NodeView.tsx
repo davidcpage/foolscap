@@ -815,15 +815,23 @@ function AnnotationsLayer({
       const sel = document.getSelection();
       if (sel && !sel.isCollapsed) return;
       const caret = caretPointAt(e.clientX, e.clientY);
-      const hit = caret
-        ? painted.current.find((en) => {
+      // Highlights can NEST (a comment on a phrase inside a comment on the whole sentence), so of all
+      // ranges containing the point, open the SMALLEST — first-match made an inner comment unreachable,
+      // which read as "my comment disappeared" (it was swallowed by the outer highlight).
+      const containing = caret
+        ? painted.current.filter((en) => {
             try {
               return en.range.isPointInRange(caret.node, caret.offset);
             } catch {
               return false;
             }
           })
-        : null;
+        : [];
+      const hit = containing.reduce<{ id: string; range: Range } | null>(
+        (best, en) =>
+          !best || en.range.toString().length < best.range.toString().length ? en : best,
+        null,
+      );
       if (hit) {
         setOpenId(hit.id);
         setPopAt(cardLocalPoint(host, e.clientX, e.clientY));

@@ -269,12 +269,17 @@ server-side and tab-free.
 
 **THE REVISION RULE (the convention that makes standoff anchors work here):** before editing an
 annotated file — and `docs/*.md` especially — read its open annotations first (the per-file GET; cheap,
-usually empty). As part of the same change: **reply** to what you can answer, **resolve** what your edit
-settles, and **re-anchor** any surviving open comment whose quoted text your edit moved (`op:"reanchor"`
-with a fresh selector minted against the new source). A comment you strand shows as a loud orphan strip
-on the card — never silently dropped, but a debt someone must pay. "Answer my comments on `<file>`"
-means: read them, reply per annotation, resolve what's settled, and where the right answer is "fix the
-doc", fix the doc (then re-anchor).
+usually empty). As part of the same change: **reply** to what you can answer, and **re-anchor** any
+surviving open comment whose quoted text your edit moved (`op:"reanchor"` with a fresh selector minted
+against the new source). A comment you strand shows as a loud orphan strip on the card — never silently
+dropped, but a debt someone must pay. "Answer my comments on `<file>`" means: reply per annotation, and
+where the right answer is "fix the doc", fix the doc (then re-anchor).
+
+**RESOLUTION BELONGS TO THE AUTHOR.** Resolve your own comments freely; **never reply-and-resolve
+someone else's question** — resolved comments are hidden from the card by default, so resolving buries
+your reply before the asker has read it (learned the hard way: the human watched their comment vanish
+and nearly missed the answer). Reply, leave it open, and let the author resolve once satisfied; resolve
+another author's comment only when they explicitly say so.
 
 Gotchas:
 - `create` 404s on paths the file endpoints wouldn't serve (blocked/internal/non-text) and needs the file

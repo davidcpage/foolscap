@@ -23,10 +23,17 @@ const INLINE_RE =
 // A plain-text run between (or around) inline matches may itself span soft line breaks — a paragraph's
 // lines arrive joined by "\n" (see paraInline). Emit those breaks as <br> HERE, on the *text* runs, so
 // the inline matcher above still sees the whole joined paragraph and a span like **…\n…** stays intact.
+// The "\n" character is kept AS TEXT alongside the <br>: visually it collapses (normal white-space eats
+// a newline before a forced break), but it keeps the DOM's textContent aligned with the source's line
+// structure — dropping it FUSED the words either side of a wrap ("of\nthe" → "ofthe"), which skewed any
+// text-offset consumer (the annotation layer's selection→anchor minting was built on those offsets).
 function pushText(out, str) {
   const parts = str.split("\n");
   for (let k = 0; k < parts.length; k++) {
-    if (k) out.push(html`<br />`);
+    if (k) {
+      out.push("\n");
+      out.push(html`<br />`);
+    }
     if (parts[k]) out.push(parts[k]);
   }
 }
