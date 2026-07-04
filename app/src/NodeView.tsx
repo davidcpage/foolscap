@@ -45,19 +45,9 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
 
   // World box positions in PAGE space (inside `.page`'s pan/zoom transform). A floating card fills its
   // FloatingFrame, which carries the screen-pixel position; the card itself just stretches to it.
-  // The peek-lens vars are inert (scale 1, offset 0) except while `z` is held (style.css / peek.ts):
-  // the hovered card magnifies via --peek-hover-scale, and every OTHER card slides outward via
-  // --peek-dx/dy (the insertion field — the canvas parts around the pop; set imperatively by peek.ts
-  // on hover change). Folded into this one transform so lens, displacement and position never fight;
-  // the displacement translate sits before the scale so it's never magnified along with the card.
   const box: React.CSSProperties = screen
     ? { position: "absolute", inset: 0, zIndex: layout.z }
-    : {
-        transform: `translate(${layout.x}px, ${layout.y}px) translate(var(--peek-dx, 0px), var(--peek-dy, 0px)) scale(var(--peek-hover-scale, 1))`,
-        width: layout.w,
-        height: layout.h,
-        zIndex: layout.z,
-      };
+    : { transform: `translate(${layout.x}px, ${layout.y}px)`, width: layout.w, height: layout.h, zIndex: layout.z };
 
   // Runtime-loaded card types (card-types-as-data.md §7) take precedence over the hardcoded views
   // below: if card-types/{type}/ defines a template, the host renders the box (SAME layout

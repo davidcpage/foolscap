@@ -90,35 +90,14 @@ body {
      that's megabytes of transcript DOM, a main-thread stall that froze the canvas mid-pan. If off-screen
      cost ever needs cutting, virtualize interiors; don't re-add the blanket hint. */
 }
-/* ── The peek lens (peek.ts) ─────────────────────────────────────────────────
-   While z is held the canvas carries .peeking, and hovering a card magnifies it in place — the
-   watchOS-style answer to "everything is too small to aim at from the overview". --peek-scale is set
-   by peek.ts per hovered card from the live zoom AND the card's size (toward readable, capped to a
-   viewport fraction so a large card pops gently instead of covering the board);
-   it rides the node's own inline transform (NodeView `box`) so lens and position never fight, and
-   scales about the CURSOR's spot on the card (a per-pop transform-origin peek.ts stamps on the host)
-   so the point being aimed at never moves when the pop triggers. The transition lives on a separate
-   .peek-anim class held briefly past release so the pop shrinks smoothly — it must never be
-   unconditional on .node (a blanket transform transition would lag every card drag). The z-index
-   !important out-ranks the inline stacking zIndex so the pop always reads above its neighbours. */
-.canvas.peek-anim .node {
-  /* easeInOutCubic: a near-zero initial slope means the pop SWELLS into being — the gradual start is
-     the user's warning, where a fast-start curve read as a sudden lurch. */
-  transition: transform 380ms cubic-bezier(0.65, 0, 0.35, 1);
-}
+/* ── The peek preview (peek.ts) ──────────────────────────────────────────────
+   While z is held the canvas carries .peeking; settling on a card flies the CAMERA most of the way
+   to the dive, so the preview is the real render — no DOM transforms, nothing for the selection
+   overlay or the wires to disagree with. (A family of transform-based lenses lived here once — hover
+   pop, insertion-field parting, a focus+context scale model — all retired for the camera; peek.ts
+   has the history.) The only styling left is a hover highlight so the aimed card reads. */
 .canvas.peeking .node:hover {
-  --peek-hover-scale: var(--peek-scale, 3);
-  z-index: 100000 !important;
-  box-shadow: 0 4px 14px #00000026, 0 18px 48px #00000033;
-}
-/* The selection overlay (corner handles / multi-select box) is drawn in page space from the layout
-   RECORDS — the lens transforms are ephemeral DOM state it can't see, so during a peek it would sit
-   detached from its displaced card. Hide it for the peek and the shrink tail (.peek-anim outlives
-   .peeking by exactly that tail); the card's own .selected ring rides the node transform and keeps
-   showing the selection. Editing handles have no meaning mid-overview anyway. */
-.canvas.peek-anim .selection-box,
-.canvas.peek-anim .resize-handle {
-  display: none;
+  box-shadow: 0 4px 14px #00000026, 0 12px 32px #00000029;
 }
 
 .node.file {
