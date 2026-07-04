@@ -262,19 +262,35 @@ Prefer the **`scripts/canvas anno`** CLI (allow-listed wrapper) over raw curl fo
 `anno list [path]` (board sweep, or one file's comments one line each), `anno reply <path> <id>` (text via
 arg / `--stdin` / `--text-file` — a long multi-paragraph reply never has to survive shell-escaping),
 `anno batch <path> replies.json` (author many replies once as a JSON data file — `[{id,text}]` or
-`{id:text}` — instead of an ad-hoc `urllib` script), `anno resolve`/`reopen <path> <id>`. Pass `--from`/
-`--by <your-sid>` to attribute (default `"human"`). Raw endpoints below for the rare op the CLI omits.
+`{id:text}` — instead of an ad-hoc `urllib` script), `anno resolve`/`reopen <path> <id>`,
+`anno ask <path> --question "…" --anchor-exact "…" [--options "A|B|C"] [--blocking]` (raise an anchored
+question — below), `anno answer <path> <id> [--choice L] [--text "…"]`. Pass `--from`/`--by <your-sid>` to
+attribute (default `"human"`). Raw endpoints below for the rare op the CLI omits.
 
 - **Sweep** ("what's awaiting an answer"): `GET /api/annotations?board=<id>` → `{files:[{path, total,
-  open, orphaned}]}` (read-only; does not reanchor). **Per file:** `…&path=<path>` → `{annotations:[{id,
-  anchor, text, author, ts, resolved, replies, thread?, orphaned, range}]}` — `orphaned`/`range` are
-  derived at read time against the file's current bytes, never stored. The per-file read also
-  **auto-reanchors** drifted comments (see the revision rule).
-- **Write:** `POST /api/annotations?board=<id>` `{path, op, …}` — `create {anchor, text, author}` (returns
-  `orphaned` immediately: check it — a mistyped `exact` is an orphan at birth), `reply {id, from, text}`,
-  `resolve`/`reopen {id, by}`, `reanchor {id, anchor, by}` (manual reanchor is now only for re-attaching a
-  *true orphan* — the routine case is automatic), `thread {id, thread}`. Attribution (`author`/`from`/`by`)
-  is `"human"` or a session sid, the thread convention.
+  open, orphaned, awaiting, answered}]}` (read-only; does not reanchor). `awaiting` = questions needing a
+  human, `answered` = questions needing an agent to apply. **Per file:** `…&path=<path>` →
+  `{annotations:[{id, anchor, text, author, ts, kind, options?, blocking?, resolved, replies, thread?,
+  orphaned, range, state?}]}` — `orphaned`/`range`/`state` are derived at read time against the file's
+  current bytes, never stored (`state` is `awaiting`/`answered`/`resolved` for a `kind:"question"`). The
+  per-file read also **auto-reanchors** drifted comments (see the revision rule).
+- **Write:** `POST /api/annotations?board=<id>` `{path, op, …}` — `create {anchor, text, author,
+  kind?, options?, blocking?}` (returns `orphaned` immediately: check it — a mistyped `exact` is an orphan
+  at birth), `reply {id, from, text}`, `answer {id, by, choice?, text?}` (a decision on a `kind:"question"`;
+  400 on a note), `resolve`/`reopen {id, by}`, `reanchor {id, anchor, by}` (manual reanchor is now only for
+  re-attaching a *true orphan* — the routine case is automatic), `thread {id, thread}`. Attribution
+  (`author`/`from`/`by`) is `"human"` or a session sid, the thread convention.
+
+**ASK ON THE DOC, NOT IN-SESSION (`docs/anchored-async-ask.md`).** When an agent hits a real decision it
+can't make alone — a design fork, a choice the human must own — it must **not** reach for the in-session
+`AskUserQuestion` block (ephemeral, board-invisible, and it pins the process open waiting). Instead raise an
+**anchored question** on the span it concerns: `create`/`canvas anno ask` with `kind:"question"`, optional
+multiple-choice `options`, and `--blocking` (the asker is waiting). The question and its answer then live on
+the doc forever, next to what they concern; the board sees the decision pending (it rolls up in the sweep's
+`awaiting` count); and a fresh session applies the answer later. The human answers where the question lives
+(`answer` op / `canvas anno answer`, an option label and/or prose), flipping it `awaiting → answered`.
+Continuation is **pull** for now (W1) — a fresh session sweeps `answered` questions and applies them; the
+auto-wake-back is W5. Reserve the in-session block for throwaway confirmations, never a decision of weight.
 
 **THE REVISION RULE (the convention that makes standoff anchors work here):** before editing an
 annotated file — and `docs/*.md` especially — read its open annotations first (`scripts/canvas anno list

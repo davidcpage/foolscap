@@ -46,6 +46,12 @@ canvas — session/coordination verbs over the agent bus
         flip resolved state. Resolve your OWN comments; leave someone else's open for them (the author
         owns resolution). NOTE: no reanchor verb — the server auto-re-anchors on read/write; a comment
         your edit MOVED fixes itself, and only a true orphan (quote gone) needs a fresh anchor via the API.
+  scripts/canvas anno ask <PATH> --question "…" [--anchor-exact "…" | --anchor-file F] [--options "A|B|C"] [--blocking] [--from ID]
+        raise an ANCHORED QUESTION on a doc span (docs/anchored-async-ask.md) — the durable, anchored
+        replacement for the in-session AskUserQuestion block. Answered async, where the question lives.
+        --options are multiple-choice labels (split on |); --blocking marks you as waiting. Prints id + orphaned.
+  scripts/canvas anno answer <PATH> <ID> [--choice LABEL] [--text "…" | --stdin | --text-file F] [--by ID]
+        answer a question (an option label and/or prose); flips it awaiting → answered.
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
@@ -82,25 +88,37 @@ anno_list() {
 import json, sys
 path, allf = sys.argv[1], bool(sys.argv[2])
 d = json.loads(sys.argv[3])
-if not path:  # the board sweep
+if not path:  # the board sweep — questions awaiting a HUMAN float to the top (docs/anchored-async-ask.md §6)
     files = d.get("files", [])
     if not files: print("no annotations on this board"); sys.exit()
-    for f in sorted(files, key=lambda f: (-f["orphaned"], -f["open"], f["path"])):
-        print(f"{f['open']:>3} open  {f['orphaned']:>2} orphan  {f['total']:>3} total   {f['path']}")
+    for f in sorted(files, key=lambda f: (-f.get("awaiting", 0), -f["orphaned"], -f["open"], f["path"])):
+        extra = ""
+        if f.get("awaiting"): extra += f"  {f['awaiting']} awaiting"
+        if f.get("answered"): extra += f"  {f['answered']} answered"
+        print(f"{f['open']:>3} open  {f['orphaned']:>2} orphan  {f['total']:>3} total   {f['path']}{extra}")
     sys.exit()
 ann = d.get("annotations", [])
 op = [a for a in ann if not a["resolved"]]
 orph = [a for a in op if a["orphaned"]]
-print(f"{path} — {len(op)} open, {len(orph)} orphaned (of {len(ann)} total)")
+nq = sum(1 for a in ann if a.get("kind") == "question")
+head = f"{path} — {len(op)} open, {len(orph)} orphaned"
+if nq: head += f", {nq} question(s)"
+print(head + f" (of {len(ann)} total)")
 for a in ann:
     if a["resolved"] and not allf: continue
-    st = "done  " if a["resolved"] else ("ORPHAN" if a["orphaned"] else "open  ")
+    if a["resolved"]:            st = "done  "
+    elif a["orphaned"]:          st = "ORPHAN"
+    elif a.get("kind") == "question": st = "Q-answ" if a.get("state") == "answered" else "Q-wait"
+    else:                        st = "open  "
     q = (a["anchor"].get("exact", "") or "").replace("\n", " ")
     if len(q) > 52: q = q[:51] + "…"
+    opts = a.get("options") or []
+    if opts: q += "  {" + "|".join(o.get("label", "") for o in opts) + "}"
     reps = a.get("replies", [])
     tail = ""
     if reps:
         r = reps[-1]; t = r["text"].replace("\n", " ")
+        if r.get("choice"): t = (f"[{r['choice']}] " + t).strip()
         if len(t) > 46: t = t[:45] + "…"
         tail = f"   last[{r['from'][:8]}]: {t}"
     print(f"  {st}  {a['id']}  {a['author'][:8]:8}  \"{q}\"  ({len(reps)} repl){tail}")
@@ -157,6 +175,69 @@ print(f"replied {ok}, failed {fail}")
 sys.exit(1 if fail else 0)
 PY
 }
+# Raise an anchored QUESTION (docs/anchored-async-ask.md) — a create with kind:"question". The anchor is
+# a quote (like a plain create): --anchor-exact "…" or --anchor-file F (a long quote from a file, no
+# shell-escaping); optional --anchor-prefix/--anchor-suffix disambiguate a repeated quote. --options are
+# multiple-choice labels split on |; --blocking marks the asker as waiting (W5 will wake it on the answer).
+anno_ask() {
+  local from="human" question="" exact="" afile="" prefix="" suffix="" options="" blocking="" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) from="${2:-}"; shift 2 ;; --question) question="${2:-}"; shift 2 ;;
+    --anchor-exact) exact="${2:-}"; shift 2 ;; --anchor-file) afile="${2:-}"; shift 2 ;;
+    --anchor-prefix) prefix="${2:-}"; shift 2 ;; --anchor-suffix) suffix="${2:-}"; shift 2 ;;
+    --options) options="${2:-}"; shift 2 ;; --blocking) blocking=1; shift ;;
+    --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno ask: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}"
+  if [ -z "$path" ]; then
+    echo "usage: canvas anno ask <path> --question \"…\" [--anchor-exact \"…\" | --anchor-file F] [--options \"A|B|C\"] [--blocking] [--from ID]" >&2; exit 2; fi
+  [ -n "$afile" ] && exact="$(cat "$afile")"
+  if [ -z "$question" ] || [ -z "$exact" ]; then
+    echo "anno ask: --question and --anchor-exact (or --anchor-file) are required" >&2; exit 2; fi
+  local body; body=$(python3 - "$path" "$from" "$question" "$exact" "$prefix" "$suffix" "$options" "$blocking" <<'PY'
+import json, sys
+path, frm, q, exact, prefix, suffix, opts, blocking = sys.argv[1:9]
+anchor = {"exact": exact}
+if prefix: anchor["prefix"] = prefix
+if suffix: anchor["suffix"] = suffix
+o = {"op": "create", "path": path, "author": frm, "kind": "question", "text": q, "anchor": anchor}
+if opts: o["options"] = [{"label": s} for s in opts.split("|") if s]
+if blocking: o["blocking"] = True
+print(json.dumps(o))
+PY
+)
+  post "$(ANNO_URL)" "$body"; echo
+}
+# Answer a question (docs/anchored-async-ask.md §4): an option label (--choice) and/or prose (--text /
+# --stdin / --text-file — a long answer never has to survive shell-escaping). Flips awaiting → answered.
+anno_answer() {
+  local by="human" choice="" tflag="" stdin="" tfile="" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --by) by="${2:-}"; shift 2 ;; --choice) choice="${2:-}"; shift 2 ;;
+    --text) tflag="${2:-}"; shift 2 ;; --stdin) stdin=1; shift ;; --text-file) tfile="${2:-}"; shift 2 ;;
+    --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno answer: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}" id="${pos[1]:-}"
+  if [ -z "$path" ] || [ -z "$id" ]; then
+    echo "usage: canvas anno answer <path> <id> [--choice LABEL] [--text \"…\" | --stdin | --text-file F] [--by ID]" >&2; exit 2; fi
+  local text; text="$(anno_read_text "$tflag" "$stdin" "$tfile")"
+  if [ -z "$choice" ] && [ -z "$text" ]; then
+    echo "anno answer: pass --choice and/or answer text (--text / --stdin / --text-file)" >&2; exit 2; fi
+  local body; body=$(python3 - "$path" "$id" "$by" "$choice" "$text" <<'PY'
+import json, sys
+path, id, by, choice, text = sys.argv[1:6]
+o = {"op": "answer", "path": path, "id": id, "by": by}
+if choice: o["choice"] = choice
+if text: o["text"] = text
+print(json.dumps(o))
+PY
+)
+  post "$(ANNO_URL)" "$body"; echo
+}
 anno_setstate() { # $1 = resolve|reopen
   local op="$1"; shift
   local by="human" pos=()
@@ -175,9 +256,11 @@ anno() {
     list) anno_list "$@" ;;
     reply) anno_reply "$@" ;;
     batch) anno_batch "$@" ;;
+    ask) anno_ask "$@" ;;
+    answer) anno_answer "$@" ;;
     resolve|reopen) anno_setstate "$sub" "$@" ;;
-    ""|-h|--help|help) echo "canvas anno list|reply|batch|resolve|reopen — see 'canvas' for details" >&2 ;;
-    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|resolve|reopen)" >&2; exit 2 ;;
+    ""|-h|--help|help) echo "canvas anno list|reply|batch|ask|answer|resolve|reopen — see 'canvas' for details" >&2 ;;
+    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|ask|answer|resolve|reopen)" >&2; exit 2 ;;
   esac
 }
 

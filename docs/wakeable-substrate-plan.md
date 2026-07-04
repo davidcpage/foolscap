@@ -47,7 +47,7 @@ dep) can run in parallel sessions.
 
 | # | Item | Implements | Depends | Effort | Status |
 |---|---|---|---|---|---|
-| W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | TODO |
+| W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `378a6fb` |
 | W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | TODO |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | TODO |
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO |
@@ -68,6 +68,17 @@ dep) can run in parallel sessions.
 - **Done when:** an agent raises an anchored question (with options); a human answers on the doc or via CLI;
   the sweep distinguishes awaiting/answered; a fresh session can sweep `answered` questions and apply them.
   Continuation is **pull** (no auto-wake yet) — this alone retires the in-session ask-block anti-pattern.
+- **Shipped** (commit `378a6fb`): `create` gains `kind:"note"|"question"` + `options` + `blocking`;
+  new `answer` event (`{ev,id,by,choice?,text}`) rides `replies` and marks the question answered; derived
+  `questionState` = awaiting/answered/resolved, read-time only (`annotations.js` + `.d.ts`). The
+  `/api/annotations` write handler takes the `answer` op (400 on a note) and the question create fields; the
+  read adds per-question `state` and the sweep adds `awaiting`/`answered` counts. `scripts/canvas anno ask`
+  / `answer` verbs; `anno list` shows Q-wait/Q-answ + option labels per file and awaiting/answered in the
+  sweep (awaiting floats to the top). Norm added to the collab brief + `CLAUDE.md`: *for a real decision,
+  ask on the doc, not the in-session block.* Tests: `annotations.test.mjs` (fold + state) +
+  `http-contract.test.mjs` (live question round-trip). **W2 note:** the read already emits `kind`,
+  `options`, `blocking`, `answer`, and `state` per annotation — the card affordance is a pure render over
+  that; `answer` events carry an optional `choice` on their `replies` entry.
 
 ### W2 — anchored-async-ask card affordance
 - Question paints distinctly from a comment (a "?" on the highlight); popover shows the question, option

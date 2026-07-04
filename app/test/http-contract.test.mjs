@@ -163,7 +163,7 @@ test("annotations: create → reply → resolve → re-anchor round-trip, orphan
   assert.equal((await post({ path: doc, op: "resolve", id, by: "human" })).status, 200);
   const sweep = await (await fetch(`${HOST}/api/annotations?board=${boardId}`)).json();
   const mine = sweep.files.find((f) => f.path === doc);
-  assert.deepEqual(mine, { path: doc, total: 1, open: 0, orphaned: 0 });
+  assert.deepEqual(mine, { path: doc, total: 1, open: 0, orphaned: 0, awaiting: 0, answered: 0 });
 
   // Edit the quote away: reopened, the annotation reads ORPHANED (quote intact — the payload), never dropped.
   assert.equal((await post({ path: doc, op: "reopen", id, by: "human" })).status, 200);
@@ -198,6 +198,67 @@ test("annotations: the status codes are the API — 400 bad op/fields, 404 block
   // GET of a never-annotated file is an empty list, not an error.
   const empty = await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=never%2Fwas.md`)).json();
   assert.deepEqual(empty.annotations, []);
+});
+
+test("annotations: anchored async-ask — question create → answer → awaiting/answered sweep (W1)", { skip: !up && "no dev server on 5173" }, async () => {
+  const doc = `docs/ask-${runTag}.md`;
+  fs.mkdirSync(path.join(scratch, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(scratch, doc), "# Ask\n\nThe wake model for R2 is undecided here.\n");
+  const post = (body) => fetch(`${HOST}/api/annotations?board=${boardId}`, j(body));
+  const state = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=${encodeURIComponent(doc)}`)).json());
+  const sweepFor = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}`)).json()).files.find((f) => f.path === doc);
+
+  // Raise a blocking, multiple-choice question anchored to the undecided span.
+  const created = await post({
+    path: doc,
+    op: "create",
+    kind: "question",
+    anchor: { exact: "wake model for R2", prefix: "The ", suffix: " is" },
+    text: "Which wake model?",
+    author: "sess-asker",
+    options: ["Always-wake", { label: "Tag-gated", description: "only @-mentions" }],
+    blocking: true,
+  });
+  assert.equal(created.status, 200);
+  const cj = await created.json();
+  assert.equal(cj.kind, "question");
+  assert.equal(cj.state, "awaiting", "a fresh question is born awaiting");
+  const id = cj.id;
+
+  // The read badges it a question awaiting a human, with its options and blocking flag.
+  let s = await state();
+  assert.equal(s.annotations[0].kind, "question");
+  assert.equal(s.annotations[0].state, "awaiting");
+  assert.equal(s.annotations[0].blocking, true);
+  assert.deepEqual(s.annotations[0].options.map((o) => o.label), ["Always-wake", "Tag-gated"]);
+  // The sweep counts it as awaiting a human, not just an open comment.
+  assert.equal((await sweepFor()).awaiting, 1);
+  assert.equal((await sweepFor()).answered, 0);
+
+  // Answering a note-shaped comment is a category error; a question needs by + (choice|text).
+  assert.equal((await post({ path: doc, op: "answer", id })).status, 400); // no by
+  assert.equal((await post({ path: doc, op: "answer", id, by: "human" })).status, 400); // no choice/text
+
+  // Human answers with an option choice + prose → awaiting flips to answered.
+  assert.equal(
+    (await post({ path: doc, op: "answer", id, by: "human", choice: "Tag-gated", text: "keep it gated" })).status,
+    200,
+  );
+  s = await state();
+  assert.equal(s.annotations[0].state, "answered");
+  assert.equal(s.annotations[0].answer.choice, "Tag-gated");
+  assert.equal(s.annotations[0].replies.at(-1).choice, "Tag-gated", "the answer rides the conversation view");
+  assert.equal((await sweepFor()).awaiting, 0);
+  assert.equal((await sweepFor()).answered, 1, "now it needs an agent to apply");
+
+  // The asker resolves once applied → no longer counted awaiting/answered.
+  assert.equal((await post({ path: doc, op: "resolve", id, by: "sess-asker" })).status, 200);
+  assert.equal((await state()).annotations[0].state, "resolved");
+  const swept = await sweepFor();
+  assert.equal(swept.awaiting, 0);
+  assert.equal(swept.answered, 0);
 });
 
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {

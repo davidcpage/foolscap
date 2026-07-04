@@ -14,6 +14,7 @@ import {
   appendAnnotationEvent,
   readAnnotationLog,
   foldAnnotations,
+  questionState,
   listAnnotatedPaths,
 } from "../annotations.js";
 
@@ -97,6 +98,78 @@ test("readAnnotationLog tolerates a ragged first line (a tail-cut / torn mid-wri
     `"anchor":{"exact":"chopped"}}\n${JSON.stringify(create("anno:2"))}\n`,
   );
   assert.deepEqual(readAnnotationLog(repo, p).map((e) => e.id), ["anno:2"]);
+});
+
+// ── anchored async-ask: kind:"question", the answer event, derived question state (W1) ──────────────
+
+test("fold: a plain create folds to kind:note (default), no question fields", () => {
+  const [a] = foldAnnotations([create("anno:1")]);
+  assert.equal(a.kind, "note", "a create with no kind is a note — back-compatible default");
+  assert.ok(!("options" in a) && !("blocking" in a) && !("answered" in a));
+  assert.equal(questionState(a), null, "a note has no question state");
+});
+
+test("fold: a question create carries kind/options/blocking; questionState is 'awaiting'", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", {
+      kind: "question",
+      text: "Wake model for R2?",
+      options: [{ label: "Always-wake" }, { label: "Tag-gated", description: "only @-mentions" }],
+      blocking: true,
+    }),
+  ]);
+  assert.equal(a.kind, "question");
+  assert.deepEqual(a.options.map((o) => o.label), ["Always-wake", "Tag-gated"]);
+  assert.equal(a.options[1].description, "only @-mentions");
+  assert.equal(a.blocking, true);
+  assert.equal(questionState(a), "awaiting", "unanswered, unresolved question awaits a human");
+});
+
+test("fold: an answer event marks answered, stamps `answer`, and rides `replies` with its choice", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "question", options: [{ label: "A" }, { label: "B" }] }),
+    { ev: "answer", id: "anno:1", by: "human", choice: "B", text: "go with B — simpler", ts: 200 },
+  ]);
+  assert.equal(a.answered, true);
+  assert.deepEqual(a.answer, { by: "human", choice: "B", text: "go with B — simpler", ts: 200 });
+  assert.equal(a.replies.length, 1, "the answer shows in the conversation view too");
+  assert.equal(a.replies[0].choice, "B");
+  assert.equal(questionState(a), "answered", "answered but not yet resolved → needs an agent to apply");
+});
+
+test("fold: an answer with only a choice (no prose) folds to text:'' and stays answered", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "question", options: [{ label: "A" }] }),
+    { ev: "answer", id: "anno:1", by: "human", choice: "A", ts: 200 },
+  ]);
+  assert.equal(a.answer.text, "");
+  assert.equal(a.replies[0].text, "");
+  assert.equal(questionState(a), "answered");
+});
+
+test("questionState: resolve supersedes → 'resolved'; a reopened-but-answered question stays 'answered'", () => {
+  const base = [
+    create("anno:1", { kind: "question" }),
+    { ev: "answer", id: "anno:1", by: "human", text: "done", ts: 200 },
+  ];
+  const [resolved] = foldAnnotations([...base, { ev: "resolve", id: "anno:1", by: "s1", ts: 300 }]);
+  assert.equal(questionState(resolved), "resolved", "the asker resolving supersedes answered");
+  const [reopened] = foldAnnotations([
+    ...base,
+    { ev: "resolve", id: "anno:1", by: "s1", ts: 300 },
+    { ev: "reopen", id: "anno:1", by: "s1", ts: 400 },
+  ]);
+  assert.equal(reopened.answered, true, "the answer still stands after reopen");
+  assert.equal(questionState(reopened), "answered", "reopen clears resolved, not the recorded answer");
+});
+
+test("questionState: null for a note even if an answer event somehow lands on it", () => {
+  const [a] = foldAnnotations([
+    create("anno:1"), // a note
+    { ev: "answer", id: "anno:1", by: "human", text: "stray", ts: 200 },
+  ]);
+  assert.equal(a.kind, "note");
+  assert.equal(questionState(a), null, "only a kind:question has a question state");
 });
 
 test("listAnnotatedPaths: missing dir → [], non-decodable strays skipped, sorted", () => {

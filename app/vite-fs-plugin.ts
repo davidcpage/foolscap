@@ -16,7 +16,7 @@ import { resolveTags } from "./thread-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
-import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, readAnnotationLog, type AnnotationEvent } from "./annotations.js";
+import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
@@ -629,11 +629,16 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
         const annos = foldAnnotations(readAnnotationLog(repoPath, p));
         const src = readAnnotatedSource(root, p);
         const open = annos.filter((a) => !a.resolved);
+        // Question roll-up (docs/anchored-async-ask.md §6): `awaiting` needs a HUMAN to decide,
+        // `answered` needs an AGENT to apply — surfaced separately from plain open comments so the
+        // sweep answers "what's waiting on me" (awaiting) and "what's ready to apply" (answered).
         return {
           path: p,
           total: annos.length,
           open: open.length,
           orphaned: open.filter((a) => src == null || !resolveAnchor(src, a.anchor)).length,
+          awaiting: annos.filter((a) => questionState(a) === "awaiting").length,
+          answered: annos.filter((a) => questionState(a) === "answered").length,
         };
       })
       .filter((f) => f.total > 0);
@@ -648,17 +653,23 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
   const annos = foldAnnotations(readAnnotationLog(repoPath, rel));
   const annotations = annos.map((a) => {
     const range = src == null ? null : resolveAnchor(src, a.anchor);
-    return { ...a, orphaned: !range, range };
+    const state = questionState(a); // null for a plain note; awaiting/answered/resolved for a question
+    return { ...a, orphaned: !range, range, ...(state ? { state } : {}) };
   });
   sendJson(res, 200, { path: rel, annotations });
 }
 
 // POST /api/annotations?board=<id> { path, op, … } → append one §5 event. Ops and their fields:
-//   create   { path, anchor:{exact, prefix?, suffix?, offset?}, text, author } → { ok, id, ts, orphaned }
+//   create   { path, anchor:{exact, prefix?, suffix?, offset?}, text, author,
+//              kind?:"note"|"question", options?:[{label,description?}], blocking? } → { ok, id, ts, orphaned, state? }
 //   reply    { path, id, from, text }
+//   answer   { path, id, by, choice?, text? }   (the target must be a kind:"question")
 //   resolve  { path, id, by }        reopen { path, id, by }
 //   reanchor { path, id, anchor, by }
 //   thread   { path, id, thread }
+// `kind:"question"` (with optional `options`/`blocking`) turns a create into an anchored async-ask
+// (docs/anchored-async-ask.md §4); `answer` records a human's/peer's decision on it. options/blocking
+// are ignored on a note. The awaiting/answered/resolved state is derived at read (never stored).
 // 400 on a bad op / missing field; 404 on a blocked/absent target file (create — never confirms a
 // blocked path, like the file read) or an unknown annotation id (every other op); 500 when the
 // append fails (the ledger is a comment's ONLY home — unlike a thread message there is no live
@@ -691,6 +702,25 @@ async function handleAnnotationsWrite(
       ...(typeof a.offset === "number" ? { offset: a.offset } : {}),
     };
   };
+  // Parse `options` (a multiple-choice question's choices) into [{label, description?}] — tolerant of
+  // both a bare string array (["A","B"]) and the object form ([{label,description}]); a malformed/empty
+  // list yields null (no options). docs/anchored-async-ask.md §4.
+  const optionsOf = (v: unknown): AnnotationOption[] | null => {
+    if (!Array.isArray(v)) return null;
+    const out: AnnotationOption[] = [];
+    for (const o of v) {
+      if (typeof o === "string" && o.length > 0) out.push({ label: o });
+      else if (o && typeof o === "object") {
+        const r = o as Record<string, unknown>;
+        if (typeof r.label === "string" && r.label.length > 0)
+          out.push({
+            label: r.label,
+            ...(typeof r.description === "string" ? { description: r.description } : {}),
+          });
+      }
+    }
+    return out.length > 0 ? out : null;
+  };
   const rel = str("path");
   const op = str("op");
   if (!rel) return sendJson(res, 400, { error: "path required" });
@@ -704,23 +734,55 @@ async function handleAnnotationsWrite(
       return sendJson(res, 400, { error: "create needs anchor.exact, text, author" });
     const src = readAnnotatedSource(root, rel);
     if (src == null) return sendJson(res, 404, { error: "not found" });
+    // kind defaults to "note" (stored implicitly — a create with no kind folds to note, so existing
+    // callers are unchanged); question fields ride only on a question.
+    const isQuestion = body.kind === "question";
+    const options = isQuestion ? optionsOf(body.options) : null;
+    const blocking = isQuestion && body.blocking === true;
     const id = "anno:" + crypto.randomUUID();
-    const ev: AnnotationEvent = { ev: "create", id, path: rel, anchor, text, author, ts };
+    const ev: AnnotationEvent = {
+      ev: "create",
+      id,
+      path: rel,
+      anchor,
+      text,
+      author,
+      ts,
+      ...(isQuestion ? { kind: "question" } : {}),
+      ...(options ? { options } : {}),
+      ...(blocking ? { blocking: true } : {}),
+    };
     if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
-    return sendJson(res, 200, { ok: true, id, ts, orphaned: !resolveAnchor(src, anchor) });
+    return sendJson(res, 200, {
+      ok: true,
+      id,
+      ts,
+      orphaned: !resolveAnchor(src, anchor),
+      ...(isQuestion ? { kind: "question", state: "awaiting" } : {}),
+    });
   }
 
   // Every other op targets an existing annotation on an existing ledger.
   const id = str("id");
   if (!id) return sendJson(res, 400, { error: "id required" });
-  if (!foldAnnotations(readAnnotationLog(repoPath, rel)).some((a) => a.id === id))
-    return sendJson(res, 404, { error: "unknown annotation" });
+  const target = foldAnnotations(readAnnotationLog(repoPath, rel)).find((a) => a.id === id);
+  if (!target) return sendJson(res, 404, { error: "unknown annotation" });
   let ev: AnnotationEvent;
   if (op === "reply") {
     const from = str("from");
     const text = str("text");
     if (!from || !text) return sendJson(res, 400, { error: "reply needs from, text" });
     ev = { ev: "reply", id, from, text, ts };
+  } else if (op === "answer") {
+    // Record a decision on a question (§4): a choice (an option label) and/or free prose; at least one
+    // is required. Answering a plain note is a category error (400) — there's nothing to answer.
+    if (target.kind !== "question") return sendJson(res, 400, { error: "not a question" });
+    const by = str("by");
+    const choice = str("choice");
+    const text = str("text");
+    if (!by) return sendJson(res, 400, { error: "answer needs by" });
+    if (!choice && !text) return sendJson(res, 400, { error: "answer needs choice and/or text" });
+    ev = { ev: "answer", id, by, ts, ...(choice ? { choice } : {}), ...(text ? { text } : {}) };
   } else if (op === "resolve" || op === "reopen") {
     const by = str("by");
     if (!by) return sendJson(res, 400, { error: `${op} needs by` });
@@ -1774,8 +1836,18 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "  • scripts/canvas anno batch <path> replies.json  many replies at once from a JSON DATA file",
     "                                                   ([{id,text}] or {id:text}) — not an ad-hoc script",
     "  • scripts/canvas anno resolve|reopen <path> <id> [--by <sid>]",
-    `  Raw endpoints if needed: GET/POST ${base}/api/annotations?board=${boardId} (ops: create/reply/resolve/`,
-    "  reopen/reanchor/thread). The per-file GET returns anchor.exact (the quoted span) + orphaned/range.",
+    "  • scripts/canvas anno ask <path> --question \"…\" --anchor-exact \"…\" [--options \"A|B|C\"] [--blocking]",
+    "                                                   raise an ANCHORED QUESTION the human answers on the doc",
+    "  • scripts/canvas anno answer <path> <id> [--choice LABEL] [--text \"…\"]   answer such a question",
+    `  Raw endpoints if needed: GET/POST ${base}/api/annotations?board=${boardId} (ops: create/reply/answer/`,
+    "  resolve/reopen/reanchor/thread). The per-file GET returns anchor.exact (the quoted span) + orphaned/range,",
+    "  and for a question its state (awaiting a human / answered, ready to apply / resolved).",
+    "ASK ON THE DOC, NOT IN-SESSION: when you hit a real decision you can't make alone — a design fork, a",
+    "choice the human must own — do NOT reach for the in-session AskUserQuestion block (it's ephemeral,",
+    "board-invisible, and pins your process open waiting). Instead raise an anchored question on the span it",
+    "concerns (scripts/canvas anno ask … --blocking), declare blocked:human, and wind down: the question and",
+    "its answer live on the doc forever, the board sees the decision pending, and a fresh session applies the",
+    "answer later. Reserve the in-session block for throwaway confirmations, never a decision of weight.",
     "THE REVISION RULE: before editing a file, read its open annotations (scripts/canvas anno list <path> —",
     "cheap, usually empty). As part of the same change: REPLY to what you can answer. You do NOT hand-reanchor",
     "moved comments — the server auto-reanchors any moved-but-still-resolvable comment on the next read/write.",

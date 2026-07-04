@@ -10,10 +10,13 @@
 // POST handler checks the append's return — a comment the server couldn't persist must 500, not
 // vanish (unlike a thread message, the ledger IS the only home; there's no in-memory live source).
 //
-// Events (one JSON object per line): create / reply / resolve / reopen / reanchor / thread.
+// Events (one JSON object per line): create / reply / resolve / reopen / reanchor / thread / answer.
 // `foldAnnotations` reduces a log to current state; `orphaned` is NOT an event and never stored —
 // it's derived at read time by resolving each anchor against the file's current bytes (anchors.js),
-// the thread-state.js principle.
+// the thread-state.js principle. A `create` may carry `kind:"question"` (with `options`/`blocking`)
+// for the anchored async-ask (docs/anchored-async-ask.md §4); the `answer` event records a human's
+// (or peer's) choice/prose on such a question. The awaiting/answered/resolved question STATE is
+// likewise derived at read (`questionState`), never stored — same principle as `orphaned`.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -100,12 +103,36 @@ export function foldAnnotations(events) {
             text: ev.text,
             author: ev.author,
             ts: ev.ts,
+            kind: ev.kind === "question" ? "question" : "note",
+            ...(Array.isArray(ev.options) ? { options: ev.options } : {}),
+            ...(ev.blocking ? { blocking: true } : {}),
             resolved: false,
             replies: [],
           });
         break;
       case "reply":
         if (a) a.replies.push({ from: ev.from, text: ev.text, ts: ev.ts });
+        break;
+      case "answer":
+        // A distinguished reply that records the human's/peer's selection and/or prose, AND marks the
+        // question answered (docs/anchored-async-ask.md §4). It rides `replies` (so the conversation
+        // view shows it) and stamps `answer` (the latest one wins, mirroring resolve's `resolvedBy`);
+        // the awaiting→answered transition is then derived by `questionState`, never stored.
+        if (a) {
+          a.answered = true;
+          a.answer = {
+            by: ev.by,
+            ...(ev.choice != null ? { choice: ev.choice } : {}),
+            text: ev.text ?? "",
+            ts: ev.ts,
+          };
+          a.replies.push({
+            from: ev.by,
+            text: ev.text ?? "",
+            ts: ev.ts,
+            ...(ev.choice != null ? { choice: ev.choice } : {}),
+          });
+        }
         break;
       case "resolve":
         if (a) {
@@ -132,6 +159,21 @@ export function foldAnnotations(events) {
     }
   }
   return [...byId.values()];
+}
+
+/**
+ * Derived question state for a folded annotation (docs/anchored-async-ask.md §4), computed at read
+ * and NEVER stored — the `orphaned` principle. Returns null for a plain note; for a `kind:"question"`:
+ *   - "resolved" — the asker has resolved it (resolution belongs to the asker; supersedes the rest).
+ *   - "answered" — an `answer` event has landed but it's not yet resolved (needs an agent to apply).
+ *   - "awaiting" — no answer yet (needs a human/peer to decide).
+ * The wake-back (W5) triggers on the awaiting→answered transition of a `blocking` question.
+ */
+export function questionState(a) {
+  if (!a || a.kind !== "question") return null;
+  if (a.resolved) return "resolved";
+  if (a.answered) return "answered";
+  return "awaiting";
 }
 
 /**
