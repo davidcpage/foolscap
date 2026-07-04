@@ -350,16 +350,47 @@ async function handleBoardPersistWrite(
     if (kind === "event") {
       if (typeof body.event !== "object" || body.event === null)
         return sendJson(res, 400, { error: "missing event" });
-      appendBoardEvent(repoPath, body.event as Record<string, unknown>);
+      const ev = body.event as Record<string, unknown>;
+      // Second-writer tripwire: tabs mint their own seq (core/src/log.ts), so the log is single-
+      // sequencer only while ONE tab writes. A non-monotonic append means a second writer (another
+      // tab, a leaked headless probe) is interleaving — the append still lands (refusing would lose
+      // a real gesture), but the collision must be LOUD, not discovered at hydrate. Seeded from the
+      // snapshot watermark on the first append after boot, so a stale writer trips even then.
+      const lastEventSeq = (fsState.lastEventSeq ??= new Map<string, number>());
+      if (typeof ev.seq === "number") {
+        const stored = readBoardSnapshot(repoPath) as { seq?: unknown } | null;
+        const last = lastEventSeq.get(boardId) ?? (stored && typeof stored.seq === "number" ? stored.seq : undefined);
+        if (last !== undefined && ev.seq <= last)
+          console.warn(
+            `[boards] event seq collision on ${boardId}: got ${ev.seq} after ${last} — ` +
+              `a second writer is appending (another tab or a leaked probe); the log now holds conflicting seqs`,
+          );
+        if (last === undefined || ev.seq > last) lastEventSeq.set(boardId, ev.seq);
+      }
+      appendBoardEvent(repoPath, ev);
       return sendJson(res, 200, { ok: true });
     }
     if (kind === "snapshot") {
       if (typeof body.snapshot !== "object" || body.snapshot === null)
         return sendJson(res, 400, { error: "missing snapshot" });
-      const snap = body.snapshot as { records?: Array<Record<string, unknown>> };
+      const snap = body.snapshot as { seq?: unknown; records?: Array<Record<string, unknown>> };
       // Capture the snapshot being replaced FIRST: the before↔after membership diff below is how a
       // human-drawn thread join/leave (a local commit that never crosses the bus) reaches onboarding.
-      const before = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
+      const before = readBoardSnapshot(repoPath) as { seq?: unknown; records?: Array<Record<string, unknown>> } | null;
+      // Watermark guard: never roll the snapshot BACKWARDS. A stale tab (behind because another tab
+      // kept committing) would otherwise clobber the newer save — events replay heals the content,
+      // but the membership diff below would then see phantom joins on the next good save. 409 is
+      // deliberate (4xx): remote-store must NOT retry a save that will never become fresh; the error
+      // surfaces via Persistence.onError in the stale tab, which is exactly where the news belongs.
+      if (
+        before && typeof before.seq === "number" && typeof snap.seq === "number" && snap.seq < before.seq
+      ) {
+        console.warn(
+          `[boards] STALE snapshot save refused for ${boardId}: seq ${snap.seq} < stored ${before.seq} — ` +
+            `a second writer is behind the board (another tab or a leaked probe)`,
+        );
+        return sendJson(res, 409, { error: "stale snapshot", storedSeq: before.seq, gotSeq: snap.seq });
+      }
       writeBoardSnapshot(repoPath, snap as Record<string, unknown>);
       sendJson(res, 200, { ok: true });
       try {
@@ -1160,6 +1191,7 @@ interface CanvasFsState {
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member
+  lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
 }
 type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
@@ -1274,6 +1306,18 @@ function attachWs(server: ViteDevServer): void {
         },
       };
       wsClients.add(client);
+      {
+        // The durable store assumes ONE writer tab per board (tabs mint their own event seq and race
+        // the debounced snapshot save). A second connection is an ordinary event now (picker, probes),
+        // so say it loudly the moment it happens — the ua is what tells a leaked headless probe from
+        // a second real browser.
+        const tabs = tabCountFor(b.boardId);
+        if (tabs > 1)
+          console.warn(
+            `[boards] ${tabs} tabs now live on ${b.boardId} — concurrent writers can mint colliding event seqs ` +
+              `and race snapshot saves. ua: ${req.headers["user-agent"] ?? "?"}`,
+          );
+      }
       for (const [feed, value] of feedValues) client.send({ ch: "feed", feed, value }); // replay, like handleFeeds
       const ping = setInterval(() => {
         if (ws.readyState === ws.OPEN) ws.ping();
