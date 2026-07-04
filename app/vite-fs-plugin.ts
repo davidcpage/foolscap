@@ -1147,7 +1147,21 @@ interface CanvasFsState {
   // busy rejection (another dev server holds the slot) → spawns fall back to in-process ownership.
   hostClient?: SessionHostClient | null;
   hostAttachStarted?: boolean; // attachSessionHost runs once per process, like the cleanup hook
+  // THE RULE: every cross-request mutable collection that affects behaviour lives on fsState (??= at its
+  // declaration site, like pendingAsks above). An unpinned module-scope map silently empties on a hot
+  // re-eval while the pinned boolean guards stop the code that would refill it — shadowRoots was the
+  // lesson: post-re-eval spawns found no watcher handle and their edits fell to the anonymous `external`
+  // shadow floor with no error anywhere. Pure recompute-on-miss caches (summaryCache, weatherCache,
+  // rootsCache) are the deliberate exception — a re-eval only costs them a recompute.
+  persistTimers?: Map<string, ReturnType<typeof setTimeout>>; // session-marker debounce (timers are process-bound, so handles stay valid across re-evals)
+  emittedMembers?: Map<string, { thread: string; sid: string; ts: number }>; // server-emitted memberships awaiting the snapshot
+  shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher
+  busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
+  lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
+  announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
+  pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member
 }
+type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
   feedClients: new Set<SseClient>(),
   feedValues: new Map<string, unknown>(),
@@ -1629,7 +1643,7 @@ interface LiveSession {
 // the session-host sidecar) still resets its cursors to 0 and the next inbox read re-delivers every joined
 // thread's whole backlog as "unread". Debounced per session (reads/posts come in bursts); the timer reads
 // s.read at fire time, so it always writes the latest cursors. Best-effort like every marker write.
-const persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const persistTimers = (fsState.persistTimers ??= new Map<string, ReturnType<typeof setTimeout>>());
 function persistSessionState(s: LiveSession): void {
   if (persistTimers.has(s.id)) return;
   persistTimers.set(
@@ -2144,7 +2158,7 @@ function seedThreadLogs(repoPath: string): void {
 // posted right after a spawn miss the new worker). Keyed edgeId → {thread, sid, ts}; threadMemberSids and
 // sessionThreads UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
 // human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
-const emittedMembers = new Map<string, { thread: string; sid: string; ts: number }>();
+const emittedMembers = (fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
 const EMITTED_MEMBER_TTL = 60_000;
 const sidFromSessionNode = (node: string): string | null =>
   node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
@@ -2856,7 +2870,9 @@ function startWorktreesFeed(boardId: string, repoPath: string): void {
 // under the canonical repo's .canvas/ (gitRoot = repoPath), so one board spans worktrees and a removed
 // worktree's history survives (we close its watcher; the DB persists). syncShadowRoots re-runs on worktree
 // add/remove so the committer set tracks boardRoots.
-const shadowRoots: Map<string, ReturnType<typeof watchRoot>> = new Map(); // key: boardId\0rootId
+const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>()); // key: boardId\0rootId — pinned:
+// an unpinned map emptied on hot re-eval while boardFeedsStarted kept syncShadowRoots from refilling it,
+// so every session spawned after a re-eval lost attribution to the `external` floor (see fsState rule).
 const SHADOW_SETTLE_MS = 800;
 // The shadow committer's watch ignore (Rule B): see `.canvas/` content so it gets versioned, but never the
 // shadow git-dirs under `.canvas/roots/` — a commit writes objects THERE, and watching them would re-commit
@@ -3054,7 +3070,7 @@ function startCardTypesFeed(): void {
 //   GET  /api/canvas?board=  → { ts, tabs, snapshot, recentIntent } from the durable store; 404 only
 //                              when the board has never persisted anything
 
-const busClients: Map<string, Set<SseClient>> = new Map();
+const busClients = (fsState.busClients ??= new Map<string, Set<SseClient>>());
 
 // The bus-client set for a board, created on first subscribe. (The SSE close handler in openSse deletes
 // the client from the set but leaves the empty set in the map — harmless; one entry per ever-seen board.)
@@ -3188,7 +3204,7 @@ function handleCanvasGet(res: ServerResponse, boardId: string): void {
 //
 //   POST /api/notebook/<id>/outputs ?board=  { ts, root, path, cells:[…], exports:{…} } (stored verbatim)
 //   GET  /api/notebook/<id>/outputs ?board=  → that card's last push, or 404 until one has arrived
-const lastNotebookOutputs = new Map<string, string>(); // key: boardId \0 nodeId → the pushed blob
+const lastNotebookOutputs = (fsState.lastNotebookOutputs ??= new Map<string, string>()); // key: boardId \0 nodeId → the pushed blob
 const nbOutKey = (boardId: string, id: string): string => boardId + "\0" + id;
 
 async function handleNotebookOutputsPush(
@@ -3334,14 +3350,14 @@ function dispatchBusCommand(
 // this Set is what makes the second a no-op. The phase is part of the key so a pending→open UPGRADE still
 // fires the open onboarding even though the pending intro already fired. Cleared on removeEdge (both
 // phases) so a genuine rejoin announces again.
-const announcedMemberships = new Set<string>();
+const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
 const announceKey = (id: string, type: string): string => `${id}|${type}`;
 
 // How much of the backlog a not-yet-onboarded member should see, keyed `<threadId>|<sid>`. Set by an
 // invite/join (or the /history action) that names a mode; consumed + cleared when member:open onboarding
 // seeds the read cursor. ABSENT ⇒ the default, FULL history — a new member replays the whole backlog on
 // their first inbox read (Slack public-channel style). "future" is the opt-out (start at the tail).
-const pendingHistoryMode = new Map<string, "full" | "future">();
+const pendingHistoryMode = (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
 const historyKey = (threadId: string, sid: string): string => `${threadId}|${sid}`;
 const historyMode = (v: unknown): "full" | "future" | undefined => (v === "full" || v === "future" ? v : undefined);
 // The read cursor that gives `sid` the chosen visibility of `log`: full ⇒ 0 (everything is unread), future
