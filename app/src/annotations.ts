@@ -19,6 +19,13 @@ export interface AnnotationReply {
   from: string;
   text: string;
   ts: number;
+  choice?: string; // an `answer` reply carries the chosen option label (docs/anchored-async-ask.md §4)
+}
+
+/** A multiple-choice question's choices (anchored async-ask §4). */
+export interface AnnotationOption {
+  label: string;
+  description?: string;
 }
 
 /** One folded annotation as GET /api/annotations serves it — including the read-time verdicts. */
@@ -36,6 +43,14 @@ export interface AnnotationInfo {
   thread?: string;
   orphaned: boolean; // the SERVER's source-based verdict — drives the orphan strip
   range: { start: number; end: number; method: string } | null; // source offsets (informational here)
+  // Anchored async-ask (docs/anchored-async-ask.md §4/§6, W2): a `kind:"question"` create carries
+  // `options`/`blocking`; the human's decision rides `answer`; `state` is the read-time question state.
+  kind?: "note" | "question";
+  options?: AnnotationOption[];
+  blocking?: boolean;
+  answered?: boolean;
+  answer?: { by: string; choice?: string; text: string; ts: number };
+  state?: "awaiting" | "answered" | "resolved"; // present only for a kind:"question"
 }
 
 // ── the off-log projection (the fileContentSignal pattern, keyed by path) ────────────────────────
@@ -202,12 +217,14 @@ export function caretPointAt(x: number, y: number): { node: Node; offset: number
 
 export interface CardHighlightRanges {
   open: Range[];
+  question: Range[]; // an anchored question (kind:"question") — painted distinctly from a comment (W2)
   resolved: Range[];
   active: Range[];
 }
 
 const HIGHLIGHT_NAMES: Record<keyof CardHighlightRanges, string> = {
   open: "anno-open",
+  question: "anno-question",
   resolved: "anno-resolved",
   active: "anno-active",
 };

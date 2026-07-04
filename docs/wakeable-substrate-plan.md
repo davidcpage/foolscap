@@ -48,14 +48,14 @@ dep) can run in parallel sessions.
 | # | Item | Implements | Depends | Effort | Status |
 |---|---|---|---|---|---|
 | W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `9e6988a` |
-| W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | TODO |
-| W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | TODO |
-| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO |
+| W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `<pending>` |
+| W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE |
+| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (held: shares thread code w/ W7) |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
 | W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
-| W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | TODO |
+| W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | WIP `051764e7` |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
-| W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | TODO |
+| W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | WIP `1d4a2353` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -84,6 +84,17 @@ dep) can run in parallel sessions.
 - Question paints distinctly from a comment (a "?" on the highlight); popover shows the question, option
   buttons + a reply box, and an awaiting/answered badge (host chrome, `NodeView.tsx` + `src/annotations.ts`).
 - **Done when:** a human can ask and answer a question entirely from the doc card.
+- **Shipped** (commit `<pending>`): `AnnotationInfo` in `src/annotations.ts` gains the W1 read-fields
+  (`kind`/`options`/`blocking`/`answer`/`state`, and `choice` on an answer reply); a new `anno-question`
+  highlight bucket paints anchored questions in a distinct blue. In `NodeView.tsx`: the draft popover gains
+  a **Comment | Ask** toggle + an optional one-per-line choices field, so a question is asked from the card;
+  the exchange popover shows an awaiting/answered/resolved **state pill**, clickable **option buttons** (one
+  click answers with that `choice`), a prose **Answer** row (the reply row becomes Answer on an open
+  question), and renders each answer reply's `choice`; the badge carries a `❓N` awaiting-question count.
+  Styling in `style.css`. Typecheck clean; `annotations.test.mjs` + `http-contract.test.mjs` green; live-board
+  smoke test drove the create-question → GET (the exact fields the card reads) → answer-by-choice →
+  awaiting→answered flip → reply-carries-choice round-trip against the running board. The card interaction
+  (clicks) is a pure render over that verified data path.
 
 ### W3 — R4 board memory.md + linked role memory
 - `.canvas/memory.md` rendered as an ordinary markdown file card, included in every spawned session's brief;
@@ -92,6 +103,17 @@ dep) can run in parallel sessions.
   stays the shared charter. No separate role-notes store.
 - **Done when:** a `memory.md` card exists, rides the spawn brief, and links at least one role-memory file
   pulled into context on demand.
+- **Shipped:** `.canvas/memory.md` exists (a curated index — one fact per line, newest-first — of this
+  board's settled norms) and renders as an ordinary file card (`node:repo:.canvas/memory.md`, dropped on the
+  board). It's **embedded in every spawned session's brief**: `board-memory.js` (`boardMemoryBrief(repoPath)`,
+  read fresh at spawn, HEAD-capped 32KB, `truncated` flag) → `ensureLiveSession` in `vite-fs-plugin.ts`.
+  Role memory hangs off the index as linked leaves under `.canvas/memory/` loaded **on demand**:
+  `.canvas/memory/pm.md` (PM/Coordinator role memory) + `.canvas/memory/board-memory.md` (how it's wired).
+  Convention (one fact/line, newest-first, links to lazy leaves, `role.md` stays the charter) stated in the
+  brief block, not enforced code. Tests: `test/board-memory.test.mjs` (null/embed/HEAD-cap/truncation). The
+  brief wiring is server code — it reaches sessions on the next dev-server restart; verified now by unit
+  tests + an integration check of the real `memory.md`. **Note:** `.canvas/` is git-ignored (shadow-
+  versioned), so the memory files persist on disk/board but aren't in the git commit — only the code is.
 
 ### W4 — P1: seats + notification levels
 - Generalize the seat onto any surface; each seat carries `level ∈ {all, mentions, paused}`. The **watch

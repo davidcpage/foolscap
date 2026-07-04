@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readThreadLog, readThreadMeta, seatForSid, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
+import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, seatForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./thread-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
@@ -19,6 +19,7 @@ import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
+import { boardMemoryBrief } from "./board-memory.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -1790,6 +1791,10 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     `      { from:"${sessionId}", to:"<their sid>", text, timeoutMs? } — the call HANGS until they reply (or it`,
     "      times out, ≤60s): { reply:{from,text,ts} } or { timedOut:true }. Use this when you NEED an answer to",
     "      continue (e.g. asking an oracle session); use /message for fire-and-forget. Only the two of you are woken.",
+    `  • PIN a message as HEAD CONTEXT: POST ${base}/api/thread/<threadId>/pin?board=${boardId} { from:"${sessionId}", seq, pinned?:true }`,
+    "      — a pinned message is re-read on EVERY wake, ahead of the recent tail (it keeps its place in the log; the",
+    "      card shows a collapsible pinned tray, and /inbox returns the pins under `pinned`). Pin the task statement,",
+    "      the `Done when:` condition, and any framing a long thread must keep in view; unpin with { seq, pinned:false }.",
     "  When you JOIN, the server messages you the thread's brief, its members, and these recipes — so you",
     "  don't need to memorise them. To start a fresh thread, addNode {type:\"thread\", title:<the task>, text:<brief>}",
     `  via POST ${base}/api/command?board=${boardId} { type, actor:"${sessionId}", payload }, then invite peers.`,
@@ -1798,8 +1803,9 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "RECEIVING. Thread messages do NOT arrive as your input — they are recorded in the thread. When a peer",
     "posts, you get a short nudge line `[canvas] new thread messages: ...`. READ the actual messages with a",
     "tool call (a normal GET — the result comes back as tool output, any time you like):",
-    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel:<threadId>, title, messages:[{seq,t,from,text}] }] } (from = a short @-taggable handle; t = MM-DD HH:MM)`,
-    "  It returns only what is new since your last read and marks it read. Call it when nudged, or proactively",
+    `  GET ${base}/api/inbox?session=${sessionId}  → { channels:[{ channel:<threadId>, title, messages:[{seq,t,from,text}], pinned? }] } (from = a short @-taggable handle; t = MM-DD HH:MM)`,
+    "  It returns only what is new since your last read and marks it read (a channel's `pinned` head context is",
+    "  ALWAYS re-served, not consumed — re-read it every wake). Call it when nudged, or proactively",
     "during a long task to check for updates without waiting for a nudge. For a LONG backlog, window the recent",
     `  tail with ?limit=N (last N messages) and/or ?bytes=K (text-byte budget) — e.g. ${base}/api/inbox?session=${sessionId}&bytes=20000;`,
     "  the response carries a `truncated` note when older messages were windowed out (re-join history:\"full\" to replay all).",
@@ -1816,6 +1822,10 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     '  intent ∈ "working" | "blocked:human" | "blocked:peer" | "done". Declare "blocked:human" whenever you ask',
     '  the human something and stop; "blocked:peer" while you wait on another session; "done" when your part of',
     "  the work is finished (then wind down, below). A short note says what you're blocked on / what you finished.",
+    "  DONE-WHEN + PROOF (R5): a thread's completion condition should be an explicit `Done when: …` message,",
+    "  PINNED (above) so it stays head context. Declaring \"done\" is not enough on its own — accompany it with a",
+    "  thread message posting PROOF against that condition (test output, a diff, a link — evidence, not assertion),",
+    "  so a reviewer checks proof against the pinned condition instead of trusting the flag.",
     "",
     "WINDING DOWN. Every idle session is treated as WAITING-FOR-A-HUMAN by default (its card glows a loud",
     "amber \"waiting\" band), so when your work is genuinely finished and you don't need the human again, end",
@@ -1913,7 +1923,7 @@ interface LiveSession {
   // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleThreadMessage
   // + sendSessionInput). Not a per-turn flag — it tracks an actual outstanding wait.
   waitingOn: string[] | null;
-  // Operating-loop heartbeat (agent-roles.md): a looping ROLE (e.g. the PM) has its idle sessions woken on a
+  // Operating-loop heartbeat (agent-roles.md): a looping ROLE (e.g. the Coordinator) has its idle sessions woken on a
   // server cadence so they sweep the board for stalls even when nobody @-tags them — built-in self-scheduling
   // does NOT fire in a `claude -p` child, so the wake must come from here. `loops` is stamped from the role at
   // spawn. The scheduler (loopTick) keeps the live cadence per session: `loopIntervalMs` is the current gap
@@ -2147,10 +2157,12 @@ function ensureLiveSession(
   const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
 
   // Appended system prompt = the ```ask convention + the canvas collaboration brief (env + protocol +
-  // norms) + the role charter if this session has one + a worker brief if spawned into a thread, with this
-  // session's own identity baked in. One --append-system-prompt flag, all blocks.
+  // norms) + the board's curated memory (R4/W3 — settled facts + the memory convention, embedded so it's
+  // head context on every wake) + the role charter if this session has one + a worker brief if spawned into
+  // a thread, with this session's own identity baked in. One --append-system-prompt flag, all blocks.
   const appendPrompt =
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
+    "\n\n" + boardMemoryBrief(repoPath) +
     (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
     (threadId ? "\n\n" + workerBrief(threadId) : "");
   // The permission relay (see PERMISSION_HOLD_MS): a per-session stdio MCP server whose one tool the
@@ -2415,6 +2427,16 @@ function threadLog(boardId: string, threadId: string): ThreadMsg[] {
 // `threadLogs` only survives a hot re-eval). `boardId` resolves which board's `.canvas/` home to write to —
 // every caller already has it. The marker upsert also makes the channel appear in the channels-list rail and
 // keeps its title/description fresh from the live snapshot. Both disk writes are best-effort (thread-ledger).
+// Publish a thread's conversation feed (the card's view). Carries the message tail PLUS the thread's PINS
+// (R-PIN head context) so the card's pinned tray stays live on every message and every pin/unpin — the pin
+// state rides the same feed the log does, no second subscription. Pins live on the durable marker (read
+// best-effort; [] when there's no repo/marker). Used by appendThreadMsg, seedThreadLogs, and the pin handler.
+function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean): void {
+  const repoPath = boards.get(boardId)?.repoPath;
+  const pins: PinnedMsg[] = repoPath ? readPins(repoPath, threadId) : [];
+  publishFeed("thread:" + threadId, { messages, truncated, pins });
+}
+
 function appendThreadMsg(
   boardId: string,
   threadId: string,
@@ -2428,7 +2450,7 @@ function appendThreadMsg(
   log.push(msg);
   let truncated = false;
   if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
-  publishFeed("thread:" + threadId, { messages: log, truncated });
+  publishThreadFeed(boardId, threadId, log, truncated);
   const repoPath = boards.get(boardId)?.repoPath;
   if (repoPath) {
     appendThreadLine(repoPath, threadId, msg);
@@ -2458,7 +2480,7 @@ function seedThreadLogs(repoPath: string): void {
     let log = readThreadLog(repoPath, threadId);
     if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS); // keep the recent tail
     threadLogs.set(threadId, log);
-    if (log.length) publishFeed("thread:" + threadId, { messages: log, truncated: false });
+    if (log.length) publishThreadFeed(repoPath ? boardIdentity(repoPath).boardId : "", threadId, log, false);
   }
 }
 
@@ -2560,7 +2582,7 @@ function flushNudge(s: LiveSession): void {
 }
 
 // ── operating-loop heartbeat (agent-roles.md) ────────────────────────────────────────────────────
-// A looping ROLE (the PM) needs to sweep the board for STALLS — but nothing emits an event when an agent
+// A looping ROLE (the Coordinator) needs to sweep the board for STALLS — but nothing emits an event when an agent
 // goes silent, so a purely reactive session would never wake to notice. And built-in self-scheduling does
 // NOT fire in a `claude -p` child (tested), so the wake can't come from inside the agent. So the SERVER
 // wakes looping-role sessions on a cadence, reusing the exact content-free nudge path a channel message
@@ -2597,7 +2619,7 @@ function loopWorldSig(s: LiveSession): string {
 
 // One scheduler tick across every board's live sessions: wake the looping ones that are idle and due, and
 // keep each session's adaptive cadence. Never wakes a RUNNING session (that would interrupt its turn — it
-// re-evaluates next tick once idle), so a heartbeat can't talk over a working PM.
+// re-evaluates next tick once idle), so a heartbeat can't talk over a working Coordinator.
 function loopTick(): void {
   const now = Date.now();
   for (const s of liveSessions.values()) {
@@ -2743,7 +2765,7 @@ async function handleSessionSpawn(
   // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
   // reads the channel card's position from the last snapshot and places the worker beside it, vs an agent
   // guessing coordinates badly) AND robustness: dispatchBusCommand records the member:open in the
-  // immediate-membership registry, so a task the PM posts right after this reliably wakes the worker even
+  // immediate-membership registry, so a task the Coordinator posts right after this reliably wakes the worker even
   // before the snapshot round-trips. `carded` reports whether a live tab applied it. Browser-initiated
   // spawns omit these params and keep placing their own card. `card:true` = a standalone card, no edge.
   let carded = false;
@@ -3290,7 +3312,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
   startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
-  startLoopHeartbeat(); // global, idempotent — wakes looping-role (PM) sessions to sweep for stalls
+  startLoopHeartbeat(); // global, idempotent — wakes looping-role (Coordinator) sessions to sweep for stalls
 }
 
 function startFeeds(): void {
@@ -3738,7 +3760,8 @@ function maybeAnnounceMembership(
       `[canvas] You joined thread ${thread.id} "${title}".\n${descLine}members: ${roster}\n` +
         `post: POST ${base}/api/thread/${thread.id}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
         `consult one member and block for the answer: POST ${base}/api/thread/${thread.id}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
-        `declare your work-intent (card-only, wakes no one): POST ${base}/api/thread/${thread.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished\n` +
+        `declare your work-intent (card-only, wakes no one): POST ${base}/api/thread/${thread.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished; a "done" should carry a thread message with PROOF against the pinned Done-when condition (R5)\n` +
+        `pin a message as head context (re-read every wake): POST ${base}/api/thread/${thread.id}/pin {"from":"${sid}","seq":<n>,"pinned":true} — pin the task statement + the Done-when condition; unpin with pinned:false. /inbox returns a thread's pins under \`pinned\`\n` +
         `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
     );
     if (others.length) {
@@ -4029,7 +4052,7 @@ async function handleThreadReply(
 // room). The latest declaration per member also rides the channel's meta marker (`intents`, keyed by sid —
 // the seat record's forerunner; step 2 moves the key to the seat so it survives an occupant respawn), which
 // is what /api/threads serves and what the thread-state projection (thread-state.js) ranges over. `done` doubles
-// as the cooperative-yield signal — for now it informs slot management (a PM/human can see who is safe to
+// as the cooperative-yield signal — for now it informs slot management (a Coordinator/human can see who is safe to
 // terminate); the reflex scheduler acting on it comes with the projection.
 async function handleThreadIntent(
   req: IncomingMessage,
@@ -4080,6 +4103,59 @@ async function handleThreadIntent(
     });
   }
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
+}
+
+// POST /api/thread/<id>/pin { from, seq, pinned } — flag (or unflag) a message as HEAD CONTEXT (R-PIN,
+// wakeable-substrate-plan W7). Pins are the thread's durable head: re-read on every wake ahead of the recent
+// tail, so the task statement, the `Done when:` condition (R5), and any load-bearing framing stay present
+// however long the log grows. The pinned message keeps its chronological place in the log; the card renders a
+// collapsible tray and the inbox surfaces the pins on every read. `pinned` defaults to true (a bare pin call
+// pins). Pinning snapshots the message onto the marker (thread-ledger), so a pin survives the log's bounded
+// tail. Consent mirrors handleThreadMessage/Intent: a member (or the human at the card) may pin.
+async function handleThreadPin(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  let body: { from?: unknown; seq?: unknown; pinned?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  if (typeof body.seq !== "number" || !Number.isInteger(body.seq) || body.seq < 1)
+    return sendJson(res, 400, { error: "seq must be a positive integer" });
+  if (body.pinned != null && typeof body.pinned !== "boolean")
+    return sendJson(res, 400, { error: "pinned must be a boolean" });
+  const pinned = body.pinned !== false; // default true — a bare pin call pins
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+
+  let pins: PinnedMsg[];
+  if (pinned) {
+    // Find the message to snapshot: the in-memory tail first (the common case), else the full ledger (a pin
+    // of an older message that has scrolled out of the bounded tail — the very case snapshotting exists for).
+    const log = threadLog(boardId, threadId);
+    let msg = log.find((mng) => mng.seq === body.seq) as ThreadMsg | undefined;
+    if (!msg) msg = readThreadLog(repoPath, threadId).find((mng) => mng.seq === body.seq) as ThreadMsg | undefined;
+    if (!msg) return sendJson(res, 404, { error: "no message at that seq in this thread" });
+    pins = pinMessage(repoPath, threadId, msg, body.from, Date.now());
+  } else {
+    pins = unpinMessage(repoPath, threadId, body.seq);
+  }
+  // Republish the conversation feed so the card's pinned tray updates live (pins ride the same feed).
+  const log = threadLog(boardId, threadId);
+  publishThreadFeed(boardId, threadId, log, false);
+  // Nudge the rail (threads:<board>) so a listing re-pull reflects the change, like an intent does.
+  publishFeed("threads:" + boardId, { ts: Date.now() });
+  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
 // The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ThreadMsg. Two
@@ -4147,7 +4223,17 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
   if (!s) return sendJson(res, 404, { error: "no such live session" });
   const boardId = boardIdentity(s.repoPath).boardId;
   const records = boardSnapshotRecords(boardId);
-  type OutChan = { channel: string; title: string; messages: InboxMsg[]; truncated?: { omitted: number; hint: string } };
+  // `pinned` is the thread's HEAD CONTEXT (R-PIN): re-read on EVERY wake ahead of the recent tail, so the
+  // task statement / `Done when:` condition / load-bearing framing stay present however far the log has
+  // scrolled. Surfaced on any thread that has fresh messages this read (a wake implies fresh content there),
+  // in the same compact shape as messages. It does NOT advance the cursor and is not counted as unread.
+  type OutChan = {
+    channel: string;
+    title: string;
+    messages: InboxMsg[];
+    pinned?: InboxMsg[];
+    truncated?: { omitted: number; hint: string };
+  };
   const channels: OutChan[] = [];
   if (records) {
     for (const threadId of sessionThreads(records, sid)) {
@@ -4174,6 +4260,10 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
         };
         if (omitted > 0)
           out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
+        // Head context: attach the pins so a woken agent re-reads the task/done-condition/framing (R-PIN).
+        const pins = readPins(s.repoPath, threadId);
+        if (pins.length)
+          out.pinned = pins.map((p) => ({ seq: p.seq, t: fmtTs(p.ts), from: inboxHandle(records, p.from), text: p.text }));
         channels.push(out);
       }
       if (log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
@@ -4274,7 +4364,7 @@ export function fsApi(): Plugin {
         // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
         // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
         // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent)$/.exec(url.pathname);
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|pin)$/.exec(url.pathname);
         if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -4285,6 +4375,7 @@ export function fsApi(): Plugin {
           if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
           if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
           if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
+          if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
           return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
         }
         if (url.pathname === "/api/session") {

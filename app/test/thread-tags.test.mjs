@@ -121,7 +121,7 @@ test("tagHit: keyword, sid prefix, and role-name prefix all hit; prose misses", 
   assert.equal(tagHit("Oracle", NAMED), true, "role name prefix");
   assert.equal(tagHit("oracle.b1", NAMED), true, "disambiguated role handle");
   assert.equal(tagHit("c0ffee", NAMED), true, "bare sid prefix");
-  assert.equal(tagHit("PM", NAMED), false, "no member named PM → miss");
+  assert.equal(tagHit("Coordinator", NAMED), false, "no member named Coordinator → miss");
   assert.equal(tagHit("nobody", NAMED), false, "prose → miss");
   assert.equal(tagHit("a9", MEMBERS), true, "bare-sid members still match");
 });

@@ -282,6 +282,10 @@ body {
 ::highlight(anno-resolved) {
   background-color: #00000012;
 }
+/* An anchored question (W2) paints in a distinct blue so an ask reads apart from a comment. */
+::highlight(anno-question) {
+  background-color: #7cc0ff55;
+}
 .anno-layer {
   position: absolute;
   inset: 0;
@@ -460,6 +464,78 @@ textarea.anno-input {
   border-color: #e4e4e7;
   background: #fafafa;
   color: #71717a;
+}
+
+/* ── anchored questions (W2, docs/anchored-async-ask.md) ─────────── */
+/* The badge's question count, awaiting a human decision — a distinct blue segment beside 💬 N. */
+.anno-badge-q {
+  margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid #c9def7;
+  color: #1d4ed8;
+}
+/* The kind toggle in the draft popover (Comment | Ask): the inactive side is `quiet`. */
+.anno-kind-toggle {
+  gap: 4px;
+}
+/* The optional choices field on a question draft — a shorter sibling of the main textarea. */
+textarea.anno-options {
+  min-height: 30px;
+}
+/* The question-state pill in the popover head: awaiting (blue), answered (green), resolved (grey). */
+.anno-qpill {
+  flex: 0 0 auto;
+  font-size: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border-radius: 8px;
+  border: 1px solid #bcdcff;
+  background: #eaf4ff;
+  color: #1d4ed8;
+}
+.anno-qpill.answered {
+  border-color: #bbe9c9;
+  background: #eafaf0;
+  color: #15803d;
+}
+.anno-qpill.resolved {
+  border-color: #e4e4e7;
+  background: #f4f4f5;
+  color: #71717a;
+}
+.anno-question-text {
+  font-weight: 500;
+}
+/* The chosen option, shown inline before an answer reply's prose. */
+.anno-choice {
+  display: inline-block;
+  margin-right: 5px;
+  padding: 0 4px;
+  border-radius: 4px;
+  background: #eafaf0;
+  color: #15803d;
+  font-weight: 600;
+}
+/* The option buttons — one click answers the question with that choice. */
+.anno-opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.anno-opt {
+  font-size: 9px;
+  padding: 3px 8px;
+  border: 1px solid #bcdcff;
+  border-radius: 5px;
+  background: #eaf4ff;
+  color: #1d4ed8;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.anno-opt:hover {
+  background: #d8ebff;
 }
 
 /* ── image card (image-cards-on-canvas) ─────────── */
@@ -1812,7 +1888,7 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   color: #2563eb;
   animation: none;
 }
-/* scheduled: a looping role (the PM) idle between server heartbeats — asleep on a timer, no demand on you.
+/* scheduled: a looping role (the Coordinator) idle between server heartbeats — asleep on a timer, no demand on you.
    Calm teal, steady, no pulse. */
 .ses-scheduled {
   color: #0d9488;

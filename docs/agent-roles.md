@@ -56,7 +56,7 @@ classifier. Today the baseline is `git commit` (a local commit is normal for any
 sessions are the norm) + the `scripts/canvas` spawn wrapper. The **red line** stays gated by the
 classifier for everyone: `git push`, destructive ops, out-of-scope changes, large/costly fan-out — these
 need a human nod. A role *may* NARROW the baseline in the rare case (e.g. a read-only reviewer that drops
-commit) via a `role.md` override, but that is the exception, never how roles normally differ. The PM is
+commit) via a `role.md` override, but that is the exception, never how roles normally differ. The Coordinator is
 the proof: it is a *coordination stance + knowledge*, using the same baseline every session has — heavily
 — not "the session with commit rights."
 
@@ -161,7 +161,7 @@ state lives:
   lands in the DM. Stateless between calls. Cheap.
 - **Task shape (a multi-step worker):** `spawn → work → (block on actor) → checkpoint → park →
   re-engage → … → done → promote → die`. Stateful. The interesting one.
-- **Looping shape (the PM):** `spawn → (heartbeat → sweep → act|sleep)* → wind-down → die`. A coordination
+- **Looping shape (the Coordinator):** `spawn → (heartbeat → sweep → act|sleep)* → wind-down → die`. A coordination
   role that must notice *silence* — a stalled thread emits no event, so a purely reactive session would
   never wake to catch it. It runs an **operating loop**: each tick, read inbox + board, sweep for stalled /
   blocked agents and drifting work, then act or sleep.
@@ -226,7 +226,7 @@ the answer is already durable in the DM).
 1. **Briefing (on spawn) — reflex.** The packet the canvas assembles deterministically: *charter +
    memory **index** (not contents) + the trigger event + the anchoring thread's tail*. "Who you are,
    what you know, why you were woken, the conversation you're joining." Its *scope* is declared in the
-   charter ("oracle: trigger-thread only"; "PM: all unread in my channels").
+   charter ("oracle: trigger-thread only"; "Coordinator: all unread in my channels").
 2. **Deep read (during work) — cortex.** The agent pulls more via tool calls — more channel history,
    follows a `[[link]]`, greps code, asks a peer. The charter *biases* this ("prefer reading code over
    asking") but does not determine it.

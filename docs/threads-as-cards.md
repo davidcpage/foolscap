@@ -68,7 +68,7 @@ a mode); they are explicitly not threads and not affected here.
 | `closed` | **explicit act** | the task is done; stamps the ledger (`endReason`-style, like session markers); terminal but reopenable as a conscious act |
 
 Dormant is the safety net (a thread everyone wandered away from); **closed is the goal state** (someone —
-the human, or a PM whose charter says so — declared the work resolved). The distinction matters for the
+the human, or a Coordinator whose charter says so — declared the work resolved). The distinction matters for the
 rail (§3): dormant threads are folded but nag-eligible; closed threads are archive proper.
 
 **Flat, not nested.** Threads form a flat set. A tree was considered and rejected: nesting is the channel
@@ -145,8 +145,8 @@ So apply the liveness ≠ identity keystone one tier down:
 
 | Tier | Identity | Lifetime | Handle |
 |---|---|---|---|
-| **role** | global — charter + memory | durable | `@PM` |
-| **seat** | a role's *post on one thread* — the participant | durable with the thread | `PM` (sole), `PM/incident` (labelled) |
+| **role** | global — charter + memory | durable | `@Coordinator` |
+| **seat** | a role's *post on one thread* — the participant | durable with the thread | `Coordinator` (sole), `Coordinator/incident` (labelled) |
 | **session** | the seat's current occupant | ephemeral | `RoleName.shortsid` (session cards only) |
 
 A **seat** is created when a role is first brought onto a thread and persists across occupant respawns.
@@ -157,14 +157,14 @@ that continuity a name the conversation can keep using.
 
 The three cases that motivated this:
 
-- **One PM coordinating across several threads.** One session occupying a seat in each. Consistent with
+- **One Coordinator coordinating across several threads.** One session occupying a seat in each. Consistent with
   `agent-roles.md` §10 — a session spans exactly the threads its work touches, and coordination *is* the
-  PM's work-unit, which inherently touches many. The PM is the principled exception, not a violation.
-- **Two PMs on one thread** (e.g. counterparts coordinating across their remits). Two seats of the same
+  Coordinator's work-unit, which inherently touches many. The Coordinator is the principled exception, not a violation.
+- **Two Coordinators on one thread** (e.g. counterparts coordinating across their remits). Two seats of the same
   role. The second seat **requires a label at creation** — the disambiguation forcing-function: bare
-  `@PM` stays unambiguous until someone deliberately adds `PM/upstream`. Once a role has multiple seats
+  `@Coordinator` stays unambiguous until someone deliberately adds `Coordinator/upstream`. Once a role has multiple seats
   on a thread: a bare `@Role` **broadcast wake** goes to *every* seat of that role (cheap — warm agents
-  glance and ignore; "PMs, …" is what a human means in a room), but an **`ask`** — which must hold one
+  glance and ignore; "Coordinators, …" is what a human means in a room), but an **`ask`** — which must hold one
   connection to one addressee — rejects the ambiguous handle (**400**, listing the candidate seats).
 - **A second Implementer beside a working one.** Explicitly create a second seat: a "+ add another
   ‹Role›" affordance on the thread card's roster (and the corresponding API verb), which mints the seat
@@ -176,7 +176,7 @@ survives its occupant being cold-parked or crashing, which softens the crash-vs-
 §1 of that doc was reaching for ("a work-unit may have many participants; a session is one ephemeral
 participant"): the seat is that participant, named.
 
-One caution: **seat labels must not become shadow roles.** If `PM/frontend` and `PM/infra` recur on every
+One caution: **seat labels must not become shadow roles.** If `Coordinator/frontend` and `Coordinator/infra` recur on every
 thread for weeks, that is two *roles* wanting their own charters and memories, and the label is hiding an
 un-versioned charter fork. A seat label expresses *situational* multiplicity within one thread; anything
 durable about how the instances differ belongs in a role definition. Role memory stays shared across all
@@ -217,7 +217,7 @@ slot-management win pays for the primitive even before the rail ships.
 
 Closing is explicit: a **close verb** (`POST /api/thread/<id>/close {from, summary?}` + the card's "✓
 close" affordance, mirroring the session card's "✓ end") stamps the ledger meta with who/when/why. The
-PM's charter gains a line, and it is deliberately **optional**:
+Coordinator's charter gains a line, and it is deliberately **optional**:
 
 > *On closing a thread, consider whether the work produced knowledge worth keeping: a short write-up as a
 > wiki page (a `docs/` file card), and any generalisable lesson promoted to your role memory. Most
@@ -269,7 +269,7 @@ CLAUDE.md's channel section rewrites at step 2, when the endpoints actually move
 
 - **Thread creation ceremony.** Must be one verb (`POST /api/threads {title, text?}` / one canvas
   gesture), or agents and humans will keep piggybacking on existing threads and scope-rot returns by the
-  back door. Who creates — human always; PM yes; can any worker spin off a thread? Probably yes (it's
+  back door. Who creates — human always; Coordinator yes; can any worker spin off a thread? Probably yes (it's
   cheap and legible), but watch for thread-spam from a confused agent — the per-role budget knot
   (`agent-roles.md` §12) covers the spawn side; creation may want the same rate-limit.
 - **Where does ambient / standing talk go?** Not every exchange is a task. The standing dev channel
@@ -278,7 +278,7 @@ CLAUDE.md's channel section rewrites at step 2, when the endpoints actually move
 - **Waiting-staleness ladder.** A `waiting` thread the human ignores for a week should demote to a
   quieter "stale, still your turn" tier — never auto-archive (`session-thread-lifecycle.md` §5). The
   rail needs that second tier from early on or the top of the list stops meaning anything.
-- **PM sweep surface.** The looping PM's world-signature currently keys on channel last-seq + member
+- **Coordinator sweep surface.** The looping Coordinator's world-signature currently keys on channel last-seq + member
   statuses; it should range over *thread states* instead (any thread newly `waiting` or newly stalled
   resets the cadence). Cheap once step 3 exists.
 - **Thread cards vs. board clutter.** Every closed task leaves a card *if* it was dragged out. Closed

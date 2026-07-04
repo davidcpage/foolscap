@@ -316,8 +316,8 @@ function ProvenanceView({
 // pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan / Backspace→delete) from
 // reaching the canvas. Mirrors TemplateCard's seam.
 type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
-// A member's readable display handle: a role-spawned session carries a `.name` ("PM.97acc4bc"); show it as
-// "PM.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
+// A member's readable display handle: a role-spawned session carries a `.name` ("Coordinator.97acc4bc"); show it as
+// "Coordinator.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
 function displayHandle(name: string | null | undefined, sid: string): string {
   if (!name || !name.trim()) return sid.slice(0, 8);
@@ -594,7 +594,7 @@ function shortTag(sid: string, all: string[]): string {
 
 type TagEntry = { sid: string; name?: string | null };
 
-// What to drop into the post box when a member pill is clicked. Prefer the READABLE role handle (`@PM`) when
+// What to drop into the post box when a member pill is clicked. Prefer the READABLE role handle (`@Coordinator`) when
 // the member has a name and that role prefix is unambiguous among current members; disambiguate to the full
 // `Role.sid` handle on a role-name collision (two PMs); fall back to the shortest unambiguous sid prefix when
 // the member is unnamed. Every form resolves server-side (thread-tags.js matches sid OR name prefix).
@@ -752,6 +752,10 @@ function AnnotationsLayer({
   // The create popover (fab clicked): same offsets, plus the draft text.
   const [draft, setDraft] = useState<{ x: number; y: number; start: number; end: number } | null>(null);
   const [draftText, setDraftText] = useState("");
+  // W2: a draft can be a plain comment or an anchored question (kind:"question"), with optional choices
+  // (one per line or `|`-separated, mirroring `canvas anno ask --options "A|B|C"`).
+  const [draftKind, setDraftKind] = useState<"note" | "question">("note");
+  const [draftOptions, setDraftOptions] = useState("");
   const [replyText, setReplyText] = useState("");
   const [showResolved, setShowResolved] = useState(false);
   // What the last paint actually placed, for click hit-testing (range → annotation id).
@@ -765,6 +769,8 @@ function AnnotationsLayer({
   const list = useMemo(() => annos ?? [], [annos]);
   const openAnnos = useMemo(() => list.filter((a) => !a.resolved), [list]);
   const orphans = useMemo(() => openAnnos.filter((a) => a.orphaned), [openAnnos]);
+  // W2: questions awaiting a human decision — surfaced as a distinct count on the badge.
+  const awaitingQs = useMemo(() => openAnnos.filter((a) => a.state === "awaiting"), [openAnnos]);
   const current = openId ? (list.find((a) => a.id === openId) ?? null) : null;
 
   // PAINT: resolve every visible anchor against the rendered text and publish the ranges. Re-runs on
@@ -778,12 +784,12 @@ function AnnotationsLayer({
     const paint = () => {
       raf = 0;
       const el = host.querySelector<HTMLElement>("[data-text]");
-      const entries: { id: string; range: Range; resolved: boolean }[] = [];
+      const entries: { id: string; range: Range; resolved: boolean; question: boolean }[] = [];
       if (el) {
         for (const a of list) {
           if (a.orphaned || (a.resolved && !showResolved)) continue;
           const range = anchorRangeIn(el, a.anchor);
-          if (range) entries.push({ id: a.id, range, resolved: a.resolved });
+          if (range) entries.push({ id: a.id, range, resolved: a.resolved, question: a.kind === "question" });
         }
       }
       painted.current = entries;
@@ -795,9 +801,13 @@ function AnnotationsLayer({
         const r = rangeFromTextOffsets(el, draft.start, draft.end);
         if (r) active.push(r);
       }
+      // Questions paint in their own bucket (a distinct hue) so an anchored ask reads apart from a plain
+      // comment at a glance; the open one still promotes to `active`, resolved to `resolved`.
+      const paintable = entries.filter((e) => e.id !== openId);
       setCardHighlights(id, {
-        open: entries.filter((e) => !e.resolved && e.id !== openId).map((e) => e.range),
-        resolved: entries.filter((e) => e.resolved && e.id !== openId).map((e) => e.range),
+        open: paintable.filter((e) => !e.resolved && !e.question).map((e) => e.range),
+        question: paintable.filter((e) => !e.resolved && e.question).map((e) => e.range),
+        resolved: paintable.filter((e) => e.resolved).map((e) => e.range),
         active,
       });
     };
@@ -932,10 +942,26 @@ function AnnotationsLayer({
     };
     const hit = source != null ? resolveAnchor(source, q) : null;
     const anchor = source != null && hit ? makeAnchor(source, hit.start, hit.end) : q;
-    const r = await postAnnotationOp(path, { op: "create", anchor, text, author: "human" });
+    const options =
+      draftKind === "question"
+        ? draftOptions
+            .split(/[\n|]/)
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : [];
+    const r = await postAnnotationOp(path, {
+      op: "create",
+      anchor,
+      text,
+      author: "human",
+      ...(draftKind === "question" ? { kind: "question" } : {}),
+      ...(options.length ? { options } : {}),
+    });
     if (r.ok) {
       setDraft(null);
       setDraftText("");
+      setDraftKind("note");
+      setDraftOptions("");
       document.getSelection()?.removeAllRanges();
     }
   };
@@ -944,6 +970,18 @@ function AnnotationsLayer({
     const text = replyText.trim();
     if (!current || !text) return;
     const r = await postAnnotationOp(path, { op: "reply", id: current.id, from: "human", text });
+    if (r.ok) setReplyText("");
+  };
+
+  // W2: record a decision on the open question — an option `choice` and/or free prose. Flips the
+  // question awaiting → answered (the server stamps `answer`); the popover stays up to show it.
+  const sendAnswer = async (choice?: string, text?: string) => {
+    if (!current) return;
+    const body: Record<string, unknown> = { op: "answer", id: current.id, by: "human" };
+    if (choice) body.choice = choice;
+    if (text) body.text = text;
+    if (!body.choice && !body.text) return;
+    const r = await postAnnotationOp(path, body);
     if (r.ok) setReplyText("");
   };
 
@@ -965,10 +1003,11 @@ function AnnotationsLayer({
       {list.length > 0 && (
         <button
           className={`anno-badge${openAnnos.length === 0 ? " quiet" : ""}`}
-          title={`${openAnnos.length} open comment${openAnnos.length === 1 ? "" : "s"} (${list.length} total) — click to ${showResolved ? "hide" : "show"} resolved`}
+          title={`${openAnnos.length} open comment${openAnnos.length === 1 ? "" : "s"} (${list.length} total)${awaitingQs.length ? ` · ${awaitingQs.length} question${awaitingQs.length === 1 ? "" : "s"} awaiting an answer` : ""} — click to ${showResolved ? "hide" : "show"} resolved`}
           onClick={() => setShowResolved((v) => !v)}
         >
           💬 {openAnnos.length}
+          {awaitingQs.length > 0 && <span className="anno-badge-q">❓{awaitingQs.length}</span>}
         </button>
       )}
       {orphans.length > 0 && (
@@ -986,10 +1025,12 @@ function AnnotationsLayer({
         <button
           className="anno-fab"
           style={{ left: Math.max(8, Math.min(fab.x, (hostRef.current?.offsetWidth ?? 200) - 40)), top: fab.y + 4 }}
-          title="comment on the selection"
+          title="comment on or ask a question about the selection"
           onClick={() => {
             setDraft(fab);
             setDraftText("");
+            setDraftKind("note");
+            setDraftOptions("");
             setFab(null);
             setOpenId(null);
           }}
@@ -999,9 +1040,26 @@ function AnnotationsLayer({
       )}
       {draft && (
         <div ref={popRef} className="anno-pop" style={{ left: clampPop(draft).x, top: clampPop(draft).y }}>
+          {/* W2: a draft is a plain comment OR an anchored question. The toggle picks the kind; a question
+              reveals an optional choices field (docs/anchored-async-ask.md §6 — ask on the doc). */}
+          <div className="anno-pop-row anno-kind-toggle">
+            <button
+              className={`anno-btn${draftKind === "note" ? "" : " quiet"}`}
+              onClick={() => setDraftKind("note")}
+            >
+              💬 Comment
+            </button>
+            <button
+              className={`anno-btn${draftKind === "question" ? "" : " quiet"}`}
+              title="ask a decision on this span — answered on the doc, not in-session"
+              onClick={() => setDraftKind("question")}
+            >
+              ❓ Ask
+            </button>
+          </div>
           <textarea
             className="anno-input"
-            placeholder="comment on the selection…"
+            placeholder={draftKind === "question" ? "ask a question about the selection…" : "comment on the selection…"}
             autoFocus
             value={draftText}
             onChange={(e) => setDraftText(e.target.value)}
@@ -1013,48 +1071,99 @@ function AnnotationsLayer({
               if (e.key === "Escape") setDraft(null);
             }}
           />
+          {draftKind === "question" && (
+            <textarea
+              className="anno-input anno-options"
+              placeholder="options, one per line (optional)"
+              value={draftOptions}
+              onChange={(e) => setDraftOptions(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setDraft(null);
+              }}
+            />
+          )}
           <div className="anno-pop-row">
-            <button className="anno-btn" onClick={() => void submitDraft()}>Comment</button>
+            <button className="anno-btn" onClick={() => void submitDraft()}>
+              {draftKind === "question" ? "Ask" : "Comment"}
+            </button>
             <button className="anno-btn quiet" onClick={() => setDraft(null)}>Cancel</button>
           </div>
         </div>
       )}
-      {current && (
+      {current && (() => {
+        const isQuestion = current.kind === "question";
+        const qState = current.state; // awaiting | answered | resolved
+        const answerable = isQuestion && !current.resolved; // a question still open to a decision
+        return (
         <div ref={popRef} className="anno-pop" style={{ left: pop.x, top: pop.y }}>
           <div className="anno-pop-head">
+            {isQuestion && (
+              <span className={`anno-qpill ${qState ?? "awaiting"}`} title="anchored question (docs/anchored-async-ask.md)">
+                {qState === "answered" ? "answered" : qState === "resolved" ? "resolved" : "awaiting"}
+              </span>
+            )}
             <span className="anno-quote">“{current.anchor.exact}”</span>
             <button className="anno-x" title="close" onClick={() => setOpenId(null)}>✕</button>
           </div>
           <div className="anno-msg">
             <span className="anno-from">{current.author}</span>
             <span className="anno-time">{formatEventTime(current.ts)}</span>
-            <div className="anno-text">{current.text}</div>
+            <div className={`anno-text${isQuestion ? " anno-question-text" : ""}`}>
+              {isQuestion && "❓ "}
+              {current.text}
+            </div>
           </div>
           {current.replies.map((rep, i) => (
             <div key={i} className="anno-msg reply">
               <span className="anno-from">{rep.from === "human" ? "human" : rep.from.slice(0, 8)}</span>
               <span className="anno-time">{formatEventTime(rep.ts)}</span>
-              <div className="anno-text">{rep.text}</div>
+              <div className="anno-text">
+                {rep.choice != null && <span className="anno-choice">chose “{rep.choice}”</span>}
+                {rep.text}
+              </div>
             </div>
           ))}
+          {/* W2: answer a question straight from the card — one click per option, or prose in the row
+              below. Answering flips awaiting → answered; the asker resolves once satisfied. */}
+          {answerable && current.options && current.options.length > 0 && (
+            <div className="anno-opts">
+              {current.options.map((o) => (
+                <button
+                  key={o.label}
+                  className="anno-opt"
+                  title={o.description ?? `answer: ${o.label}`}
+                  onClick={() => void sendAnswer(o.label)}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+          )}
           {current.thread && <div className="anno-escalated">discussion moved to a thread</div>}
           <div className="anno-pop-row">
             <input
               className="anno-input"
-              placeholder="reply…"
+              placeholder={answerable ? "answer in prose…" : "reply…"}
               value={replyText}
               onChange={(e) => setReplyText(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") void sendReply();
+                if (e.key === "Enter") answerable ? void sendAnswer(undefined, replyText.trim()) : void sendReply();
                 if (e.key === "Escape") setOpenId(null);
               }}
             />
             {replyText.trim() ? (
-              // Typed text swaps Resolve out for Reply: the send affordance was Enter-only (invisible),
-              // and Resolve here would dismiss the popover and lose the unsent draft.
-              <button className="anno-btn" title="add your comment to this exchange (Enter)" onClick={() => void sendReply()}>
-                Reply
-              </button>
+              // Typed text swaps Resolve out for the send action: on a question that's an Answer, else a
+              // Reply. The send affordance was Enter-only (invisible), and Resolve here would dismiss the
+              // popover and lose the unsent draft.
+              answerable ? (
+                <button className="anno-btn" title="record this as the answer (Enter)" onClick={() => void sendAnswer(undefined, replyText.trim())}>
+                  Answer
+                </button>
+              ) : (
+                <button className="anno-btn" title="add your comment to this exchange (Enter)" onClick={() => void sendReply()}>
+                  Reply
+                </button>
+              )
             ) : (
               <button
                 className="anno-btn"
@@ -1066,7 +1175,8 @@ function AnnotationsLayer({
             )}
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

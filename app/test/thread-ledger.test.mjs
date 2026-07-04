@@ -141,23 +141,23 @@ test("migrateChannelLedger leaves an already-migrated (or fresh) board alone", (
 test("seats: fillSeat creates once, is idempotent for the same occupant, and re-fills on a respawn", () => {
   const repo = tmpRepo();
   const id = "node:thread:seats";
-  const first = fillSeat(repo, id, "PM", "sid-a", 100);
+  const first = fillSeat(repo, id, "Coordinator", "sid-a", 100);
   assert.equal(first.refilled, false, "first fill creates the seat");
-  assert.deepEqual(first.seat, { role: "PM", sid: "sid-a", createdAt: 100, filledAt: 100, fills: 1 });
+  assert.deepEqual(first.seat, { role: "Coordinator", sid: "sid-a", createdAt: 100, filledAt: 100, fills: 1 });
   // Same occupant re-onboards (a re-announced edge): no change, no write.
-  const again = fillSeat(repo, id, "PM", "sid-a", 200);
+  const again = fillSeat(repo, id, "Coordinator", "sid-a", 200);
   assert.equal(again.refilled, false);
-  assert.equal(readThreadMeta(repo, id).seats.PM.filledAt, 100, "idempotent — the marker didn't churn");
+  assert.equal(readThreadMeta(repo, id).seats.Coordinator.filledAt, 100, "idempotent — the marker didn't churn");
   // A fresh session of the same role (respawn): the SEAT persists, the occupant changes.
-  const refill = fillSeat(repo, id, "PM", "sid-b", 300);
+  const refill = fillSeat(repo, id, "Coordinator", "sid-b", 300);
   assert.equal(refill.refilled, true, "a new occupant is a re-fill");
-  assert.deepEqual(refill.seat, { role: "PM", sid: "sid-b", createdAt: 100, filledAt: 300, fills: 2 });
+  assert.deepEqual(refill.seat, { role: "Coordinator", sid: "sid-b", createdAt: 100, filledAt: 300, fills: 2 });
   // A second role gets its own seat beside it.
   fillSeat(repo, id, "Reviewer", "sid-c", 400);
   const seats = readThreadMeta(repo, id).seats;
-  assert.deepEqual(Object.keys(seats).sort(), ["PM", "Reviewer"]);
+  assert.deepEqual(Object.keys(seats).sort(), ["Coordinator", "Reviewer"]);
   // seatForSid resolves the current occupants only — the parked sid-a no longer holds a seat.
-  assert.equal(seatForSid(seats, "sid-b"), "PM");
+  assert.equal(seatForSid(seats, "sid-b"), "Coordinator");
   assert.equal(seatForSid(seats, "sid-c"), "Reviewer");
   assert.equal(seatForSid(seats, "sid-a"), null);
   assert.equal(seatForSid(undefined, "sid-b"), null, "no seats map → null, not a throw");

@@ -267,7 +267,7 @@ Instead of a 3-question in-session `ask` block, the reviewing session would have
 1. `canvas anno ask docs/claude-tag-lessons.md --anchor-exact "conditioning the fan-out on each member's
    work-intent" --question "Wake model for R2?" --options "Always-wake members|Keep tag-gating|Hybrid"
    --blocking` — one anchored question per fork, each on the span it concerns (the R2 paragraph, the pinning
-   non-rec, the PM/Coordinator naming). Each `--blocking` ask takes an ask-armed seat on the doc at
+   non-rec, the Coordinator naming). Each `--blocking` ask takes an ask-armed seat on the doc at
    `mentions` level. No thread.
 2. Declares itself waiting, winds down. The session card settles to waiting-for-human; the doc shows three
    awaiting questions on three spans; the board's awaiting-questions sweep lists the doc.

@@ -29,9 +29,9 @@ test("renderRoleFile omits the colour line when there is no colour; parse → co
 });
 
 test("loops round-trips: rendered only when true, parsed to a boolean", () => {
-  const looped = renderRoleFile({ name: "PM", colour: "green", loops: true, charter: "coordinate" });
+  const looped = renderRoleFile({ name: "Coordinator", colour: "green", loops: true, charter: "coordinate" });
   assert.match(looped, /^loops: true$/m);
-  assert.equal(parseRoleFile(looped, "pm").loops, true);
+  assert.equal(parseRoleFile(looped, "coordinator").loops, true);
   // omitted unless true; absent frontmatter ⇒ false (a plain reactive role)
   const plain = renderRoleFile({ name: "Plain", charter: "hi" });
   assert.doesNotMatch(plain, /loops:/);

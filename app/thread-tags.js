@@ -22,7 +22,7 @@ const ALL_TOKENS = new Set(["all", "everyone", "channel", "here"]);
 const HUMAN_TOKENS = new Set(["human", "user"]);
 
 // The canonical tag-token grammar, defined ONCE so the resolver (server) and the highlighter (client, which
-// imports this module) can never drift apart — divergence here is exactly the @PM-doesn't-light-up bug.
+// imports this module) can never drift apart — divergence here is exactly the @Coordinator-doesn't-light-up bug.
 // `/g` is stateful (lastIndex), so hand out a FRESH RegExp per call rather than sharing one mutable literal.
 function tagRe() {
   return /(?<![\w@])@([A-Za-z0-9][\w.-]*)/g;

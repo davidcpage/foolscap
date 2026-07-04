@@ -48,6 +48,18 @@ export interface ThreadMetaMarker {
   lastTs?: number;
   intents?: Record<string, DeclaredIntent>;
   seats?: Record<string, SeatRecord>;
+  pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
+}
+
+// A pinned message (R-PIN, W7): a SNAPSHOT of a thread message flagged as head context — re-read on every
+// wake, ahead of the recent tail. Snapshotted (not a bare seq) so it survives the log's bounded tail.
+export interface PinnedMsg {
+  seq: number;
+  from: string;
+  text: string;
+  ts: number;
+  pinnedBy: string;
+  pinnedAt: number;
 }
 
 export function canvasThreadsDir(repoPath: string): string;
@@ -65,3 +77,12 @@ export function fillSeat(
   ts: number,
 ): { seat: SeatRecord; refilled: boolean };
 export function seatForSid(seats: Record<string, SeatRecord> | undefined, sid: string): string | null;
+export function readPins(repoPath: string, threadId: string): PinnedMsg[];
+export function pinMessage(
+  repoPath: string,
+  threadId: string,
+  msg: ThreadLogMsg,
+  by: string,
+  ts: number,
+): PinnedMsg[];
+export function unpinMessage(repoPath: string, threadId: string, seq: number): PinnedMsg[];

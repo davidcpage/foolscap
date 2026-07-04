@@ -182,3 +182,47 @@ export function seatForSid(seats, sid) {
   for (const [handle, s] of Object.entries(seats ?? {})) if (s && s.sid === sid) return handle;
   return null;
 }
+
+// ── pins (R-PIN, wakeable-substrate-plan W7) ────────────────────────────────────────────────────────
+// A PIN is the thread's HEAD CONTEXT: a message flagged to be re-read on every wake, ahead of the recent
+// tail (claude-tag-lessons R-PIN). The task statement, the `Done when:` condition (R5), and any framing a
+// long thread must keep in view become pinned posts, so they stay present however far the log grows — the
+// canvas-native answer to Tag's head-window problem, without a hard-coded head bias. Pinning must NOT
+// reorder the log: a pin is a SNAPSHOT of the message (`{seq, from, text, ts, pinnedBy, pinnedAt}`) kept on
+// the marker, in CHRONOLOGICAL (seq) order, and the card renders a collapsible tray that references it.
+// We snapshot rather than store a bare seq because the live log is a bounded tail (MAX_THREAD_MSGS) and the
+// ledger read is byte-bounded — a pin older than either would otherwise vanish from view, exactly the
+// content-loss the head context is meant to prevent. `pins` lives on the meta marker beside `seats`/`intents`.
+
+/**
+ * The thread's pins (chronological snapshots), or [] if none / no marker. Best-effort, never throws.
+ */
+export function readPins(repoPath, threadId) {
+  const pins = readThreadMeta(repoPath, threadId)?.pins;
+  return Array.isArray(pins) ? pins : [];
+}
+
+/**
+ * Pin a message (idempotent by seq): add its snapshot to the marker's `pins`, sorted by seq. Re-pinning an
+ * already-pinned seq is a no-op that returns the existing set (never a duplicate). `msg` is the stored
+ * ThreadMsg; we keep only the fields the tray/head-context need. Returns the updated pins array.
+ */
+export function pinMessage(repoPath, threadId, msg, by, ts) {
+  const prior = readPins(repoPath, threadId);
+  if (prior.some((p) => p.seq === msg.seq)) return prior; // already pinned — idempotent
+  const snapshot = { seq: msg.seq, from: msg.from, text: msg.text, ts: msg.ts, pinnedBy: by, pinnedAt: ts };
+  const pins = [...prior, snapshot].sort((a, b) => a.seq - b.seq);
+  upsertThreadMeta(repoPath, threadId, { pins });
+  return pins;
+}
+
+/**
+ * Unpin a message by seq. A no-op (returns the prior set) if that seq wasn't pinned. Returns updated pins.
+ */
+export function unpinMessage(repoPath, threadId, seq) {
+  const prior = readPins(repoPath, threadId);
+  const pins = prior.filter((p) => p.seq !== seq);
+  if (pins.length === prior.length) return prior; // nothing pinned at that seq
+  upsertThreadMeta(repoPath, threadId, { pins });
+  return pins;
+}
