@@ -53,7 +53,7 @@ dep) can run in parallel sessions.
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (held: shares thread code w/ W7) |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
 | W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
-| W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | WIP `051764e7` |
+| W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE (this commit; ledger in `addaf14`) |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
 
@@ -156,6 +156,20 @@ dep) can run in parallel sessions.
   thread message with proof against it; the Coordinator's review = checking proof against condition.
 - **Done when:** a message can be pinned and shows in a tray; a Done-when + proof-at-done norm is in the
   briefs.
+- **Shipped** (this commit; ledger helpers bundled in `addaf14`): pins are SNAPSHOTS on the thread marker
+  (`pins: [{seq, from, text, ts, pinnedBy, pinnedAt}]`, chronological), so a pin survives the log's bounded
+  tail — `readPins`/`pinMessage` (idempotent by seq)/`unpinMessage` in `thread-ledger.js` (+ `.d.ts`).
+  New endpoint `POST /api/thread/<id>/pin {from, seq, pinned?}` (default pins; 400 bad seq, 404 no message,
+  403 non-member). Pins ride the `thread:<id>` feed via `publishThreadFeed`, and `/api/inbox` returns a
+  channel's `pinned` array on every wake (re-served, never consumed — the head-context re-read), attached to
+  any thread with fresh messages. Card UI (`NodeView.tsx` + `style.css`): a collapsible amber pinned tray
+  above the log, plus a per-message 📌 toggle (`setThreadPin` in `threads.ts`); a pinned message keeps its
+  place in the log, lit. **R5 norm** added to the collab brief + the thread-join brief: a `Done when:`
+  condition should be pinned, and a `done` intent must carry a thread message with PROOF against it. Tests:
+  `thread-ledger.test.mjs` (pin snapshot/idempotence/chronology/coexists-with-seats+intents) +
+  `http-contract.test.mjs` (live pin→unpin round-trip, 400/404). Live-board smoke: pinned the W7 assignment
+  on this thread, confirmed the durable marker + `/inbox` `pinned`, unpinned. CLAUDE.md updated (the
+  agent-coordination § now documents `/pin` + the R5 done-discipline norm).
 
 ### W9 — PM → Coordinator rename
 - Repo-wide mechanical rename (currently doc-only in `claude-tag-lessons.md`): `docs/agent-roles.md`, the

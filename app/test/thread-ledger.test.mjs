@@ -18,6 +18,9 @@ import {
   listThreads,
   fillSeat,
   seatForSid,
+  readPins,
+  pinMessage,
+  unpinMessage,
 } from "../thread-ledger.js";
 
 function tmpRepo() {
@@ -161,4 +164,37 @@ test("seats: fillSeat creates once, is idempotent for the same occupant, and re-
   assert.equal(seatForSid(seats, "sid-c"), "Reviewer");
   assert.equal(seatForSid(seats, "sid-a"), null);
   assert.equal(seatForSid(undefined, "sid-b"), null, "no seats map → null, not a throw");
+});
+
+test("pins (R-PIN): pin snapshots a message, is idempotent, stays chronological, and unpins", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:pins";
+  assert.deepEqual(readPins(repo, id), [], "no marker → no pins, not a throw");
+  // Pin out of order — the set stays sorted by seq (chronological head context).
+  pinMessage(repo, id, msg(5, "done-when"), "human", 900);
+  const after1 = pinMessage(repo, id, msg(2, "task statement"), "s1", 800);
+  assert.deepEqual(after1.map((p) => p.seq), [2, 5], "pins are kept seq-sorted regardless of pin order");
+  // A pin is a SNAPSHOT (survives the log's bounded tail), carrying who/when it was pinned.
+  assert.deepEqual(readPins(repo, id)[0], {
+    seq: 2, from: "s1", text: "task statement", ts: 20, pinnedBy: "s1", pinnedAt: 800,
+  });
+  // Re-pinning the same seq is a no-op — never a duplicate.
+  const again = pinMessage(repo, id, msg(2, "task statement"), "human", 999);
+  assert.deepEqual(again.map((p) => p.seq), [2, 5], "re-pin is idempotent");
+  // Unpin by seq; unpinning an unpinned seq is a harmless no-op.
+  assert.deepEqual(unpinMessage(repo, id, 2).map((p) => p.seq), [5]);
+  assert.deepEqual(unpinMessage(repo, id, 2).map((p) => p.seq), [5], "unpin of a non-pin is a no-op");
+  assert.deepEqual(readPins(repo, id).map((p) => p.seq), [5], "the durable marker reflects the unpin");
+});
+
+test("pins ride the marker beside seats/intents without clobbering them", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:coexist";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  upsertThreadMeta(repo, id, { intents: { Coordinator: { intent: "working", ts: 100, sid: "sid-a" } } });
+  pinMessage(repo, id, msg(1, "Done when: tests green"), "sid-a", 200);
+  const meta = readThreadMeta(repo, id);
+  assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat survives a pin write");
+  assert.equal(meta.intents.Coordinator.intent, "working", "intent survives a pin write");
+  assert.equal(meta.pins.length, 1, "pins land alongside");
 });

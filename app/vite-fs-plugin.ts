@@ -3575,7 +3575,8 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
 //   POST /api/thread/<threadId>/invite  ?board=  { from, target, history? } — propose membership for another session
 //   POST /api/thread/<threadId>/history ?board=  { target, mode } — set a member's backlog visibility (full|future)
 //   POST /api/thread/<threadId>/intent  ?board=  { from, intent, note? } — declare work-intent (card-only typed act)
-//   GET  /api/inbox ?session=<sid>                            — read this session's unread thread messages
+//   POST /api/thread/<threadId>/pin     ?board=  { from, seq, pinned? } — flag/unflag a message as head context (R-PIN)
+//   GET  /api/inbox ?session=<sid>                            — read this session's unread thread messages (+ pins)
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
 // never has to construct node/edge ids — it works in thread ids + its own sid only.
 

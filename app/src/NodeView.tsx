@@ -8,7 +8,7 @@ import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
-import { MEMBER_OPEN, postToThread, setThreadHistory } from "./threads";
+import { MEMBER_OPEN, postToThread, setThreadHistory, setThreadPin } from "./threads";
 import { openCanvasLink, resolveCanvasLink } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { intentGlyph } from "../work-intent.js";
@@ -316,6 +316,8 @@ function ProvenanceView({
 // pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan / Backspace→delete) from
 // reaching the canvas. Mirrors TemplateCard's seam.
 type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
+// A pinned message (R-PIN): a snapshot flagged as head context, rendered in the collapsible pinned tray.
+type PinnedMsg = { seq: number; from: string; text: string; ts: number; pinnedBy?: string; pinnedAt?: number };
 // A member's readable display handle: a role-spawned session carries a `.name` ("Coordinator.97acc4bc"); show it as
 // "Coordinator.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
@@ -350,8 +352,10 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[] }>("thread:" + id));
   const msgs = feed?.messages ?? [];
+  const pins = feed?.pins ?? [];
+  const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
 
   const [description, setDescription] = useState(node.text);
   // Charter render/edit toggle: read mode shows the rendered markdown (MarkdownInline), a click flips to the
@@ -468,6 +472,13 @@ function ThreadView({
     if (r.ok) { setPost(""); setStatus("posted"); }
     else setStatus(r.error ?? "failed");
   };
+  // Pin/unpin a message as head context (R-PIN). The feed republishes the pins on success, so the tray and
+  // the message's pin glyph update from the live feed — no local pin state to keep in sync.
+  const togglePin = async (seq: number) => {
+    const pinned = !pinnedSeqs.has(seq);
+    const r = await setThreadPin(id, "human", seq, pinned);
+    if (!r.ok) setStatus(r.error ?? "pin failed");
+  };
 
   return (
     <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
@@ -505,6 +516,27 @@ function ThreadView({
           )}
         </div>
       )}
+      {pins.length > 0 && (
+        // The pinned tray (R-PIN): the thread's head context — the task statement, the Done-when condition,
+        // any framing kept in view. Collapsible (<details>), chronological (the server keeps pins seq-sorted).
+        // It REFERENCES the messages (they keep their place in the log below); clicking a row's 📌 unpins.
+        <details className="chan-pins" data-interactive open>
+          <summary className="chan-pins-summary">📌 pinned · {pins.length}</summary>
+          {pins.map((p) => (
+            <div key={p.seq} className="chan-pin">
+              <span className="chan-msg-from" title={p.from}>{senderLabel(p.from, nameForSid(p.from))}</span>
+              <div className="chan-msg-text">{renderTaggedText(p.text, openEntries)}</div>
+              <button
+                className="chan-pin-toggle on"
+                title="unpin — remove from head context"
+                onClick={(e) => { e.stopPropagation(); void togglePin(p.seq); }}
+              >
+                📌
+              </button>
+            </div>
+          ))}
+        </details>
+      )}
       <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
         {feed?.truncated && (
           <span className="chan-empty">…earlier messages dropped (showing the most recent {msgs.length})</span>
@@ -523,9 +555,17 @@ function ThreadView({
                 <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
               </div>
             ) : (
-              <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}`}>
+              <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}>
                 <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
                 <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                <button
+                  className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
+                  data-interactive
+                  title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
+                  onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
+                >
+                  📌
+                </button>
                 <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries)}</div>
               </div>
             ),

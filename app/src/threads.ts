@@ -129,6 +129,28 @@ export async function postToThread(threadId: string, from: string, text: string)
   }
 }
 
+// Pin (or unpin) a thread message as HEAD CONTEXT (R-PIN): a pinned message is re-read on every wake and
+// shows in the card's pinned tray. `from` is the actor — "human" when the board owner clicks the pin on a
+// message in the thread card. Returns a thin ok/error like postToThread.
+export async function setThreadPin(
+  threadId: string,
+  from: string,
+  seq: number,
+  pinned: boolean,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/pin?board=${activeBoardId()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, seq, pinned }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    return res.ok ? { ok: true } : { ok: false, error: body.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
 // Set how much of the backlog a member sees: "full" replays the whole history to them on their next read
 // (and nudges them), "future" jumps them to the latest. Applies now if they're a live member, else it's
 // remembered for when they join. The board owner's per-member control on the thread card.

@@ -2543,6 +2543,50 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font-style: italic;
 }
 .chan-msg.sys .chan-msg-from { color: #71717a; }
+/* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
+   keeps its place in the log and shows its 📌 lit; the collapsible pinned tray above is the head-context
+   surface (re-read on every wake — mirrored server-side into /inbox's `pinned`). */
+.chan-pin-toggle {
+  margin-left: 6px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0;
+  filter: grayscale(1);
+  transition: opacity 0.1s;
+}
+.chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
+.chan-pin-toggle.on { opacity: 1; filter: none; }
+.chan-msg.pinned { background: #f59e0b11; border-radius: 4px; }
+/* The pinned tray: the thread's head context, folded by default-open. Sits above the log, referencing the
+   pinned messages (which stay in place below). Amber-tinted to read as "kept in view". */
+.chan-pins {
+  margin: 2px 4px 0;
+  padding: 3px 6px;
+  background: #f59e0b14;
+  border: 1px solid #f59e0b33;
+  border-radius: 5px;
+  font-size: 11px;
+}
+.chan-pins-summary {
+  cursor: pointer;
+  font: 10px ui-monospace, Menlo, monospace;
+  font-weight: 600;
+  color: #b45309;
+  user-select: none;
+}
+.chan-pin {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 3px;
+  line-height: 1.35;
+}
+.chan-pin .chan-msg-text { flex: 1 1 auto; }
+.chan-pin .chan-pin-toggle { opacity: 1; filter: none; margin-left: 0; }
 /* A work-intent typed act (threads-as-cards §6): a slim card-only status line, not a conversation turn.
    Tints follow the session-status vocabulary — amber = your turn, blue = in flight elsewhere, green = done. */
 .chan-intent {

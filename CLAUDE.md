@@ -241,6 +241,16 @@ done/exited, none blocked:human; unstaffed threads are dormant; computed at read
   the thread's meta marker and `GET /api/threads` (`intents` — keyed by the declarer's SEAT handle when it
   holds one, so the state survives a respawn; else by sid); the derived thread `state` (see above) ranges
   over it. Enum lives in `app/work-intent.js`.
+- **Pins — the head-context tray (R-PIN, `wakeable-substrate-plan.md` W7):** `POST /api/thread/<id>/pin
+  {from, seq, pinned?}` flags a message as **head context** — re-read on every wake, ahead of the recent
+  tail (`pinned` defaults true; unpin with `pinned:false`). The pin is a **snapshot** on the thread marker
+  (`pins`, chronological), so it survives the log's bounded tail; the message keeps its place in the log.
+  The card shows a collapsible pinned tray + a per-message 📌; `GET /api/inbox` returns a channel's `pinned`
+  array on any read with fresh messages (re-served, not consumed — so a woken agent always re-reads it).
+  **R5 done-discipline (norm, no schema):** a thread's `Done when:` condition should be a **pinned** post,
+  and a `done` intent must be accompanied by a thread message posting **proof** against it (test output, a
+  diff, a link) — the Coordinator's review is checking proof against the pinned condition, not trusting the
+  flag. Helpers in `app/thread-ledger.js` (`readPins`/`pinMessage`/`unpinMessage`).
 
 Gotchas:
 - **Membership must be in the saved snapshot before `ask`/`message` will accept it.** Membership is read

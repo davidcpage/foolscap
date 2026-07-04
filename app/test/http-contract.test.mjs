@@ -110,6 +110,35 @@ test("thread append lazy-seeds from the on-disk ledger — never mints seq 1 ont
   assert.equal((await res.json()).seq, 401);
 });
 
+test("thread pin (R-PIN): pin → unpin round-trip, snapshots head context, 400/404 on bad input", { skip: !up && "no dev server on 5173" }, async () => {
+  const threadId = `node:thread:pin-${runTag}`;
+  await fetch(
+    `${HOST}/api/board/persist/snapshot?board=${boardId}`,
+    j({ snapshot: { seq: 30, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Pin" }] } }),
+  );
+  // Post a couple of messages to pin.
+  await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`, j({ from: "human", text: "Done when: tests green" }));
+  const m2 = await (await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`, j({ from: "human", text: "chatter" }))).json();
+  const doneSeq = m2.seq - 1;
+  // Pin the done-condition (bare call defaults pinned:true) — the response carries the pin snapshot.
+  const pinRes = await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: doneSeq }));
+  assert.equal(pinRes.status, 200);
+  const pinned = await pinRes.json();
+  assert.equal(pinned.pinned, true);
+  assert.deepEqual(pinned.pins.map((p) => p.seq), [doneSeq]);
+  assert.equal(pinned.pins[0].text, "Done when: tests green", "the pin is a snapshot of the message text");
+  // Re-pinning is idempotent; pinning a second message keeps them chronological.
+  await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: doneSeq }));
+  const two = await (await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: m2.seq }))).json();
+  assert.deepEqual(two.pins.map((p) => p.seq), [doneSeq, m2.seq]);
+  // Unpin.
+  const un = await (await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: doneSeq, pinned: false }))).json();
+  assert.deepEqual(un.pins.map((p) => p.seq), [m2.seq]);
+  // Bad input: a non-integer seq is 400; a seq with no message is 404.
+  assert.equal((await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: "x" }))).status, 400);
+  assert.equal((await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: 99999 }))).status, 404);
+});
+
 test("thread and channel API paths are aliases", { skip: !up && "no dev server on 5173" }, async () => {
   const a = await (await fetch(`${HOST}/api/threads?board=${boardId}`)).json();
   const b = await (await fetch(`${HOST}/api/channels?board=${boardId}`)).json();
