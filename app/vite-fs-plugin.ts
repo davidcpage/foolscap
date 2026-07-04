@@ -17,6 +17,7 @@ import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-
 import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, readAnnotationLog, type AnnotationEvent } from "./annotations.js";
+import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
@@ -562,6 +563,7 @@ async function handleFileWrite(
   res: ServerResponse,
   root: string,
   rel: string,
+  repoPath: string,
 ): Promise<void> {
   const abs = safeResolve(root, rel);
   const allowed =
@@ -582,6 +584,15 @@ async function handleFileWrite(
     fs.writeFileSync(abs!, body.content, "utf8");
   } catch (err) {
     return sendJson(res, 500, { error: String(err) });
+  }
+  // Self-heal any annotations this write moved (§4), so a viewing card's highlights track the new bytes
+  // immediately rather than waiting for the next annotation read. Best-effort — a no-op for an unannotated
+  // file, and never allowed to fail the write it rides on. (The agent's Edit tool bypasses this path and
+  // hits the disk directly; the read-time reanchor covers that — this is the /api/file card-save fast path.)
+  try {
+    reanchorFile(repoPath, body.content, rel);
+  } catch {
+    /* reanchor is best-effort; the write already succeeded */
   }
   sendJson(res, 200, { path: rel, ok: true });
 }
@@ -628,8 +639,13 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
       .filter((f) => f.total > 0);
     return sendJson(res, 200, { files });
   }
-  const annos = foldAnnotations(readAnnotationLog(repoPath, rel));
   const src = readAnnotatedSource(root, rel); // a deleted/blocked file ⇒ every anchor orphans (quotes intact — the payload)
+  // Self-heal (§4): re-mint anchors an intervening edit moved BEFORE we fold, so the read reflects the
+  // fresh selectors and future reads hit the offset fast path. Best-effort, converges in one pass, and
+  // covers every edit path (the Edit tool, /api/file, an external editor, git) — this read is the one
+  // place that sees the current bytes and the ledger together, so no watcher is needed.
+  reanchorFile(repoPath, src ?? null, rel);
+  const annos = foldAnnotations(readAnnotationLog(repoPath, rel));
   const annotations = annos.map((a) => {
     const range = src == null ? null : resolveAnchor(src, a.anchor);
     return { ...a, orphaned: !range, range };
@@ -1750,17 +1766,21 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     "",
     "DOC ANNOTATIONS. Files on this board can carry standoff comments — quote-anchored questions and notes",
     "stored OUTSIDE the file (the bytes you read/edit never contain them; ledger: .canvas/annotations/). The",
-    "human highlights a span on a doc card and asks; your answer lands where the question lives.",
-    `  • sweep "what's awaiting an answer":  GET ${base}/api/annotations?board=${boardId}  → { files:[{path, open, orphaned}] }`,
-    `  • read one file's:  GET ${base}/api/annotations?board=${boardId}&path=<path>  → { annotations:[{id,`,
-    "    anchor:{exact,…}, text, author, replies, resolved, orphaned}] } — anchor.exact is the quoted span.",
-    `  • act on one:  POST ${base}/api/annotations?board=${boardId}  { path, op, … } with op one of:`,
-    `    reply {id, from:"${sessionId}", text} · resolve / reopen {id, by:"${sessionId}"} · reanchor {id, anchor,`,
-    `    by:"${sessionId}"} · create {anchor:{exact, prefix?, suffix?, offset?}, text, author:"${sessionId}"}.`,
-    "THE REVISION RULE: before editing a file, read its open annotations (the per-file GET — cheap, usually",
-    "empty). As part of the same change: REPLY to what you can answer, and RE-ANCHOR any surviving open",
-    "comment whose quoted text your edit moved (op reanchor, a fresh selector minted against the NEW file",
-    "text) — an un-re-anchored comment surfaces as a loud orphan strip on the card, never silently.",
+    "human highlights a span on a doc card and asks; your answer lands where the question lives. Prefer the",
+    "scripts/canvas anno CLI over raw curl for the whole loop:",
+    "  • scripts/canvas anno list [<path>]              board sweep, or one file's comments (one line each)",
+    "  • scripts/canvas anno reply <path> <id> [TEXT]   --stdin / --text-file for long replies (no escaping);",
+    `                                                   --from ${sessionId} to attribute`,
+    "  • scripts/canvas anno batch <path> replies.json  many replies at once from a JSON DATA file",
+    "                                                   ([{id,text}] or {id:text}) — not an ad-hoc script",
+    "  • scripts/canvas anno resolve|reopen <path> <id> [--by <sid>]",
+    `  Raw endpoints if needed: GET/POST ${base}/api/annotations?board=${boardId} (ops: create/reply/resolve/`,
+    "  reopen/reanchor/thread). The per-file GET returns anchor.exact (the quoted span) + orphaned/range.",
+    "THE REVISION RULE: before editing a file, read its open annotations (scripts/canvas anno list <path> —",
+    "cheap, usually empty). As part of the same change: REPLY to what you can answer. You do NOT hand-reanchor",
+    "moved comments — the server auto-reanchors any moved-but-still-resolvable comment on the next read/write.",
+    "It only leaves TRUE ORPHANS (comments whose quoted text your edit DELETED), shown as a loud orphan strip;",
+    "re-attach those from the quote or resolve them.",
     "RESOLUTION BELONGS TO THE AUTHOR: resolve your OWN comments freely, but NEVER reply-and-resolve someone",
     "else's question — a resolved comment is hidden from the card by default, so resolving it buries your",
     "reply before the asker has read it. Reply, leave it OPEN, and let the author resolve once satisfied",
@@ -4306,7 +4326,7 @@ export function fsApi(): Plugin {
           return handleFileDelete(res, root, url.searchParams.get("path") ?? "");
         if (url.pathname === "/api/file") {
           if (req.method === "POST")
-            return void handleFileWrite(req, res, root, url.searchParams.get("path") ?? "");
+            return void handleFileWrite(req, res, root, url.searchParams.get("path") ?? "", board.repoPath);
           return handleFile(res, root, url.searchParams.get("path") ?? "");
         }
         if (url.pathname === "/api/asset") {

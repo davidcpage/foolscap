@@ -258,22 +258,33 @@ fast-path → exact+context → fuzzy → orphan); storage is an append-only jso
 `<board repo>/.canvas/annotations/` (`app/annotations.js`, thread-ledger sibling). Reads/writes are
 server-side and tab-free.
 
+Prefer the **`scripts/canvas anno`** CLI (allow-listed wrapper) over raw curl for the whole loop:
+`anno list [path]` (board sweep, or one file's comments one line each), `anno reply <path> <id>` (text via
+arg / `--stdin` / `--text-file` — a long multi-paragraph reply never has to survive shell-escaping),
+`anno batch <path> replies.json` (author many replies once as a JSON data file — `[{id,text}]` or
+`{id:text}` — instead of an ad-hoc `urllib` script), `anno resolve`/`reopen <path> <id>`. Pass `--from`/
+`--by <your-sid>` to attribute (default `"human"`). Raw endpoints below for the rare op the CLI omits.
+
 - **Sweep** ("what's awaiting an answer"): `GET /api/annotations?board=<id>` → `{files:[{path, total,
-  open, orphaned}]}`. **Per file:** `…&path=<path>` → `{annotations:[{id, anchor, text, author, ts,
-  resolved, replies, thread?, orphaned, range}]}` — `orphaned`/`range` are derived at read time against
-  the file's current bytes, never stored.
+  open, orphaned}]}` (read-only; does not reanchor). **Per file:** `…&path=<path>` → `{annotations:[{id,
+  anchor, text, author, ts, resolved, replies, thread?, orphaned, range}]}` — `orphaned`/`range` are
+  derived at read time against the file's current bytes, never stored. The per-file read also
+  **auto-reanchors** drifted comments (see the revision rule).
 - **Write:** `POST /api/annotations?board=<id>` `{path, op, …}` — `create {anchor, text, author}` (returns
   `orphaned` immediately: check it — a mistyped `exact` is an orphan at birth), `reply {id, from, text}`,
-  `resolve`/`reopen {id, by}`, `reanchor {id, anchor, by}`, `thread {id, thread}`. Attribution
-  (`author`/`from`/`by`) is `"human"` or a session sid, the thread convention.
+  `resolve`/`reopen {id, by}`, `reanchor {id, anchor, by}` (manual reanchor is now only for re-attaching a
+  *true orphan* — the routine case is automatic), `thread {id, thread}`. Attribution (`author`/`from`/`by`)
+  is `"human"` or a session sid, the thread convention.
 
 **THE REVISION RULE (the convention that makes standoff anchors work here):** before editing an
-annotated file — and `docs/*.md` especially — read its open annotations first (the per-file GET; cheap,
-usually empty). As part of the same change: **reply** to what you can answer, and **re-anchor** any
-surviving open comment whose quoted text your edit moved (`op:"reanchor"` with a fresh selector minted
-against the new source). A comment you strand shows as a loud orphan strip on the card — never silently
-dropped, but a debt someone must pay. "Answer my comments on `<file>`" means: reply per annotation, and
-where the right answer is "fix the doc", fix the doc (then re-anchor).
+annotated file — and `docs/*.md` especially — read its open annotations first (`scripts/canvas anno list
+<path>`; cheap, usually empty). As part of the same change: **reply** to what you can answer. You **no
+longer hand-reanchor** comments your edit moved — the server auto-reanchors any moved-but-still-resolvable
+comment on the next read/write (re-minting its selector against the new bytes, converging in one pass). It
+only leaves behind **true orphans** — comments whose quoted text your edit *deleted* — which show as a loud
+orphan strip; re-attach those from the quote (a fresh `create`/`reanchor`) or resolve them. "Answer my
+comments on `<file>`" means: reply per annotation, and where the right answer is "fix the doc", fix the doc
+(the server keeps the surviving comments anchored for you).
 
 **RESOLUTION BELONGS TO THE AUTHOR.** Resolve your own comments freely; **never reply-and-resolve
 someone else's question** — resolved comments are hidden from the card by default, so resolving buries

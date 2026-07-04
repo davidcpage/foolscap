@@ -32,6 +32,20 @@ canvas — session/coordination verbs over the agent bus
   scripts/canvas input <sid> <text>                   send a turn to a live session's stdin (reads AS the human)
   scripts/canvas done <sid>                            mark a session done + terminate it
   scripts/canvas terminate <sid>                       kill a live session, free its slot
+
+  scripts/canvas anno list [PATH] [--all] [--json]     no PATH: board sweep (open/orphan counts per file);
+        with PATH: that file's annotations, one scannable line each (status, id, author, quote, replies).
+        Default hides resolved (--all shows them). Replaces the hand-rolled /api/annotations curls.
+  scripts/canvas anno reply <PATH> <ID> [TEXT] [--stdin|--text-file F] [--from ID]
+        reply to one annotation. Pass long/multi-paragraph text via --stdin or --text-file so it never
+        has to survive shell-escaping. --from is the author (a session passes its sid; default "human").
+  scripts/canvas anno batch <PATH> <replies.json> [--from ID]
+        reply to many at once: replies.json is DATA — [{"id":..,"text":..}] or {"<id>":"<text>"} — so you
+        author replies once as JSON (Write tool), not as an ad-hoc urllib script. One POST per entry.
+  scripts/canvas anno resolve|reopen <PATH> <ID> [--by ID]
+        flip resolved state. Resolve your OWN comments; leave someone else's open for them (the author
+        owns resolution). NOTE: no reanchor verb — the server auto-re-anchors on read/write; a comment
+        your edit MOVED fixes itself, and only a true orphan (quote gone) needs a fresh anchor via the API.
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
@@ -39,6 +53,133 @@ USAGE
 # JSON-encode a single string safely (handles quotes/newlines/unicode).
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' -d "$2"; }
+
+# ── doc-annotation verbs (docs/doc-annotations.md) ──────────────────────────────────────────────────
+# Ergonomic replacements for the raw /api/annotations curl the review flow used to hand-roll (and the
+# ad-hoc python scripts it wrote to escape multi-paragraph replies). The server now auto-re-anchors on
+# read/write, so there is no manual reanchor verb here — a comment your edit moved fixes itself; only a
+# true orphan (its quoted text gone) needs a fresh anchor, which stays a raw create via the API.
+ANNO_URL() { echo "$SERVER/api/annotations?board=$BOARD"; }
+# read TEXT from a positional arg, --stdin, or --text-file — the point is that a long, multi-paragraph
+# reply never has to survive shell-escaping: pipe it or hand it a file.
+anno_read_text() { # $1=positional-or-empty $2=stdin-flag $3=text-file-or-empty
+  if [ -n "$2" ]; then cat; elif [ -n "$3" ]; then cat "$3"; else printf '%s' "$1"; fi
+}
+anno_list() {
+  local path="" all="" json=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --all) all=1; shift ;; --json) json=1; shift ;; --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno list: unknown flag '$1'" >&2; exit 2 ;;
+    *) path="$1"; shift ;;
+  esac; done
+  local url; url="$(ANNO_URL)"
+  [ -n "$path" ] && url="$url&path=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$path")"
+  if [ -n "$json" ]; then curl -sS "$url"; echo; return; fi
+  # Pass the response as an argv, not a pipe: `python3 - <<PY` already claims stdin for the heredoc
+  # script, so a `curl | python3 -` would feed the JSON into the same fd and lose it.
+  local resp; resp="$(curl -sS "$url")"
+  python3 - "$path" "$all" "$resp" <<'PY'
+import json, sys
+path, allf = sys.argv[1], bool(sys.argv[2])
+d = json.loads(sys.argv[3])
+if not path:  # the board sweep
+    files = d.get("files", [])
+    if not files: print("no annotations on this board"); sys.exit()
+    for f in sorted(files, key=lambda f: (-f["orphaned"], -f["open"], f["path"])):
+        print(f"{f['open']:>3} open  {f['orphaned']:>2} orphan  {f['total']:>3} total   {f['path']}")
+    sys.exit()
+ann = d.get("annotations", [])
+op = [a for a in ann if not a["resolved"]]
+orph = [a for a in op if a["orphaned"]]
+print(f"{path} — {len(op)} open, {len(orph)} orphaned (of {len(ann)} total)")
+for a in ann:
+    if a["resolved"] and not allf: continue
+    st = "done  " if a["resolved"] else ("ORPHAN" if a["orphaned"] else "open  ")
+    q = (a["anchor"].get("exact", "") or "").replace("\n", " ")
+    if len(q) > 52: q = q[:51] + "…"
+    reps = a.get("replies", [])
+    tail = ""
+    if reps:
+        r = reps[-1]; t = r["text"].replace("\n", " ")
+        if len(t) > 46: t = t[:45] + "…"
+        tail = f"   last[{r['from'][:8]}]: {t}"
+    print(f"  {st}  {a['id']}  {a['author'][:8]:8}  \"{q}\"  ({len(reps)} repl){tail}")
+PY
+}
+anno_reply() {
+  local from="human" stdin="" tfile="" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) from="${2:-}"; shift 2 ;; --stdin) stdin=1; shift ;; --text-file) tfile="${2:-}"; shift 2 ;;
+    --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno reply: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}" id="${pos[1]:-}" arg="${pos[2]:-}"
+  if [ -z "$path" ] || [ -z "$id" ]; then
+    echo "usage: canvas anno reply <path> <id> [TEXT | --stdin | --text-file F] [--from ID]" >&2; exit 2; fi
+  local text; text="$(anno_read_text "$arg" "$stdin" "$tfile")"
+  if [ -z "$text" ]; then echo "anno reply: empty text (pass TEXT, --stdin, or --text-file)" >&2; exit 2; fi
+  local body; body=$(python3 - "$path" "$id" "$from" "$text" <<'PY'
+import json, sys
+print(json.dumps({"op": "reply", "path": sys.argv[1], "id": sys.argv[2], "from": sys.argv[3], "text": sys.argv[4]}))
+PY
+)
+  post "$(ANNO_URL)" "$body"; echo
+}
+anno_batch() {
+  local from="human" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) from="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno batch: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}" file="${pos[1]:-}"
+  if [ -z "$path" ] || [ -z "$file" ]; then
+    echo "usage: canvas anno batch <path> <replies.json> [--from ID]" >&2
+    echo "  replies.json = [{\"id\":...,\"text\":...}] or {\"<id>\":\"<text>\"} — author replies once as DATA," >&2
+    echo "  not as an ad-hoc script; one POST per entry." >&2; exit 2; fi
+  python3 - "$SERVER" "$BOARD" "$path" "$from" "$file" <<'PY'
+import json, sys, urllib.request
+server, board, path, frm, file = sys.argv[1:6]
+data = json.load(open(file))
+items = data if isinstance(data, list) else [{"id": k, "text": v} for k, v in data.items()]
+url = f"{server}/api/annotations?board={board}"
+ok = fail = 0
+for it in items:
+    body = json.dumps({"op": "reply", "path": path, "id": it["id"],
+                       "from": it.get("from", frm), "text": it["text"]}).encode()
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(req); ok += 1; print(f"  ok   {it['id']}")
+    except Exception as e:
+        fail += 1; print(f"  FAIL {it['id']}: {e}")
+print(f"replied {ok}, failed {fail}")
+sys.exit(1 if fail else 0)
+PY
+}
+anno_setstate() { # $1 = resolve|reopen
+  local op="$1"; shift
+  local by="human" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --by) by="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno $op: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}" id="${pos[1]:-}"
+  if [ -z "$path" ] || [ -z "$id" ]; then echo "usage: canvas anno $op <path> <id> [--by ID]" >&2; exit 2; fi
+  post "$(ANNO_URL)" "{\"op\":\"$op\",\"path\":$(jstr "$path"),\"id\":$(jstr "$id"),\"by\":$(jstr "$by")}"; echo
+}
+anno() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    list) anno_list "$@" ;;
+    reply) anno_reply "$@" ;;
+    batch) anno_batch "$@" ;;
+    resolve|reopen) anno_setstate "$sub" "$@" ;;
+    ""|-h|--help|help) echo "canvas anno list|reply|batch|resolve|reopen — see 'canvas' for details" >&2 ;;
+    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|resolve|reopen)" >&2; exit 2 ;;
+  esac
+}
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
@@ -76,6 +217,8 @@ PY
   terminate)
     sid="${1:?usage: canvas terminate <sid>}"
     post "$SERVER/api/session/$sid/terminate" "{}"; echo ;;
+  anno)
+    anno "$@" ;;
   ""|-h|--help|help) usage ;;
   *) echo "unknown verb: $cmd" >&2; usage >&2; exit 2 ;;
 esac

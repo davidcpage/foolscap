@@ -65,19 +65,39 @@ coordinate system; the card maps a source range to DOM highlights at paint time 
 in one owned module (`app/src/anchors.ts`), pure string-in/range-out, so core/interaction never learn
 about annotations.
 
-## 4. Anchor drift: the agent is in the maintenance loop
+## 4. Anchor drift: the SERVER is in the maintenance loop
 
-The reason standoff annotation is usually painful is that nobody re-anchors comments after an edit. Here
-the docs are mostly **revised by agents, on request** — and the reviser can be *required* (brief + CLAUDE.md
-convention) to read a doc's open annotations before editing it, then, as part of the same change: answer
-what it can (reply), mark addressed questions **resolved**, and **re-anchor** survivors whose text moved
-(rewrite the selector against the new source). The agent is part of the anchoring-maintenance loop — an
-assumption Notion never gets to make.
+The reason standoff annotation is usually painful is that nobody re-anchors comments after an edit. The
+first cut of this feature put the *agent* in that loop (a brief + CLAUDE.md convention: read a doc's open
+annotations before editing, then reply/resolve/**re-anchor** the survivors whose text moved). That worked
+but was a manual, token-heavy chore — a review session hand-wrote a selector for every moved comment,
+re-reading the doc several times to find the new byte spans. So the mechanical half is now **automatic**
+(`annotation-reanchor.js`): the server re-anchors on its own, and the agent is left only the judgement
+half (reply, resolve, and re-attach *true orphans*).
+
+**Auto-reanchor.** After a file's bytes change, every open annotation is re-resolved against the new
+source. Any whose stored anchor drifted — resolves via the `exact` or `fuzzy` pass rather than the
+`offset` fast path — is **re-minted** (`makeAnchor` against the new bytes) and an `ev:"reanchor"` event
+authored by `"system"` is appended. This is exactly what the manual convention asked of agents, done by
+the one component that always sees the current bytes and the ledger together. Two invariants keep it safe:
+
+- **It only re-anchors what still resolves.** A quote the edit *deleted* (resolution returns null) is
+  never touched — it stays a loud orphan, never silently re-attached to the wrong place. Auto-reanchor
+  shrinks the orphan set to exactly the comments that genuinely lost their referent.
+- **It converges in one pass.** A re-minted anchor's `offset` is its new start, so the next resolve hits
+  the fast path and no further reanchor fires — running it again is a no-op (idempotent).
+
+**Where it fires** — not a watcher (the codebase has enough of those), but the two points that already
+touch a file's bytes: the annotation **read** (`GET …&path=`, the one place that holds current source and
+ledger together — this covers *every* edit path: the agent's Edit tool, `/api/file`, an external editor,
+git) and the `/api/file` **write** (so a card's highlights self-heal the instant a card-save lands, before
+anyone reads). The no-path *sweep* stays pure — it only counts.
 
 When resolution still fails, the failure is loud, not silent: the card shows an **orphaned strip** (top of
 card) listing each unresolvable annotation with its quote intact. The quote *is* the payload — "this asked
 about text that has since changed" is often exactly the answer the human needs, and an agent sweeping
-comments can usually re-attach or resolve an orphan from the quote alone.
+comments can usually re-attach or resolve an orphan from the quote alone. Auto-reanchor means this strip
+now holds *only* those genuine orphans, not every comment near an edit.
 
 ## 5. Record & storage: a per-doc ledger in `.canvas/annotations/`
 
@@ -108,14 +128,25 @@ annotated file**, folded to current state at read. Events:
 
 - `GET  /api/annotations?board=<id>&path=<path>` → folded state: `{path, annotations:[{id, anchor, text,
   author, ts, resolved, replies:[…], orphaned}]}`. `orphaned` is computed at read time by resolving each
-  anchor against the current file bytes — derived, never stored (the `thread-state.js` principle).
-  Omitting `path` lists all annotated files with open/orphan counts — the "what's awaiting an answer"
-  sweep surface.
+  anchor against the current file bytes — derived, never stored (the `thread-state.js` principle). This
+  per-file read also **auto-reanchors** drifted anchors before folding (§4), so the response reflects
+  fresh selectors. Omitting `path` lists all annotated files with open/orphan counts — the "what's
+  awaiting an answer" sweep surface; the sweep does *not* reanchor (read-only).
 - `POST /api/annotations?board=<id>` `{path, op:"create"|"reply"|"resolve"|"reopen"|"reanchor", …}` →
   appends the event, nudges watchers. Server-side writes, so **no live tab is required** to comment or
-  reply — an agent can answer annotations on a board nobody has open.
+  reply — an agent can answer annotations on a board nobody has open. (`reanchor` stays a valid manual op
+  for re-attaching an orphan; the *automatic* reanchor of moved-but-resolvable anchors is §4.)
+- `POST /api/file?board=<id>&path=<path>` (a card-save) also auto-reanchors that file after the write (§4),
+  so highlights self-heal immediately without waiting for a read.
 - Changes publish on the file's existing watch stream (the card already re-renders on doc edits; annotation
   events ride the same invalidation).
+
+**CLI** (`scripts/canvas anno …`, the allow-listed wrapper): `list [path]` (board sweep or one file's
+comments, one scannable line each), `reply <path> <id>` (text via arg, `--stdin`, or `--text-file` so a
+long reply never fights shell-escaping), `batch <path> replies.json` (author many replies once as a JSON
+data file, not an ad-hoc `urllib` script), `resolve`/`reopen <path> <id>`. There is deliberately **no
+reanchor verb** — the server does it. This is the ergonomic answer to a review session that had to
+hand-roll `/api/annotations` curls and escape multi-paragraph replies into throwaway python.
 
 **Card UI** (the doc/file card, `NodeView.tsx` territory):
 
@@ -130,12 +161,15 @@ annotated file**, folded to current state at read. Events:
 
 What the whole feature is *for* — three interactions, cheapest first:
 
-1. **Sweep on request.** "Answer my comments on `docs/foo.md`" → the session GETs the annotations, and each
-   arrives as `{quote, prefix, suffix, question}` — a citation better than any chat paraphrase. It replies
-   per-annotation (`op:"reply"`), resolves what's settled, edits the doc where the right answer is "fix the
-   doc", and re-anchors what its edit moved (§4).
-2. **Revision convention.** Any agent editing an annotated doc reads open annotations first — brief-level
-   rule, no new machinery.
+1. **Sweep on request.** "Answer my comments on `docs/foo.md`" → the session lists the annotations
+   (`canvas anno list docs/foo.md`), and each arrives as `{quote, prefix, suffix, question}` — a citation
+   better than any chat paraphrase. It replies per-annotation (`canvas anno reply`, or `batch` for many at
+   once) and resolves what's settled. Where the right answer is "fix the doc", it edits the doc — and the
+   comments its edit moves **re-anchor themselves** (§4); the agent only re-attaches a *true orphan* (quote
+   gone), which the sweep surfaces distinctly.
+2. **Revision convention.** Any agent editing an annotated doc reads open annotations first (to *answer*
+   them) — but no longer has to hand-reanchor survivors; that's the server's job now. Brief-level rule, no
+   new machinery.
 3. **Escalation.** A comment that turns into real discussion becomes a **thread** (`ev:"thread"`): the
    annotation card-links to it and further replies happen there, with the anchor as the thread's opening
    context. Threads stay the one conversation substrate.
@@ -166,6 +200,11 @@ nudge + inbox entry, the existing §15/§16 transport, added then, not now.
 3. **Conventions** — brief + CLAUDE.md additions: revisers read open annotations first; the sweep recipe.
 4. **Later, if earned** — thread escalation wiring, annotation pins on the board, nudge-on-reply,
    annotations on non-doc file cards (should mostly fall out of 1–2).
+5. **Auto-reanchor + CLI ergonomics** (§4, §6) — `annotation-reanchor.js` (server re-anchors moved-but-
+   resolvable comments on read/write, converges in one pass, leaves true orphans loud) and the
+   `scripts/canvas anno` verb family (`list`/`reply`/`batch`/`resolve`/`reopen`). Motivated by a real
+   review session that hand-rolled the reanchor protocol and escaped multi-paragraph replies into ad-hoc
+   python — the manual maintenance loop moved into the server, the raw curls into the wrapper.
 
 Step 1 alone already yields the core value: highlight → ask → "answer my comments on the architecture doc" →
 answers land where the questions live.
