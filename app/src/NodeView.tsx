@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { layoutId, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
@@ -756,6 +756,11 @@ function AnnotationsLayer({
   const [showResolved, setShowResolved] = useState(false);
   // What the last paint actually placed, for click hit-testing (range → annotation id).
   const painted = useRef<{ id: string; range: Range }[]>([]);
+  // The live popover element + its measured height. The popover grows with its content (replies, reply
+  // row) up to max-height:55% of the card, so a fixed height guess under-clamps `top` and the .node box
+  // clips the bottom — text the popover's own scroll can't reach because its box overflows the card.
+  const popRef = useRef<HTMLDivElement>(null);
+  const [popH, setPopH] = useState(0);
 
   const list = useMemo(() => annos ?? [], [annos]);
   const openAnnos = useMemo(() => list.filter((a) => !a.resolved), [list]);
@@ -890,15 +895,25 @@ function AnnotationsLayer({
   }, [hostRef]);
 
   // Clamp a card-local anchor point so the popover stays inside the card box (.node clips overflow).
+  // The vertical bound is the popover's MEASURED height (popH, from the layout effect below) so a tall
+  // exchange near the card bottom is lifted fully into view rather than clipped; 120 is only the
+  // pre-measure fallback for the first frame.
   const clampPop = (p: { x: number; y: number }): { x: number; y: number } => {
     const host = hostRef.current;
     const w = host?.offsetWidth ?? 0;
     const h = host?.offsetHeight ?? 0;
+    const ph = popH || 120;
     return {
       x: Math.max(8, Math.min(p.x, Math.max(8, w - ANNO_POP_W - 8))),
-      y: Math.max(24, Math.min(p.y, Math.max(24, h - 120))),
+      y: Math.max(8, Math.min(p.y, Math.max(8, h - ph - 8))),
     };
   };
+
+  // Measure the popover after each render so clampPop above can bound against its true height. Reading
+  // offsetHeight is position-independent, so this converges in one extra render (no reflow loop).
+  useLayoutEffect(() => {
+    setPopH(popRef.current?.offsetHeight ?? 0);
+  }, [current, draft, draftText, replyText, popAt, list, showResolved]);
 
   // CREATE: mint the selector from the drafted selection. The rendered-text quote re-resolves
   // against the SOURCE so the stored anchor is source-true (see the section comment); if the source
@@ -983,7 +998,7 @@ function AnnotationsLayer({
         </button>
       )}
       {draft && (
-        <div className="anno-pop" style={{ left: clampPop(draft).x, top: clampPop(draft).y }}>
+        <div ref={popRef} className="anno-pop" style={{ left: clampPop(draft).x, top: clampPop(draft).y }}>
           <textarea
             className="anno-input"
             placeholder="comment on the selection…"
@@ -1005,7 +1020,7 @@ function AnnotationsLayer({
         </div>
       )}
       {current && (
-        <div className="anno-pop" style={{ left: pop.x, top: pop.y }}>
+        <div ref={popRef} className="anno-pop" style={{ left: pop.x, top: pop.y }}>
           <div className="anno-pop-head">
             <span className="anno-quote">“{current.anchor.exact}”</span>
             <button className="anno-x" title="close" onClick={() => setOpenId(null)}>✕</button>
