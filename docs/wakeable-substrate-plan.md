@@ -48,7 +48,7 @@ dep) can run in parallel sessions.
 | # | Item | Implements | Depends | Effort | Status |
 |---|---|---|---|---|---|
 | W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `9e6988a` |
-| W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `<pending>` |
+| W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `addaf14` |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE `addaf14` |
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (held: shares thread code w/ W7) |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
@@ -84,7 +84,7 @@ dep) can run in parallel sessions.
 - Question paints distinctly from a comment (a "?" on the highlight); popover shows the question, option
   buttons + a reply box, and an awaiting/answered badge (host chrome, `NodeView.tsx` + `src/annotations.ts`).
 - **Done when:** a human can ask and answer a question entirely from the doc card.
-- **Shipped** (commit `<pending>`): `AnnotationInfo` in `src/annotations.ts` gains the W1 read-fields
+- **Shipped** (commit `addaf14`, bundled with W3's `git add -A`): `AnnotationInfo` in `src/annotations.ts` gains the W1 read-fields
   (`kind`/`options`/`blocking`/`answer`/`state`, and `choice` on an answer reply); a new `anno-question`
   highlight bucket paints anchored questions in a distinct blue. In `NodeView.tsx`: the draft popover gains
   a **Comment | Ask** toggle + an optional one-per-line choices field, so a question is asked from the card;
