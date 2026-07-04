@@ -18,6 +18,7 @@ import {
   anchorRangeIn,
   caretPointAt,
   postAnnotationOp,
+  rangeFromTextOffsets,
   setCardHighlights,
   textOffsetOf,
   type AnnotationInfo,
@@ -781,10 +782,18 @@ function AnnotationsLayer({
         }
       }
       painted.current = entries;
+      const active = entries.filter((e) => e.id === openId).map((e) => e.range);
+      // The DRAFTED selection stays marked while its comment is being written: the native selection
+      // dies the moment the popover's textarea takes focus, and losing the mark mid-thought (or after
+      // an interruption) makes the author forget what they were commenting on.
+      if (el && draft) {
+        const r = rangeFromTextOffsets(el, draft.start, draft.end);
+        if (r) active.push(r);
+      }
       setCardHighlights(id, {
         open: entries.filter((e) => !e.resolved && e.id !== openId).map((e) => e.range),
         resolved: entries.filter((e) => e.resolved && e.id !== openId).map((e) => e.range),
-        active: entries.filter((e) => e.id === openId).map((e) => e.range),
+        active,
       });
     };
     const schedule = () => {
@@ -800,7 +809,7 @@ function AnnotationsLayer({
       painted.current = [];
       setCardHighlights(id, null);
     };
-  }, [hostRef, id, list, openId, showResolved, source]);
+  }, [hostRef, id, list, openId, draft, showResolved, source]);
 
   // CLICK a highlight → open its exchange; click prose that isn't one → close whatever is open.
   // Native listener (the canvas seam is native too); layer chrome handles its own clicks and is
