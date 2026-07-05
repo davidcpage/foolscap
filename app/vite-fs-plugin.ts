@@ -20,6 +20,7 @@ import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
+import { dueJobs, jobClaimKey, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { boardMemoryBrief } from "./board-memory.js";
@@ -2722,6 +2723,7 @@ function loopWorldSig(s: LiveSession): string {
 // re-evaluates next tick once idle), so a heartbeat can't talk over a working Coordinator.
 function loopTick(): void {
   autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
+  standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers)
   const now = Date.now();
   for (const s of liveSessions.values()) {
     if (!s.loops || s.status === "exited") continue;
@@ -2772,9 +2774,15 @@ function sendSessionInterrupt(id: string): boolean {
 // first prompt if given. The client drops a session card titled <id>, which subscribes to session:<id>.
 // The host:port the browser actually reached us on (so the spawned agent's API base matches the live
 // server, not a guessed default — sidesteps the 5173/5174 footgun). Falls back to the default dev port.
+// The last request host we saw — the origin a SERVER-FIRED spawn (standingJobsTick) seeds its worker brief /
+// bus commands with, since it has no triggering request of its own. The server is strictPort-pinned to
+// 127.0.0.1:5173, so the constant fallback is correct until the first request refines it.
+let lastKnownOrigin = "127.0.0.1:5173";
 function originOf(req: IncomingMessage): string {
   const host = req.headers.host;
-  return typeof host === "string" && host ? host : "localhost:5173";
+  const origin = typeof host === "string" && host ? host : "localhost:5173";
+  lastKnownOrigin = origin;
+  return origin;
 }
 
 // Cap on CONCURRENT live sessions (status !== "exited"), across every board this server hosts. The guard
@@ -3049,6 +3057,97 @@ function autoWakeReapTick(): void {
         `${IDLE_KEEPALIVE_MS / 1000}s keep-alive) — winding down; next activity respawns fresh`,
     );
     endSession(s.id, "done");
+  }
+}
+
+// The standing-job worker's first-turn brief (R6, W6). The job's `instruction` is the payload; the framing
+// enforces the two R6 norms explicitly — "skip days with nothing" is INSTRUCTED here (a periodic job that
+// finds nothing must post NOTHING and wind down, or it becomes per-interval "all clear" noise — silence has
+// to be told, not assumed), and the worker is told it's a FRESH session (never a resume) so it reads the
+// thread for context rather than expecting recovered process state.
+function standingJobBrief(job: { instruction: string; role: string | null }, origin: string): string {
+  return (
+    `[canvas] You are an auto-spawned STANDING-JOB WORKER — a scheduled job on this thread fired on its interval. ` +
+    `This is a FRESH session (NOT a resume); read the thread first if you need context: ` +
+    `GET http://${origin}/api/inbox?session=<your session id>.\n` +
+    `YOUR SCHEDULED INSTRUCTION:\n${job.instruction}\n\n` +
+    `- Do exactly what the instruction says. Leave any real finding as a thread message BEFORE you wind down ` +
+    `(a fresh session can't recover your process state).\n` +
+    `- **If there is NOTHING to do, post NOTHING and wind down immediately.** A periodic job that finds nothing ` +
+    `must be SILENT — do NOT post "nothing to report" / "all clear" noise. Silence is the correct output of an ` +
+    `empty run ("skip days with nothing").\n` +
+    `- When done (whether you acted or found nothing): POST http://${origin}/api/session/<your session id>/done.`
+  );
+}
+
+// The standing-job NUDGE: the cheap wake for a job whose target session is STILL LIVE (a role-seat job
+// firing at an interval shorter than the 5-min keep-alive window). Reuses the live session's assembled
+// context — the sendSessionInput nudge path the loop heartbeat uses — rather than paying a fresh respawn's
+// context-reassembly cost. The instruction rides the nudge inline (unlike a content-free wake).
+function standingJobNudge(job: { instruction: string }, origin: string): string {
+  return (
+    `[canvas] ⏱ STANDING JOB — your scheduled tick (not a human message). YOUR INSTRUCTION:\n${job.instruction}\n\n` +
+    `- Do exactly what it says. **If there's nothing to do, post NOTHING** ("skip days with nothing") — no "all clear" noise.\n` +
+    `- Then go back to sleep (stay live for the next tick). Read your inbox first if you need context: ` +
+    `GET http://${origin}/api/inbox?session=<your session id>.`
+  );
+}
+
+// Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
+// heartbeat, fire the standing jobs that have come due across every board's threads. WAKE-LIVE-ELSE-RESPAWN
+// (the efficiency norm — human's W6 concern, seq 104): a role-seat job whose seat is still occupied by a LIVE
+// session NUDGES that session (cheap — context intact), and only a DORMANT target pays a fresh respawn via the
+// serverSpawnWorker primitive (the same path doc-wake and dormant-seat respawn ride). This makes the
+// "<5min ⇒ wake existing / >5min ⇒ full respawn" split FALL OUT of the 5-min keep-alive window automatically:
+// a short interval finds the occupant still alive (nudge); an interval past keep-alive finds it reaped
+// (respawn). SINGLE-FLIGHT: a job whose prior fire is still running (its surface claimed, or the live occupant
+// mid-turn) is SKIPPED this tick and retried next — no double-fire, never talk over a working session.
+// FIRE-NEXT-DUE: stampFired re-bases the schedule to now only on a REAL fire, so a boot-time overdue job fires
+// once (never replaying missed fires) and a cap-skipped / busy-skipped fire retries next tick. Jobs live on
+// the thread marker, so they survive their creator and a restart.
+function standingJobsTick(): void {
+  const now = Date.now();
+  for (const [boardId, board] of boards) {
+    let threads;
+    try {
+      threads = listThreads(board.repoPath);
+    } catch {
+      continue;
+    }
+    for (const t of threads) {
+      for (const job of dueJobs(readJobs(board.repoPath, t.threadId), now)) {
+        const key = jobClaimKey(t.threadId, job);
+        if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
+
+        // Role-seat job: prefer waking a LIVE occupant over a fresh respawn (the efficiency norm). Resolve the
+        // seat's current sid; if it's live, nudge it (cheap) — unless it's mid-turn, in which case skip WITHOUT
+        // stamping so the fire lands the moment it's idle. Only a dormant/absent occupant triggers a respawn.
+        if (job.role) {
+          const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
+          const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
+          if (live && live.status !== "exited") {
+            if (live.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
+            sendSessionInput(live.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+            stampFired(board.repoPath, t.threadId, job.id, now);
+            continue;
+          }
+        }
+        // Dormant target (or a bare job) → a full fresh respawn seeded from the durable record.
+        const newSid = serverSpawnWorker({
+          boardId,
+          repoPath: board.repoPath,
+          origin: lastKnownOrigin,
+          roleId: job.role ?? null,
+          threadId: t.threadId,
+          anchorNodeId: t.threadId,
+          claimKey: key,
+          firstPrompt: standingJobBrief(job, lastKnownOrigin),
+        });
+        // Only re-base the schedule on a REAL spawn: a cap-skipped fire (newSid null — serverSpawnWorker
+        // already logged it) leaves lastFiredAt untouched so it re-fires next tick, no silent drop.
+        if (newSid) stampFired(board.repoPath, t.threadId, job.id, now);
+      }
+    }
   }
 }
 
@@ -4460,6 +4559,60 @@ async function handleThreadPin(
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
+// POST /api/thread/<id>/job — create/update or remove a STANDING JOB (R6, W6, standing-jobs.js). A standing
+// job is a periodic server-fired worker on this thread's durable marker: every `intervalMs` the server spawns
+// a fresh worker (the one serverSpawnWorker primitive, single-flight) seeded with `instruction`, then it acts
+// or (finding nothing) winds down silently. Jobs survive their creator AND a server restart — they live on the
+// marker, not the session. Create/update: { from, instruction, intervalMs?, role?, jobId? } — `jobId` updates
+// an existing job in place; a named `role` fires INTO that role's seat, else a bare worker; `intervalMs` is
+// clamped up to the 60s floor. Remove: { from, jobId, remove:true }. Consent mirrors intent/pin/level: a
+// member (or the human at the card) may manage a thread's jobs. Read the current jobs with GET .../jobs.
+async function handleThreadJob(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  let body: { from?: unknown; instruction?: unknown; intervalMs?: unknown; role?: unknown; jobId?: unknown; remove?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+
+  // Remove a job by id.
+  if (body.remove === true) {
+    if (typeof body.jobId !== "string" || !body.jobId) return sendJson(res, 400, { error: "remove needs a jobId" });
+    const { removed, jobs } = removeJob(repoPath, threadId, body.jobId);
+    publishFeed("threads:" + boardId, { ts: Date.now() }); // nudge the rail to re-pull like an intent does
+    return sendJson(res, removed ? 200 : 404, { ok: removed, thread: threadId, removed, jobs });
+  }
+  // Create or update.
+  if (typeof body.instruction !== "string" || !body.instruction.trim())
+    return sendJson(res, 400, { error: "missing instruction" });
+  if (body.intervalMs != null && !Number.isFinite(Number(body.intervalMs)))
+    return sendJson(res, 400, { error: "intervalMs must be a number of milliseconds" });
+  if (body.role != null && typeof body.role !== "string")
+    return sendJson(res, 400, { error: "role must be a string (a role id) or omitted" });
+  const { job, jobs } = upsertJob(repoPath, threadId, {
+    id: typeof body.jobId === "string" ? body.jobId : undefined,
+    role: typeof body.role === "string" ? body.role : null,
+    intervalMs: body.intervalMs,
+    instruction: body.instruction,
+    by: body.from,
+  });
+  publishFeed("threads:" + boardId, { ts: Date.now() });
+  sendJson(res, 200, { ok: true, thread: threadId, job, jobs });
+}
+
 // The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ThreadMsg. Two
 // changes vs the raw record: `from` is a short HANDLE not a 36-char UUID (see inboxHandle), and `ts` (an
 // opaque 13-digit epoch-ms) becomes `t`, a compact local `MM-DD HH:MM` (see fmtTs) — which is both readable
@@ -4666,7 +4819,7 @@ export function fsApi(): Plugin {
         // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
         // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
         // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin)$/.exec(url.pathname);
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|job)$/.exec(url.pathname);
         if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -4679,7 +4832,16 @@ export function fsApi(): Plugin {
           if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
           if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
           if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
+          if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
           return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
+        }
+        // GET /api/thread/<id>/jobs — read this thread's standing jobs (R6/W6, for the CLI + smoke test).
+        const threadJobsMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/jobs$/.exec(url.pathname);
+        if (threadJobsMatch && req.method === "GET") {
+          const b = reqBoard(url);
+          if (!b) return sendJson(res, 400, { error: "unknown board" });
+          const threadId = decodeURIComponent(threadJobsMatch[1]!);
+          return sendJson(res, 200, { thread: threadId, jobs: readJobs(b.repoPath, threadId) });
         }
         if (url.pathname === "/api/session") {
           const b = reqBoard(url);

@@ -56,6 +56,15 @@ canvas — session/coordination verbs over the agent bus
         watch a doc for comments (P1/W4) — bind a ROLE as a watcher at a notification level (the durable
         "who to wake when a comment lands"). --pause/--resume toggle without losing the level; --unwatch drops
         it. Role defaults to Coordinator. anno list shows watchers (👁 role:level) per doc.
+
+  scripts/canvas job add <THREAD> --instruction TEXT [--interval MS] [--role R] [--from ID] [--job-id ID]
+        declare a STANDING JOB (R6/W6) on a thread marker — a periodic server-fired worker. Every --interval
+        (ms; clamped up to a 60s floor) the server spawns a FRESH worker seeded with --instruction; a named
+        --role fires into that role's seat, else a bare worker. Jobs survive their creator AND a restart (they
+        live on the marker). Pass --job-id to update an existing job in place. Norm: a firing that finds
+        nothing posts nothing ("skip days with nothing").
+  scripts/canvas job list <THREAD>                     list a thread's standing jobs (id, role, interval, lastFired)
+  scripts/canvas job rm <THREAD> <JOB_ID> [--from ID]  remove a standing job
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
@@ -305,6 +314,56 @@ anno() {
   esac
 }
 
+# ── standing-job verbs (R6, docs/wakeable-substrate-plan.md W6) ─────────────────────────────────────
+# Manage periodic server-fired jobs on a THREAD marker. A job spawns a fresh worker every interval, seeded
+# with an instruction; a named --role fires into that role's seat, else a bare worker. Jobs survive their
+# creator AND a server restart (they live on the marker, not the session). The interval is clamped up to a
+# 60s floor server-side. "skip days with nothing": a firing that finds nothing posts nothing and winds down.
+job() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    add|set)
+      local thread="" instruction="" interval="" role="" from="human" jobid=""
+      while [ $# -gt 0 ]; do case "$1" in
+        --instruction)          instruction="${2:-}"; shift 2 ;;
+        --interval|--interval-ms) interval="${2:-}"; shift 2 ;;
+        --role)                 role="${2:-}"; shift 2 ;;
+        --from)                 from="${2:-}"; shift 2 ;;
+        --job-id|--jobid)       jobid="${2:-}"; shift 2 ;;
+        --board)                BOARD="${2:-}"; shift 2 ;;
+        --*) echo "job add: unknown flag '$1'" >&2; exit 2 ;;
+        *) thread="$1"; shift ;;
+      esac; done
+      [ -n "$thread" ] || { echo "job add: need a <threadId>" >&2; exit 2; }
+      [ -n "$instruction" ] || { echo "job add: need --instruction TEXT" >&2; exit 2; }
+      local body; body=$(python3 - "$from" "$instruction" "$interval" "$role" "$jobid" <<'PY'
+import json, sys
+frm, instr, interval, role, jobid = sys.argv[1:6]
+o = {"from": frm, "instruction": instr}
+if interval: o["intervalMs"] = int(float(interval))
+if role:     o["role"] = role
+if jobid:    o["jobId"] = jobid
+print(json.dumps(o))
+PY
+)
+      post "$SERVER/api/thread/$thread/job?board=$BOARD" "$body"; echo ;;
+    rm|remove|delete)
+      local thread="${1:-}" jobid="${2:-}" from="human"
+      shift 2 2>/dev/null || true
+      while [ $# -gt 0 ]; do case "$1" in --from) from="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;; *) shift ;; esac; done
+      { [ -n "$thread" ] && [ -n "$jobid" ]; } || { echo "job rm: need <threadId> <jobId>" >&2; exit 2; }
+      post "$SERVER/api/thread/$thread/job?board=$BOARD" "{\"from\":$(jstr "$from"),\"jobId\":$(jstr "$jobid"),\"remove\":true}"; echo ;;
+    list|ls)
+      local thread="${1:-}"
+      shift || true
+      while [ $# -gt 0 ]; do case "$1" in --board) BOARD="${2:-}"; shift 2 ;; *) shift ;; esac; done
+      [ -n "$thread" ] || { echo "job list: need a <threadId>" >&2; exit 2; }
+      curl -sS "$SERVER/api/thread/$thread/jobs?board=$BOARD"; echo ;;
+    ""|-h|--help|help) echo "canvas job add|list|rm — periodic server-fired jobs on a thread marker (see 'canvas' for details)" >&2 ;;
+    *) echo "job: unknown subcommand '$sub' (add|list|rm)" >&2; exit 2 ;;
+  esac
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
   spawn)
@@ -343,6 +402,8 @@ PY
     post "$SERVER/api/session/$sid/terminate" "{}"; echo ;;
   anno)
     anno "$@" ;;
+  job)
+    job "$@" ;;
   ""|-h|--help|help) usage ;;
   *) echo "unknown verb: $cmd" >&2; usage >&2; exit 2 ;;
 esac

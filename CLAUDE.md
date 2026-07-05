@@ -257,6 +257,21 @@ done/exited, none blocked:human; unstaffed threads are dormant; computed at read
   and a `done` intent must be accompanied by a thread message posting **proof** against it (test output, a
   diff, a link) — the Coordinator's review is checking proof against the pinned condition, not trusting the
   flag. Helpers in `app/thread-ledger.js` (`readPins`/`pinMessage`/`unpinMessage`).
+- **Standing jobs (R6, `wakeable-substrate-plan.md` W6):** a periodic, **server-fired** worker declared on a
+  thread's durable marker — the canvas-native heartbeat (a `claude -p` session can't self-schedule, so the
+  SERVER fires the timer and the durable RECORD, not the session, owns the schedule). `POST
+  /api/thread/<id>/job {from, instruction, intervalMs?, role?, jobId?}` creates/updates a job (`jobId` edits
+  in place; a named `role` fires INTO that role's seat, else a bare worker; `intervalMs` is clamped up to a
+  **60s floor**); `{from, jobId, remove:true}` removes one; `GET /api/thread/<id>/jobs` lists them. Every
+  `intervalMs` the server (`standingJobsTick` on the loop heartbeat) fires the job via the **one**
+  `serverSpawnWorker` primitive — **wake-live-else-respawn**: a role-seat job whose seat is still occupied by
+  a LIVE session **nudges** that session (cheap, context intact), and only a **dormant** target pays a fresh
+  respawn (so the "<5min ⇒ wake existing / >5min ⇒ full respawn" split falls out of the 5-min keep-alive
+  window automatically). **Single-flight** (a still-running fire isn't doubled) and **fire-next-due** (a
+  boot-time overdue job fires ONCE, never replaying missed fires). Two norms: **"skip days with nothing"** (a
+  firing that finds nothing posts nothing and winds down — the worker brief instructs the silence) and **jobs
+  survive their creator AND a restart** (they live on the marker, not the session). CLI: `scripts/canvas job
+  add|list|rm`. Ledger in `app/standing-jobs.js`.
 
 Gotchas:
 - **Membership must be in the saved snapshot before `ask`/`message` will accept it.** Membership is read

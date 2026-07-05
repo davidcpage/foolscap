@@ -344,6 +344,34 @@ test("thread level (P1/W4): set → 400 on a bad level → seatless sid fallback
   assert.equal(oj.seat, null, "a seatless (non-role) participant lands on the sid fallback");
 });
 
+test("standing job (R6/W6): create → GET jobs → update in place → remove; 400 on missing fields", { skip: !up && "no dev server on 5173" }, async () => {
+  const threadId = `node:thread:job-${runTag}`;
+  await fetch(`${HOST}/api/board/persist/snapshot?board=${boardId}`, j({ snapshot: { seq: 50, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Job" }] } }));
+  const url = (a) => `${HOST}/api/thread/${encodeURIComponent(threadId)}/${a}?board=${boardId}`;
+  // Missing instruction is a 400; a create without a body role is a bare job.
+  assert.equal((await fetch(url("job"), j({ from: "human" }))).status, 400, "no instruction ⇒ 400");
+  const created = await (await fetch(url("job"), j({ from: "human", instruction: "sweep", intervalMs: 100 }))).json();
+  assert.ok(created.ok && created.job.id, "created with an id");
+  assert.equal(created.job.intervalMs, 60_000, "sub-floor interval clamped to the 60s floor");
+  assert.equal(created.job.role, null, "no role ⇒ bare worker");
+  // GET .../jobs reads it back off the marker.
+  const listed = await (await fetch(url("jobs"), { method: "GET" })).json();
+  assert.equal(listed.jobs.length, 1);
+  assert.equal(listed.jobs[0].id, created.job.id);
+  // Update in place by jobId — same id, new interval/instruction.
+  const updated = await (await fetch(url("job"), j({ from: "human", jobId: created.job.id, instruction: "sweep v2", intervalMs: 300_000, role: "Coordinator" }))).json();
+  assert.equal(updated.jobs.length, 1, "updated in place, not appended");
+  assert.equal(updated.job.id, created.job.id);
+  assert.equal(updated.job.intervalMs, 300_000);
+  assert.equal(updated.job.role, "Coordinator");
+  // Remove needs a jobId; removing an unknown id is 404; the real remove is 200 and empties the list.
+  assert.equal((await fetch(url("job"), j({ from: "human", remove: true }))).status, 400, "remove without jobId ⇒ 400");
+  assert.equal((await fetch(url("job"), j({ from: "human", remove: true, jobId: "no-such" }))).status, 404, "remove unknown ⇒ 404");
+  const removed = await (await fetch(url("job"), j({ from: "human", remove: true, jobId: created.job.id }))).json();
+  assert.ok(removed.ok && removed.removed);
+  assert.equal((await (await fetch(url("jobs"), { method: "GET" })).json()).jobs.length, 0, "list empty after remove");
+});
+
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {
   const res = await fetch(`${HOST}/api/board/persist?board=${boardId}`, { method: "DELETE" });
   assert.equal(res.status, 200);
