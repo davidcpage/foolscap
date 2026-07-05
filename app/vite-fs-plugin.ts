@@ -19,6 +19,7 @@ import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
+import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { boardMemoryBrief } from "./board-memory.js";
@@ -691,11 +692,19 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
 // sid — the thread-message attribution convention. A create whose anchor doesn't resolve is still
 // accepted but reported `orphaned:true`, so a curl'd selector with a typo'd quote isn't born a
 // silent orphan.
+// The reserved watcher handle an ask-armed doc seat holds (P2/W5, anchored-async-ask §4): a `--blocking`
+// question auto-arms it at `mentions` level so the later `answer` wakes a continuation with no human having
+// pre-watched the doc. Cleared once no unresolved blocking question remains. Not a real role, so an
+// answer-driven wake spawns a plain (bare) doc worker.
+const ASK_WATCH_ROLE = "ask";
+
 async function handleAnnotationsWrite(
   req: IncomingMessage,
   res: ServerResponse,
   root: string,
   repoPath: string,
+  boardId: string,
+  origin: string,
 ): Promise<void> {
   let body: Record<string, unknown>;
   try {
@@ -767,6 +776,13 @@ async function handleAnnotationsWrite(
       ...(blocking ? { blocking: true } : {}),
     };
     if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
+    if (isQuestion) {
+      // A blocking question arms an ask-armed doc seat (mentions) so the ANSWER wakes a continuation (§4).
+      // The question itself awaits a HUMAN — it wakes no agent (no-op-spawn avoidance), so no doc-wake here.
+      if (blocking) setWatcher(repoPath, rel, { role: ASK_WATCH_ROLE, level: "mentions", by: author, ts });
+    } else {
+      maybeWakeDocWorker(boardId, repoPath, origin, rel, "note"); // a comment — wakes an `all`-level watcher
+    }
     return sendJson(res, 200, {
       ok: true,
       id,
@@ -839,6 +855,17 @@ async function handleAnnotationsWrite(
     return sendJson(res, 400, { error: "unknown op" });
   }
   if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
+  // Post-write wake (P2/W5): an ANSWER is activity addressed to the ask-armed seat → wake a continuation.
+  if (op === "answer") maybeWakeDocWorker(boardId, repoPath, origin, rel, "answer");
+  // Clearing the ask-armed seat: once NO unresolved blocking question remains on the doc, drop it (§4 — the
+  // `resolve` clears the watcher the `--blocking` create armed). Re-derived from state, so it survives
+  // multiple concurrent blocking asks (only the last resolve removes it).
+  if (op === "resolve") {
+    const stillBlocking = foldAnnotations(readAnnotationLog(repoPath, rel)).some(
+      (a) => a.kind === "question" && a.blocking && questionState(a) !== "resolved",
+    );
+    if (!stillBlocking) removeWatcher(repoPath, rel, ASK_WATCH_ROLE);
+  }
   sendJson(res, 200, { ok: true, id, ts });
 }
 
@@ -1985,6 +2012,13 @@ interface LiveSession {
   // Shadow-git attribution (doc §6): an Edit/Write tool_use claims its target path on the shadow watcher;
   // the matching tool_result commits it attributed. Maps tool_use_id → {shadow-root key, path rel to root}.
   pendingEdits: Map<string, { key: string; rel: string }>;
+  // Auto-wake worker lifecycle (P2/W5, auto-wake.js): set on a session the SERVER spawned from a durable
+  // record (a doc's comment queue, a dormant thread seat). `autoWakeKey` is its single-flight surface claim
+  // (released on exit); `idleSince` stamps when it last went idle, so the R1 keep-alive reaper winds it down
+  // after the grace window. All undefined on a human- or role-spawned session (they're never auto-reaped).
+  autoWake?: boolean;
+  autoWakeKey?: string;
+  idleSince?: number;
 }
 
 // liveSessions lives on fsState (aliased at the top) so spawned children survive a server reload and
@@ -2116,6 +2150,7 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       s.inflight = null;
       s.status = "idle"; // turn finished; the process waits on stdin for the next prompt
       s.verb = null; // no live activity to label; keep `usage` so the pill shows the turn's final counts
+      if (s.autoWake) s.idleSince = Date.now(); // start the R1 keep-alive clock for an auto-wake worker
       if (s.nudge) flushNudge(s); // a channel message arrived mid-turn → wake to read it at the boundary (§9)
       break;
     case "stream_event": {
@@ -2404,6 +2439,10 @@ function wireSessionHooks(get: () => LiveSession): ProcHooks {
     },
     onExit({ reason }) {
       const s = get();
+      // Release this worker's single-flight claim even on the endSession path: endSession sets status
+      // "exited" before its kill lands here (so the guard below early-returns), so the release must run
+      // first. Idempotent — releaseSurface only frees a claim this exact sid still holds.
+      if (s.autoWakeKey) releaseSurface(s.autoWakeKey, s.id);
       if (s.status === "exited") return; // endSession already tore it down (kill → this hook still fires)
       s.status = "exited";
       s.inflight = null;
@@ -2428,6 +2467,7 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
   if (!s || s.status === "exited") return false;
   s.lines.push(JSON.stringify({ type: "user", message: { role: "user", content: text } }));
   s.status = "running";
+  s.idleSince = undefined; // back to work — reset the auto-wake keep-alive clock (no-op for a normal session)
   // A real prompt is the turn boundary we own (tool_result `user` events are mid-turn) — reset the
   // turn's token accrual and show a neutral verb until the first stream frame names the activity.
   s.turnOut = 0;
@@ -2592,7 +2632,7 @@ function wakeThreadMembers(
   boardId: string,
   threadId: string,
   exceptSid: string,
-  opts: { broadcast: boolean; mentioned?: Set<string> },
+  opts: { broadcast: boolean; mentioned?: Set<string>; origin?: string },
 ): number {
   const records = boardSnapshotRecords(boardId);
   if (!records) return 0;
@@ -2603,7 +2643,14 @@ function wakeThreadMembers(
     const mentioned = opts.mentioned?.has(sid) ?? false;
     if (!wakesSeat(threadLevelForSid(meta, sid), { mentioned, broadcast: opts.broadcast })) continue;
     const s = liveSessions.get(sid);
-    if (!s || s.status === "exited") continue;
+    if (!s || s.status === "exited") {
+      // Dormant seat (P2/W5, R1): the member is addressable but no live process backs it. An @-ADDRESSED
+      // message reconstitutes it from the durable record; a bare broadcast to a dormant room wakes no one
+      // (the R1 "addresses a dormant seat" condition — a broadcast never respawns). `origin` gates it: only
+      // the thread-message path (which passes it) reconstitutes; a join broadcast has none, so it's inert.
+      if (mentioned && opts.origin) maybeRespawnDormantSeat(boardId, threadId, sid, opts.origin, meta);
+      continue;
+    }
     s.nudge = true;
     woken++;
     if (s.status === "idle") flushNudge(s);
@@ -2674,6 +2721,7 @@ function loopWorldSig(s: LiveSession): string {
 // keep each session's adaptive cadence. Never wakes a RUNNING session (that would interrupt its turn — it
 // re-evaluates next tick once idle), so a heartbeat can't talk over a working Coordinator.
 function loopTick(): void {
+  autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
   const now = Date.now();
   for (const s of liveSessions.values()) {
     if (!s.loops || s.status === "exited") continue;
@@ -2841,6 +2889,169 @@ async function handleSessionSpawn(
   sendJson(res, 200, { id, roleId, roleName, roleColour, carded });
 }
 
+// ── P2/W5: server-spawn-from-a-durable-record (auto-wake.js) ─────────────────────────────────────────
+// The SERVER reconstitutes a session from a durable record on a qualifying wake — a comment/answer on a
+// watched doc (Trigger 1, maybeWakeDocWorker) or an @-addressed message to a dormant thread seat (Trigger 2,
+// maybeRespawnDormantSeat). Both share this one primitive: mint a fresh session, seed it from the record
+// (thread history / the doc's annotation queue + the memory brief ensureLiveSession already bakes in), claim
+// the surface single-flight, drop a card, and send the first-turn worker brief. `--resume` is deliberately
+// NOT used (R1): reconstitution is a FRESH spawn seeded from the durable substrate, never a transcript
+// replay. W6 (standing jobs) rides this same function. Returns the new sid, or null if it couldn't spawn
+// (cap reached / spawn error — logged, never thrown: a wake is best-effort, it degrades to pull).
+const IDLE_KEEPALIVE_MS = 5 * 60_000; // R1: an auto-wake worker idles this long, then the reaper winds it down
+
+function serverSpawnWorker(opts: {
+  boardId: string;
+  repoPath: string;
+  origin: string;
+  roleId: string | null;
+  threadId: string | null; // set → member:open edge + thread-cursor seed; null → a standalone doc worker
+  anchorNodeId: string | null; // the node to position the worker card beside (thread card / doc card)
+  claimKey: string;
+  firstPrompt: string;
+}): string | null {
+  // Replicate handleSessionSpawn's cap guard — a server-fired spawn must not blow past MAX_LIVE_SESSIONS.
+  // No silent drop (repo principle): LOG the skip so a doc/seat that should've been serviced isn't left
+  // invisibly waiting. It re-fires on the next qualifying activity (a deferred-wake queue is a follow-up).
+  if (liveSessionCount() >= MAX_LIVE_SESSIONS) {
+    console.warn(
+      `[auto-wake] live-session cap (${MAX_LIVE_SESSIONS}) reached — SKIPPING spawn for ${opts.claimKey}; ` +
+        `it will re-fire on the next qualifying activity (no deferred-wake queue yet)`,
+    );
+    return null;
+  }
+  const id = crypto.randomUUID();
+  let live: LiveSession;
+  try {
+    live = ensureLiveSession(id, opts.repoPath, false, opts.origin, opts.roleId, opts.threadId);
+  } catch (err) {
+    console.warn(`[auto-wake] spawn failed for ${opts.claimKey}: ${String(err)}`);
+    return null;
+  }
+  live.autoWake = true;
+  live.autoWakeKey = opts.claimKey;
+  claimSurface(opts.claimKey, id); // single-flight: the surface is now being serviced by this sid
+  // A thread worker starts at the thread's FULL backlog (history:"full") so it's seeded from the thread's
+  // durable history — the addressed message that woke it replays on its first inbox read (R1).
+  if (opts.threadId) {
+    pendingHistoryMode.set(historyKey(opts.threadId, id), "full");
+    live.read[opts.threadId] = seedCursor("full", threadLog(opts.boardId, opts.threadId));
+    persistSessionState(live);
+  }
+  // Drop the worker card (+ member:open edge for a thread worker), positioned by the SERVER beside the
+  // anchor node — the human should SEE the summoned worker, and agents place cards badly. maybeAnnounceMembership
+  // (fired by the addEdge) onboards a thread worker and re-fills its seat from the card name.
+  const records = boardSnapshotRecords(opts.boardId);
+  const role = opts.roleId ? readRole(opts.repoPath, opts.roleId) : null;
+  const node = `node:live:${id}`;
+  const nodePayload: Record<string, unknown> = {
+    id: node, type: "session", title: id, color: role?.colour ?? "blue",
+    ...placeWorkerCard(records, opts.anchorNodeId),
+  };
+  if (role?.name) nodePayload.name = `${role.name}.${id.slice(0, 8)}`;
+  dispatchBusCommand(opts.boardId, { type: "addNode", actor: "system", payload: nodePayload }, opts.origin);
+  if (opts.threadId)
+    dispatchBusCommand(
+      opts.boardId,
+      { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${opts.threadId}`, from: node, to: opts.threadId, type: "member:open" } },
+      opts.origin,
+    );
+  sendSessionInput(id, opts.firstPrompt);
+  return id;
+}
+
+// The doc worker's first-turn brief: service the doc's open-annotation queue, loop-until-dry, wind down.
+// Its own session id is baked into the collab brief (ensureLiveSession), so `<your session id>` resolves.
+function docWorkerBrief(rel: string, origin: string): string {
+  return (
+    `[canvas] You are an auto-spawned DOC WORKER for \`${rel}\`. Activity landed on this doc's annotations and needs servicing.\n` +
+    `- Read the open queue: \`scripts/canvas anno list ${rel}\` (or GET http://${origin}/api/annotations?path=${encodeURIComponent(rel)}).\n` +
+    `- For each ANSWERED question (a human decided): apply the decision by editing the doc, then RESOLVE the question (resolution belongs to the asker — you).\n` +
+    `- For each open COMMENT (note) meant for you: reply and make the change it asks for.\n` +
+    `- LEAVE questions still AWAITING a human — you can't answer those; don't touch or resolve them.\n` +
+    `- Re-read the queue after each pass so a comment that arrived mid-work is caught; LOOP until nothing actionable remains.\n` +
+    `- Then WIND DOWN: POST http://${origin}/api/session/<your session id>/done. Don't linger idle — batch this wake and exit; fresh activity will spawn a new worker.`
+  );
+}
+
+// The dormant-seat reconstitution brief: a FRESH session standing back up an addressed-but-vacant seat.
+function dormantWakeBrief(handle: string, origin: string): string {
+  return (
+    `[canvas] You've been RECONSTITUTED as the \`${handle}\` seat on this thread — a message was addressed to you while the prior session had wound down. This is a FRESH session seeded from the thread's durable history (NOT a resume): read the thread to catch up.\n` +
+    `- Read your inbox: GET http://${origin}/api/inbox?session=<your session id> — the message addressed to you is there (the full backlog replays on this first read).\n` +
+    `- Read the thread, then respond to what was asked and continue the seat's work.\n` +
+    `- Leave anything you need in the thread before you wind down — a fresh session can't recover your process state.\n` +
+    `- When your part is done: POST http://${origin}/api/session/<your session id>/done.`
+  );
+}
+
+// Trigger 1 — DOC-WAKE. Called after a qualifying annotation write (a `note` comment, or an `answer` on a
+// question). If any active watcher's level clears the event (auto-wake.js reuses W4's wakesSeat), service the
+// doc: NUDGE a live worker already on it (R1 keep-alive continuity — a comment within its idle window
+// continues it, no duplicate) or spawn a fresh one. Single-flight per doc; the worker loops-until-dry.
+function maybeWakeDocWorker(boardId: string, repoPath: string, origin: string, rel: string, eventKind: "note" | "answer"): void {
+  const qualifying = qualifyingWatchers(readWatchers(repoPath, rel), eventKind);
+  if (qualifying.length === 0) return; // no watcher this activity would wake — nothing to do
+  const key = docSurfaceKey(rel);
+  const claimant = surfaceClaimant(key);
+  if (claimant) {
+    const s = liveSessions.get(claimant);
+    if (s && s.status !== "exited") {
+      // A worker is already servicing this doc — nudge it to re-check rather than spawn a duplicate.
+      sendSessionInput(
+        claimant,
+        `[canvas] new annotation activity on ${rel} — re-check the open queue (\`scripts/canvas anno list ${rel}\`) and keep servicing it; POST /api/session/<your session id>/done when the queue is dry.`,
+      );
+      return;
+    }
+    releaseSurface(key, claimant); // stale claim (worker gone) — clear it and spawn fresh below
+  }
+  // The worker runs as the first qualifying watcher whose role is a real charter'd role; else bare (the
+  // ask-armed watcher's reserved handle isn't a role, so an answer-driven wake spawns a plain doc worker).
+  let roleId: string | null = null;
+  for (const w of qualifying) if (readRole(repoPath, w.role)) { roleId = w.role; break; }
+  serverSpawnWorker({
+    boardId, repoPath, origin, roleId, threadId: null, anchorNodeId: `node:repo:${rel}`,
+    claimKey: key, firstPrompt: docWorkerBrief(rel, origin),
+  });
+}
+
+// Trigger 2 — DORMANT-SEAT RESPAWN (R1). Called from wakeThreadMembers when an @-addressed member has no
+// live session. Reconstitute the seat: read the dormant occupant's role from its marker, spawn fresh into
+// the thread, and re-occupy the SAME seat with the new sid. Single-flight per seat; a bare (unseated)
+// dormant member has no reconstitution identity, so it's left as a dropped nudge (unchanged behaviour).
+function maybeRespawnDormantSeat(boardId: string, threadId: string, dormantSid: string, origin: string, meta: ThreadMetaMarker | null): void {
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return;
+  const handle = seatForSid(meta?.seats, dormantSid);
+  if (!handle) return; // a plain sid participant, not a seated role — nothing durable to stand back up
+  const key = seatSurfaceKey(threadId, handle);
+  if (isSurfaceClaimed(key)) return; // already being reconstituted — don't race a second worker onto the seat
+  const roleId = (readCanvasSession(repoPath, dormantSid)?.roleId as string | undefined) ?? null;
+  const newSid = serverSpawnWorker({
+    boardId, repoPath, origin, roleId, threadId, anchorNodeId: threadId,
+    claimKey: key, firstPrompt: dormantWakeBrief(handle, origin),
+  });
+  // Re-occupy the seat immediately with the fresh sid so the next addressed message finds it live/claimed
+  // (onboarding also fills it from the card name; fillSeat is idempotent on the same sid).
+  if (newSid) fillSeat(repoPath, threadId, handle, newSid, Date.now());
+}
+
+// The R1 keep-alive reaper: an auto-wake worker that's been idle past the grace window is wound down (its
+// seat/doc goes dormant; the next qualifying activity respawns fresh). Only auto-wake workers are eligible —
+// never a human card, never the looping Coordinator. Runs on the loop heartbeat's cadence (loopTick).
+function autoWakeReapTick(): void {
+  const now = Date.now();
+  for (const s of liveSessions.values()) {
+    if (!shouldReapIdle(s, now, IDLE_KEEPALIVE_MS)) continue;
+    console.warn(
+      `[auto-wake] reaping idle worker ${s.id} (idle ${Math.round((now - s.idleSince!) / 1000)}s ≥ ` +
+        `${IDLE_KEEPALIVE_MS / 1000}s keep-alive) — winding down; next activity respawns fresh`,
+    );
+    endSession(s.id, "done");
+  }
+}
+
 // POST /api/session/<id>/input  { text } → write a prompt into the live process. Session-internal: no
 // canvas-log entry, no editor.commit (session-timelines §4). 409 if the session isn't live.
 async function handleSessionInput(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
@@ -2910,6 +3121,7 @@ function endSession(id: string, endReason: "done" | "terminated"): boolean {
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
   denySessionPermissions(id, `the session was ${endReason} before a human decided`);
+  if (s.autoWakeKey) releaseSurface(s.autoWakeKey, s.id); // free its single-flight surface immediately
   s.endReason = endReason;
   recordSessionEnd(s.repoPath, id, endReason);
   s.proc.kill();
@@ -3900,7 +4112,7 @@ async function handleThreadMessage(
   // @-tags decide the wake set, now gated by each member's seat level (P1/W4): `@all` is a room broadcast
   // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an untagged
   // post is ambient (neither — wakes no one).
-  const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged) });
+  const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin: originOf(req) });
   sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified });
 }
 
@@ -4563,7 +4775,7 @@ export function fsApi(): Plugin {
         if (url.pathname === "/api/annotations") {
           const canonical = rootDir(boardId, null);
           if (!canonical) return sendJson(res, 400, { error: "unknown root" });
-          if (req.method === "POST") return void handleAnnotationsWrite(req, res, canonical, board.repoPath);
+          if (req.method === "POST") return void handleAnnotationsWrite(req, res, canonical, board.repoPath, boardId, originOf(req));
           return handleAnnotationsRead(res, canonical, board.repoPath, url.searchParams.get("path"));
         }
 
