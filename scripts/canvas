@@ -52,6 +52,10 @@ canvas — session/coordination verbs over the agent bus
         --options are multiple-choice labels (split on |); --blocking marks you as waiting. Prints id + orphaned.
   scripts/canvas anno answer <PATH> <ID> [--choice LABEL] [--text "…" | --stdin | --text-file F] [--by ID]
         answer a question (an option label and/or prose); flips it awaiting → answered.
+  scripts/canvas anno watch <PATH> [--role R] [--level all|mentions|paused] [--pause|--resume|--unwatch] [--by ID]
+        watch a doc for comments (P1/W4) — bind a ROLE as a watcher at a notification level (the durable
+        "who to wake when a comment lands"). --pause/--resume toggle without losing the level; --unwatch drops
+        it. Role defaults to Coordinator. anno list shows watchers (👁 role:level) per doc.
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
@@ -95,8 +99,17 @@ if not path:  # the board sweep — questions awaiting a HUMAN float to the top 
         extra = ""
         if f.get("awaiting"): extra += f"  {f['awaiting']} awaiting"
         if f.get("answered"): extra += f"  {f['answered']} answered"
+        # "what's watched" (P1/W4): the watchers arming this doc, role+level, paused ones parenthesised.
+        for w in f.get("watchers", []):
+            lvl = w.get("level", "all")
+            extra += f"  👁 {w.get('role','?')}:{lvl}" + ("(paused)" if w.get("state") == "paused" else "")
         print(f"{f['open']:>3} open  {f['orphaned']:>2} orphan  {f['total']:>3} total   {f['path']}{extra}")
     sys.exit()
+watchers = d.get("watchers", [])
+if watchers:
+    print("watchers: " + ", ".join(
+        f"{w.get('role','?')}:{w.get('level','all')}" + ("(paused)" if w.get("state") == "paused" else "")
+        for w in watchers))
 ann = d.get("annotations", [])
 op = [a for a in ann if not a["resolved"]]
 orph = [a for a in op if a["orphaned"]]
@@ -238,6 +251,33 @@ PY
 )
   post "$(ANNO_URL)" "$body"; echo
 }
+# Watch a doc for comments (docs/anchored-async-ask.md §2, wakeable-substrate-plan W4 — P1). Binds a ROLE
+# as a watcher on the doc at a notification LEVEL (all/mentions/paused), the durable "who to wake when a
+# comment lands" — a seat, one surface up from a thread. --pause/--resume toggle it without losing the
+# level; --unwatch drops it. Role defaults to Coordinator (the board's standing watcher). W4 is pull-mode
+# plumbing: this records the seat + level; the auto-spawn on a qualifying comment is W5.
+anno_watch() {
+  local role="Coordinator" level="" op="watch" by="human" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --role) role="${2:-}"; shift 2 ;; --level) level="${2:-}"; shift 2 ;;
+    --pause) op="pause"; shift ;; --resume) op="resume"; shift ;; --unwatch) op="unwatch"; shift ;;
+    --by) by="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno watch: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}"
+  if [ -z "$path" ]; then
+    echo "usage: canvas anno watch <path> [--role R] [--level all|mentions|paused] [--pause|--resume|--unwatch] [--by ID]" >&2; exit 2; fi
+  local body; body=$(python3 - "$path" "$op" "$role" "$level" "$by" <<'PY'
+import json, sys
+path, op, role, level, by = sys.argv[1:6]
+o = {"op": op, "path": path, "role": role, "by": by}
+if op == "watch" and level: o["level"] = level
+print(json.dumps(o))
+PY
+)
+  post "$(ANNO_URL)" "$body"; echo
+}
 anno_setstate() { # $1 = resolve|reopen
   local op="$1"; shift
   local by="human" pos=()
@@ -258,9 +298,10 @@ anno() {
     batch) anno_batch "$@" ;;
     ask) anno_ask "$@" ;;
     answer) anno_answer "$@" ;;
+    watch) anno_watch "$@" ;;
     resolve|reopen) anno_setstate "$sub" "$@" ;;
-    ""|-h|--help|help) echo "canvas anno list|reply|batch|ask|answer|resolve|reopen — see 'canvas' for details" >&2 ;;
-    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|ask|answer|resolve|reopen)" >&2; exit 2 ;;
+    ""|-h|--help|help) echo "canvas anno list|reply|batch|ask|answer|watch|resolve|reopen — see 'canvas' for details" >&2 ;;
+    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|ask|answer|watch|resolve|reopen)" >&2; exit 2 ;;
   esac
 }
 

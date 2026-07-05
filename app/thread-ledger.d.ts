@@ -2,6 +2,7 @@
 // import the ledger without allowJs. Keep in sync with the exports in thread-ledger.js.
 
 import type { WorkIntent } from "./work-intent.js";
+import type { NotificationLevel } from "./notification-levels.js";
 
 // One persisted thread message — the same shape the in-memory ThreadMsg holds. `kind` marks a CARD-ONLY
 // entry (ask echo / work-intent act — rendered by the card, never inbox content); `intent` rides kind:"intent".
@@ -33,6 +34,7 @@ export interface SeatRecord {
   createdAt: number;
   filledAt: number;
   fills: number;
+  level?: NotificationLevel; // wake preference (P1/W4); absent ⇒ the default `all`
 }
 
 // A thread's on-disk marker — the rail's source of truth. createdAt is written once; title/text/lastSeq/lastTs
@@ -48,6 +50,7 @@ export interface ThreadMetaMarker {
   lastTs?: number;
   intents?: Record<string, DeclaredIntent>;
   seats?: Record<string, SeatRecord>;
+  levels?: Record<string, NotificationLevel>; // sid-keyed wake preference for seatless members (P1/W4)
   pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
 }
 
@@ -77,6 +80,13 @@ export function fillSeat(
   ts: number,
 ): { seat: SeatRecord; refilled: boolean };
 export function seatForSid(seats: Record<string, SeatRecord> | undefined, sid: string): string | null;
+export function setThreadLevel(
+  repoPath: string,
+  threadId: string,
+  sid: string,
+  level: unknown,
+): { seat: string | null; level: NotificationLevel };
+export function threadLevelForSid(meta: ThreadMetaMarker | null | undefined, sid: string): NotificationLevel;
 export function readPins(repoPath: string, threadId: string): PinnedMsg[];
 export function pinMessage(
   repoPath: string,

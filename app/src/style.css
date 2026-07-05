@@ -312,6 +312,25 @@ body {
   background: #fafafa;
   color: #a1a1aa;
 }
+/* Watch-for-comments chip (P1/W4): the doc's watcher seat. Top-LEFT, clear of the badge (top-right) and
+   the orphan strip. `on` = an armed, non-paused watcher (a live eye); quiet = unwatched or paused. */
+.anno-watch {
+  position: absolute;
+  top: 4px;
+  left: 6px;
+  font-size: 9px;
+  padding: 1px 6px;
+  border: 1px solid #e4e4e7;
+  border-radius: 9px;
+  background: #fafafa;
+  color: #a1a1aa;
+  cursor: pointer;
+}
+.anno-watch.on {
+  border-color: #bcd7f5;
+  background: #eef5fd;
+  color: #2f6db3;
+}
 /* The orphan strip (doc §4): loud, top of card, quote intact — never a silent drop. */
 .anno-strip {
   position: absolute;

@@ -11,12 +11,14 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, seatForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./thread-tags.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
+import { isNotificationLevel, NOTIFICATION_LEVELS, wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
+import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { boardMemoryBrief } from "./board-memory.js";
@@ -625,11 +627,15 @@ function readAnnotatedSource(root: string, rel: string): string | null {
 // the sweep surface ("what's awaiting an answer", doc §7).
 function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: string, rel: string | null): void {
   if (!rel) {
-    const files = listAnnotatedPaths(repoPath)
+    // The sweep spans every doc that has annotations OR a watcher (P1/W4) — so "what's watched" shows up
+    // even on a doc no one has commented on yet.
+    const paths = [...new Set([...listAnnotatedPaths(repoPath), ...listWatchedPaths(repoPath)])].sort();
+    const files = paths
       .map((p) => {
         const annos = foldAnnotations(readAnnotationLog(repoPath, p));
         const src = readAnnotatedSource(root, p);
         const open = annos.filter((a) => !a.resolved);
+        const watchers = readWatchers(repoPath, p);
         // Question roll-up (docs/anchored-async-ask.md §6): `awaiting` needs a HUMAN to decide,
         // `answered` needs an AGENT to apply — surfaced separately from plain open comments so the
         // sweep answers "what's waiting on me" (awaiting) and "what's ready to apply" (answered).
@@ -640,9 +646,12 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
           orphaned: open.filter((a) => src == null || !resolveAnchor(src, a.anchor)).length,
           awaiting: annos.filter((a) => questionState(a) === "awaiting").length,
           answered: annos.filter((a) => questionState(a) === "answered").length,
+          // "what's watched" (P1/W4): the count of active (non-paused) watchers arming this doc.
+          watched: watchers.filter((w) => w.state !== "paused").length,
+          watchers,
         };
       })
-      .filter((f) => f.total > 0);
+      .filter((f) => f.total > 0 || f.watchers.length > 0);
     return sendJson(res, 200, { files });
   }
   const src = readAnnotatedSource(root, rel); // a deleted/blocked file ⇒ every anchor orphans (quotes intact — the payload)
@@ -657,7 +666,9 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
     const state = questionState(a); // null for a plain note; awaiting/answered/resolved for a question
     return { ...a, orphaned: !range, range, ...(state ? { state } : {}) };
   });
-  sendJson(res, 200, { path: rel, annotations });
+  // A doc's SEAT roster (P1/W4) — who's armed to be woken by a comment, at what level. Rides the per-file
+  // read so the card can paint a watcher chip alongside the annotations.
+  sendJson(res, 200, { path: rel, annotations, watchers: readWatchers(repoPath, rel) });
 }
 
 // POST /api/annotations?board=<id> { path, op, … } → append one §5 event. Ops and their fields:
@@ -668,6 +679,8 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
 //   resolve  { path, id, by }        reopen { path, id, by }
 //   reanchor { path, id, anchor, by }
 //   thread   { path, id, thread }
+//   watch    { path, role, level?, state?, by }   (arm/re-level a doc watcher — P1/W4)
+//   pause    { path, role }   resume { path, role }   unwatch { path, role }   (a watcher's state)
 // `kind:"question"` (with optional `options`/`blocking`) turns a create into an anchored async-ask
 // (docs/anchored-async-ask.md §4); `answer` records a human's/peer's decision on it. options/blocking
 // are ignored on a note. The awaiting/answered/resolved state is derived at read (never stored).
@@ -761,6 +774,31 @@ async function handleAnnotationsWrite(
       orphaned: !resolveAnchor(src, anchor),
       ...(isQuestion ? { kind: "question", state: "awaiting" } : {}),
     });
+  }
+
+  // Doc-WATCH ops (P1/W4, doc-watch.js) — a doc's SEAT roster, not an annotation. They key on `role`, not
+  // an annotation id, so they're handled before the id-gated block below. `watch` binds/re-levels a role as
+  // a watcher (arm the "watch for comments" affordance); `pause`/`resume` toggle its state; `unwatch` drops
+  // it. The doc must exist (like `create`). W4 is pull-mode plumbing: this records who to wake — the actual
+  // server-spawn on a qualifying comment is W5.
+  if (op === "watch" || op === "unwatch" || op === "pause" || op === "resume") {
+    const role = str("role");
+    const by = str("by") ?? "human";
+    if (!role) return sendJson(res, 400, { error: `${op} needs role` });
+    if (readAnnotatedSource(root, rel) == null) return sendJson(res, 404, { error: "not found" });
+    if (op === "unwatch") {
+      const removed = removeWatcher(repoPath, rel, role);
+      return sendJson(res, removed ? 200 : 404, removed ? { ok: true, removed: true } : { error: "no such watcher" });
+    }
+    if (op === "pause" || op === "resume") {
+      const w = setWatcherState(repoPath, rel, role, op === "pause" ? "paused" : "active");
+      return w ? sendJson(res, 200, { ok: true, watcher: w }) : sendJson(res, 404, { error: "no such watcher" });
+    }
+    // op === "watch": bind or re-level (level defaults to `all` on a fresh bind; state via optional field).
+    const level = isNotificationLevel(body.level) ? body.level : undefined;
+    const state = body.state === "paused" ? "paused" : body.state === "active" ? "active" : undefined;
+    const w = setWatcher(repoPath, rel, { role, level, state, by, ts });
+    return sendJson(res, 200, { ok: true, watcher: w });
   }
 
   // Every other op targets an existing annotation on an existing ledger.
@@ -2532,23 +2570,29 @@ function sessionThreads(records: Array<Record<string, unknown>>, sid: string): s
 
 // A message arrived in a thread: mark every OTHER live member as owing a nudge and wake the idle ones now
 // (busy ones fire at their turn boundary). Returns how many live members were notified.
-// Wake the members a post NAMED (4-tag era): `wakeSids` is the explicit set of sids to nudge (the @-tag
-// resolution). A null set means "the whole room" (an `@all` post, or any non-tagging caller) — the old
-// broadcast. An empty set wakes no one: an untagged post is ambient — logged for everyone to read on their
-// own cursor, but it interrupts nobody. The sender is always skipped. The unread CURSOR is untouched here,
+//
+// The wake is gated by each member's SEAT LEVEL (P1/W4, notification-levels.js) — the R2 recast: a member's
+// static, self-declared preference decides whether a room broadcast reaches it, and an explicit @-mention
+// always overrides (reaching a `mentions`/`paused` seat too). `opts`:
+//   • broadcast — a room-wide post (`@all`, or a room event like a join): wakes only members at level `all`.
+//   • mentioned — the sids a post @-addressed: woken regardless of their level (the @-mention override).
+// An untagged post is neither (broadcast:false, mentioned empty): ambient, wakes no one — logged for
+// everyone to read on their own cursor. The sender is always skipped. The unread CURSOR is untouched here,
 // so a member that wasn't woken still sees the message next time it reads — wake is gated, content is not.
 function wakeThreadMembers(
   boardId: string,
   threadId: string,
   exceptSid: string,
-  wakeSids: Set<string> | null,
+  opts: { broadcast: boolean; mentioned?: Set<string> },
 ): number {
   const records = boardSnapshotRecords(boardId);
   if (!records) return 0;
+  const meta = boards.get(boardId)?.repoPath ? readThreadMeta(boards.get(boardId)!.repoPath, threadId) : null;
   let woken = 0;
   for (const sid of threadMemberSids(records, threadId)) {
     if (sid === exceptSid) continue;
-    if (wakeSids && !wakeSids.has(sid)) continue; // named-only; null ⇒ broadcast (whole room)
+    const mentioned = opts.mentioned?.has(sid) ?? false;
+    if (!wakesSeat(threadLevelForSid(meta, sid), { mentioned, broadcast: opts.broadcast })) continue;
     const s = liveSessions.get(sid);
     if (!s || s.status === "exited") continue;
     s.nudge = true;
@@ -3767,7 +3811,7 @@ function maybeAnnounceMembership(
     );
     if (others.length) {
       appendThreadMsg(boardId, thread.id, "system", `${sid} joined the thread. members now: ${roster}.`);
-      wakeThreadMembers(boardId, thread.id, sid, null); // a join is a room event — broadcast it to all members
+      wakeThreadMembers(boardId, thread.id, sid, { broadcast: true }); // a join is a room event — reaches level-`all` seats
     }
     const js = liveSessions.get(sid);
     if (js) {
@@ -3820,7 +3864,6 @@ async function handleThreadMessage(
   // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
   const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
   const { wakeAll, human, members: tagged } = resolveTags(body.text, memberEntries);
-  const wakeSids = wakeAll ? null : new Set(tagged);
   const ss = liveSessions.get(from);
   if (ss) {
     ss.read[threadId] = msg.seq;
@@ -3845,7 +3888,10 @@ async function handleThreadMessage(
       publishSession(w);
     }
   }
-  const notified = wakeThreadMembers(boardId, threadId, from, wakeSids);
+  // @-tags decide the wake set, now gated by each member's seat level (P1/W4): `@all` is a room broadcast
+  // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an untagged
+  // post is ambient (neither — wakes no one).
+  const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged) });
   sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified });
 }
 
@@ -4104,6 +4150,40 @@ async function handleThreadIntent(
     });
   }
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
+}
+
+// POST /api/thread/<id>/level { from, level } — set the caller's notification LEVEL on this thread (P1/W4,
+// notification-levels.js): `all` (the default — any room broadcast wakes it), `mentions` (only an @-address
+// wakes it), or `paused` (nothing auto-wakes; an @-mention still overrides). The level rides the caller's
+// SEAT when it holds one (durable across respawn), else a sid-keyed fallback. It is NOT a card entry — it
+// changes only the wake fan-out condition (wakeThreadMembers), never the message record. Consent mirrors
+// intent: a member (or the human at the card) may set a level. 400 on a bad level; 403 for a non-member.
+async function handleThreadLevel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  let body: { from?: unknown; level?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  if (!isNotificationLevel(body.level))
+    return sendJson(res, 400, { error: `level must be one of ${NOTIFICATION_LEVELS.map((l) => `"${l}"`).join(" | ")}` });
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  const { seat, level } = setThreadLevel(repoPath, threadId, body.from, body.level);
+  // Nudge the rail so a listing re-pull reflects the change (like an intent/pin does).
+  publishFeed("threads:" + boardId, { ts: Date.now() });
+  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, level });
 }
 
 // POST /api/thread/<id>/pin { from, seq, pinned } — flag (or unflag) a message as HEAD CONTEXT (R-PIN,
@@ -4365,7 +4445,7 @@ export function fsApi(): Plugin {
         // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
         // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
         // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|pin)$/.exec(url.pathname);
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin)$/.exec(url.pathname);
         if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -4376,6 +4456,7 @@ export function fsApi(): Plugin {
           if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
           if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
           if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
+          if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
           if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
           return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
         }

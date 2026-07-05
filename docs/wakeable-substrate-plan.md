@@ -50,7 +50,7 @@ dep) can run in parallel sessions.
 | W1 | anchored-async-ask **record layer** | async-ask §4/§6 steps 1–2 | — | M | DONE `9e6988a` |
 | W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `addaf14` |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE `addaf14` |
-| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | TODO (unblocked — W7 landed; next up) |
+| W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | DONE `PENDING` |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
 | W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
@@ -125,6 +125,30 @@ dep) can run in parallel sessions.
   `@`-mention override. The change is the nudge fan-out condition only.
 - **Done when:** a thread or doc seat carries a level; the wake fan-out respects it; an `@`-mention reaches a
   `mentions`/`paused` seat; a doc can be watched/paused from CLI and card.
+- **Shipped** (commit `PENDING`): the reusable core is `app/notification-levels.js` — the level enum
+  (`all`/`mentions`/`paused`) + one `wakesSeat(level, {mentioned, broadcast})` predicate every wakeable
+  surface routes through (mention always wakes — the `@`-mention override, even at `paused`; a broadcast
+  wakes only `all`; ambient wakes no one). **Doc side:** `app/doc-watch.js` — a per-doc watch marker
+  (`<enc>.watch.json`) beside the annotation ledger holding `{role, level, state:"active"|"paused", by,
+  createdAt}` watchers (a doc's seat roster, one surface up from a thread). New `/api/annotations` ops
+  `watch`/`pause`/`resume`/`unwatch` (keyed by role, not an annotation id); the per-file read returns
+  `watchers`, the sweep adds a `watched` count + `watchers`. `scripts/canvas anno watch <doc> [--role
+  --level] [--pause|--resume|--unwatch]`; `anno list` shows `👁 role:level` per doc. The doc card grows a
+  **watch chip** (`NodeView.tsx`, top-left of the anno layer) that cycles all→mentions→paused→off over
+  `docWatchersSignal`. **Thread side:** the level rides the SEAT (`seats[handle].level`, durable across
+  respawn — `fillSeat` now carries it) with a sid-keyed `levels` fallback for seatless members;
+  `setThreadLevel`/`threadLevelForSid` in `thread-ledger.js`; new `POST /api/thread/<id>/level {from,
+  level}`. `wakeThreadMembers` now gates each member on `wakesSeat(threadLevelForSid(meta, sid), …)` —
+  `@all` is a broadcast (wakes level-`all` seats), a member tag is a mention (wakes it regardless of level),
+  an untagged post is ambient (wakes no one); **the message record is unchanged — only the nudge condition.**
+  This is PULL-mode plumbing (the watch record + level + fan-out condition); the server-spawn-on-a-qualifying-
+  comment is W5, which consumes this watch record. **Tests:** `notification-levels.test.mjs` (the predicate,
+  every level×event), `doc-watch.test.mjs` (marker CRUD, pause preserves level, last-watcher deletes marker),
+  `thread-ledger.test.mjs` (seat vs sid-fallback level, survives respawn), `http-contract.test.mjs` (live
+  watch round-trip watch→re-level→pause/resume→unwatch surfaced in read+sweep; live thread-level set + 400 +
+  seatless fallback). All 277 app tests + typecheck green. **Live-board smoke** (foolscap-a9921027, throwaway
+  doc + thread cleaned up): the `canvas anno watch` CLI loop arm→re-level→pause→sweep→unwatch, and a thread
+  `/level` set landing `levels:{human:"mentions"}` on the durable marker.
 
 ### W5 — P2: server-spawn-from-record + wake trigger
 - **Idle lifecycle (R1):** a session is kept alive ~5 min (server-side idle timer) then exits; default

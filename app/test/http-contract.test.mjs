@@ -192,7 +192,7 @@ test("annotations: create → reply → resolve → re-anchor round-trip, orphan
   assert.equal((await post({ path: doc, op: "resolve", id, by: "human" })).status, 200);
   const sweep = await (await fetch(`${HOST}/api/annotations?board=${boardId}`)).json();
   const mine = sweep.files.find((f) => f.path === doc);
-  assert.deepEqual(mine, { path: doc, total: 1, open: 0, orphaned: 0, awaiting: 0, answered: 0 });
+  assert.deepEqual(mine, { path: doc, total: 1, open: 0, orphaned: 0, awaiting: 0, answered: 0, watched: 0, watchers: [] });
 
   // Edit the quote away: reopened, the annotation reads ORPHANED (quote intact — the payload), never dropped.
   assert.equal((await post({ path: doc, op: "reopen", id, by: "human" })).status, 200);
@@ -288,6 +288,60 @@ test("annotations: anchored async-ask — question create → answer → awaitin
   const swept = await sweepFor();
   assert.equal(swept.awaiting, 0);
   assert.equal(swept.answered, 0);
+});
+
+test("doc-watch (P1/W4): watch → re-level → pause/resume → unwatch, surfaced in read + sweep", { skip: !up && "no dev server on 5173" }, async () => {
+  const doc = `docs/watch-${runTag}.md`;
+  fs.mkdirSync(path.join(scratch, "docs"), { recursive: true });
+  fs.writeFileSync(path.join(scratch, doc), "# Watched\n\nA doc that carries a watcher seat.\n");
+  const post = (body) => fetch(`${HOST}/api/annotations?board=${boardId}`, j(body));
+  const watchers = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=${encodeURIComponent(doc)}`)).json()).watchers;
+  const sweepFor = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}`)).json()).files.find((f) => f.path === doc);
+
+  // Bad input: a watch needs a role; a watch on a blocked path 404s like create.
+  assert.equal((await post({ path: doc, op: "watch" })).status, 400);
+  assert.equal((await post({ path: ".env", op: "watch", role: "Coordinator" })).status, 404);
+  // Pausing a not-yet-armed watcher is a 404 (nothing to pause).
+  assert.equal((await post({ path: doc, op: "pause", role: "Coordinator" })).status, 404);
+
+  // Arm a watcher — defaults to level `all`, state active; it surfaces on the read and the sweep.
+  const armed = await post({ path: doc, op: "watch", role: "Coordinator", by: "human" });
+  assert.equal(armed.status, 200);
+  assert.equal((await armed.json()).watcher.level, "all");
+  assert.deepEqual((await watchers()).map((w) => [w.role, w.level, w.state]), [["Coordinator", "all", "active"]]);
+  assert.equal((await sweepFor()).watched, 1, "an active watcher counts in the sweep");
+
+  // Re-level in place (no duplicate watcher).
+  await post({ path: doc, op: "watch", role: "Coordinator", level: "mentions" });
+  assert.deepEqual((await watchers()).map((w) => [w.role, w.level]), [["Coordinator", "mentions"]]);
+
+  // Pause drops the sweep count but keeps the level (resume restores it, not a reset to `all`).
+  await post({ path: doc, op: "pause", role: "Coordinator" });
+  assert.equal((await watchers())[0].state, "paused");
+  assert.equal((await sweepFor()).watched, 0, "a paused watcher is not counted active");
+  await post({ path: doc, op: "resume", role: "Coordinator" });
+  assert.deepEqual((await watchers()).map((w) => [w.role, w.level, w.state]), [["Coordinator", "mentions", "active"]]);
+
+  // Unwatch removes it; the doc drops out of the sweep (no annotations, no watchers).
+  assert.equal((await post({ path: doc, op: "unwatch", role: "Coordinator" })).status, 200);
+  assert.deepEqual(await watchers(), []);
+  assert.equal(await sweepFor(), undefined, "an unwatched, un-annotated doc is not in the sweep");
+  assert.equal((await post({ path: doc, op: "unwatch", role: "Coordinator" })).status, 404, "double-unwatch is 404");
+});
+
+test("thread level (P1/W4): set → 400 on a bad level → seatless sid fallback", { skip: !up && "no dev server on 5173" }, async () => {
+  const threadId = `node:thread:level-${runTag}`;
+  await fetch(`${HOST}/api/board/persist/snapshot?board=${boardId}`, j({ snapshot: { seq: 40, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Level" }] } }));
+  const url = (a) => `${HOST}/api/thread/${encodeURIComponent(threadId)}/${a}?board=${boardId}`;
+  // A non-session `from` (the human at the card) may set a level; a bad level is 400.
+  assert.equal((await fetch(url("level"), j({ from: "human", level: "loud" }))).status, 400);
+  const ok = await fetch(url("level"), j({ from: "human", level: "mentions" }));
+  assert.equal(ok.status, 200);
+  const oj = await ok.json();
+  assert.equal(oj.level, "mentions");
+  assert.equal(oj.seat, null, "a seatless (non-role) participant lands on the sid fallback");
 });
 
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {

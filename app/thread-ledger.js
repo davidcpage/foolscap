@@ -20,6 +20,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { normLevel } from "./notification-levels.js";
 
 // Bound the seed READ at the byte (the truncation doctrine: cap once, at the read, keep the TAIL — the most
 // recent messages are what a scroll-to-bottom conversation wants). Generous: a thread log is small text.
@@ -168,6 +169,9 @@ export function fillSeat(repoPath, threadId, role, sid, ts) {
     createdAt: existing?.createdAt ?? ts,
     filledAt: ts,
     fills: (existing?.fills ?? 0) + 1,
+    // The seat's notification level (P1/W4) is durable across respawn: a fresh occupant of the same role
+    // inherits the prior seat's wake preference rather than resetting to the default.
+    ...(existing?.level ? { level: existing.level } : {}),
   };
   upsertThreadMeta(repoPath, threadId, { seats: { ...prior, [role]: seat } });
   return { seat, refilled: !!existing };
@@ -181,6 +185,49 @@ export function fillSeat(repoPath, threadId, role, sid, ts) {
 export function seatForSid(seats, sid) {
   for (const [handle, s] of Object.entries(seats ?? {})) if (s && s.sid === sid) return handle;
   return null;
+}
+
+// ── notification levels (P1, wakeable-substrate-plan W4; claude-tag R2 recast) ──────────────────────
+// A thread member's SEAT carries a notification LEVEL — the same wake preference a doc watcher carries
+// (notification-levels.js), one surface up. Default `all` (any room broadcast wakes it, the R2 default);
+// a member opts DOWN to `mentions`/`paused` to turn its own traffic down without leaving. The level lives
+// ON THE SEAT (`seats[handle].level`) so it survives an occupant respawn — a fresh session of the same role
+// re-fills the seat and inherits the level. A plain sid-only member (no seat) can still set a level; it's
+// stored on a `levels` map keyed by sid (ephemeral like the member). The wake fan-out reads it via
+// threadLevelForSid; only the nudge CONDITION changes — the message record and content path are untouched.
+
+/**
+ * Set the notification level for the participant `sid` on a thread. If it occupies a seat, the level rides
+ * the SEAT (durable across respawn); otherwise it rides a sid-keyed `levels` fallback map. `level` is
+ * normalized (unknown ⇒ `all`). Returns { seat, level } — `seat` is the handle it landed on, or null for
+ * the sid fallback. Best-effort (upsertThreadMeta swallows write errors).
+ */
+export function setThreadLevel(repoPath, threadId, sid, level) {
+  const lvl = normLevel(level);
+  const meta = readThreadMeta(repoPath, threadId) ?? {};
+  const seats = meta.seats ?? {};
+  const handle = seatForSid(seats, sid);
+  if (handle) {
+    upsertThreadMeta(repoPath, threadId, {
+      seats: { ...seats, [handle]: { ...seats[handle], level: lvl } },
+    });
+    return { seat: handle, level: lvl };
+  }
+  const levels = meta.levels ?? {};
+  upsertThreadMeta(repoPath, threadId, { levels: { ...levels, [sid]: lvl } });
+  return { seat: null, level: lvl };
+}
+
+/**
+ * The notification level `sid` has on a thread: its seat's level if it occupies one, else its sid-keyed
+ * fallback, else the default `all`. Pure — callers pass the thread's meta marker. This is how the nudge
+ * fan-out resolves a wake preference from the only identity a live session knows: its own sid.
+ */
+export function threadLevelForSid(meta, sid) {
+  const seats = meta?.seats ?? {};
+  const handle = seatForSid(seats, sid);
+  const raw = handle ? seats[handle]?.level : meta?.levels?.[sid];
+  return normLevel(raw);
 }
 
 // ── pins (R-PIN, wakeable-substrate-plan W7) ────────────────────────────────────────────────────────

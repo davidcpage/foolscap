@@ -18,6 +18,8 @@ import {
   listThreads,
   fillSeat,
   seatForSid,
+  setThreadLevel,
+  threadLevelForSid,
   readPins,
   pinMessage,
   unpinMessage,
@@ -197,4 +199,48 @@ test("pins ride the marker beside seats/intents without clobbering them", () => 
   assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat survives a pin write");
   assert.equal(meta.intents.Coordinator.intent, "working", "intent survives a pin write");
   assert.equal(meta.pins.length, 1, "pins land alongside");
+});
+
+// ── notification levels (P1, wakeable-substrate-plan W4) ─────────────────────────────────────────────
+
+test("threadLevelForSid defaults to `all` for an unknown member / empty meta", () => {
+  assert.equal(threadLevelForSid(null, "sid-x"), "all");
+  assert.equal(threadLevelForSid({}, "sid-x"), "all");
+});
+
+test("setThreadLevel rides the SEAT when the sid occupies one (durable across respawn)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:lvl";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  const r = setThreadLevel(repo, id, "sid-a", "mentions");
+  assert.deepEqual(r, { seat: "Coordinator", level: "mentions" });
+  // Stored on the seat, so a re-fill by a fresh session of the role inherits it.
+  const meta = readThreadMeta(repo, id);
+  assert.equal(meta.seats.Coordinator.level, "mentions");
+  assert.equal(threadLevelForSid(meta, "sid-a"), "mentions");
+  // A fresh occupant re-fills the same seat and inherits the level.
+  fillSeat(repo, id, "Coordinator", "sid-b", 200);
+  assert.equal(threadLevelForSid(readThreadMeta(repo, id), "sid-b"), "mentions", "level survives respawn");
+});
+
+test("setThreadLevel falls back to a sid-keyed map for a seatless member", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:lvl2";
+  const r = setThreadLevel(repo, id, "sid-plain", "paused");
+  assert.deepEqual(r, { seat: null, level: "paused" });
+  const meta = readThreadMeta(repo, id);
+  assert.equal(meta.levels["sid-plain"], "paused");
+  assert.equal(threadLevelForSid(meta, "sid-plain"), "paused");
+});
+
+test("setThreadLevel normalizes an unknown level to `all` and preserves seats/pins", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:lvl3";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  pinMessage(repo, id, msg(1, "Done when: green"), "sid-a", 150);
+  setThreadLevel(repo, id, "sid-a", "nonsense");
+  const meta = readThreadMeta(repo, id);
+  assert.equal(meta.seats.Coordinator.level, "all", "bad level → all");
+  assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat identity intact");
+  assert.equal(meta.pins.length, 1, "pins survive a level write");
 });

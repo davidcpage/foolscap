@@ -17,6 +17,7 @@ import {
   annotationsSignal,
   anchorRangeIn,
   caretPointAt,
+  docWatchersSignal,
   postAnnotationOp,
   rangeFromTextOffsets,
   setCardHighlights,
@@ -773,6 +774,10 @@ function cardLocalPoint(host: HTMLElement, clientX: number, clientY: number): { 
 }
 
 const ANNO_POP_W = 260; // popover width (style.css .anno-pop) — used to clamp inside the card
+// The role a card-armed "watch for comments" binds (P1/W4). The board's standing watcher; the CLI
+// (`canvas anno watch --role`) can bind any role. W5 will spawn/wake this role on a qualifying comment.
+const DEFAULT_WATCH_ROLE = "Coordinator";
+const WATCH_LEVELS = ["all", "mentions", "paused"] as const;
 
 function AnnotationsLayer({
   id,
@@ -784,6 +789,7 @@ function AnnotationsLayer({
   hostRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const annos = useSignal(useMemo(() => annotationsSignal(path), [path]));
+  const watchers = useSignal(useMemo(() => docWatchersSignal(path), [path]));
   const source = useSignal(useMemo(() => fileContentSignal("repo", path), [path]));
   const [openId, setOpenId] = useState<string | null>(null);
   const [popAt, setPopAt] = useState<{ x: number; y: number }>({ x: 12, y: 28 });
@@ -1038,6 +1044,20 @@ function AnnotationsLayer({
   };
 
   const pop = clampPop(popAt);
+  // The doc's primary watcher (P1/W4) — the first armed role, if any. The chip cycles its wake level
+  // all → mentions → paused → (off), and the CLI (`canvas anno watch`) covers multi-role / role choice.
+  const watcher = (watchers ?? [])[0] ?? null;
+  const cycleWatch = () => {
+    if (!watcher) {
+      void postAnnotationOp(path, { op: "watch", role: DEFAULT_WATCH_ROLE, level: "all", by: "human" });
+      return;
+    }
+    const i = WATCH_LEVELS.indexOf(watcher.level);
+    const next = WATCH_LEVELS[i + 1]; // undefined past `paused` → unwatch (a full cycle back to off)
+    if (next) void postAnnotationOp(path, { op: "watch", role: watcher.role, level: next, by: "human" });
+    else void postAnnotationOp(path, { op: "unwatch", role: watcher.role, by: "human" });
+  };
+
   return (
     <div className="anno-layer" data-interactive>
       {list.length > 0 && (
@@ -1050,6 +1070,19 @@ function AnnotationsLayer({
           {awaitingQs.length > 0 && <span className="anno-badge-q">❓{awaitingQs.length}</span>}
         </button>
       )}
+      {/* Watch-for-comments chip (P1/W4): arm/re-level/unwatch a watcher on this doc — the "who to wake
+          when a comment lands" seat. Click cycles all → mentions → paused → off. */}
+      <button
+        className={`anno-watch${watcher && watcher.level !== "paused" ? " on" : " quiet"}`}
+        title={
+          watcher
+            ? `watched by ${watcher.role} · ${watcher.level} — click to cycle level / unwatch`
+            : "watch this doc for comments — click to arm a watcher"
+        }
+        onClick={cycleWatch}
+      >
+        👁{watcher ? ` ${watcher.role}:${watcher.level}` : ""}
+      </button>
       {orphans.length > 0 && (
         <div className="anno-strip" title="comments whose quoted text no longer matches this file">
           {orphans.map((a) => (

@@ -53,14 +53,26 @@ export interface AnnotationInfo {
   state?: "awaiting" | "answered" | "resolved"; // present only for a kind:"question"
 }
 
+/** A doc's watcher (P1/W4, docs/anchored-async-ask.md §4) — a role armed to be woken by a comment. */
+export interface WatchRecord {
+  role: string;
+  level: "all" | "mentions" | "paused";
+  state: "active" | "paused";
+  by: string;
+  createdAt: number;
+}
+
 // ── the off-log projection (the fileContentSignal pattern, keyed by path) ────────────────────────
 // Annotations are CANONICAL-ROOT only (the ledger is keyed by repo-relative path — the server refuses
 // ?root=), so unlike file content the key is just the path.
 
 const values = new Map<string, AnnotationInfo[]>();
+const watchValues = new Map<string, WatchRecord[]>(); // the doc's watcher roster, rides the same GET
 const subs = new Map<string, Set<() => void>>();
+const watchSubs = new Map<string, Set<() => void>>();
 const inflight = new Set<string>();
 const sigs = new Map<string, Subscribable<AnnotationInfo[] | undefined>>();
+const watchSigs = new Map<string, Subscribable<WatchRecord[] | undefined>>();
 
 async function fetchAnnotations(path: string): Promise<void> {
   if (inflight.has(path)) return;
@@ -68,15 +80,37 @@ async function fetchAnnotations(path: string): Promise<void> {
   try {
     const r = await fetch(`/api/annotations?board=${activeBoardId()}&path=${encodeURIComponent(path)}`);
     if (r.ok) {
-      const d = (await r.json()) as { annotations?: AnnotationInfo[] };
+      const d = (await r.json()) as { annotations?: AnnotationInfo[]; watchers?: WatchRecord[] };
       values.set(path, d.annotations ?? []);
+      watchValues.set(path, d.watchers ?? []);
       for (const fn of subs.get(path) ?? []) fn();
+      for (const fn of watchSubs.get(path) ?? []) fn();
     }
   } catch {
     // offline — leave unset; a later subscribe (or a watch-driven refresh) retries
   } finally {
     inflight.delete(path);
   }
+}
+
+/** Channel-1 handle for one doc's watcher roster (P1/W4). Shares fetchAnnotations' GET, so subscribing to
+ *  either lazily loads both. */
+export function docWatchersSignal(path: string): Subscribable<WatchRecord[] | undefined> {
+  let s = watchSigs.get(path);
+  if (!s) {
+    s = {
+      get: () => watchValues.get(path),
+      subscribe(onChange) {
+        let set = watchSubs.get(path);
+        if (!set) watchSubs.set(path, (set = new Set()));
+        set.add(onChange);
+        if (!watchValues.has(path)) void fetchAnnotations(path);
+        return () => set!.delete(onChange);
+      },
+    };
+    watchSigs.set(path, s);
+  }
+  return s;
 }
 
 /** Channel-1 handle for one file's annotations. First subscribe lazily fetches. */
