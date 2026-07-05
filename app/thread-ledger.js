@@ -158,11 +158,21 @@ export function listThreads(repoPath) {
 /**
  * Create or re-occupy the seat for `role` on a thread. Same occupant → no write (idempotent onboarding).
  * Returns { seat, refilled } — `refilled` true when an existing seat changed occupant.
+ *
+ * LIVE-OCCUPANCY GUARD (seat-displacement fix): a seat must never DISPLACE a LIVE occupant. A fresh joiner
+ * takes an existing seat only when the prior occupant has EXITED — the legitimate respawn re-fill (§5: a
+ * fresh session of the same role re-fills the seat AFTER the prior one is gone). When the seat is still held
+ * by a live session of the role, the joiner must NOT steal it: pass `isLive` (a `sid => bool` liveness
+ * predicate) and the call returns WITHOUT writing, signalled by `blocked:true` + `heldBy:<the live sid>` so
+ * the caller onboards the joiner SEATLESS. Omitting `isLive` keeps the old unconditional re-fill (the ledger
+ * unit tests that don't model liveness, and any caller that has already vetted liveness itself).
  */
-export function fillSeat(repoPath, threadId, role, sid, ts) {
+export function fillSeat(repoPath, threadId, role, sid, ts, isLive) {
   const prior = readThreadMeta(repoPath, threadId)?.seats ?? {};
   const existing = prior[role];
   if (existing && existing.sid === sid) return { seat: existing, refilled: false };
+  if (existing && existing.sid !== sid && typeof isLive === "function" && isLive(existing.sid))
+    return { seat: existing, refilled: false, blocked: true, heldBy: existing.sid };
   const seat = {
     role,
     sid,
@@ -175,6 +185,23 @@ export function fillSeat(repoPath, threadId, role, sid, ts) {
   };
   upsertThreadMeta(repoPath, threadId, { seats: { ...prior, [role]: seat } });
   return { seat, refilled: !!existing };
+}
+
+/**
+ * Release (remove) the seat `sid` currently occupies on a thread, if any — the `leave` companion to
+ * fillSeat. A seat SURVIVES its occupant's process EXIT (so a respawn re-fills it), but an explicit thread
+ * LEAVE is a deliberate departure: the leaver gives the seat back so the next same-role join fills a fresh
+ * seat rather than inheriting a stuck one. Also self-heals a seat left stuck to a departed sid. Idempotent:
+ * returns the freed handle, or null when `sid` held no seat (nothing to release). Best-effort.
+ */
+export function releaseSeat(repoPath, threadId, sid) {
+  const meta = readThreadMeta(repoPath, threadId);
+  const seats = meta?.seats ?? {};
+  const handle = seatForSid(seats, sid);
+  if (!handle) return null;
+  const { [handle]: _removed, ...rest } = seats;
+  upsertThreadMeta(repoPath, threadId, { seats: rest });
+  return handle;
 }
 
 /**

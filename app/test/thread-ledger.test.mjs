@@ -17,6 +17,7 @@ import {
   upsertThreadMeta,
   listThreads,
   fillSeat,
+  releaseSeat,
   seatForSid,
   setThreadLevel,
   threadLevelForSid,
@@ -166,6 +167,58 @@ test("seats: fillSeat creates once, is idempotent for the same occupant, and re-
   assert.equal(seatForSid(seats, "sid-c"), "Reviewer");
   assert.equal(seatForSid(seats, "sid-a"), null);
   assert.equal(seatForSid(undefined, "sid-b"), null, "no seats map → null, not a throw");
+});
+
+test("seats: the live-occupancy guard never displaces a LIVE seat, but an EXITED one still re-fills", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:seat-guard";
+  // sid-a holds the Coordinator seat.
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  // A second Coordinator (sid-b) joins while sid-a is LIVE: the guard blocks the steal — no write, and the
+  // result reports who holds it so the caller can onboard the joiner seatless. THE CORE FIX.
+  const live = new Set(["sid-a"]);
+  const isLive = (sid) => live.has(sid);
+  const blocked = fillSeat(repo, id, "Coordinator", "sid-b", 200, isLive);
+  assert.equal(blocked.blocked, true, "a live occupant is not displaced");
+  assert.equal(blocked.heldBy, "sid-a", "the result names the live holder");
+  assert.equal(blocked.refilled, false);
+  const seats1 = readThreadMeta(repo, id).seats;
+  assert.equal(seats1.Coordinator.sid, "sid-a", "the seat still belongs to the live occupant");
+  assert.equal(seats1.Coordinator.fills, 1, "no re-fill happened (fills unchanged)");
+  // Now sid-a EXITS (the legitimate respawn case): sid-b re-filling passes the guard and takes the seat.
+  live.delete("sid-a");
+  const refill = fillSeat(repo, id, "Coordinator", "sid-b", 300, isLive);
+  assert.equal(refill.blocked, undefined, "an exited holder does not block the respawn re-fill");
+  assert.equal(refill.refilled, true);
+  const seats2 = readThreadMeta(repo, id).seats;
+  assert.equal(seats2.Coordinator.sid, "sid-b", "the exited seat re-fills to the fresh occupant");
+  assert.equal(seats2.Coordinator.fills, 2);
+  // Idempotent onboarding of the live holder itself is never blocked (same sid → no-op, guard skipped).
+  live.add("sid-b");
+  const same = fillSeat(repo, id, "Coordinator", "sid-b", 400, isLive);
+  assert.equal(same.blocked, undefined);
+  assert.equal(same.refilled, false, "same live occupant re-onboarding is an idempotent no-op");
+  // With no predicate, the old unconditional re-fill still holds (callers that vetted liveness themselves).
+  const noPred = fillSeat(repo, id, "Coordinator", "sid-c", 500);
+  assert.equal(noPred.refilled, true, "omitting isLive keeps the unconditional re-fill");
+});
+
+test("seats: releaseSeat frees the seat a leaver holds, self-healing a stuck seat", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:seat-release";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  fillSeat(repo, id, "Reviewer", "sid-b", 110);
+  // The Coordinator LEAVES: its seat is returned, the Reviewer seat is untouched.
+  assert.equal(releaseSeat(repo, id, "sid-a"), "Coordinator", "returns the freed handle");
+  const seats = readThreadMeta(repo, id).seats;
+  assert.deepEqual(Object.keys(seats), ["Reviewer"], "only the leaver's seat is cleared");
+  // A vacated seat now frees for the next same-role join to fill fresh.
+  const refill = fillSeat(repo, id, "Coordinator", "sid-c", 200);
+  assert.equal(refill.refilled, false, "the freed seat fills as a fresh seat, not a re-fill");
+  assert.equal(readThreadMeta(repo, id).seats.Coordinator.sid, "sid-c");
+  // Releasing when the sid holds no seat is a harmless no-op.
+  assert.equal(releaseSeat(repo, id, "sid-a"), null, "a non-holder release is a no-op → null");
+  assert.equal(releaseSeat(repo, id, "sid-nobody"), null);
 });
 
 test("pins (R-PIN): pin snapshots a message, is idempotent, stays chronological, and unpins", () => {

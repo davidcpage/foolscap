@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./thread-tags.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
@@ -2011,6 +2011,7 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     '(resolve another author\'s comment only when they explicitly say so). "Answer the comments on <file>"',
     'means: reply per annotation, and where the right answer is "fix the doc", fix the doc (then re-anchor).',
     "",
+    "PUBLIC CHANNELS ARE THE RECORD — WHEN YOU'RE IN A THREAD. If you are a member of a thread, the thread (and any companion doc) is the durable, readable trace of your work: post status, decisions, blockers, and handoffs there, and never assume a peer or human reads your in-session text / session-card narration. (A standalone session with no thread can address the human via its card as usual — this applies only to thread work.)",
     "NORMS. Read the board, talk in threads, and claim work before racing a peer on the same file. Stay within",
     "your thread's task/brief. Doing the work you were spawned for — editing files, running tests, and",
     "COMMITTING your work to the local repo — is in bounds and needs no nod: a local commit is a normal act, and",
@@ -2807,6 +2808,13 @@ function originOf(req: IncomingMessage): string {
 // /terminate frees a slot. A ceiling on concurrency, not on total spawns over time.
 const MAX_LIVE_SESSIONS = 12;
 const liveSessionCount = (): number => [...liveSessions.values()].filter((s) => s.status !== "exited").length;
+// Is `sid` a LIVE session right now (running or idle, not exited / not gone)? The synchronous liveness
+// predicate the seat machinery reaches for — an exited session (or one never seen) fails it, which is what
+// lets a departed-occupant seat re-fill on respawn while a live occupant is never displaced.
+const isSidLive = (sid: string): boolean => {
+  const s = liveSessions.get(sid);
+  return !!s && s.status !== "exited";
+};
 
 // Footprint of a SERVER-created worker card (matches the client's session-card default size).
 const WORKER_CARD_W = 800;
@@ -4199,14 +4207,26 @@ function maybeAnnounceMembership(
       persistSessionState(js);
     }
     // Seat (§5): a role-spawned joiner FILLS its role's seat on this thread — created on first join,
-    // re-occupied (same seat, new sid) when a fresh session of the role arrives. The role rides the
-    // session card's `name` ("RoleName.<short-sid>"); a plain unnamed session takes no seat (it stays a
-    // sid-identified participant). 1:1 with roles until labelled multiplicity ships.
+    // re-occupied (same seat, new sid) when a fresh session of the role arrives AFTER the prior occupant
+    // exited (the respawn re-fill). The role rides the session card's `name` ("RoleName.<short-sid>"); a
+    // plain unnamed session takes no seat (it stays a sid-identified participant). 1:1 with roles until
+    // labelled multiplicity ships. LIVE-OCCUPANCY GUARD: if the seat is still held by a LIVE session of the
+    // same role, the joiner must NOT displace it — fillSeat returns `blocked` and we onboard it SEATLESS,
+    // telling it who holds the seat (fixes the two-Coordinator seat-theft; the departed-occupant re-fill
+    // still works because an exited holder fails the liveness predicate).
     const name = sessionNameForSid(records, sid);
     if (name) {
       const role = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
       const repoPath = boards.get(boardId)?.repoPath;
-      if (role && repoPath) fillSeat(repoPath, thread.id, role, sid, Date.now());
+      if (role && repoPath) {
+        const r = fillSeat(repoPath, thread.id, role, sid, Date.now(), isSidLive);
+        if (r.blocked)
+          sendSessionInput(
+            sid,
+            `[canvas] The ${role} seat on thread ${thread.id} is held by a live session (${r.heldBy}); ` +
+              `you joined SEATLESS (a sid-identified member). @${role} mentions still route to the seated ${role}.`,
+          );
+      }
     }
   }
 }
@@ -4349,6 +4369,11 @@ async function handleThreadMembership(
     const id = memberEdge(records, sessionNode, threadId);
     if (!id) return sendJson(res, 404, { error: "not a member of this channel" });
     cmd = { type: "removeEdge", actor: body.from, payload: { id } };
+    // Release the seat this leaver holds (§5): a seat survives a process EXIT (respawn re-fills it), but an
+    // explicit LEAVE is a deliberate departure — give the seat back so the next same-role join fills fresh,
+    // and self-heal a seat stuck to a departed sid. Best-effort; keyed on the leaver's sid, not the role.
+    const repoPath = boards.get(boardId)?.repoPath;
+    if (repoPath) releaseSeat(repoPath, threadId, body.from);
   } else {
     const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
     const type = action === "join" ? "member:open" : "member:pending";

@@ -78,7 +78,9 @@ export function fillSeat(
   role: string,
   sid: string,
   ts: number,
-): { seat: SeatRecord; refilled: boolean };
+  isLive?: (sid: string) => boolean,
+): { seat: SeatRecord; refilled: boolean; blocked?: boolean; heldBy?: string };
+export function releaseSeat(repoPath: string, threadId: string, sid: string): string | null;
 export function seatForSid(seats: Record<string, SeatRecord> | undefined, sid: string): string | null;
 export function setThreadLevel(
   repoPath: string,
