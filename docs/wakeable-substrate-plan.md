@@ -51,7 +51,7 @@ dep) can run in parallel sessions.
 | W2 | anchored-async-ask **card affordance** | async-ask §6 step 3 | W1 | M | DONE `addaf14` |
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE `addaf14` |
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | DONE `b5af3a0` |
-| W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | TODO |
+| W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | DONE `4c749f5` |
 | W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
@@ -166,6 +166,36 @@ dep) can run in parallel sessions.
 - **Done when:** an answer/comment on a watched doc auto-spawns a per-doc worker that services the whole open
   queue and winds down; an addressed message to a dormant thread seat respawns it; the idle keep-alive→exit
   timer runs.
+- **Shipped** (commit `4c749f5`): the reusable core is `app/auto-wake.js` — an in-memory **single-flight
+  claim registry** (`docSurfaceKey`/`seatSurfaceKey` → the servicing sid; `claim`/`release`(sid-guarded)/
+  `isSurfaceClaimed`) so one worker services a surface's whole queue, plus PURE qualification predicates:
+  `qualifyingWatchers` reuses W4's `wakesSeat`/`watcherEffectiveLevel` (an `answer` is *addressed*/mention, a
+  `note` comment is a *broadcast* → `all` only; a fresh awaiting `question` wakes no agent — no-op-spawn
+  avoidance), and `shouldReapIdle` is the R1 keep-alive decision. All spawning stays in `vite-fs-plugin.ts`
+  (`serverSpawnWorker` — the one primitive W6 rides): mint a fresh session via `ensureLiveSession` (**never
+  `--resume`** — R1 fresh-seed), claim the surface, drop a server-placed card, seed the worker brief. **Trigger
+  1 (doc-wake)** hooks `handleAnnotationsWrite` after a `note`/`answer` append: a live worker in its keep-alive
+  window is NUDGED (not duplicated); else a per-doc worker spawns, loops-until-dry, self-`done`s. A
+  `--blocking` question auto-arms an **ask-armed watcher** (reserved `ask` role, `mentions`), cleared once no
+  unresolved blocking question remains — so the `answer` wakes a continuation with no human pre-watch (async-
+  ask push loop closed). **Trigger 2 (dormant-seat respawn, R1)** hooks the `wakeThreadMembers` nudge-drop:
+  an @-addressed message to a dormant seat reconstitutes a fresh session (roleId read from the dormant
+  occupant's marker, seeded `history:"full"`) that re-fills the SAME seat (`fills++`); a bare broadcast never
+  respawns. **Idle lifecycle:** auto-wake workers carry `autoWake`/`idleSince`; `autoWakeReapTick` (on the
+  loop heartbeat) winds one down after `IDLE_KEEPALIVE_MS` (5 min) — never a human card or the looping
+  Coordinator; the claim releases on exit. **Cap-safe:** a server-fired spawn re-checks `MAX_LIVE_SESSIONS`
+  and LOGS the skip (no silent drop) rather than a wake storm. **Tests:** `auto-wake.test.mjs` (13 — keys,
+  claim sid-guard/supersede, wake-class × every level/event, the ask-armed pattern, reap decision × window/
+  mid-turn/no-stamp/non-worker); full app suite + typecheck green (concurrent-:5173 permission-mcp flake
+  aside). **Live acceptance smoke** (foolscap-a9921027, throwaway doc + thread, cleaned up): (1) a
+  `--blocking` question armed the `ask` watcher; the human's `answer` auto-spawned a bare doc worker that
+  resolved the question (`resolvedBy` = the worker), cleared the ask watcher, and self-wound-down; (2) a
+  Generalist seat, terminated to dormancy, was reconstituted by an `@Generalist` message into a fresh sid
+  re-filling the seat (`fills:2`, original `createdAt` kept). The 5-min reaper backstop is covered by
+  `shouldReapIdle` unit tests (both live workers self-`done`d before the window, so it wasn't exercised
+  live). **Known limitation** (per Coordinator, acceptable): in-memory claims mean a server restart mid-
+  service can spawn a duplicate worker on the next activity — fine, since single-flight is best-effort dedup
+  and the queue ops (apply/answer/resolve) are idempotent.
 
 ### W6 — R6 standing jobs
 - A `watch` entry with an interval + instruction on a thread/doc marker, server-fired (rides P2's spawn):
