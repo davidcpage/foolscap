@@ -271,7 +271,11 @@ done/exited, none blocked:human; unstaffed threads are dormant; computed at read
   boot-time overdue job fires ONCE, never replaying missed fires). Two norms: **"skip days with nothing"** (a
   firing that finds nothing posts nothing and winds down — the worker brief instructs the silence) and **jobs
   survive their creator AND a restart** (they live on the marker, not the session). CLI: `scripts/canvas job
-  add|list|rm`. Ledger in `app/standing-jobs.js`.
+  add|list|rm`. Ledger in `app/standing-jobs.js`. **The Coordinator heartbeat IS a standing job** (the bespoke
+  per-session heartbeat loop was retired and converged onto this machinery): its canonical spec lives in
+  `app/coordinator-heartbeat.js` and `scripts/canvas job coordinator <thread>` enables it — that command is the
+  **human-gated autonomy switch** (an auto-firing Coordinator that wakes on its interval to sweep the board via
+  wake-live-else-respawn); absent the job there is no auto-heartbeat.
 
 Gotchas:
 - **Membership must be in the saved snapshot before `ask`/`message` will accept it.** Membership is read
