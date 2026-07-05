@@ -1,4 +1,4 @@
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { layoutId, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
@@ -521,12 +521,12 @@ function ThreadView({
         // The pinned tray (R-PIN): the thread's head context — the task statement, the Done-when condition,
         // any framing kept in view. Collapsible (<details>), chronological (the server keeps pins seq-sorted).
         // It REFERENCES the messages (they keep their place in the log below); clicking a row's 📌 unpins.
-        <details className="chan-pins" data-interactive open>
+        <details className="chan-pins" data-interactive>
           <summary className="chan-pins-summary">📌 pinned · {pins.length}</summary>
           {pins.map((p) => (
             <div key={p.seq} className="chan-pin">
               <span className="chan-msg-from" title={p.from}>{senderLabel(p.from, nameForSid(p.from))}</span>
-              <div className="chan-msg-text">{renderTaggedText(p.text, openEntries)}</div>
+              <div className="chan-msg-text">{renderTaggedText(p.text, openEntries, m)}</div>
               <button
                 className="chan-pin-toggle on"
                 title="unpin — remove from head context"
@@ -567,7 +567,7 @@ function ThreadView({
                 >
                   📌
                 </button>
-                <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries)}</div>
+                <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries, m)}</div>
               </div>
             ),
           )
@@ -651,11 +651,11 @@ function tagFor(mem: TagEntry, open: TagEntry[]): string {
   return shortTag(mem.sid, open.map((o) => o.sid));
 }
 
-// Render channel message text with @-tags highlighted. A token is highlighted only if it would actually
+// Highlight the resolved @-tags inside a PLAIN-text run. A token is highlighted only if it would actually
 // resolve — a keyword (@all/@human/…) or a prefix of a current member's sid OR role name — by delegating to
 // the SERVER's own matcher (thread-tags.js `matchTagSpans`), so the highlight set never drifts from who a
-// tag actually wakes. Highlight-in-place: the shown text equals the logged text. Returns React nodes.
-function renderTaggedText(text: string, entries: TagEntry[]): React.ReactNode {
+// tag actually wakes. Highlight-in-place: the shown text equals the logged text.
+function highlightTags(text: string, entries: TagEntry[]): React.ReactNode {
   const spans = matchTagSpans(text, entries);
   if (spans.length === 0) return text;
   const parts: React.ReactNode[] = [];
@@ -674,6 +674,17 @@ function renderTaggedText(text: string, entries: TagEntry[]): React.ReactNode {
   return parts;
 }
 
+// Render channel message text with inline markdown applied AND @-tags highlighted. Markdown is parsed over
+// the WHOLE text (renderInline: [text](href) links, **bold**, `code`), and @-tags are highlighted WITHIN the
+// resulting plain and bold runs. Parsing markdown first is what keeps a tag INSIDE a bold span (e.g.
+// `**…tag @7505562d…**`) from splitting the `**…**` in two — an earlier version highlighted tags first and
+// the split left the bold markers unpaired (literal `**`, runaway bold). Tags inside `code`/link labels stay
+// literal by design (code is verbatim; a link's text is its label). Line breaks come for free from
+// `.chan-msg-text { white-space: pre-wrap }`, so `\n` stays plain text — no <br> needed.
+function renderTaggedText(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
+  return renderInline(text, m, (run) => highlightTags(run, entries));
+}
+
 // A tight, focused inline markdown renderer for the channel charter (Channel UI improvements). Deliberately
 // NOT the lit-html vendor parser (app/vendor/markdown.js): that emits raw target=_blank links and is the
 // wrong renderer for React. We handle exactly what a charter needs — [text](href), **bold**, `code`, and
@@ -681,14 +692,20 @@ function renderTaggedText(text: string, entries: TagEntry[]): React.ReactNode {
 // canvas FOCUSES that card instead of navigating away (http(s) hrefs stay ordinary external links). Links
 // are the point; bold/code are a small courtesy. data-interactive keeps a click off the canvas-drag seam.
 const MD_INLINE = /\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`/g;
-function renderInline(line: string, m: InteractionManager): React.ReactNode[] {
+// `renderText` (optional) transforms a PLAIN-text run before it's emitted — used by messages to highlight
+// @-tags inside plain and bold spans. It defaults to identity, so the charter (MarkdownInline) is unchanged.
+function renderInline(
+  line: string,
+  m: InteractionManager,
+  renderText: (run: string) => React.ReactNode = (run) => run,
+): React.ReactNode[] {
   const out: React.ReactNode[] = [];
   let last = 0;
   let key = 0;
   let mm: RegExpExecArray | null;
   MD_INLINE.lastIndex = 0;
   while ((mm = MD_INLINE.exec(line))) {
-    if (mm.index > last) out.push(line.slice(last, mm.index));
+    if (mm.index > last) out.push(<Fragment key={key++}>{renderText(line.slice(last, mm.index))}</Fragment>);
     if (mm[1] !== undefined) {
       const href = mm[2];
       const link = resolveCanvasLink(href);
@@ -720,13 +737,13 @@ function renderInline(line: string, m: InteractionManager): React.ReactNode[] {
         );
       }
     } else if (mm[3] !== undefined) {
-      out.push(<strong key={key++}>{mm[3]}</strong>);
+      out.push(<strong key={key++}>{renderText(mm[3])}</strong>);
     } else if (mm[4] !== undefined) {
       out.push(<code key={key++}>{mm[4]}</code>);
     }
     last = mm.index + mm[0].length;
   }
-  if (last < line.length) out.push(line.slice(last));
+  if (last < line.length) out.push(<Fragment key={key++}>{renderText(line.slice(last))}</Fragment>);
   return out;
 }
 function MarkdownInline({ text, m }: { text: string; m: InteractionManager }) {

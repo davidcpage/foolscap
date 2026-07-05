@@ -2557,6 +2557,22 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #2563eb;
   font-weight: 600;
 }
+/* inline markdown inside a message (renderInline via renderTaggedText) — mirrors the charter's
+   .chan-description-view rules so `code` and links read the same in a message as in a brief. */
+.chan-msg-text code {
+  font: 11px ui-monospace, Menlo, monospace;
+  background: #00000010;
+  padding: 0 3px;
+  border-radius: 3px;
+}
+.chan-msg-text a { color: #2563eb; }
+.chan-msg-text .canvas-link {
+  color: #7c3aed;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
 .chan-msg.sys {
   opacity: 0.7;
   font-style: italic;
