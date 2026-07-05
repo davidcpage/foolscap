@@ -57,6 +57,8 @@ dep) can run in parallel sessions.
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
 | W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE `2b2d85f` |
+| W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | TODO (handoff) |
+| W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | TODO (handoff) |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -319,3 +321,50 @@ in parallel sessions (no unmet deps). Then `W2` (rides W1). Then the primitives 
 - **R3 spend accounting** — deferred; cheap to record on the thread marker once P2's marker exists.
 - **Multiplicity of seats** — labelled multiple seats of one role on a surface (`threads-as-cards.md` §5)
   is still 1:1; not needed until a real case appears.
+
+## Session handoff (2026-07-05) — remaining work
+
+The core plan (W1–W7, W9, +W10) is **DONE**: the wakeable substrate is built — docs/threads are wakeable
+surfaces and the server spawns compute from them (P1 seats+levels, P2 server-spawn-from-record, R6 standing
+jobs, async-ask push wake-back, pins/done-discipline, board memory). Verified per-item (independent
+typecheck+tests on W4/W5; authority checks throughout). Drove via one fresh builder per item on thread
+`node:thread:b8ec7f42`.
+
+**One open clause on W6:** the standing-job **live timer-fire is restart-gated** — the running dev process
+holds the pre-edit `loopTick`, so the new `standingJobsTick` won't fire until the dev server restarts. Not a
+bug (the endpoint hot-reloaded; a 160s live watch showed no fire *and no spawn attempt logged*, proving the
+un-reloaded boot-path). **Action:** after the next dev-server restart, run `/tmp/w6_fire_watch.sh` (~90s) to
+close the live-fire proof. Mechanism otherwise verified (unit + endpoint + read-path + wiring identical to
+the working `autoWakeReapTick`).
+
+**Deferred items (queued, not started — pick up in fresh sessions/threads):**
+
+- **W11 — mention-gated thread-post CAS guard.** A thread post is rejected if the poster has unread
+  messages that **@-mention it** (compare-and-swap on the read cursor; Claude-Code's stale-file guard applied
+  to posting); return the unread so one read-then-repost clears it; exempt `from:"human"` + card-only
+  intents/pins; keep a `force` override. Fixes a real silent-message-loss failure hit this session (a post
+  advanced the cursor past an unread @-mention). Touches `handleThreadMessage`/`wakeThreadMembers` in
+  `vite-fs-plugin.ts`. Full design on the thread (seq 78).
+- **W12 — doc-edit optimistic-concurrency guard (`baseVersion`→409).** No concurrent-doc-edit lock exists
+  today (only a norm); W5's auto-spawned doc-workers editing concurrently with humans make the gap bite.
+  Same CAS pattern as W11 — build them as a pair. Source: `docs/simple-markdown-editor-lessons.md` Idea 2.
+- **doc-jobs** — extend W6 standing jobs from thread markers onto **doc** markers (same record shape; the
+  W6 module was structured for this drop-in).
+- **wake-live loop-migration** — migrate the looping-Coordinator heartbeat onto a **standing job** (W6 built
+  the `wake-live-else-respawn` fire-mode that makes this efficient: nudge the live seat within the ~5-min
+  keep-alive window, reconstitute only when dormant). The plan's "graduate to being driven by its own
+  machinery" dogfood milestone.
+- **Worktree + merge + integrator workflow** — `docs/multi-agent-collab-workflow.md` (written this session):
+  parallelize file-disjoint items in worktrees, serialize overlapping ones, one serialized live-board
+  integration-test gate, and a **designated integrator** (Coordinator or a separate role — open) that owns
+  merge+test+fix since authoring agents are ephemeral. To be taken into its own dedicated thread.
+- **Suggestion track-changes (Idea 1)** — a `kind:"suggestion"` annotation (propose span replacement,
+  accept/reject as a unit); its accept/reject are natural doc-wake events (W5's qualification predicate is
+  already event-kind-extensible).
+- **Pinned-tray collapse-by-default** (UI, this session) — small NodeView fix; being landed at wind-down.
+
+**Settled decisions this session:** (1) **Idea-3 (one seq'd feed per record vs per-surface triggers):
+DEFERRED** — three triggers (doc-wake, seat-respawn, standing-job) now share one `serverSpawnWorker` +
+one claim registry; that shared-primitive factoring is the pragmatic unification, full feed-rebuild is
+YAGNI absent a 4th-surface pain. (2) **Bundled commits stay OK** until a worktree+merge workflow exists.
+(3) roleId dir stays `pm` (display name Coordinator).
