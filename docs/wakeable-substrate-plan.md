@@ -52,7 +52,7 @@ dep) can run in parallel sessions.
 | W3 | **R4 board `memory.md`** card + linked role memory | claude-tag R4 | — | S | DONE `addaf14` |
 | W4 | **P1: seats + notification levels** | R2 recast, async-ask §2 | threads (built) | M | DONE `b5af3a0` |
 | W5 | **P2: server-spawn-from-record + wake trigger** | R1, async-ask §8 step 5, doc-wake | W4 (+W1) | L | DONE `4c749f5` |
-| W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | TODO |
+| W6 | **R6 standing jobs** (server-fired watches) | claude-tag R6 | W5 | M | DONE `55dc302` |
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
@@ -203,6 +203,41 @@ dep) can run in parallel sessions.
   firing that finds nothing posts nothing) and **jobs survive their creator** (owned by the place).
 - **Done when:** a scheduled instruction fires a worker on its interval and no-ops silently when there's
   nothing to do.
+- **Shipped** (commit `55dc302`): the ledger is `app/standing-jobs.js` (+ `.d.ts`) — a standing job
+  `{id, role, intervalMs, instruction, by, createdAt, lastFiredAt}` lives on the **thread meta marker**
+  (beside seats/intents/pins, via `upsertThreadMeta`), so it survives its creator AND a restart. Pure
+  due-logic: `jobDue`/`dueJobs` are **fire-next-due** (a boot-time overdue job — server was down — fires
+  ONCE and `stampFired` re-bases the schedule to now; it never replays the fires it missed, the wake-storm
+  "skip days with nothing" forbids); `normInterval` clamps to a **60s floor** (the loop tick is ~15s, real
+  jobs are minutes+); `jobClaimKey` keys a role job by its **seat** (`seatSurfaceKey` — so a timer fire and
+  a dormant-seat respawn mutually exclude on the seat) and a bare job by its own id. **Firing** is
+  `standingJobsTick()` in `vite-fs-plugin.ts`, hung on the existing loop heartbeat (`loopTick`, beside
+  `autoWakeReapTick`): for each due job it fires via the one W5 `serverSpawnWorker` primitive. **Wake-live-
+  else-respawn** (human's efficiency concern, thread seq 104): a role-seat job whose seat is still occupied
+  by a **live** session NUDGES that session (cheap — assembled context intact; skipped if it's mid-turn,
+  never interrupted), and only a **dormant** target pays a fresh respawn — so the "<5min ⇒ wake existing /
+  >5min ⇒ full respawn" split falls out of the 5-min keep-alive window automatically (Coordinator-approved,
+  seq 109; also the clean seam for the future looping-Coordinator migration). **Single-flight** (a claimed
+  surface isn't double-fired); **fire-next-due** only stamps on a REAL fire (a cap-skipped fire retries next
+  tick — no silent drop). The **worker brief** (`standingJobBrief`/`standingJobNudge`) INSTRUCTS the silence
+  ("if there's nothing to do, post NOTHING and wind down" — loop-until-dry alone isn't enough; the "all
+  clear" noise has to be told-not-to). Surfaces: `POST /api/thread/<id>/job` (create/update by `jobId`, or
+  `{remove:true}`) + `GET .../jobs`; `scripts/canvas job add|list|rm`; CLAUDE.md documents both.
+  **Tests:** `standing-jobs.test.mjs` (12 — floor clamp, CRUD, first-fire-one-interval-out,
+  fire-next-due-not-catch-up, claim keys, coexist-with-seats/intents/pins) + a live `http-contract` job
+  round-trip (create → GET → update-in-place → remove, 400/404). Typecheck + full app suite green (bar the
+  known permission-mcp :5173 flake). **Verification status — READ THIS:** the ledger, due-logic, and both
+  HTTP surfaces are verified live (unit + a read-path replica against the real board marker confirming
+  `listThreads`→`readJobs`→`dueJobs` sees a created job as due exactly one interval out). The end-to-end
+  **live fire** (tick → spawn a worker) is **pending a dev-server restart**: `standingJobsTick` is installed
+  by `startLoopHeartbeat` at board boot, and the long-lived dev process is still running the pre-edit
+  `loopTick` (the request handler hot-reloaded — `/job`/`/jobs` are live — but the `setInterval(loopTick)`
+  timer is the old closure). This is the same "server code reaches the running server only on the next
+  dev-server restart" property W3/W4/W5's server code had; it is NOT a code bug (a bug would still have
+  *attempted* a spawn — none was logged). A 160s live watch confirmed no fire on the un-restarted process;
+  the fire will activate on the next restart, at which point the throwaway-job smoke should be re-run to
+  close the Done-when's "fires a worker" clause. I did not restart the shared, actively-used dev server
+  unilaterally (peers mid-work + session budget wind-down) — flagged to the Coordinator.
 
 ### W7 — R-PIN + R5
 - **R-PIN:** any thread message is pinnable; the pinned set is the head-context tray, re-read on every wake,
