@@ -60,6 +60,7 @@ dep) can run in parallel sessions.
 | W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | DONE `09e5205` |
 | W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
 | W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE `1c6ac13` |
+| W14 | **wake-live loop-migration** (Coordinator heartbeat → standing job) | W6 dogfood | W6 | M | DONE `f8cb1a9` (enable human-gated) |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -366,10 +367,28 @@ the working `autoWakeReapTick`).
   8 cases + full suite 326 green), `npm run typecheck` clean, and a **live-board smoke** — a 60s doc job fired on
   its tick (`lastFiredAt` stamped), spawned a fresh STANDING-JOB WORKER seeded with the instruction, which read
   its brief and wound down via `/done`; then `job rm --doc` removed it and deleted the marker.
-- **wake-live loop-migration** — migrate the looping-Coordinator heartbeat onto a **standing job** (W6 built
-  the `wake-live-else-respawn` fire-mode that makes this efficient: nudge the live seat within the ~5-min
-  keep-alive window, reconstitute only when dormant). The plan's "graduate to being driven by its own
-  machinery" dogfood milestone.
+- **wake-live loop-migration (W14).** ✅ SHIPPED `f8cb1a9`. The looping-Coordinator heartbeat is migrated off
+  its bespoke per-session loop (`loopTick`'s inner wake that nudged every already-live looping session on an
+  adaptive cadence) **onto the general R6/W6 standing-job machinery** — one driver, no fork. The heartbeat is
+  now a standing job on the Coordinator's thread (`app/coordinator-heartbeat.js` — the canonical spec: role
+  `Coordinator`, a calm **4-min default interval** set just inside the ~5-min idle keep-alive window so
+  wake-live-else-respawn favours the cheap NUDGE, the sweep-inbox+board instruction), fired by the **same**
+  `standingJobsTick` through the **one** `serverSpawnWorker`. This is strictly MORE capable than the old loop:
+  it nudges a live+idle Coordinator (cheap) AND — unlike the bespoke path — **reconstitutes a DORMANT one**
+  (the autonomy the human gated). The wake-live-else-respawn decision was factored into a pure, unit-tested
+  `planRoleJobFire(occupantStatus)` (`standing-jobs.js`; idle→nudge, running→skip-no-stamp, dormant/absent→
+  respawn) and wired into `standingJobsTick`'s role branch (behaviour identical). `loopTick` is now just
+  `autoWakeReapTick()`+`standingJobsTick()`; the bespoke wake loop, `loopWorldSig`, the `LOOP_BASE/FLOOR/CEIL/
+  BACKOFF` constants, and the dead per-session cadence fields (`loopIntervalMs`/`loopNextAt`/`loopSig`) are
+  removed. The `loops` role flag + the calm `scheduled` status band are KEPT (legibility only). **Verified:**
+  `coordinator-heartbeat.test.mjs` (spec + `planRoleJobFire` + a **mocked tick** over idle/running/dormant
+  occupants, fire-next-due, seat-keyed single-flight) + full app suite 332 + typecheck green; the CLI spec-
+  builder round-tripped live. **AUTONOMY SWITCH (human-gated — NOT flipped here):** enable with one command —
+  `scripts/canvas job coordinator <coordinatorThreadId> [--interval MS]` (builds the job from the canonical
+  spec); turn OFF with `scripts/canvas job list <thread>` then `job rm <thread> <jobId>`. Absent that job
+  there is no auto-heartbeat — the correct gated-off state. Live end-to-end fire is a standing-job fire like
+  any other (doc-jobs W13 proved the tick fires live), so it needs no separate restart-gated proof; the switch
+  itself is the human's to run behind the nod.
 - **Worktree + merge + integrator workflow** — `docs/multi-agent-collab-workflow.md` (written this session):
   parallelize file-disjoint items in worktrees, serialize overlapping ones, one serialized live-board
   integration-test gate, and a **designated integrator** (Coordinator or a separate role — open) that owns
