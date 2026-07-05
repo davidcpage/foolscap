@@ -21,7 +21,7 @@ import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
+import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
@@ -2065,17 +2065,11 @@ interface LiveSession {
   // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleThreadMessage
   // + sendSessionInput). Not a per-turn flag — it tracks an actual outstanding wait.
   waitingOn: string[] | null;
-  // Operating-loop heartbeat (agent-roles.md): a looping ROLE (e.g. the Coordinator) has its idle sessions woken on a
-  // server cadence so they sweep the board for stalls even when nobody @-tags them — built-in self-scheduling
-  // does NOT fire in a `claude -p` child, so the wake must come from here. `loops` is stamped from the role at
-  // spawn. The scheduler (loopTick) keeps the live cadence per session: `loopIntervalMs` is the current gap
-  // (BASE while work is active, ×2-backoff up to the ceiling when the channel is quiet), `loopNextAt` is when
-  // the next heartbeat is due, and `loopSig` is the last world-signature (channel activity + member statuses)
-  // used to detect new activity and reset the cadence to BASE. All inert unless `loops`.
+  // Operating-loop legibility (agent-roles.md): `loops` is stamped from the role at spawn for a looping ROLE
+  // (e.g. the Coordinator). It no longer drives a bespoke wake cadence — the heartbeat was migrated onto the
+  // standing-job machinery (see loopTick / coordinator-heartbeat.js) — it survives only so an idle looping
+  // session reads the calm `scheduled` band (sessionStatus) instead of the loud amber "waiting".
   loops: boolean;
-  loopIntervalMs: number;
-  loopNextAt: number;
-  loopSig: string;
   origin: string;
   // Shadow-git attribution (doc §6): an Edit/Write tool_use claims its target path on the shadow watcher;
   // the matching tool_result commits it attributed. Maps tool_use_id → {shadow-root key, path rel to root}.
@@ -2375,7 +2369,7 @@ function ensureLiveSession(
     // them to 0 and re-deliver every joined thread's backlog as unread.
     read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
     nudge: false, waitingOn: null,
-    loops, loopIntervalMs: LOOP_BASE_MS, loopNextAt: Date.now() + LOOP_BASE_MS, loopSig: "",
+    loops,
     origin, pendingEdits: new Map(),
   };
   if (resume) seedFromTranscript(s);
@@ -2477,7 +2471,7 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
     read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
     nudge: false,
     waitingOn: Array.isArray(marker.waitingOn) ? (marker.waitingOn as string[]) : null,
-    loops: !!marker.loops, loopIntervalMs: LOOP_BASE_MS, loopNextAt: Date.now() + LOOP_BASE_MS, loopSig: "",
+    loops: !!marker.loops,
     origin: typeof marker.origin === "string" ? marker.origin : "localhost:5173",
     pendingEdits: new Map(), // an Edit claimed pre-restart commits unattributed — accepted loss
   };
@@ -2752,68 +2746,24 @@ function flushNudge(s: LiveSession): void {
 // ── operating-loop heartbeat (agent-roles.md) ────────────────────────────────────────────────────
 // A looping ROLE (the Coordinator) needs to sweep the board for STALLS — but nothing emits an event when an agent
 // goes silent, so a purely reactive session would never wake to notice. And built-in self-scheduling does
-// NOT fire in a `claude -p` child (tested), so the wake can't come from inside the agent. So the SERVER
-// wakes looping-role sessions on a cadence, reusing the exact content-free nudge path a channel message
-// uses (sendSessionInput): the woken session reads its inbox + the board, sweeps, and acts or sleeps.
-//
-// CADENCE is adaptive and self-tuning per session (all tunable below): tight (~BASE) while work is active,
-// exponential ×BACKOFF up to CEIL when the channel is quiet, snapped back to BASE the moment anything
-// changes (a new message or a member's status flips). Floor keeps cost/cache sane; the @-tag / ask path is
-// the unchanged immediate INTERRUPT for anything urgent, so the heartbeat only has to catch the silent.
-const LOOP_BASE_MS = 75_000; // active cadence — a looping session sweeps about this often while work moves
-const LOOP_FLOOR_MS = 60_000; // never wake a looping session more often than this (cost / prompt-cache TTL)
-const LOOP_CEIL_MS = 600_000; // quiet cadence ceiling (10 min) — the longest gap between sweeps when idle
-const LOOP_BACKOFF = 2; // each quiet beat multiplies the interval by this, up to the ceiling
-const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due/activity (≤ FLOOR)
+// NOT fire in a `claude -p` child (tested), so the wake can't come from inside the agent — the SERVER has to
+// fire the timer. This USED to be a bespoke per-session loop here (a cadence timer that nudged every already-
+// live looping session). It has been RETIRED and CONVERGED onto the general STANDING-JOB machinery (R6/W6):
+// the Coordinator heartbeat is now a standing job on the Coordinator's thread (`coordinator-heartbeat.js`),
+// fired by `standingJobsTick` through the one `serverSpawnWorker` primitive with WAKE-LIVE-ELSE-RESPAWN — so
+// it nudges a live+idle Coordinator (cheap) AND, unlike the old bespoke path, reconstitutes a DORMANT one.
+// One driver, no fork. Enabling that job is the AUTONOMY SWITCH and is human-gated (`scripts/canvas job
+// coordinator <thread>`); absent the job there is no auto-heartbeat, which is the correct gated-off state.
+// The `loops` role flag survives only as LEGIBILITY: an idle looping session reads the calm `scheduled` band
+// (sessionStatus) rather than the loud amber "waiting", since its wake comes from a scheduled job not a human.
+const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due jobs / reaps idle workers
 
-// A cheap signature of everything a looping session would react to: per member-channel last-seq (new
-// messages) and each live member's status (a working→waiting flip etc.). When it changes between ticks the
-// world moved, so the cadence resets to BASE. Sorted+joined so it's order-stable across snapshot churn.
-function loopWorldSig(s: LiveSession): string {
-  const boardId = boardIdentity(s.repoPath).boardId;
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return s.loopSig; // no snapshot to read → treat as unchanged, don't thrash the cadence
-  const parts: string[] = [];
-  for (const threadId of sessionThreads(records, s.id)) {
-    const log = threadLogs.get(threadId) ?? [];
-    parts.push(threadId + ":" + (log.length ? log[log.length - 1]!.seq : 0));
-    for (const sid of threadMemberSids(records, threadId)) {
-      const m = liveSessions.get(sid);
-      parts.push(sid + "=" + (m ? m.status + (m.waitingOn?.length ? "/wa" : "") : "off"));
-    }
-  }
-  return parts.sort().join("|");
-}
-
-// One scheduler tick across every board's live sessions: wake the looping ones that are idle and due, and
-// keep each session's adaptive cadence. Never wakes a RUNNING session (that would interrupt its turn — it
-// re-evaluates next tick once idle), so a heartbeat can't talk over a working Coordinator.
+// One scheduler tick: reap idle auto-wake workers and fire due standing jobs. Both iterate their own records;
+// neither interrupts a RUNNING session (a mid-turn target is skipped and retried next tick).
 function loopTick(): void {
   autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
-  standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers)
-  const now = Date.now();
-  for (const s of liveSessions.values()) {
-    if (!s.loops || s.status === "exited") continue;
-    const sig = loopWorldSig(s);
-    if (sig !== s.loopSig) {
-      s.loopSig = sig;
-      s.loopIntervalMs = LOOP_BASE_MS; // the world moved → tighten the cadence back to base
-      if (s.loopNextAt > now + LOOP_BASE_MS) s.loopNextAt = now + LOOP_BASE_MS; // pull a far-out wake in
-    }
-    if (s.status !== "idle") continue; // mid-turn: don't interrupt; re-check next tick when idle
-    if (now < s.loopNextAt) continue; // not due yet
-    sendSessionInput(
-      s.id,
-      "[canvas] ⏱ loop heartbeat — your scheduled tick (not a human message): read your inbox " +
-        `(GET http://${s.origin}/api/inbox?session=${s.id}) and the board (GET /api/canvas, /api/sessions); ` +
-        "sweep for stalled or blocked agents, unanswered asks, and drifting work; then act or go back to sleep.",
-      { keepWaitingOn: true },
-    );
-    // Just woke it on a quiet beat → back the cadence off for next time (a new-activity tick will have reset
-    // it to BASE above). Clamp to the ceiling, and never below the floor.
-    s.loopIntervalMs = Math.min(Math.max(s.loopIntervalMs * LOOP_BACKOFF, LOOP_FLOOR_MS), LOOP_CEIL_MS);
-    s.loopNextAt = now + s.loopIntervalMs;
-  }
+  standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
+  //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
 }
 
 // Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
@@ -3186,18 +3136,21 @@ function standingJobsTick(): void {
         const key = jobClaimKey(t.threadId, job);
         if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
 
-        // Role-seat job: prefer waking a LIVE occupant over a fresh respawn (the efficiency norm). Resolve the
-        // seat's current sid; if it's live, nudge it (cheap) — unless it's mid-turn, in which case skip WITHOUT
-        // stamping so the fire lands the moment it's idle. Only a dormant/absent occupant triggers a respawn.
+        // Role-seat job (incl. the migrated Coordinator heartbeat): prefer waking a LIVE occupant over a fresh
+        // respawn (the efficiency norm). Resolve the seat's current sid and let planRoleJobFire decide from its
+        // liveness — "nudge" a live+idle occupant (cheap), "skip" a mid-turn one WITHOUT stamping (so the fire
+        // lands the moment it's idle), "respawn" a dormant/absent one. A bare (roleless) job always respawns.
         if (job.role) {
           const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
           const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
-          if (live && live.status !== "exited") {
-            if (live.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
-            sendSessionInput(live.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+          const plan = planRoleJobFire(live?.status ?? null);
+          if (plan === "skip") continue; // mid-turn occupant — don't interrupt; retry next tick (no stamp)
+          if (plan === "nudge") {
+            sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
             stampFired(board.repoPath, t.threadId, job.id, now);
             continue;
           }
+          // plan === "respawn" → fall through to the fresh spawn below
         }
         // Dormant target (or a bare job) → a full fresh respawn seeded from the durable record.
         const newSid = serverSpawnWorker({

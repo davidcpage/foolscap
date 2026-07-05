@@ -19,6 +19,7 @@ set -euo pipefail
 
 BOARD="${CANVAS_BOARD:-foolscap-a9921027}"
 SERVER="${CANVAS_SERVER:-http://127.0.0.1:5173}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" # repo root (this script lives in scripts/)
 
 usage() {
   cat <<USAGE
@@ -64,6 +65,10 @@ canvas — session/coordination verbs over the agent bus
         live on the marker). Pass --job-id to update an existing job in place. Norm: a firing that finds
         nothing posts nothing ("skip days with nothing"). With --doc PATH the job lives on a DOC's marker
         instead (doc-jobs; one worker per doc, fired by the same tick).
+  scripts/canvas job coordinator <THREAD> [--interval MS] [--from ID]
+        THE AUTONOMY SWITCH — enable the Coordinator HEARTBEAT as a standing job on <THREAD>, built from the
+        canonical spec (app/coordinator-heartbeat.js). Fires the Coordinator seat on its interval to sweep the
+        board (nudged if live, respawned if dormant). Deliberate + human-gated; turn OFF via job list + job rm.
   scripts/canvas job list <THREAD>|--doc PATH          list a thread's (or doc's) standing jobs (id, role, interval, lastFired)
   scripts/canvas job rm <THREAD> <JOB_ID> | --doc PATH <JOB_ID> [--from ID]  remove a standing job
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
@@ -364,6 +369,29 @@ print(json.dumps(o))
 PY
 )
       post "$SERVER/api/thread/$thread/job?board=$BOARD" "$body"; echo ;;
+    coordinator|coord)
+      # THE AUTONOMY SWITCH (wakeable-substrate-plan.md — wake-live loop-migration). Enable the Coordinator
+      # heartbeat as a standing job on <THREAD>, built from the canonical spec (coordinator-heartbeat.js) so
+      # the sweep instruction never drifts. This is a deliberate, human-gated act: it starts an auto-firing
+      # Coordinator that wakes on its interval to sweep the board (nudged if live, respawned if dormant).
+      # Remove it (turn autonomy OFF) with `job list <THREAD>` then `job rm <THREAD> <jobId>`.
+      local thread="" interval="" from="human"
+      while [ $# -gt 0 ]; do case "$1" in
+        --interval|--interval-ms) interval="${2:-}"; shift 2 ;;
+        --from) from="${2:-}"; shift 2 ;;
+        --board) BOARD="${2:-}"; shift 2 ;;
+        --*) echo "job coordinator: unknown flag '$1'" >&2; exit 2 ;;
+        *) thread="$1"; shift ;;
+      esac; done
+      [ -n "$thread" ] || { echo "job coordinator: need a <threadId> (the Coordinator's thread)" >&2; exit 2; }
+      local body; body=$(CH_ROOT="$REPO_ROOT" CH_FROM="$from" CH_INTERVAL="$interval" node --input-type=module <<'PY'
+const { coordinatorHeartbeatJobSpec } = await import(`${process.env.CH_ROOT}/app/coordinator-heartbeat.js`);
+const interval = process.env.CH_INTERVAL;
+const spec = coordinatorHeartbeatJobSpec(interval ? { intervalMs: Number(interval) } : {});
+process.stdout.write(JSON.stringify({ from: process.env.CH_FROM, ...spec }));
+PY
+) || { echo "job coordinator: failed to build the spec" >&2; exit 1; }
+      post "$SERVER/api/thread/$thread/job?board=$BOARD" "$body"; echo ;;
     rm|remove|delete)
       local thread="" doc="" jobid="" from="human" pos=()
       while [ $# -gt 0 ]; do case "$1" in
@@ -394,7 +422,7 @@ PY
       fi
       [ -n "$thread" ] || { echo "job list: need a <threadId> (or --doc PATH)" >&2; exit 2; }
       curl -sS "$SERVER/api/thread/$thread/jobs?board=$BOARD"; echo ;;
-    ""|-h|--help|help) echo "canvas job add|list|rm [--doc PATH] — periodic server-fired jobs on a thread OR doc marker (see 'canvas' for details)" >&2 ;;
+    ""|-h|--help|help) echo "canvas job add|list|rm [--doc PATH] | coordinator <THREAD> — periodic server-fired jobs on a thread OR doc marker (see 'canvas' for details)" >&2 ;;
     *) echo "job: unknown subcommand '$sub' (add|list|rm)" >&2; exit 2 ;;
   esac
 }

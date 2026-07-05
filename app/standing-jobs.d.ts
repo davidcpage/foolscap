@@ -47,3 +47,6 @@ export function stampFired(repoPath: string, threadId: string, id: string, ts: n
 export function jobDue(job: StandingJob | null | undefined, now: number): boolean;
 export function dueJobs(jobs: StandingJob[] | null | undefined, now: number): StandingJob[];
 export function jobClaimKey(threadId: string, job: StandingJob): string;
+export function planRoleJobFire(
+  occupantStatus: "idle" | "running" | "exited" | null | undefined,
+): "nudge" | "skip" | "respawn";

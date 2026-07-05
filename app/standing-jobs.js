@@ -153,3 +153,19 @@ export function dueJobs(jobs, now) {
 export function jobClaimKey(threadId, job) {
   return job?.role ? seatSurfaceKey(threadId, job.role) : `job:${threadId}#${job?.id}`;
 }
+
+/**
+ * PURE — the WAKE-LIVE-ELSE-RESPAWN decision for a role-seat job's fire, given the current liveness of the
+ * seat's occupant. This is the efficiency norm (W6 seq 104) factored out of standingJobsTick so it can be
+ * unit-tested (a "mocked tick") and shared: a job whose seat is occupied by a LIVE, IDLE session is served by
+ * NUDGING it (cheap — assembled context intact); a MID-TURN occupant is skipped WITHOUT stamping (retry next
+ * tick the moment it's idle, never talk over a working session); a DORMANT/absent occupant pays a fresh
+ * respawn seeded from the durable record. `occupantStatus` is the LiveSession status of the seat's current
+ * sid — `"idle"` / `"running"` (mid-turn) / `"exited"`, or `null` when the seat has no live occupant at all.
+ * Returns `"nudge"` | `"skip"` (mid-turn, no stamp) | `"respawn"`.
+ */
+export function planRoleJobFire(occupantStatus) {
+  if (occupantStatus === "idle") return "nudge";
+  if (occupantStatus === "running") return "skip";
+  return "respawn"; // "exited" or null (no live occupant) → reconstitute fresh
+}
