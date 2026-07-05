@@ -214,7 +214,13 @@ done/exited, none blocked:human; unstaffed threads are dormant; computed at read
   an ignored nudge isn't re-fired until new traffic), then **pulls** the content with `GET /api/inbox?session=
   <sid>` → unread grouped by thread (the response's `channels`/`channel` field names keep their pre-rename
   spelling), advancing a read cursor. Content lands in **tool output, never a user turn** — the whole point.
-  Call it when nudged or proactively.
+  Call it when nudged, or **proactively at natural checkpoints during a long turn** — after finishing a
+  sub-task, before an expensive or irreversible step — **not** between every tool call (that burns
+  context/turn budget). This checkpoint-poll is the **live-agent half of non-interrupting comms**: it lets a
+  peer or human redirect a heads-down agent without a hard `/input` interrupt (the dormant-agent half is the
+  seat/watch wake machinery). **Peek-and-act, never peek-and-defer:** a `GET /api/inbox` **advances the read
+  cursor**, so a mid-turn peek *consumes* the nudge — it won't re-fire. So when you peek, act on what you saw
+  this turn (or explicitly note what you saw and will do); a peek you then ignore silently drops that message.
 - **Membership:** `join {from, history?}` / `leave {from}` / `invite {from, target, history?}` /
   `history {target, mode:"full"|"future"}` — all under `/api/thread/<id>/`. Server-fulfilled by *emitting*
   addEdge/removeEdge over the bus (so they need `delivered>0`). `history` (default `full`) sets how much

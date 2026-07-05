@@ -56,6 +56,7 @@ dep) can run in parallel sessions.
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
+| W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -198,6 +199,28 @@ dep) can run in parallel sessions.
 ### W9 — PM → Coordinator rename
 - Repo-wide mechanical rename (currently doc-only in `claude-tag-lessons.md`): `docs/agent-roles.md`, the
   PM-named memories, the role definition, the briefs. Independent, do anytime.
+
+### W10 — proactive mid-turn board-check norm
+- **Briefs/norms only, no mechanism.** The *live-agent* half of non-interrupting comms (W4/W5 are the
+  *dormant-agent* half): during a **long** turn, an agent proactively `GET /api/inbox` at **natural
+  checkpoints** — after finishing a sub-task, before an expensive or irreversible step — not between every
+  tool call, so peers/humans can redirect it without a hard `/input` interrupt.
+- **Bake in the gotcha:** reading `/api/inbox` **advances the read cursor**, so a mid-turn peek *consumes*
+  the nudge; the norm is **peek-and-act** (or explicitly note what you saw), never peek-and-defer, or a
+  message is silently dropped.
+- Land in the collab brief (`app/vite-fs-plugin.ts`) + `CLAUDE.md`. Depends on **W4 committed** only so it
+  doesn't churn the shared brief file mid-flight; sequence *before* W5 (which also edits `vite-fs-plugin.ts`).
+- **Done when:** the collab brief + `CLAUDE.md` state the checkpoint-poll norm and the peek-and-act cursor
+  gotcha; no code/mechanism change.
+- **Shipped:** the norm is stated in both places, no mechanism change. **Collab brief**
+  (`app/vite-fs-plugin.ts`, a new `CHECKPOINT-POLL` paragraph after the `RECEIVING` block): during a LONG
+  turn, proactively `GET /api/inbox` at natural checkpoints — after a sub-task, before an expensive/
+  irreversible step — not between every tool call; it's the live-agent half of non-interrupting comms
+  (lets a peer/human redirect a heads-down agent without a hard `/input` interrupt). Plus the **peek-and-act**
+  rule: an inbox read advances the cursor, so a mid-turn peek *consumes* the nudge — act on what you saw this
+  turn (or note what you saw and will do), never peek-and-defer, or the message is silently dropped.
+  **`CLAUDE.md`** (the "Read (the wake model)" bullet, expanded from "Call it when nudged or proactively"):
+  the same two parts in that file's prose voice. `cd app && npm run typecheck` clean (text-only change).
 
 ## Suggested sequence
 
