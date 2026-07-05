@@ -56,7 +56,7 @@ dep) can run in parallel sessions.
 | W7 | **R-PIN + R5** (pinnable posts, done-condition, proof) | claude-tag R-PIN/R5 | threads (built) | M | DONE `3f556d9` (ledger in `addaf14`) |
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
-| W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE |
+| W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE `2b2d85f` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
