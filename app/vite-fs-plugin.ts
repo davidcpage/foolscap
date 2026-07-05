@@ -13,6 +13,7 @@ import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from
 import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { resolveTags } from "./thread-tags.js";
+import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { isNotificationLevel, NOTIFICATION_LEVELS, wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
@@ -507,6 +508,17 @@ function readText(abs: string): { content: string; truncated: boolean } | null {
   }
 }
 
+// W12 — the doc's optimistic-concurrency version: a content hash of its FULL on-disk bytes (not the
+// MAX_BYTES preview), so the CAS detects a change anywhere in the file, and `null` for a file that doesn't
+// exist yet. A read stamps this alongside the content; a write echoes it as `baseVersion` (handleFileWrite).
+function fileVersion(abs: string): string | null {
+  try {
+    return contentVersion(fs.readFileSync(abs));
+  } catch {
+    return null; // no such file — the version of "absent" (a create passes baseVersion:null)
+  }
+}
+
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json");
@@ -553,7 +565,8 @@ function handleFile(res: ServerResponse, root: string, rel: string): void {
     !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
   const r = allowed ? readText(abs!) : null;
   if (!r) return sendJson(res, 404, { error: "not found" });
-  sendJson(res, 200, { path: rel, content: r.content, truncated: r.truncated });
+  // W12: stamp the content version so a card can echo it back as `baseVersion` on write (optimistic lock).
+  sendJson(res, 200, { path: rel, content: r.content, truncated: r.truncated, version: fileVersion(abs!) });
 }
 
 // WRITE a file's content (POST /api/file) — Phase-3 write-back, first consumer the notebook card's
@@ -574,7 +587,7 @@ async function handleFileWrite(
   const allowed =
     !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
   if (!allowed) return sendJson(res, 404, { error: "not found" }); // 404, like the read — never confirm a blocked path
-  let body: { content?: unknown };
+  let body: { content?: unknown; baseVersion?: unknown };
   try {
     body = JSON.parse(await readBody(req));
   } catch {
@@ -584,6 +597,23 @@ async function handleFileWrite(
   // Bound the write at the one place a byte cap belongs (CLAUDE.md): the same MAX_BYTES the read previews
   // at — a card's editable view is preview-sized, so a write larger than that is out of this path's scope.
   if (Buffer.byteLength(body.content, "utf8") > MAX_BYTES) return sendJson(res, 413, { error: "too large" });
+  // W12 — optimistic-concurrency CAS: a write MAY carry `baseVersion` (the version it read). If it does and
+  // the file has since moved, reject 409 with the current version + content so the writer can rebase — the
+  // conflict IS the coordination (docs/simple-markdown-editor-lessons.md Idea 2). Opt-in: a write that omits
+  // `baseVersion` (every caller today — notebook write-back, sticky/thread bodies) is unguarded, unchanged.
+  if (body.baseVersion !== undefined) {
+    const current = fileVersion(abs!);
+    if (isStaleWrite(body.baseVersion, current)) {
+      const r = current == null ? null : readText(abs!);
+      return sendJson(res, 409, {
+        error: "stale write: file changed since baseVersion — re-read and rebase",
+        path: rel,
+        currentVersion: current,
+        content: r?.content ?? null,
+        truncated: r?.truncated ?? false,
+      });
+    }
+  }
   try {
     fs.mkdirSync(path.dirname(abs!), { recursive: true });
     fs.writeFileSync(abs!, body.content, "utf8");
@@ -599,7 +629,8 @@ async function handleFileWrite(
   } catch {
     /* reanchor is best-effort; the write already succeeded */
   }
-  sendJson(res, 200, { path: rel, ok: true });
+  // Return the NEW version so a card can chain edits without a re-read (W12): the write's own next baseVersion.
+  sendJson(res, 200, { path: rel, ok: true, version: fileVersion(abs!) });
 }
 
 // ── doc annotations (docs/doc-annotations.md; build-order step 1) ───────────────────────────────
@@ -4157,7 +4188,7 @@ async function handleThreadMessage(
   boardId: string,
   threadId: string,
 ): Promise<void> {
-  let body: { from?: unknown; text?: unknown };
+  let body: { from?: unknown; text?: unknown; force?: unknown };
   try {
     body = JSON.parse(await readBody(req));
   } catch {
@@ -4175,6 +4206,30 @@ async function handleThreadMessage(
   // at the channel card) is the board owner and may post to any channel — §7, legibility not authz.
   if (sessionNodeForSid(records, from) && !members.includes(from))
     return sendJson(res, 403, { error: "sender is not a member of this channel" });
+
+  // W11 — mention-gated CAS guard (compare-and-swap on the poster's read cursor). A live SESSION poster may
+  // not post over a message that @-mentioned it and still sits unread past its cursor: it must read the
+  // thread first (structurally, not just by norm). Exempt a non-session `from` (the human at the card sees
+  // the whole thread), and honor an explicit `force:true` override. The 409 hands back the blocking unread
+  // so one read-then-repost clears it (no archaeology — the poster GETs /api/inbox to advance its cursor,
+  // then reposts). Card-only intents/pins go through their own handlers, so this path is real messages only.
+  const posting = liveSessions.get(from);
+  if (posting && body.force !== true) {
+    const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
+    const blocking = unreadMentions({
+      log: threadLogs.get(threadId) ?? [],
+      cursor: posting.read[threadId] ?? 0,
+      from,
+      members: memberEntries,
+    });
+    if (blocking.length)
+      return sendJson(res, 409, {
+        error: "unread @-mention: read the thread (GET /api/inbox) before posting, or pass force:true",
+        channel: threadId,
+        cursor: posting.read[threadId] ?? 0,
+        unread: blocking.map((m) => ({ seq: m.seq, from: m.from, text: m.text, ts: m.ts })),
+      });
+  }
 
   // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
   // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
