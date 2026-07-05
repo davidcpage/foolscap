@@ -57,8 +57,8 @@ dep) can run in parallel sessions.
 | W8 | **R3 per-thread spend** accounting | claude-tag R3 | W5 marker | S | LATER |
 | W9 | **PM → Coordinator** repo-wide rename | claude-tag review loose end | — | S | DONE `addaf14` |
 | W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE `2b2d85f` |
-| W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | TODO (handoff) |
-| W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | TODO (handoff) |
+| W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | DONE `09e5205` |
+| W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -339,15 +339,18 @@ the working `autoWakeReapTick`).
 
 **Deferred items (queued, not started — pick up in fresh sessions/threads):**
 
-- **W11 — mention-gated thread-post CAS guard.** A thread post is rejected if the poster has unread
-  messages that **@-mention it** (compare-and-swap on the read cursor; Claude-Code's stale-file guard applied
-  to posting); return the unread so one read-then-repost clears it; exempt `from:"human"` + card-only
-  intents/pins; keep a `force` override. Fixes a real silent-message-loss failure hit this session (a post
-  advanced the cursor past an unread @-mention). Touches `handleThreadMessage`/`wakeThreadMembers` in
-  `vite-fs-plugin.ts`. Full design on the thread (seq 78).
-- **W12 — doc-edit optimistic-concurrency guard (`baseVersion`→409).** No concurrent-doc-edit lock exists
-  today (only a norm); W5's auto-spawned doc-workers editing concurrently with humans make the gap bite.
-  Same CAS pattern as W11 — build them as a pair. Source: `docs/simple-markdown-editor-lessons.md` Idea 2.
+- **W11 — mention-gated thread-post CAS guard.** ✅ SHIPPED `09e5205`. A thread post is rejected (409) if the
+  poster is a live session with unread messages that **@-mention it** (compare-and-swap on the read cursor;
+  Claude-Code's stale-file guard applied to posting); the 409 returns the blocking unread so one
+  read-then-repost clears it; exempts a non-session `from:"human"` + card-only intents/pins (their own
+  handlers), and honours a `force:true` override. Fixes the real silent-message-loss hit this session (a post
+  advanced the cursor past an unread @-mention). Pure logic in `app/cas-guard.js` (`unreadMentions`), wired
+  into `handleThreadMessage` in `vite-fs-plugin.ts`. (Design was old thread seq 78.)
+- **W12 — doc-edit optimistic-concurrency guard (`baseVersion`→409).** ✅ SHIPPED `09e5205`. `/api/file` reads
+  now stamp a content `version`; a write MAY carry `baseVersion` and a mismatch returns 409 with the current
+  version + content to rebase from — opt-in, so every existing caller (which omits it) is unchanged. Same CAS
+  shape as W11 (`app/cas-guard.js` `contentVersion`/`isStaleWrite`, wired into `handleFile`/`handleFileWrite`).
+  Source: `docs/simple-markdown-editor-lessons.md` Idea 2.
 - **doc-jobs** — extend W6 standing jobs from thread markers onto **doc** markers (same record shape; the
   W6 module was structured for this drop-in).
 - **wake-live loop-migration** — migrate the looping-Coordinator heartbeat onto a **standing job** (W6 built
