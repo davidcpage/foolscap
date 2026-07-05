@@ -59,7 +59,7 @@ dep) can run in parallel sessions.
 | W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE `2b2d85f` |
 | W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | DONE `09e5205` |
 | W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
-| W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE (pending commit) |
+| W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE `1c6ac13` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -352,7 +352,7 @@ the working `autoWakeReapTick`).
   version + content to rebase from — opt-in, so every existing caller (which omits it) is unchanged. Same CAS
   shape as W11 (`app/cas-guard.js` `contentVersion`/`isStaleWrite`, wired into `handleFile`/`handleFileWrite`).
   Source: `docs/simple-markdown-editor-lessons.md` Idea 2.
-- **doc-jobs (W13).** ✅ SHIPPED (pending commit). W6 standing jobs extended from thread markers onto **doc**
+- **doc-jobs (W13).** ✅ SHIPPED `1c6ac13`. W6 standing jobs extended from thread markers onto **doc**
   markers, same record shape. The W6 CRUD was refactored to a storage-agnostic **job store** (`standing-jobs.js`
   `readJobsIn`/`upsertJobIn`/`removeJobIn`/`stampFiredIn`), and `app/doc-jobs.js` supplies a DOC store backed by
   a per-doc `<enc>.jobs.json` marker beside the annotation `.jsonl` + `.watch.json` (a separate marker from
