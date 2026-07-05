@@ -59,6 +59,7 @@ dep) can run in parallel sessions.
 | W10 | **proactive mid-turn board-check** norm | workflow review 2026-07-05 | W4 committed | S | DONE `2b2d85f` |
 | W11 | **mention-gated thread-post CAS guard** | comms-miss review 2026-07-05 | threads (built) | S | DONE `09e5205` |
 | W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
+| W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE (pending commit) |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -351,8 +352,20 @@ the working `autoWakeReapTick`).
   version + content to rebase from — opt-in, so every existing caller (which omits it) is unchanged. Same CAS
   shape as W11 (`app/cas-guard.js` `contentVersion`/`isStaleWrite`, wired into `handleFile`/`handleFileWrite`).
   Source: `docs/simple-markdown-editor-lessons.md` Idea 2.
-- **doc-jobs** — extend W6 standing jobs from thread markers onto **doc** markers (same record shape; the
-  W6 module was structured for this drop-in).
+- **doc-jobs (W13).** ✅ SHIPPED (pending commit). W6 standing jobs extended from thread markers onto **doc**
+  markers, same record shape. The W6 CRUD was refactored to a storage-agnostic **job store** (`standing-jobs.js`
+  `readJobsIn`/`upsertJobIn`/`removeJobIn`/`stampFiredIn`), and `app/doc-jobs.js` supplies a DOC store backed by
+  a per-doc `<enc>.jobs.json` marker beside the annotation `.jsonl` + `.watch.json` (a separate marker from
+  watchers, so removeWatcher's last-watcher-deletes-marker can't nuke a doc's jobs). `standingJobsTick` now
+  iterates docs (`listDocsWithJobs`) beside threads, firing each due doc job through the **one**
+  `serverSpawnWorker` — keyed by the doc **surface** (`docJobClaimKey` = `docSurfaceKey`), so a timer-fired job
+  and an annotation-driven doc-wake mutually exclude (one worker per doc's queue). Same guarantees as W6:
+  single-flight, fire-next-due, wake-live-else-respawn (nudge a live claimant, respawn a dormant one), survives
+  creator + restart, "skip with nothing". Endpoint: `POST /api/annotations {op:"job"|"unjob", …}` + `jobs` on the
+  per-file GET; CLI: `scripts/canvas job add|list|rm --doc PATH`. **Verified:** `node --test` (doc-jobs.test.mjs,
+  8 cases + full suite 326 green), `npm run typecheck` clean, and a **live-board smoke** — a 60s doc job fired on
+  its tick (`lastFiredAt` stamped), spawned a fresh STANDING-JOB WORKER seeded with the instruction, which read
+  its brief and wound down via `/done`; then `job rm --doc` removed it and deleted the marker.
 - **wake-live loop-migration** — migrate the looping-Coordinator heartbeat onto a **standing job** (W6 built
   the `wake-live-else-respawn` fire-mode that makes this efficient: nudge the live seat within the ~5-min
   keep-alive window, reconstitute only when dormant). The plan's "graduate to being driven by its own

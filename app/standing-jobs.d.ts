@@ -14,11 +14,32 @@ export interface StandingJob {
 export const MIN_INTERVAL_MS: number;
 export function normInterval(ms: unknown): number;
 
+// A storage-agnostic job STORE — the marker read/write the doc/thread layers supply, so the identical CRUD
+// serves both a thread's meta marker and a doc's marker (doc-jobs.js).
+export interface JobStore {
+  read(): StandingJob[] | undefined | null;
+  write(jobs: StandingJob[]): void;
+}
+export type UpsertJobOpts = {
+  id?: string;
+  role?: string | null;
+  intervalMs?: unknown;
+  instruction?: string;
+  by?: string;
+  ts?: number;
+};
+
+// The shared CRUD core (operates over any JobStore).
+export function readJobsIn(store: JobStore): StandingJob[];
+export function upsertJobIn(store: JobStore, opts?: UpsertJobOpts): { job: StandingJob; jobs: StandingJob[] };
+export function removeJobIn(store: JobStore, id: string): { removed: boolean; jobs: StandingJob[] };
+export function stampFiredIn(store: JobStore, id: string, ts: number): StandingJob[];
+
 export function readJobs(repoPath: string, threadId: string): StandingJob[];
 export function upsertJob(
   repoPath: string,
   threadId: string,
-  opts: { id?: string; role?: string | null; intervalMs?: unknown; instruction?: string; by?: string; ts?: number },
+  opts: UpsertJobOpts,
 ): { job: StandingJob; jobs: StandingJob[] };
 export function removeJob(repoPath: string, threadId: string, id: string): { removed: boolean; jobs: StandingJob[] };
 export function stampFired(repoPath: string, threadId: string, id: string, ts: number): StandingJob[];

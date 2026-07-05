@@ -22,6 +22,7 @@ import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionSta
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { dueJobs, jobClaimKey, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
+import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
 import { boardMemoryBrief } from "./board-memory.js";
@@ -699,9 +700,10 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
     const state = questionState(a); // null for a plain note; awaiting/answered/resolved for a question
     return { ...a, orphaned: !range, range, ...(state ? { state } : {}) };
   });
-  // A doc's SEAT roster (P1/W4) — who's armed to be woken by a comment, at what level. Rides the per-file
-  // read so the card can paint a watcher chip alongside the annotations.
-  sendJson(res, 200, { path: rel, annotations, watchers: readWatchers(repoPath, rel) });
+  // A doc's SEAT roster (P1/W4) — who's armed to be woken by a comment, at what level — plus its standing
+  // JOBS (doc-jobs.js), the server-fired timers on this doc's marker. Both ride the per-file read so the card
+  // can paint a watcher chip / job list alongside the annotations, and the CLI `job list --doc` reads it.
+  sendJson(res, 200, { path: rel, annotations, watchers: readWatchers(repoPath, rel), jobs: readDocJobs(repoPath, rel) });
 }
 
 // POST /api/annotations?board=<id> { path, op, … } → append one §5 event. Ops and their fields:
@@ -714,6 +716,8 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
 //   thread   { path, id, thread }
 //   watch    { path, role, level?, state?, by }   (arm/re-level a doc watcher — P1/W4)
 //   pause    { path, role }   resume { path, role }   unwatch { path, role }   (a watcher's state)
+//   job      { path, instruction, intervalMs?, role?, jobId?, by }   (create/update a doc standing job — doc-jobs.js)
+//   unjob    { path, jobId, by }   (remove a doc standing job)
 // `kind:"question"` (with optional `options`/`blocking`) turns a create into an anchored async-ask
 // (docs/anchored-async-ask.md §4); `answer` records a human's/peer's decision on it. options/blocking
 // are ignored on a note. The awaiting/answered/resolved state is derived at read (never stored).
@@ -847,6 +851,38 @@ async function handleAnnotationsWrite(
     const state = body.state === "paused" ? "paused" : body.state === "active" ? "active" : undefined;
     const w = setWatcher(repoPath, rel, { role, level, state, by, ts });
     return sendJson(res, 200, { ok: true, watcher: w });
+  }
+
+  // Doc-JOB ops (doc-jobs.js) — a STANDING JOB on the doc's marker, the W6 thread-job drop-in generalized
+  // onto a doc (the `/api/thread/<id>/job` shape, doc-scoped). `job` creates/updates (jobId edits in place;
+  // a named `role` fires into that role's seat, else a bare doc worker; intervalMs clamps up to the 60s
+  // floor); `unjob` removes by jobId. Keyed on job fields, not an annotation id, so handled before the
+  // id-gated block. The doc must exist (like `create`/`watch`). The server-fired half is standingJobsTick.
+  if (op === "job" || op === "unjob") {
+    const by = str("by") ?? "human";
+    if (readAnnotatedSource(root, rel) == null) return sendJson(res, 404, { error: "not found" });
+    if (op === "unjob") {
+      const jobId = str("jobId");
+      if (!jobId) return sendJson(res, 400, { error: "unjob needs jobId" });
+      const { removed, jobs } = removeDocJob(repoPath, rel, jobId);
+      return sendJson(res, removed ? 200 : 404, { ok: removed, path: rel, removed, jobs });
+    }
+    const instruction = str("instruction");
+    const jobId = str("jobId");
+    if (!instruction && !jobId) return sendJson(res, 400, { error: "job needs instruction" });
+    if (body.intervalMs != null && !Number.isFinite(Number(body.intervalMs)))
+      return sendJson(res, 400, { error: "intervalMs must be a number of milliseconds" });
+    if (body.role != null && typeof body.role !== "string")
+      return sendJson(res, 400, { error: "role must be a string (a role id) or omitted" });
+    const { job, jobs } = upsertDocJob(repoPath, rel, {
+      id: jobId ?? undefined,
+      role: typeof body.role === "string" ? body.role : null,
+      intervalMs: body.intervalMs as number | undefined,
+      instruction: instruction ?? undefined,
+      by,
+      ts,
+    });
+    return sendJson(res, 200, { ok: true, path: rel, job, jobs });
   }
 
   // Every other op targets an existing annotation on an existing ledger.
@@ -3177,6 +3213,46 @@ function standingJobsTick(): void {
         // Only re-base the schedule on a REAL spawn: a cap-skipped fire (newSid null — serverSpawnWorker
         // already logged it) leaves lastFiredAt untouched so it re-fires next tick, no silent drop.
         if (newSid) stampFired(board.repoPath, t.threadId, job.id, now);
+      }
+    }
+
+    // Doc standing jobs (doc-jobs.js) — the SAME server-fired timer on a DOC's marker. One surface per doc
+    // (docJobClaimKey = docSurfaceKey), so a timer-fired doc worker and an annotation-driven doc-wake worker
+    // mutually exclude (the "one worker per doc's open queue" model). Structure mirrors maybeWakeDocWorker's
+    // claimant handling AND the thread job's mid-turn skip: a LIVE claimant on the doc surface is nudged
+    // (cheap — it's already on the doc) unless mid-turn (retry next tick, no stamp); a dead/absent claimant
+    // is respawned fresh. Same fire-next-due / single-flight guarantees as the thread half.
+    let docPaths: string[];
+    try {
+      docPaths = listDocsWithJobs(board.repoPath);
+    } catch {
+      docPaths = [];
+    }
+    for (const rel of docPaths) {
+      for (const job of dueJobs(readDocJobs(board.repoPath, rel), now)) {
+        const key = docJobClaimKey(rel);
+        const claimant = surfaceClaimant(key);
+        if (claimant) {
+          const s = liveSessions.get(claimant);
+          if (s && s.status !== "exited") {
+            if (s.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
+            sendSessionInput(claimant, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+            stampDocFired(board.repoPath, rel, job.id, now);
+            continue;
+          }
+          releaseSurface(key, claimant); // stale claim (worker gone) — clear it and respawn fresh below
+        }
+        const newSid = serverSpawnWorker({
+          boardId,
+          repoPath: board.repoPath,
+          origin: lastKnownOrigin,
+          roleId: job.role ?? null,
+          threadId: null, // a doc worker: no member:open edge, positioned beside the doc card
+          anchorNodeId: `node:repo:${rel}`,
+          claimKey: key,
+          firstPrompt: standingJobBrief(job, lastKnownOrigin),
+        });
+        if (newSid) stampDocFired(board.repoPath, rel, job.id, now);
       }
     }
   }

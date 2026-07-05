@@ -33,21 +33,27 @@ export function normInterval(ms) {
   return Number.isFinite(n) ? Math.max(MIN_INTERVAL_MS, n) : MIN_INTERVAL_MS;
 }
 
-/** A thread's standing jobs (array), or [] if none / no marker. Best-effort, never throws. */
-export function readJobs(repoPath, threadId) {
-  const jobs = readThreadMeta(repoPath, threadId)?.jobs;
+// ── The storage-agnostic CRUD core ────────────────────────────────────────────────────────────────
+// The job RECORD and its lifecycle are the same whether the marker is a thread's meta (`.canvas/threads/`)
+// or a DOC's marker (`.canvas/annotations/`; doc-jobs.js) — the doc-jobs drop-in W6 was structured for. So
+// the CRUD operates over a STORE — `{ read(): jobs[], write(jobs) }` — and the thread/doc layers only supply
+// that store. `read` returns the surface's jobs array (a non-array ⇒ treated as none); `write` persists it.
+
+/** A surface's standing jobs (array), or [] if none / unreadable. Best-effort, never throws. */
+export function readJobsIn(store) {
+  const jobs = store.read();
   return Array.isArray(jobs) ? jobs : [];
 }
 
 /**
- * Create or update a standing job on a thread (upsert by `id`). A fresh job mints a uuid, stamps `createdAt`,
+ * Create or update a standing job on a store (upsert by `id`). A fresh job mints a uuid, stamps `createdAt`,
  * and starts with `lastFiredAt: null` (its first fire is one interval after creation, not immediately — see
  * jobDue). Updating an existing job (pass its `id`) keeps `id`/`createdAt`/`by`/`lastFiredAt` and overlays the
  * given `role`/`intervalMs`/`instruction`. `role` null ⇒ a bare (seatless) worker; a named role fires INTO
  * that role's seat. Returns { job, jobs } (the whole updated list). Best-effort write.
  */
-export function upsertJob(repoPath, threadId, { id, role, intervalMs, instruction, by, ts } = {}) {
-  const prior = readJobs(repoPath, threadId);
+export function upsertJobIn(store, { id, role, intervalMs, instruction, by, ts } = {}) {
+  const prior = readJobsIn(store);
   const now = ts ?? Date.now();
   const existing = id ? prior.find((j) => j.id === id) : null;
   const job = {
@@ -60,34 +66,65 @@ export function upsertJob(repoPath, threadId, { id, role, intervalMs, instructio
     lastFiredAt: existing?.lastFiredAt ?? null,
   };
   const jobs = existing ? prior.map((j) => (j.id === job.id ? job : j)) : [...prior, job];
-  upsertThreadMeta(repoPath, threadId, { jobs });
+  store.write(jobs);
   return { job, jobs };
 }
 
-/** Remove a job by id. Returns { removed, jobs }. A missing id is a no-op (removed:false). */
-export function removeJob(repoPath, threadId, id) {
-  const prior = readJobs(repoPath, threadId);
+/** Remove a job by id. Returns { removed, jobs }. A missing id is a no-op (removed:false, no write). */
+export function removeJobIn(store, id) {
+  const prior = readJobsIn(store);
   const jobs = prior.filter((j) => j.id !== id);
   if (jobs.length === prior.length) return { removed: false, jobs: prior };
-  upsertThreadMeta(repoPath, threadId, { jobs });
+  store.write(jobs);
   return { removed: true, jobs };
 }
 
 /**
- * Stamp a job's `lastFiredAt` (called when a fire actually spawns a worker — a cap-skipped fire must NOT
- * stamp, so it retries next tick). Re-bases the schedule to `ts`, which is what makes a boot-time overdue job
- * fire exactly ONCE (fire-next-due) rather than replaying every missed interval. Returns updated jobs.
+ * Stamp a job's `lastFiredAt` (called when a fire actually spawns/nudges a worker — a cap-skipped fire must
+ * NOT stamp, so it retries next tick). Re-bases the schedule to `ts`, which is what makes a boot-time overdue
+ * job fire exactly ONCE (fire-next-due) rather than replaying every missed interval. Returns updated jobs.
  */
-export function stampFired(repoPath, threadId, id, ts) {
-  const prior = readJobs(repoPath, threadId);
+export function stampFiredIn(store, id, ts) {
+  const prior = readJobsIn(store);
   let hit = false;
   const jobs = prior.map((j) => {
     if (j.id !== id) return j;
     hit = true;
     return { ...j, lastFiredAt: ts };
   });
-  if (hit) upsertThreadMeta(repoPath, threadId, { jobs });
+  if (hit) store.write(jobs);
   return jobs;
+}
+
+// ── Thread-marker layer ───────────────────────────────────────────────────────────────────────────
+// A thread's jobs live on its `.canvas/threads/` meta marker, beside seats/intents/pins.
+
+/** The job store backed by a thread's meta marker. */
+function threadJobStore(repoPath, threadId) {
+  return {
+    read: () => readThreadMeta(repoPath, threadId)?.jobs,
+    write: (jobs) => upsertThreadMeta(repoPath, threadId, { jobs }),
+  };
+}
+
+/** A thread's standing jobs (array), or [] if none / no marker. Best-effort, never throws. */
+export function readJobs(repoPath, threadId) {
+  return readJobsIn(threadJobStore(repoPath, threadId));
+}
+
+/** Create or update a standing job on a thread (upsert by `id`). See upsertJobIn. */
+export function upsertJob(repoPath, threadId, opts) {
+  return upsertJobIn(threadJobStore(repoPath, threadId), opts);
+}
+
+/** Remove a thread job by id. Returns { removed, jobs }. See removeJobIn. */
+export function removeJob(repoPath, threadId, id) {
+  return removeJobIn(threadJobStore(repoPath, threadId), id);
+}
+
+/** Stamp a thread job's `lastFiredAt`. See stampFiredIn. */
+export function stampFired(repoPath, threadId, id, ts) {
+  return stampFiredIn(threadJobStore(repoPath, threadId), id, ts);
 }
 
 /**
