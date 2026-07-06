@@ -18,7 +18,7 @@ import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-
 import { isNotificationLevel, NOTIFICATION_LEVELS, wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
-import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
+import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, suggestionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
@@ -697,7 +697,9 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
   const annos = foldAnnotations(readAnnotationLog(repoPath, rel));
   const annotations = annos.map((a) => {
     const range = src == null ? null : resolveAnchor(src, a.anchor);
-    const state = questionState(a); // null for a plain note; awaiting/answered/resolved for a question
+    // `state` is the read-time derived status: awaiting/answered/resolved for a question,
+    // pending/accepted/rejected for a suggestion, absent for a plain note (the `orphaned` principle).
+    const state = questionState(a) ?? suggestionState(a);
     return { ...a, orphaned: !range, range, ...(state ? { state } : {}) };
   });
   // A doc's SEAT roster (P1/W4) — who's armed to be woken by a comment, at what level — plus its standing
@@ -708,9 +710,10 @@ function handleAnnotationsRead(res: ServerResponse, root: string, repoPath: stri
 
 // POST /api/annotations?board=<id> { path, op, … } → append one §5 event. Ops and their fields:
 //   create   { path, anchor:{exact, prefix?, suffix?, offset?}, text, author,
-//              kind?:"note"|"question", options?:[{label,description?}], blocking? } → { ok, id, ts, orphaned, state? }
+//              kind?:"note"|"question"|"suggestion", options?:[{label,description?}], blocking?, replacement? } → { ok, id, ts, orphaned, state? }
 //   reply    { path, id, from, text }
 //   answer   { path, id, by, choice?, text? }   (the target must be a kind:"question")
+//   accept   { path, id, by }   reject { path, id, by }   (the target must be a kind:"suggestion")
 //   resolve  { path, id, by }        reopen { path, id, by }
 //   reanchor { path, id, anchor, by }
 //   thread   { path, id, thread }
@@ -794,10 +797,16 @@ async function handleAnnotationsWrite(
     const src = readAnnotatedSource(root, rel);
     if (src == null) return sendJson(res, 404, { error: "not found" });
     // kind defaults to "note" (stored implicitly — a create with no kind folds to note, so existing
-    // callers are unchanged); question fields ride only on a question.
+    // callers are unchanged); question fields ride only on a question, `replacement` only on a suggestion.
     const isQuestion = body.kind === "question";
+    const isSuggestion = body.kind === "suggestion";
     const options = isQuestion ? optionsOf(body.options) : null;
     const blocking = isQuestion && body.blocking === true;
+    // A suggestion is a span REPLACEMENT — the proposed new text is required (an empty string is a valid
+    // deletion, so the guard is "is it a string", not "is it truthy").
+    const replacement = isSuggestion ? (typeof body.replacement === "string" ? body.replacement : null) : null;
+    if (isSuggestion && replacement == null)
+      return sendJson(res, 400, { error: "a suggestion needs a replacement string" });
     const id = "anno:" + crypto.randomUUID();
     const ev: AnnotationEvent = {
       ev: "create",
@@ -807,9 +816,10 @@ async function handleAnnotationsWrite(
       text,
       author,
       ts,
-      ...(isQuestion ? { kind: "question" } : {}),
+      ...(isQuestion ? { kind: "question" } : isSuggestion ? { kind: "suggestion" } : {}),
       ...(options ? { options } : {}),
       ...(blocking ? { blocking: true } : {}),
+      ...(replacement != null ? { replacement } : {}),
     };
     if (!appendAnnotationEvent(repoPath, rel, ev)) return sendJson(res, 500, { error: "append failed" });
     if (isQuestion) {
@@ -817,7 +827,8 @@ async function handleAnnotationsWrite(
       // The question itself awaits a HUMAN — it wakes no agent (no-op-spawn avoidance), so no doc-wake here.
       if (blocking) setWatcher(repoPath, rel, { role: ASK_WATCH_ROLE, level: "mentions", by: author, ts });
     } else {
-      maybeWakeDocWorker(boardId, repoPath, origin, rel, "note"); // a comment — wakes an `all`-level watcher
+      // A note OR a suggestion is room-wide activity a reviewer should service → wake an `all` watcher.
+      maybeWakeDocWorker(boardId, repoPath, origin, rel, isSuggestion ? "suggestion" : "note");
     }
     return sendJson(res, 200, {
       ok: true,
@@ -825,6 +836,7 @@ async function handleAnnotationsWrite(
       ts,
       orphaned: !resolveAnchor(src, anchor),
       ...(isQuestion ? { kind: "question", state: "awaiting" } : {}),
+      ...(isSuggestion ? { kind: "suggestion", state: "pending" } : {}),
     });
   }
 
@@ -890,6 +902,57 @@ async function handleAnnotationsWrite(
   if (!id) return sendJson(res, 400, { error: "id required" });
   const target = foldAnnotations(readAnnotationLog(repoPath, rel)).find((a) => a.id === id);
   if (!target) return sendJson(res, 404, { error: "unknown annotation" });
+
+  // Suggestion ACCEPT/REJECT (track-changes) — a terminal decision on a `kind:"suggestion"`. Accept APPLIES
+  // the replacement to the file's bytes (splice the anchored span → replacement) and resolves; reject just
+  // resolves, bytes untouched. Both are one-shot: a suggestion already decided is refused (409). Handled
+  // here — ahead of the shared `ev` assembly below — because accept mutates the file, not just the ledger.
+  if (op === "accept" || op === "reject") {
+    if (target.kind !== "suggestion") return sendJson(res, 400, { error: "not a suggestion" });
+    const by = str("by");
+    if (!by) return sendJson(res, 400, { error: `${op} needs by` });
+    if (target.decision) return sendJson(res, 409, { error: `suggestion already ${target.decision}` });
+    if (op === "accept") {
+      // Resolve the span against the SAME preview the card sees (readAnnotatedSource) to get [start,end);
+      // an orphan can't be applied (its span is gone) → 409, the writer must re-anchor or reject.
+      const src = readAnnotatedSource(root, rel);
+      if (src == null) return sendJson(res, 404, { error: "not found" });
+      const range = resolveAnchor(src, target.anchor);
+      if (!range) return sendJson(res, 409, { error: "orphaned suggestion — its span is gone; re-anchor or reject" });
+      // Splice into the FULL on-disk bytes, not the MAX_BYTES preview: a truncated splice would silently drop
+      // the file's tail. The head is byte-identical up to the cut, so the preview-derived [start,end) — which
+      // can only resolve within the preview — are valid offsets into the full text too (CLAUDE.md size-cap rule).
+      const abs = safeResolve(root, rel);
+      let full: string;
+      try {
+        full = fs.readFileSync(abs!, "utf8");
+      } catch (err) {
+        return sendJson(res, 500, { error: String(err) });
+      }
+      const next = full.slice(0, range.start) + (target.replacement ?? "") + full.slice(range.end);
+      try {
+        fs.writeFileSync(abs!, next, "utf8");
+      } catch (err) {
+        return sendJson(res, 500, { error: String(err) });
+      }
+      // Record the accept only AFTER the bytes landed: on the rare append failure the file is edited but the
+      // suggestion stays pending (visible, not silently diverged) and the 500 tells the caller.
+      if (!appendAnnotationEvent(repoPath, rel, { ev: "accept", id, by, ts }))
+        return sendJson(res, 500, { error: "append failed" });
+      // Self-heal the sibling anchors the splice moved (the /api/file write path's move), best-effort.
+      try {
+        reanchorFile(repoPath, next, rel);
+      } catch {
+        /* reanchor is best-effort; the edit already landed */
+      }
+      return sendJson(res, 200, { ok: true, id, ts, state: "accepted", applied: true, version: fileVersion(abs!) });
+    }
+    // reject — resolve without touching the bytes.
+    if (!appendAnnotationEvent(repoPath, rel, { ev: "reject", id, by, ts }))
+      return sendJson(res, 500, { error: "append failed" });
+    return sendJson(res, 200, { ok: true, id, ts, state: "rejected", applied: false });
+  }
+
   let ev: AnnotationEvent;
   if (op === "reply") {
     const from = str("from");
@@ -3022,7 +3085,7 @@ function dormantWakeBrief(handle: string, origin: string): string {
 // question). If any active watcher's level clears the event (auto-wake.js reuses W4's wakesSeat), service the
 // doc: NUDGE a live worker already on it (R1 keep-alive continuity — a comment within its idle window
 // continues it, no duplicate) or spawn a fresh one. Single-flight per doc; the worker loops-until-dry.
-function maybeWakeDocWorker(boardId: string, repoPath: string, origin: string, rel: string, eventKind: "note" | "answer"): void {
+function maybeWakeDocWorker(boardId: string, repoPath: string, origin: string, rel: string, eventKind: "note" | "answer" | "suggestion"): void {
   const qualifying = qualifyingWatchers(readWatchers(repoPath, rel), eventKind);
   if (qualifying.length === 0) return; // no watcher this activity would wake — nothing to do
   const key = docSurfaceKey(rel);

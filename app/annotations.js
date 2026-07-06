@@ -10,13 +10,19 @@
 // POST handler checks the append's return — a comment the server couldn't persist must 500, not
 // vanish (unlike a thread message, the ledger IS the only home; there's no in-memory live source).
 //
-// Events (one JSON object per line): create / reply / resolve / reopen / reanchor / thread / answer.
-// `foldAnnotations` reduces a log to current state; `orphaned` is NOT an event and never stored —
-// it's derived at read time by resolving each anchor against the file's current bytes (anchors.js),
+// Events (one JSON object per line): create / reply / resolve / reopen / reanchor / thread / answer /
+// accept / reject. `foldAnnotations` reduces a log to current state; `orphaned` is NOT an event and never
+// stored — it's derived at read time by resolving each anchor against the file's current bytes (anchors.js),
 // the thread-state.js principle. A `create` may carry `kind:"question"` (with `options`/`blocking`)
 // for the anchored async-ask (docs/anchored-async-ask.md §4); the `answer` event records a human's
 // (or peer's) choice/prose on such a question. The awaiting/answered/resolved question STATE is
 // likewise derived at read (`questionState`), never stored — same principle as `orphaned`.
+//
+// A `create` may also carry `kind:"suggestion"` with a `replacement` string (a track-changes proposal:
+// replace the anchored span with `replacement`, accepted or rejected AS A UNIT). `accept` records that the
+// replacement was applied to the file's bytes (the endpoint splices them); `reject` records a decline —
+// both are TERMINAL (they stamp `decision` accepted/rejected and resolve). `suggestionState` derives
+// pending/accepted/rejected at read, the `questionState` sibling.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -103,9 +109,15 @@ export function foldAnnotations(events) {
             text: ev.text,
             author: ev.author,
             ts: ev.ts,
-            kind: ev.kind === "question" ? "question" : "note",
+            kind:
+              ev.kind === "question"
+                ? "question"
+                : ev.kind === "suggestion"
+                  ? "suggestion"
+                  : "note",
             ...(Array.isArray(ev.options) ? { options: ev.options } : {}),
             ...(ev.blocking ? { blocking: true } : {}),
+            ...(typeof ev.replacement === "string" ? { replacement: ev.replacement } : {}),
             resolved: false,
             replies: [],
           });
@@ -148,6 +160,26 @@ export function foldAnnotations(events) {
           delete a.resolvedTs;
         }
         break;
+      case "accept":
+        // A suggestion's replacement was applied to the file (the endpoint splices the bytes); the record
+        // is stamped accepted and resolved. `decision` is terminal — a second accept/reject is refused
+        // upstream, so reopen (which un-resolves) leaves `decision` alone: an applied edit can't un-happen.
+        if (a) {
+          a.resolved = true;
+          a.resolvedBy = ev.by;
+          a.resolvedTs = ev.ts;
+          a.decision = "accepted";
+        }
+        break;
+      case "reject":
+        // A suggestion declined: resolved, bytes untouched. Terminal like accept (stamps `decision`).
+        if (a) {
+          a.resolved = true;
+          a.resolvedBy = ev.by;
+          a.resolvedTs = ev.ts;
+          a.decision = "rejected";
+        }
+        break;
       case "reanchor":
         if (a) a.anchor = ev.anchor;
         break;
@@ -174,6 +206,22 @@ export function questionState(a) {
   if (a.resolved) return "resolved";
   if (a.answered) return "answered";
   return "awaiting";
+}
+
+/**
+ * Derived suggestion state (track-changes), computed at read and NEVER stored — the `orphaned`/`questionState`
+ * principle. Returns null for anything but a `kind:"suggestion"`; otherwise:
+ *   - "accepted" — the replacement was applied to the file's bytes (an `accept` event landed).
+ *   - "rejected" — the suggestion was declined (a `reject` event landed); bytes untouched.
+ *   - "pending"  — no decision yet (awaits an accept/reject).
+ * Derived from `decision` (terminal), not `resolved`, so a reopen of a decided suggestion — an applied edit
+ * that can't un-happen — still reads as its decision. The doc-wake (W5) triggers on the suggestion `create`.
+ */
+export function suggestionState(a) {
+  if (!a || a.kind !== "suggestion") return null;
+  if (a.decision === "accepted") return "accepted";
+  if (a.decision === "rejected") return "rejected";
+  return "pending";
 }
 
 /**

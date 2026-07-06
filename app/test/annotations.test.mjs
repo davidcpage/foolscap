@@ -15,6 +15,7 @@ import {
   readAnnotationLog,
   foldAnnotations,
   questionState,
+  suggestionState,
   listAnnotatedPaths,
 } from "../annotations.js";
 
@@ -170,6 +171,68 @@ test("questionState: null for a note even if an answer event somehow lands on it
   ]);
   assert.equal(a.kind, "note");
   assert.equal(questionState(a), null, "only a kind:question has a question state");
+});
+
+// ── suggestion track-changes: kind:"suggestion", accept/reject, derived suggestion state ────────────
+
+test("fold: a suggestion create carries kind/replacement; suggestionState is 'pending'", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "suggestion", text: "tighten this", replacement: "the crisp new text" }),
+  ]);
+  assert.equal(a.kind, "suggestion");
+  assert.equal(a.replacement, "the crisp new text");
+  assert.equal(a.resolved, false);
+  assert.equal(suggestionState(a), "pending", "an undecided suggestion is pending");
+  assert.equal(questionState(a), null, "a suggestion is not a question");
+});
+
+test("fold: an empty-string replacement (a deletion proposal) round-trips, not dropped", () => {
+  const [a] = foldAnnotations([create("anno:1", { kind: "suggestion", replacement: "" })]);
+  assert.equal(a.kind, "suggestion");
+  assert.equal(a.replacement, "", "'' is a valid replacement — deleting the span");
+  assert.equal(suggestionState(a), "pending");
+});
+
+test("fold: accept marks the suggestion accepted + resolved; suggestionState is 'accepted'", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "suggestion", replacement: "X" }),
+    { ev: "accept", id: "anno:1", by: "human", ts: 200 },
+  ]);
+  assert.equal(a.decision, "accepted");
+  assert.equal(a.resolved, true, "an accepted suggestion is resolved (drops out of the open queue)");
+  assert.equal(a.resolvedBy, "human");
+  assert.equal(a.resolvedTs, 200);
+  assert.equal(suggestionState(a), "accepted");
+});
+
+test("fold: reject marks the suggestion rejected + resolved; suggestionState is 'rejected'", () => {
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "suggestion", replacement: "X" }),
+    { ev: "reject", id: "anno:1", by: "s1", ts: 300 },
+  ]);
+  assert.equal(a.decision, "rejected");
+  assert.equal(a.resolved, true);
+  assert.equal(suggestionState(a), "rejected");
+});
+
+test("suggestionState: the decision is terminal — a reopen un-resolves but the applied edit stands", () => {
+  // Accepting splices the file; reopening can't un-apply it, so `decision` survives reopen (only `resolved`
+  // flips). The endpoint refuses a second accept/reject on a decided suggestion, so this can't double-apply.
+  const [a] = foldAnnotations([
+    create("anno:1", { kind: "suggestion", replacement: "X" }),
+    { ev: "accept", id: "anno:1", by: "human", ts: 200 },
+    { ev: "reopen", id: "anno:1", by: "human", ts: 300 },
+  ]);
+  assert.equal(a.resolved, false, "reopen clears resolved");
+  assert.equal(a.decision, "accepted", "but the accept decision is terminal — the edit already landed");
+  assert.equal(suggestionState(a), "accepted");
+});
+
+test("suggestionState: null for a note or a question", () => {
+  const [note] = foldAnnotations([create("anno:1")]);
+  assert.equal(suggestionState(note), null);
+  const [q] = foldAnnotations([create("anno:2", { kind: "question" })]);
+  assert.equal(suggestionState(q), null, "a question has a questionState, not a suggestionState");
 });
 
 test("listAnnotatedPaths: missing dir → [], non-decodable strays skipped, sorted", () => {

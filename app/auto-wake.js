@@ -60,13 +60,16 @@ export function clearAllClaims() {
  *     (wakes a seat at any level, including a paused/mentions ask-armed one — the @-mention override).
  *   - a `note` comment is room-wide activity ADDRESSED to no one in particular → a `broadcast` (wakes a
  *     watcher at level `all` only).
- * Only these two kinds wake a doc worker (docs/wakeable-substrate-plan.md W5 refinement: a fresh
- * `question` awaits a HUMAN, so it must NOT wake an agent — no-op spawn avoidance; `reply`/`resolve`/
- * `reanchor`/`thread` aren't agent-actionable triggers). Any other kind returns neither → wakes no one.
+ *   - a `suggestion` create is a track-changes PROPOSAL awaiting an accept/reject decision — room-wide
+ *     activity a reviewer should look at → a `broadcast` too (same class as a note).
+ * These wake a doc worker (docs/wakeable-substrate-plan.md W5 refinement: a fresh `question` awaits a
+ * HUMAN, so it must NOT wake an agent — no-op spawn avoidance; `reply`/`resolve`/`reanchor`/`thread` and a
+ * suggestion's TERMINAL `accept`/`reject` aren't agent-actionable triggers — the decision is already made,
+ * so waking on it would spawn a no-op worker). Any other kind returns neither → wakes no one.
  */
 export function annotationWakeClass(eventKind) {
   if (eventKind === "answer") return { mentioned: true, broadcast: false };
-  if (eventKind === "note") return { mentioned: false, broadcast: true };
+  if (eventKind === "note" || eventKind === "suggestion") return { mentioned: false, broadcast: true };
   return { mentioned: false, broadcast: false };
 }
 

@@ -65,11 +65,14 @@ test("clearAllClaims resets the whole registry", () => {
 });
 
 // ── annotation wake class ───────────────────────────────────────────────────────────────────────────
-test("annotationWakeClass: answer=addressed(mention), note=broadcast, everything else wakes no one", () => {
+test("annotationWakeClass: answer=addressed(mention), note/suggestion=broadcast, everything else wakes no one", () => {
   assert.deepEqual(annotationWakeClass("answer"), { mentioned: true, broadcast: false });
   assert.deepEqual(annotationWakeClass("note"), { mentioned: false, broadcast: true });
-  // A fresh question awaits a HUMAN — no agent wake (no-op-spawn avoidance); ditto reply/resolve/etc.
-  for (const k of ["question", "reply", "resolve", "reanchor", "thread", "", "whatever"])
+  // A suggestion create is a proposal a reviewer should service — broadcast, same class as a note.
+  assert.deepEqual(annotationWakeClass("suggestion"), { mentioned: false, broadcast: true });
+  // A fresh question awaits a HUMAN — no agent wake (no-op-spawn avoidance); ditto reply/resolve/etc. and a
+  // suggestion's TERMINAL accept/reject (the decision is already made — waking would spawn a no-op worker).
+  for (const k of ["question", "reply", "resolve", "reanchor", "thread", "accept", "reject", "", "whatever"])
     assert.deepEqual(annotationWakeClass(k), { mentioned: false, broadcast: false }, `kind=${k}`);
 });
 

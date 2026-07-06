@@ -61,6 +61,7 @@ dep) can run in parallel sessions.
 | W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
 | W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE `1c6ac13` |
 | W14 | **wake-live loop-migration** (Coordinator heartbeat → standing job) | W6 dogfood | W6 | M | DONE `f8cb1a9` (enable human-gated) |
+| W15 | **suggestion track-changes** (`kind:"suggestion"` propose/accept/reject) | Idea 1, doc-annotations §4 | annotations (built), W5 | M | DONE `PENDING` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
@@ -393,9 +394,14 @@ the working `autoWakeReapTick`).
   parallelize file-disjoint items in worktrees, serialize overlapping ones, one serialized live-board
   integration-test gate, and a **designated integrator** (Coordinator or a separate role — open) that owns
   merge+test+fix since authoring agents are ephemeral. To be taken into its own dedicated thread.
-- **Suggestion track-changes (Idea 1)** — a `kind:"suggestion"` annotation (propose span replacement,
-  accept/reject as a unit); its accept/reject are natural doc-wake events (W5's qualification predicate is
-  already event-kind-extensible).
+- **Suggestion track-changes (Idea 1)** — **DONE (W15)**. A `kind:"suggestion"` annotation carries a
+  `replacement`; new `accept`/`reject` ops decide it as a unit — accept splices the anchored span → replacement
+  into the file's FULL bytes (not the MAX_BYTES preview) and resolves, reject resolves untouched; both terminal
+  (a decided suggestion → 409). `suggestionState` (pending/accepted/rejected) derives at read like `questionState`.
+  Wake wiring: a suggestion *create* broadcasts to `all` watchers (a proposal to review, like a note); the
+  terminal accept/reject deliberately do NOT wake (no-op-spawn avoidance, matching how `question` resolve
+  doesn't wake). CLI `anno suggest/accept/reject`; card UI = draft toggle + replacement field + a diff view +
+  Accept/Reject buttons + a green `anno-suggestion` highlight.
 - **Pinned-tray collapse-by-default** (UI, this session) — small NodeView fix; being landed at wind-down.
 
 **Settled decisions this session:** (1) **Idea-3 (one seq'd feed per record vs per-surface triggers):

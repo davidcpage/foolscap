@@ -815,10 +815,11 @@ function AnnotationsLayer({
   // The create popover (fab clicked): same offsets, plus the draft text.
   const [draft, setDraft] = useState<{ x: number; y: number; start: number; end: number } | null>(null);
   const [draftText, setDraftText] = useState("");
-  // W2: a draft can be a plain comment or an anchored question (kind:"question"), with optional choices
-  // (one per line or `|`-separated, mirroring `canvas anno ask --options "A|B|C"`).
-  const [draftKind, setDraftKind] = useState<"note" | "question">("note");
+  // W2: a draft can be a plain comment, an anchored question (kind:"question") with optional choices,
+  // or a track-changes suggestion (kind:"suggestion") carrying a replacement for the selected span.
+  const [draftKind, setDraftKind] = useState<"note" | "question" | "suggestion">("note");
   const [draftOptions, setDraftOptions] = useState("");
+  const [draftReplacement, setDraftReplacement] = useState("");
   const [replyText, setReplyText] = useState("");
   const [showResolved, setShowResolved] = useState(false);
   // What the last paint actually placed, for click hit-testing (range → annotation id).
@@ -834,6 +835,8 @@ function AnnotationsLayer({
   const orphans = useMemo(() => openAnnos.filter((a) => a.orphaned), [openAnnos]);
   // W2: questions awaiting a human decision — surfaced as a distinct count on the badge.
   const awaitingQs = useMemo(() => openAnnos.filter((a) => a.state === "awaiting"), [openAnnos]);
+  // Track-changes suggestions awaiting an accept/reject — a distinct count on the badge, like awaitingQs.
+  const pendingSuggestions = useMemo(() => openAnnos.filter((a) => a.state === "pending"), [openAnnos]);
   const current = openId ? (list.find((a) => a.id === openId) ?? null) : null;
 
   // PAINT: resolve every visible anchor against the rendered text and publish the ranges. Re-runs on
@@ -847,12 +850,19 @@ function AnnotationsLayer({
     const paint = () => {
       raf = 0;
       const el = host.querySelector<HTMLElement>("[data-text]");
-      const entries: { id: string; range: Range; resolved: boolean; question: boolean }[] = [];
+      const entries: { id: string; range: Range; resolved: boolean; question: boolean; suggestion: boolean }[] = [];
       if (el) {
         for (const a of list) {
           if (a.orphaned || (a.resolved && !showResolved)) continue;
           const range = anchorRangeIn(el, a.anchor);
-          if (range) entries.push({ id: a.id, range, resolved: a.resolved, question: a.kind === "question" });
+          if (range)
+            entries.push({
+              id: a.id,
+              range,
+              resolved: a.resolved,
+              question: a.kind === "question",
+              suggestion: a.kind === "suggestion",
+            });
         }
       }
       painted.current = entries;
@@ -868,8 +878,9 @@ function AnnotationsLayer({
       // comment at a glance; the open one still promotes to `active`, resolved to `resolved`.
       const paintable = entries.filter((e) => e.id !== openId);
       setCardHighlights(id, {
-        open: paintable.filter((e) => !e.resolved && !e.question).map((e) => e.range),
+        open: paintable.filter((e) => !e.resolved && !e.question && !e.suggestion).map((e) => e.range),
         question: paintable.filter((e) => !e.resolved && e.question).map((e) => e.range),
+        suggestion: paintable.filter((e) => !e.resolved && e.suggestion).map((e) => e.range),
         resolved: paintable.filter((e) => e.resolved).map((e) => e.range),
         active,
       });
@@ -995,7 +1006,9 @@ function AnnotationsLayer({
   const submitDraft = async () => {
     const host = hostRef.current;
     const el = host?.querySelector<HTMLElement>("[data-text]");
-    const text = draftText.trim();
+    // A suggestion's payload is its replacement, so the note is optional (default it); a comment/question
+    // requires its text. The endpoint requires `text`, so a note-less suggestion gets a stand-in label.
+    const text = draftKind === "suggestion" ? draftText.trim() || "suggested edit" : draftText.trim();
     if (!el || !draft || !text) return;
     const rendered = el.textContent ?? "";
     const q = {
@@ -1018,6 +1031,7 @@ function AnnotationsLayer({
       text,
       author: "human",
       ...(draftKind === "question" ? { kind: "question" } : {}),
+      ...(draftKind === "suggestion" ? { kind: "suggestion", replacement: draftReplacement } : {}),
       ...(options.length ? { options } : {}),
     });
     if (r.ok) {
@@ -1025,6 +1039,7 @@ function AnnotationsLayer({
       setDraftText("");
       setDraftKind("note");
       setDraftOptions("");
+      setDraftReplacement("");
       document.getSelection()?.removeAllRanges();
     }
   };
@@ -1051,6 +1066,14 @@ function AnnotationsLayer({
   const toggleResolve = async (a: AnnotationInfo) => {
     await postAnnotationOp(path, { op: a.resolved ? "reopen" : "resolve", id: a.id, by: "human" });
     if (!a.resolved) setOpenId(null); // resolving dismisses the exchange; reopen keeps it up
+  };
+
+  // Track-changes decision on the open suggestion: accept applies the replacement to the file's bytes
+  // (server-side splice) and resolves; reject resolves, bytes untouched. Both dismiss the popover.
+  const decideSuggestion = async (op: "accept" | "reject") => {
+    if (!current) return;
+    const r = await postAnnotationOp(path, { op, id: current.id, by: "human" });
+    if (r.ok) setOpenId(null);
   };
 
   const openFromStrip = (a: AnnotationInfo) => {
@@ -1080,11 +1103,12 @@ function AnnotationsLayer({
       {list.length > 0 && (
         <button
           className={`anno-badge${openAnnos.length === 0 ? " quiet" : ""}`}
-          title={`${openAnnos.length} open comment${openAnnos.length === 1 ? "" : "s"} (${list.length} total)${awaitingQs.length ? ` · ${awaitingQs.length} question${awaitingQs.length === 1 ? "" : "s"} awaiting an answer` : ""} — click to ${showResolved ? "hide" : "show"} resolved`}
+          title={`${openAnnos.length} open comment${openAnnos.length === 1 ? "" : "s"} (${list.length} total)${awaitingQs.length ? ` · ${awaitingQs.length} question${awaitingQs.length === 1 ? "" : "s"} awaiting an answer` : ""}${pendingSuggestions.length ? ` · ${pendingSuggestions.length} suggestion${pendingSuggestions.length === 1 ? "" : "s"} to review` : ""} — click to ${showResolved ? "hide" : "show"} resolved`}
           onClick={() => setShowResolved((v) => !v)}
         >
           💬 {openAnnos.length}
           {awaitingQs.length > 0 && <span className="anno-badge-q">❓{awaitingQs.length}</span>}
+          {pendingSuggestions.length > 0 && <span className="anno-badge-s">✏️{pendingSuggestions.length}</span>}
         </button>
       )}
       {/* Watch-for-comments chip (P1/W4): arm/re-level/unwatch a watcher on this doc — the "who to wake
@@ -1130,8 +1154,8 @@ function AnnotationsLayer({
       )}
       {draft && (
         <div ref={popRef} className="anno-pop" style={{ left: clampPop(draft).x, top: clampPop(draft).y }}>
-          {/* W2: a draft is a plain comment OR an anchored question. The toggle picks the kind; a question
-              reveals an optional choices field (docs/anchored-async-ask.md §6 — ask on the doc). */}
+          {/* A draft is a plain comment, an anchored question (§6), or a track-changes suggestion. The
+              toggle picks the kind; a question reveals a choices field, a suggestion a replacement field. */}
           <div className="anno-pop-row anno-kind-toggle">
             <button
               className={`anno-btn${draftKind === "note" ? "" : " quiet"}`}
@@ -1146,11 +1170,36 @@ function AnnotationsLayer({
             >
               ❓ Ask
             </button>
+            <button
+              className={`anno-btn${draftKind === "suggestion" ? "" : " quiet"}`}
+              title="propose a replacement for this span — accepted or rejected as a unit"
+              onClick={() => setDraftKind("suggestion")}
+            >
+              ✏️ Suggest
+            </button>
           </div>
+          {draftKind === "suggestion" && (
+            <textarea
+              className="anno-input anno-replacement"
+              placeholder="replace the selected span with…"
+              autoFocus
+              value={draftReplacement}
+              onChange={(e) => setDraftReplacement(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setDraft(null);
+              }}
+            />
+          )}
           <textarea
             className="anno-input"
-            placeholder={draftKind === "question" ? "ask a question about the selection…" : "comment on the selection…"}
-            autoFocus
+            placeholder={
+              draftKind === "question"
+                ? "ask a question about the selection…"
+                : draftKind === "suggestion"
+                  ? "why this edit? (optional note)…"
+                  : "comment on the selection…"
+            }
+            autoFocus={draftKind !== "suggestion"}
             value={draftText}
             onChange={(e) => setDraftText(e.target.value)}
             onKeyDown={(e) => {
@@ -1174,7 +1223,7 @@ function AnnotationsLayer({
           )}
           <div className="anno-pop-row">
             <button className="anno-btn" onClick={() => void submitDraft()}>
-              {draftKind === "question" ? "Ask" : "Comment"}
+              {draftKind === "question" ? "Ask" : draftKind === "suggestion" ? "Suggest" : "Comment"}
             </button>
             <button className="anno-btn quiet" onClick={() => setDraft(null)}>Cancel</button>
           </div>
@@ -1182,8 +1231,10 @@ function AnnotationsLayer({
       )}
       {current && (() => {
         const isQuestion = current.kind === "question";
+        const isSuggestion = current.kind === "suggestion";
         const qState = current.state; // awaiting | answered | resolved
         const answerable = isQuestion && !current.resolved; // a question still open to a decision
+        const decidable = isSuggestion && !current.decision; // a suggestion still open to accept/reject
         return (
         <div ref={popRef} className="anno-pop" style={{ left: pop.x, top: pop.y }}>
           <div className="anno-pop-head">
@@ -1192,14 +1243,28 @@ function AnnotationsLayer({
                 {qState === "answered" ? "answered" : qState === "resolved" ? "resolved" : "awaiting"}
               </span>
             )}
+            {isSuggestion && (
+              <span className={`anno-spill ${current.decision ?? "pending"}`} title="track-changes suggestion">
+                {current.decision ?? "pending"}
+              </span>
+            )}
             <span className="anno-quote">“{current.anchor.exact}”</span>
             <button className="anno-x" title="close" onClick={() => setOpenId(null)}>✕</button>
           </div>
+          {/* A suggestion shows the proposed change as a diff: the anchored span struck through, the
+              replacement inserted below it. */}
+          {isSuggestion && (
+            <div className="anno-diff">
+              <div className="anno-diff-old">{current.anchor.exact}</div>
+              <div className="anno-diff-new">{current.replacement}</div>
+            </div>
+          )}
           <div className="anno-msg">
             <span className="anno-from">{current.author}</span>
             <span className="anno-time">{formatEventTime(current.ts)}</span>
             <div className={`anno-text${isQuestion ? " anno-question-text" : ""}`}>
               {isQuestion && "❓ "}
+              {isSuggestion && "✏️ "}
               {current.text}
             </div>
           </div>
@@ -1227,6 +1292,26 @@ function AnnotationsLayer({
                   {o.label}
                 </button>
               ))}
+            </div>
+          )}
+          {/* Track-changes decision: accept splices the replacement into the file's bytes and resolves;
+              reject resolves, bytes untouched. Shown only while the suggestion is still undecided. */}
+          {decidable && (
+            <div className="anno-opts anno-decide">
+              <button
+                className="anno-opt anno-accept"
+                title="apply the replacement to the file and resolve"
+                onClick={() => void decideSuggestion("accept")}
+              >
+                ✓ Accept
+              </button>
+              <button
+                className="anno-opt anno-reject"
+                title="decline — resolve without changing the file"
+                onClick={() => void decideSuggestion("reject")}
+              >
+                ✕ Reject
+              </button>
             </div>
           )}
           {current.thread && <div className="anno-escalated">discussion moved to a thread</div>}

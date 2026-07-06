@@ -290,6 +290,83 @@ test("annotations: anchored async-ask — question create → answer → awaitin
   assert.equal(swept.answered, 0);
 });
 
+test("annotations: suggestion track-changes — create → ACCEPT applies to bytes, another → REJECT leaves bytes", { skip: !up && "no dev server on 5173" }, async () => {
+  const doc = `docs/suggest-${runTag}.md`;
+  fs.mkdirSync(path.join(scratch, "docs"), { recursive: true });
+  const body0 = "# Draft\n\nThe quick brown fox jumps over the lazy dog.\n";
+  fs.writeFileSync(path.join(scratch, doc), body0);
+  const abs = path.join(scratch, doc);
+  const post = (b) => fetch(`${HOST}/api/annotations?board=${boardId}`, j(b));
+  const state = async () =>
+    (await (await fetch(`${HOST}/api/annotations?board=${boardId}&path=${encodeURIComponent(doc)}`)).json());
+
+  // A suggestion needs a replacement string (a create without one is 400).
+  assert.equal(
+    (await post({ path: doc, op: "create", kind: "suggestion", anchor: { exact: "quick brown fox" }, text: "tighten", author: "sess-1" })).status,
+    400,
+  );
+
+  // Create a suggestion proposing to replace the span "quick brown fox" → "swift red fox".
+  const c1 = await post({
+    path: doc, op: "create", kind: "suggestion",
+    anchor: { exact: "quick brown fox", prefix: "The ", suffix: " jumps", offset: 13 },
+    text: "tighten the phrasing", replacement: "swift red fox", author: "sess-1",
+  });
+  assert.equal(c1.status, 200);
+  const cj1 = await c1.json();
+  assert.equal(cj1.kind, "suggestion");
+  assert.equal(cj1.state, "pending", "a fresh suggestion is born pending");
+  const id1 = cj1.id;
+  // The read badges it a pending suggestion carrying its replacement.
+  let s = await state();
+  let a1 = s.annotations.find((a) => a.id === id1);
+  assert.equal(a1.kind, "suggestion");
+  assert.equal(a1.state, "pending");
+  assert.equal(a1.replacement, "swift red fox");
+
+  // accept/reject validate their target: not-a-suggestion / missing by.
+  assert.equal((await post({ path: doc, op: "accept", id: id1 })).status, 400); // no by
+
+  // ACCEPT: the replacement lands in the file's bytes and the suggestion resolves accepted.
+  const acc = await post({ path: doc, op: "accept", id: id1, by: "human" });
+  assert.equal(acc.status, 200);
+  assert.equal((await acc.json()).applied, true);
+  assert.equal(fs.readFileSync(abs, "utf8"), "# Draft\n\nThe swift red fox jumps over the lazy dog.\n", "accept spliced the span into the file");
+  s = await state();
+  a1 = s.annotations.find((a) => a.id === id1);
+  assert.equal(a1.state, "accepted");
+  assert.equal(a1.resolved, true);
+  // A second decision on an already-decided suggestion is refused (terminal).
+  assert.equal((await post({ path: doc, op: "accept", id: id1, by: "human" })).status, 409);
+  assert.equal((await post({ path: doc, op: "reject", id: id1, by: "human" })).status, 409);
+
+  // Create a second suggestion, then REJECT it — the bytes must be untouched.
+  const bytesBeforeReject = fs.readFileSync(abs, "utf8");
+  const c2 = await post({
+    path: doc, op: "create", kind: "suggestion",
+    anchor: { exact: "lazy dog", prefix: "the ", suffix: ".\n" },
+    text: "no", replacement: "sleeping cat", author: "sess-1",
+  });
+  assert.equal(c2.status, 200);
+  const id2 = (await c2.json()).id;
+  const rej = await post({ path: doc, op: "reject", id: id2, by: "human" });
+  assert.equal(rej.status, 200);
+  assert.equal((await rej.json()).applied, false);
+  assert.equal(fs.readFileSync(abs, "utf8"), bytesBeforeReject, "reject leaves the file's bytes untouched");
+  s = await state();
+  assert.equal(s.annotations.find((a) => a.id === id2).state, "rejected");
+
+  // Accepting an ORPHANED suggestion (its span isn't in the doc) is refused 409 — can't apply a gone span.
+  const c3 = await post({
+    path: doc, op: "create", kind: "suggestion",
+    anchor: { exact: "a span that does not exist in the doc at all" },
+    text: "x", replacement: "y", author: "sess-1",
+  });
+  const c3j = await c3.json();
+  assert.equal(c3j.orphaned, true, "an anchor that doesn't resolve is born orphaned");
+  assert.equal((await post({ path: doc, op: "accept", id: c3j.id, by: "human" })).status, 409, "an orphaned suggestion can't be applied");
+});
+
 test("doc-watch (P1/W4): watch → re-level → pause/resume → unwatch, surfaced in read + sweep", { skip: !up && "no dev server on 5173" }, async () => {
   const doc = `docs/watch-${runTag}.md`;
   fs.mkdirSync(path.join(scratch, "docs"), { recursive: true });

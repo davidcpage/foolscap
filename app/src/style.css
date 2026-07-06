@@ -286,6 +286,10 @@ body {
 ::highlight(anno-question) {
   background-color: #7cc0ff55;
 }
+/* A track-changes suggestion paints in a distinct green — the "proposed change" hue. */
+::highlight(anno-suggestion) {
+  background-color: #6ed49a55;
+}
 .anno-layer {
   position: absolute;
   inset: 0;
@@ -555,6 +559,83 @@ textarea.anno-options {
 }
 .anno-opt:hover {
   background: #d8ebff;
+}
+
+/* ── track-changes suggestions ─────────── */
+/* The badge's pending-suggestion count — a distinct green segment beside 💬 N (and ❓ N). */
+.anno-badge-s {
+  margin-left: 4px;
+  padding-left: 4px;
+  border-left: 1px solid #c6ead4;
+  color: #15803d;
+}
+/* The optional replacement field on a suggestion draft — a sibling of the main textarea, green-tinted. */
+textarea.anno-replacement {
+  min-height: 34px;
+  border-color: #bbe9c9;
+  background: #f6fdf9;
+}
+/* The suggestion-state pill in the popover head: pending (green), accepted (green-solid), rejected (grey). */
+.anno-spill {
+  flex: 0 0 auto;
+  font-size: 8px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 1px 5px;
+  border-radius: 8px;
+  border: 1px solid #bbe9c9;
+  background: #eafaf0;
+  color: #15803d;
+}
+.anno-spill.accepted {
+  border-color: #86d3a3;
+  background: #d9f5e5;
+  color: #0f6a30;
+}
+.anno-spill.rejected {
+  border-color: #e4e4e7;
+  background: #f4f4f5;
+  color: #71717a;
+}
+/* The proposed change, shown as a compact diff in the popover: old span struck, replacement inserted. */
+.anno-diff {
+  margin: 2px 0 4px;
+  font-size: 10px;
+  line-height: 1.35;
+  border-left: 2px solid #86d3a3;
+  padding-left: 6px;
+}
+.anno-diff-old {
+  color: #b91c1c;
+  text-decoration: line-through;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.anno-diff-new {
+  color: #15803d;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* The accept/reject buttons reuse .anno-opt; accept is green-filled, reject is a quiet red. */
+.anno-decide {
+  margin-top: 2px;
+}
+.anno-opt.anno-accept {
+  border-color: #86d3a3;
+  background: #d9f5e5;
+  color: #0f6a30;
+}
+.anno-opt.anno-accept:hover {
+  background: #c3edd4;
+}
+.anno-opt.anno-reject {
+  border-color: #f0c2c2;
+  background: #fdeeee;
+  color: #b91c1c;
+}
+.anno-opt.anno-reject:hover {
+  background: #f9dede;
 }
 
 /* ── image card (image-cards-on-canvas) ─────────── */

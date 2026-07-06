@@ -45,12 +45,16 @@ export interface AnnotationInfo {
   range: { start: number; end: number; method: string } | null; // source offsets (informational here)
   // Anchored async-ask (docs/anchored-async-ask.md §4/§6, W2): a `kind:"question"` create carries
   // `options`/`blocking`; the human's decision rides `answer`; `state` is the read-time question state.
-  kind?: "note" | "question";
+  // A `kind:"suggestion"` (track-changes) carries `replacement` (the proposed span text) and `decision`
+  // (accepted/rejected); its `state` is pending/accepted/rejected.
+  kind?: "note" | "question" | "suggestion";
   options?: AnnotationOption[];
   blocking?: boolean;
+  replacement?: string; // a kind:"suggestion"'s proposed replacement for the anchored span
+  decision?: "accepted" | "rejected"; // a suggestion's terminal decision
   answered?: boolean;
   answer?: { by: string; choice?: string; text: string; ts: number };
-  state?: "awaiting" | "answered" | "resolved"; // present only for a kind:"question"
+  state?: "awaiting" | "answered" | "resolved" | "pending" | "accepted" | "rejected";
 }
 
 /** A doc's watcher (P1/W4, docs/anchored-async-ask.md §4) — a role armed to be woken by a comment. */
@@ -252,6 +256,7 @@ export function caretPointAt(x: number, y: number): { node: Node; offset: number
 export interface CardHighlightRanges {
   open: Range[];
   question: Range[]; // an anchored question (kind:"question") — painted distinctly from a comment (W2)
+  suggestion: Range[]; // a track-changes suggestion (kind:"suggestion") — painted distinctly again
   resolved: Range[];
   active: Range[];
 }
@@ -259,6 +264,7 @@ export interface CardHighlightRanges {
 const HIGHLIGHT_NAMES: Record<keyof CardHighlightRanges, string> = {
   open: "anno-open",
   question: "anno-question",
+  suggestion: "anno-suggestion",
   resolved: "anno-resolved",
   active: "anno-active",
 };

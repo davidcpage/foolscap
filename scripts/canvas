@@ -67,6 +67,10 @@ canvas — session/coordination verbs over the agent bus
         --options are multiple-choice labels (split on |); --blocking marks you as waiting. Prints id + orphaned.
   scripts/canvas anno answer <PATH> <ID> [--choice LABEL] [--text "…" | --stdin | --text-file F] [--by ID]
         answer a question (an option label and/or prose); flips it awaiting → answered.
+  scripts/canvas anno suggest <PATH> (--anchor-exact "…"|--anchor-file F) (--replacement "…"|--replacement-file F) [--note "…"] [--from ID]
+        propose a track-changes edit: replace the anchored span with the replacement, decided as a unit.
+  scripts/canvas anno accept|reject <PATH> <ID> [--by ID]
+        accept applies the replacement to the file's bytes + resolves; reject resolves, bytes untouched.
   scripts/canvas anno watch <PATH> [--role R] [--level all|mentions|paused] [--pause|--resume|--unwatch] [--by ID]
         watch a doc for comments (P1/W4) — bind a ROLE as a watcher at a notification level (the durable
         "who to wake when a comment lands"). --pause/--resume toggle without losing the level; --unwatch drops
@@ -153,11 +157,16 @@ for a in ann:
     if a["resolved"]:            st = "done  "
     elif a["orphaned"]:          st = "ORPHAN"
     elif a.get("kind") == "question": st = "Q-answ" if a.get("state") == "answered" else "Q-wait"
+    elif a.get("kind") == "suggestion": st = "S-prop"
     else:                        st = "open  "
     q = (a["anchor"].get("exact", "") or "").replace("\n", " ")
     if len(q) > 52: q = q[:51] + "…"
     opts = a.get("options") or []
     if opts: q += "  {" + "|".join(o.get("label", "") for o in opts) + "}"
+    if a.get("kind") == "suggestion":
+        rep = (a.get("replacement", "") or "").replace("\n", " ")
+        if len(rep) > 40: rep = rep[:39] + "…"
+        q += f'  → "{rep}"'
     reps = a.get("replies", [])
     tail = ""
     if reps:
@@ -282,6 +291,55 @@ PY
 )
   post "$(ANNO_URL)" "$body"; echo
 }
+# Propose a track-changes SUGGESTION (a create with kind:"suggestion") — replace the anchored span with
+# --replacement text, accepted or rejected as a unit. The anchor is a quote like a plain create; the
+# replacement rides --replacement "…" or --replacement-file F (a long body, no shell-escaping).
+anno_suggest() {
+  local from="human" exact="" afile="" prefix="" suffix="" replacement="" rfile="" note="" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --from) from="${2:-}"; shift 2 ;;
+    --anchor-exact) exact="${2:-}"; shift 2 ;; --anchor-file) afile="${2:-}"; shift 2 ;;
+    --anchor-prefix) prefix="${2:-}"; shift 2 ;; --anchor-suffix) suffix="${2:-}"; shift 2 ;;
+    --replacement) replacement="${2:-}"; shift 2 ;; --replacement-file) rfile="${2:-}"; shift 2 ;;
+    --note|--text) note="${2:-}"; shift 2 ;;
+    --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno suggest: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}"
+  if [ -z "$path" ]; then
+    echo "usage: canvas anno suggest <path> (--anchor-exact \"…\" | --anchor-file F) (--replacement \"…\" | --replacement-file F) [--note \"…\"] [--from ID]" >&2; exit 2; fi
+  [ -n "$afile" ] && exact="$(cat "$afile")"
+  [ -n "$rfile" ] && replacement="$(cat "$rfile")"
+  if [ -z "$exact" ]; then echo "anno suggest: --anchor-exact (or --anchor-file) is required" >&2; exit 2; fi
+  # An empty replacement is a valid deletion proposal, so there's no non-empty check on it.
+  local body; body=$(python3 - "$path" "$from" "$exact" "$prefix" "$suffix" "$replacement" "$note" <<'PY'
+import json, sys
+path, frm, exact, prefix, suffix, replacement, note = sys.argv[1:8]
+anchor = {"exact": exact}
+if prefix: anchor["prefix"] = prefix
+if suffix: anchor["suffix"] = suffix
+o = {"op": "create", "path": path, "author": frm, "kind": "suggestion",
+     "text": note or "suggested edit", "anchor": anchor, "replacement": replacement}
+print(json.dumps(o))
+PY
+)
+  post "$(ANNO_URL)" "$body"; echo
+}
+# Decide a suggestion: accept (apply the replacement to the file's bytes + resolve) or reject (resolve,
+# bytes untouched). Both are one-shot — a decided suggestion is refused.
+anno_decide() { # $1 = accept|reject
+  local op="$1"; shift
+  local by="human" pos=()
+  while [ $# -gt 0 ]; do case "$1" in
+    --by) by="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
+    --*) echo "anno $op: unknown flag '$1'" >&2; exit 2 ;;
+    *) pos+=("$1"); shift ;;
+  esac; done
+  local path="${pos[0]:-}" id="${pos[1]:-}"
+  if [ -z "$path" ] || [ -z "$id" ]; then echo "usage: canvas anno $op <path> <id> [--by ID]" >&2; exit 2; fi
+  post "$(ANNO_URL)" "{\"op\":\"$op\",\"path\":$(jstr "$path"),\"id\":$(jstr "$id"),\"by\":$(jstr "$by")}"; echo
+}
 # Watch a doc for comments (docs/anchored-async-ask.md §2, wakeable-substrate-plan W4 — P1). Binds a ROLE
 # as a watcher on the doc at a notification LEVEL (all/mentions/paused), the durable "who to wake when a
 # comment lands" — a seat, one surface up from a thread. --pause/--resume toggle it without losing the
@@ -329,10 +387,12 @@ anno() {
     batch) anno_batch "$@" ;;
     ask) anno_ask "$@" ;;
     answer) anno_answer "$@" ;;
+    suggest) anno_suggest "$@" ;;
+    accept|reject) anno_decide "$sub" "$@" ;;
     watch) anno_watch "$@" ;;
     resolve|reopen) anno_setstate "$sub" "$@" ;;
-    ""|-h|--help|help) echo "canvas anno list|reply|batch|ask|answer|watch|resolve|reopen — see 'canvas' for details" >&2 ;;
-    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|ask|answer|watch|resolve|reopen)" >&2; exit 2 ;;
+    ""|-h|--help|help) echo "canvas anno list|reply|batch|ask|answer|suggest|accept|reject|watch|resolve|reopen — see 'canvas' for details" >&2 ;;
+    *) echo "anno: unknown subcommand '$sub' (list|reply|batch|ask|answer|suggest|accept|reject|watch|resolve|reopen)" >&2; exit 2 ;;
   esac
 }
 
