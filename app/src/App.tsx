@@ -184,18 +184,16 @@ function Board({ m, undo, persistence }: Engine) {
   // point so a chosen widget lands under the cursor. Null = closed.
   const [menu, setMenu] = useState<{ screen: Pos; at: Pos } | null>(null);
 
-  // Saved camera views + the unwind stack (views.ts). Per-board, created once. A brief toast confirms a
-  // save/recall — these are keyboard moves with no on-screen target, so a flicker of feedback matters.
-  const views = useMemo(() => new ViewStore(activeBoardId()), []);
+  // The camera unwind stack (views.ts), created once. A brief toast confirms a keyboard move with no
+  // on-screen target (e.g. "nothing to go back to"), so a flicker of feedback matters.
+  const views = useMemo(() => new ViewStore(), []);
   const [toast, setToast] = useState<{ text: string; seq: number } | null>(null);
   const toastSeq = useRef(0);
-  // TAP Alt/Option to cycle the minimap through three modes: Off → On (plain map) → Frames (map +
-  // numbered saved-view frames, where numbers jump and Alt+Shift+N saves) → Off. A simple explicit
-  // cycle, no auto-show/fade — the minimap is just in the state you put it in. "Tap" = Alt pressed and
-  // released ALONE — if another key OR a pointer press happens while Alt is down it's a combo
-  // (Alt+Shift+N save, an alt-drag wire, …) and must not cycle. Tracked window-wide; a click or blur
-  // clears the pending tap so it never fires spuriously.
-  const [minimapMode, setMinimapMode] = useState<0 | 1 | 2>(0);
+  // TAP Alt/Option to toggle the minimap On ↔ Off. A simple explicit toggle, no auto-show/fade — the
+  // minimap is just in the state you put it in. "Tap" = Alt pressed and released ALONE — if another key
+  // OR a pointer press happens while Alt is down it's a combo (an alt-drag wire, …) and must not toggle.
+  // Tracked window-wide; a click or blur clears the pending tap so it never fires spuriously.
+  const [minimapMode, setMinimapMode] = useState<0 | 1>(0);
   useEffect(() => {
     let pristine = false; // Alt is down with nothing else since → still a tap candidate
     const down = (e: KeyboardEvent) => {
@@ -205,7 +203,7 @@ function Board({ m, undo, persistence }: Engine) {
     };
     const up = (e: KeyboardEvent) => {
       if (e.key !== "Alt") return;
-      if (pristine) setMinimapMode((v) => ((v + 1) % 3) as 0 | 1 | 2);
+      if (pristine) setMinimapMode((v) => (v ? 0 : 1));
       pristine = false;
     };
     const cancel = () => {
@@ -444,28 +442,14 @@ function Board({ m, undo, persistence }: Engine) {
         if (prev) m.flyTo(prev);
         else flash("nothing to go back to");
       } else if (!meta && /^Digit[1-9]$/.test(e.code)) {
-        // The view keymap, all on the number row (`code` not `key` so it's layout-proof — Shift/Alt
-        // mangle the printed `key`):
-        //   Shift+1 / Shift+2  → zoom to fit all / to selection (the tldraw pair)
-        //   Alt+Shift+N        → save the current pose to slot N. A combo, so the Alt press never
-        //                        toggles Frames mode (see the tap detection above).
-        //   N (Frames mode on) → jump to saved view N. Numbers navigate ONLY while the minimap's
-        //                        Frames mode is on (tap Alt) — so they're inert otherwise and a stray
-        //                        digit can't clobber a slot or jump unexpectedly.
+        // The view keymap, on the number row (`code` not `key` so it's layout-proof — Shift mangles the
+        // printed `key`): Shift+1 / Shift+2 → zoom to fit all / to selection (the tldraw pair). Bare and
+        // Alt-modified digits are free (no saved-view slots).
         const n = Number(e.code.slice(5));
-        if (e.altKey && e.shiftKey) {
-          e.preventDefault();
-          views.save(n, m.camera.state);
-          flash(`saved view ${n}`);
-        } else if (e.shiftKey) {
+        if (e.shiftKey) {
           e.preventDefault();
           if (n === 1) navigate(() => m.fitAll(isFloating));
           else if (n === 2) navigate(() => m.fitSelection(isFloating));
-        } else if (!e.altKey && minimapMode === 2) {
-          e.preventDefault();
-          const v = views.recall(n);
-          if (v) navigate(() => m.flyTo(v));
-          else flash(`view ${n} empty · ⌥⇧${n} to save`);
         }
       } else if ((e.key === "p" || e.key === "P") && !meta) {
         // Pin / unpin the single selected card (float it in the viewport ⇄ drop it on the canvas).
@@ -477,7 +461,7 @@ function Board({ m, undo, persistence }: Engine) {
       } else if (e.key === "v" || e.key === "V") m.setTool("select");
       else if (e.key === "h" || e.key === "H") m.setTool("hand");
     },
-    [m, undo, deleteSelected, views, navigate, flash, togglePin, minimapMode],
+    [m, undo, deleteSelected, views, navigate, flash, togglePin],
   );
 
   // Drag-out from a browser card: a row dragged out of a directory card (a file/sub-folder,
@@ -676,7 +660,7 @@ function Board({ m, undo, persistence }: Engine) {
 
       {/* The minimap HUD — a sibling of the canvas (so its pointer events never reach the interaction
           engine). Tap Alt to cycle Off → On → Frames (+ numbered view frames). */}
-      <MinimapHud m={m} views={views} mode={minimapMode} />
+      <MinimapHud m={m} mode={minimapMode} />
 
       {/* The only standing chrome: a faint cue on an empty board, since right-click is otherwise invisible. */}
       {nodes.length === 0 && (

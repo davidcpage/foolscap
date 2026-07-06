@@ -1,25 +1,18 @@
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { boxCenter, screenToPage, worldBounds, type Box, type CameraState, type InteractionManager } from "./lib";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { boxCenter, worldBounds, type Box, type InteractionManager } from "./lib";
 import { useSignal } from "./reactive";
 import { sessionListSignal } from "./content";
 import { STATUS_COLOR, type SessionStatus } from "./session-status";
-import type { ViewStore } from "./views";
 
-// The minimap HUD — navigation chrome, not a card. Tapping Alt cycles it through three modes (Off → On →
-// Frames; `mode` 0/1/2): Off is hidden, On shows the plain map, Frames adds the numbered saved-view
-// frames (a number jumps, Alt+Shift+N saves). No auto-show/fade — it's simply in the state you put it
-// in. It lives OUTSIDE the canvas's DOM subtree (a sibling of the bindDom element), so its pointer
-// events never reach the interaction engine and it can use plain React handlers (it also preventDefaults
-// mousedown so a click on it never steals keyboard focus from the canvas — otherwise the number keys,
-// handled on the canvas, would go dead). Reuses worldBounds + the camera + ViewStore; pressing/dragging
-// the map recenters the camera, clicking a frame flies there.
+// The minimap HUD — navigation chrome, not a card. Tapping Alt toggles it On ↔ Off (`mode` 0/1): Off is
+// hidden, On shows the plain map (card rects + the board edges between them + the viewport frustum). No
+// auto-show/fade — it's simply in the state you put it in. It lives OUTSIDE the canvas's DOM subtree (a
+// sibling of the bindDom element), so its pointer events never reach the interaction engine and it can
+// use plain React handlers (it also preventDefaults mousedown so a click on it never steals keyboard
+// focus from the canvas — otherwise the number keys, handled on the canvas, would go dead). Reuses
+// worldBounds + the camera; pressing/dragging the map recenters the camera.
 
-// One hue per saved-view slot 1–9, chosen for strong contrast between ADJACENT slots (red→green→blue…)
-// so neighbouring frames never read as the same colour. Yellow is omitted (too faint on the pale map).
-const FRAME_HUES = ["#ef4444", "#22c55e", "#3b82f6", "#f97316", "#a855f7", "#14b8a6", "#ec4899", "#a16207", "#64748b"];
-const hue = (n: number): string => FRAME_HUES[(n - 1) % FRAME_HUES.length] ?? "#64748b";
-
-export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: ViewStore; mode: 0 | 1 | 2 }) {
+export function MinimapHud({ m, mode }: { m: InteractionManager; mode: 0 | 1 }) {
   // Visibility is purely the explicit cycle (no auto-show/fade). The SHELL stays mounted so the CSS
   // opacity transition runs both ways; the BODY — which subscribes to the camera and rebuilds an SVG
   // rect per card on every pan/zoom frame — unmounts once the fade-out completes. It used to stay
@@ -42,40 +35,31 @@ export function MinimapHud({ m, views, mode }: { m: InteractionManager; views: V
       // would otherwise blur it and the digit shortcuts would go dead until you clicked the canvas again.
       onMouseDown={(e) => e.preventDefault()}
     >
-      {renderBody && <MinimapBody m={m} views={views} mode={mode} />}
+      {renderBody && <MinimapBody m={m} />}
     </div>
   );
 }
 
-function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewStore; mode: 0 | 1 | 2 }) {
+function MinimapBody({ m }: { m: InteractionManager }) {
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
   const nodeQuery = useMemo(() => store.query({ typeName: "node" }), [store]);
   const nodes = useSignal(nodeQuery);
+  const edgeQuery = useMemo(() => store.query({ typeName: "edge" }), [store]);
+  const edges = useSignal(edgeQuery);
   useSignal(m.camera.signal); // re-project rects + frustum as the camera pans/zooms
   const svgRef = useRef<SVGSVGElement>(null);
   const dragging = useRef(false);
 
-  // Re-render when a saved view is added/removed so the frames track it live (ViewStore isn't a signal).
-  const [, force] = useReducer((x: number) => x + 1, 0);
-  useEffect(() => views.subscribe(force), [views]);
-
-  // Keep the frames PAINTED through the panel's fade-out when leaving Frames mode, so Frames→Off is one
-  // transition (frames fade WITH the panel) rather than the frames vanishing a beat before it hides.
-  const [renderFrames, setRenderFrames] = useState(mode === 2);
-  useEffect(() => {
-    if (mode === 2) {
-      setRenderFrames(true);
-      return;
-    }
-    const t = setTimeout(() => setRenderFrames(false), 220); // ~ the CSS opacity transition
-    return () => clearTimeout(t);
-  }, [mode]);
-
   const colorOf = useMemo(() => {
     const map = new Map<string, string>();
     for (const n of nodes) map.set(n.id, n.color);
+    return map;
+  }, [nodes]);
+  const typeOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const n of nodes) map.set(n.id, n.type);
     return map;
   }, [nodes]);
 
@@ -102,27 +86,37 @@ function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewSto
   // reconciling one rect per card per pan frame.
   const cardRects = useMemo(
     () =>
-      world.map((l) => (
-        <rect
-          key={l.nodeId}
-          className={`minimap-card c-${colorOf.get(l.nodeId) ?? "blue"}`}
-          x={l.x}
-          y={l.y}
-          width={l.w}
-          height={l.h}
-        />
-      )),
-    [world, colorOf],
+      world.map((l) => {
+        const cls = `minimap-card c-${colorOf.get(l.nodeId) ?? "blue"}`;
+        // The clock card reads as a CIRCLE in the minimap (it's a clock face), so it's recognisable at a
+        // glance; every other card is a plain rect. Radius = half the smaller dimension, centred on the rect.
+        if (typeOf.get(l.nodeId) === "clock") {
+          return (
+            <circle key={l.nodeId} className={cls} cx={l.x + l.w / 2} cy={l.y + l.h / 2} r={Math.min(l.w, l.h) / 2} />
+          );
+        }
+        return <rect key={l.nodeId} className={cls} x={l.x} y={l.y} width={l.w} height={l.h} />;
+      }),
+    [world, colorOf, typeOf],
   );
+  // The board edges, drawn as thin lines between the centres of the two cards they connect — painted
+  // UNDER the card rects (first in document order). Same page-space coords as the rects; an edge whose
+  // endpoint has no world layout (a screen-anchored or missing node) is skipped.
+  const edgeLines = useMemo(() => {
+    const center = new Map<string, { cx: number; cy: number }>();
+    for (const l of world) center.set(l.nodeId, { cx: l.x + l.w / 2, cy: l.y + l.h / 2 });
+    return edges.flatMap((e) => {
+      const a = center.get(e.from);
+      const b = center.get(e.to);
+      if (!a || !b) return [];
+      return [<line key={e.id} className="minimap-edge" x1={a.cx} y1={a.cy} x2={b.cx} y2={b.cy} />];
+    });
+  }, [world, edges]);
   const wb = worldBounds(store, (l) => l.anchor === "screen");
   const view = m.visibleBox();
   // Drawn extent = content ∪ current viewport (so the frustum stays in frame even parked in empty
-  // space), then padded; with the view frames summoned, union them in too so off-screen views show.
-  const vp = m.viewportSize;
-  const frames = renderFrames && vp.w > 0 ? views.entries().map(([n, pose]) => ({ n, box: viewRect(pose, vp.w, vp.h) })) : [];
-  let extSrc = unionBox(wb, view);
-  for (const f of frames) extSrc = unionBox(extSrc, f.box);
-  const ext = padBox(extSrc ?? { x: 0, y: 0, w: 1, h: 1 }, 0.06);
+  // space), then padded.
+  const ext = padBox(unionBox(wb, view) ?? { x: 0, y: 0, w: 1, h: 1 }, 0.06);
   const labelSize = Math.max(ext.w, ext.h) * 0.045;
 
   // ── interaction (plain React — we're outside the canvas subtree) ──
@@ -154,12 +148,6 @@ function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewSto
     dragging.current = false;
     svgRef.current?.releasePointerCapture(e.pointerId);
   };
-  const jump = (n: number) => {
-    const pose = views.recall(n);
-    if (!pose) return;
-    views.pushHistory(m.camera.state); // so ` steps back out of the jump
-    m.flyTo(pose);
-  };
 
   return (
     <div className="minimap">
@@ -173,6 +161,7 @@ function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewSto
         onPointerMove={onMove}
         onPointerUp={onUp}
       >
+        {edgeLines}
         {cardRects}
         {world.map((l) => {
             const st = statusOf.get(l.nodeId);
@@ -195,32 +184,11 @@ function MinimapBody({ m, views, mode }: { m: InteractionManager; views: ViewSto
             );
           })}
         {view && <rect className="minimap-frustum" x={view.x} y={view.y} width={view.w} height={view.h} />}
-        {frames.map(({ n, box }) => (
-          <g
-            key={n}
-            className="minimap-view"
-            onPointerDown={(e) => {
-              e.stopPropagation(); // a frame click jumps; it must not also recenter
-              jump(n);
-            }}
-          >
-            <rect x={box.x} y={box.y} width={box.w} height={box.h} fill={hue(n)} fillOpacity={0.08} stroke={hue(n)} strokeWidth={2} vectorEffect="non-scaling-stroke" />
-            <text x={box.x + labelSize * 0.35} y={box.y + labelSize * 1.05} fontSize={labelSize} fill={hue(n)} fontWeight={700}>
-              {n}
-            </text>
-          </g>
-        ))}
       </svg>
     </div>
   );
 }
 
-// The page-space rectangle a saved camera pose would show (its visibleBox at that pose).
-const viewRect = (c: CameraState, vw: number, vh: number): Box => {
-  const tl = screenToPage(c, { x: 0, y: 0 });
-  const br = screenToPage(c, { x: vw, y: vh });
-  return { x: tl.x, y: tl.y, w: br.x - tl.x, h: br.y - tl.y };
-};
 const unionBox = (a: Box | null, b: Box | null): Box | null => {
   if (!a) return b;
   if (!b) return a;

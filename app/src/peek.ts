@@ -33,10 +33,15 @@ const MOVE_THRESHOLD_PX = 4; // cursor travel below this doesn't count as aiming
 const PREVIEW_DEPTH = 1; // how far toward the final pose a hover flies (log-zoom fraction). 1 = the
 // preview IS the final view and releasing z is motionless confirmation — a partial depth (0.65 was
 // tried) left a residual zoom on release that read as unexpected movement, not context
-const HOVER_DELAY_MS = 60; // settle on a card this long before the preview flies — kept short: the
-// real sweep-calming is the LONG gentle flight (below), whose slow first beats are cancellable warning
-const PREVIEW_FLIGHT_MS = 450; // the preview flight, deliberately slower than flyTo's default 300 —
-// its eased start doubles as the hover warning, so the delay above could shrink
+const HOVER_DELAY_MS = 220; // settle on a card this long before the preview flies. Deliberately generous:
+// a card you merely CROSS while sweeping the cursor toward your real target must not grab focus — only a
+// card you come to rest on should. (Was 60ms, which let a mid-move crossing steal the zoom target.)
+const PREVIEW_FLIGHT_MS = 500; // the preview / backout / dive flight, deliberately slower than flyTo's
+// default 300 — its eased start (easeInOutQuad) doubles as the hover warning, so the delay above could shrink
+const PEEK_OUT_MS = 520; // the OPENING fly-out on z-down — the gesture's very first motion, so the most
+// unhurried of all: over flyTo's fixed ease-in a longer flight ramps the zoom-out up gently instead of
+// snapping (the default 300 read as too aggressive a START). A touch longer than the preview since it
+// covers the whole zoom-out range from wherever the camera happened to be.
 const BACKOUT_DELAY_MS = 120; // off every card this long → fly back out to the overview. Short on
 // purpose: at full preview depth the rest of the board is out of view, so leaving the card's border
 // must return the overview promptly or there's no way to aim at the next card
@@ -107,6 +112,34 @@ export function bindPeek(
     return { x: pose.x + dx, y: pose.y + dy, z: pose.z };
   };
 
+  // The FIXED zoom the dive (and its preview) targets for a card, INDEPENDENT of the pre-press zoom —
+  // fit the card into the viewport (pad 0.15), but cap the zoom-IN at maxZoom 1 (actual size). So a
+  // LARGE card fits comfortably to screen (fit zoom < 1, unchanged), while a SMALL card lands at ~actual
+  // size instead of being magnified to fill the screen — small cards never want to be full-screen, and
+  // maxZoom 2 (the sh-2 framing) over-magnified them into an uncomfortably close landing. Falls back to
+  // the given zoom only if the card/viewport can't be measured.
+  const diveZoom = (l: LayoutRecord, fallback: number): number => {
+    const fit = m.camera.fitState(
+      { x: l.x, y: l.y, w: l.w, h: l.h },
+      el.clientWidth,
+      el.clientHeight,
+      { pad: 0.15, maxZoom: 1 },
+    );
+    return fit ? fit.z : fallback;
+  };
+
+  // The world card currently under the cursor (screen-anchored chrome excluded) — used at release to
+  // pick the dive target directly from the pointer, so a quick aim-and-release that never let the
+  // preview settle on the card still dives to it (not to the last previewed card / bare-canvas overview).
+  const cardUnderCursor = (): LayoutRecord | null => {
+    if (!last) return null;
+    const host = document.elementFromPoint(last.x, last.y)?.closest<HTMLElement>("[data-node-id]") ?? null;
+    const id = host?.dataset.nodeId;
+    if (!id) return null;
+    const l = m.editor.store.get<"layout">(layoutId(id as Id<"node">));
+    return l && l.anchor !== "screen" ? l : null;
+  };
+
   const endPeek = () => {
     clearTimers();
     hoverId = null;
@@ -168,11 +201,15 @@ export function bindPeek(
         if (!l || l.anchor === "screen") return;
         hoverId = id;
         // Fly PREVIEW_DEPTH of the log-zoom way from the overview to the dive, anchored at the
-        // cursor and framed so the settled card is fully in view. Depth is measured pose-to-pose
-        // (not from wherever the camera currently is), so retargeting card-to-card holds a
-        // consistent altitude — and at that altitude the move is framedPose's pan (see above).
+        // cursor and framed so the settled card is fully in view. The dive target is the card's FIXED
+        // fit zoom (diveZoom, not the pre-press zoom — capped at actual size so small cards aren't
+        // over-magnified), so at PREVIEW_DEPTH=1 the preview IS the dive and release is motionless.
+        // Depth is measured pose-to-pose (not from wherever the camera
+        // currently is), so retargeting card-to-card holds a consistent altitude — and at that altitude
+        // the move is framedPose's pan (see above).
+        const target = diveZoom(l, prePeek.z);
         const z = Math.exp(
-          Math.log(overview.z) + (Math.log(prePeek.z) - Math.log(overview.z)) * PREVIEW_DEPTH,
+          Math.log(overview.z) + (Math.log(target) - Math.log(overview.z)) * PREVIEW_DEPTH,
         );
         m.flyTo(framedPose(anchoredPose(z), l), { durationMs: PREVIEW_FLIGHT_MS });
       }, HOVER_DELAY_MS);
@@ -206,7 +243,7 @@ export function bindPeek(
     // Compute the overview pose ourselves (rather than m.fitAll) so backout knows where "out" is.
     const box = worldBounds(m.editor.store, opts.skipLayout);
     overview = box ? m.camera.fitState(box, el.clientWidth, el.clientHeight, { pad: 0.08, maxZoom: 1 }) : null;
-    if (overview) m.flyTo(overview); // empty board / unmeasured viewport: keyup just bounces home
+    if (overview) m.flyTo(overview, { durationMs: PEEK_OUT_MS }); // empty board / unmeasured viewport: keyup just bounces home
     setPeekNavigationActive(true);
     el.classList.add("peeking");
   };
@@ -220,10 +257,18 @@ export function bindPeek(
     const from = prePeek;
     prePeek = null;
     endPeek();
-    // Dive: complete the zoom to the level you left, anchored at the cursor — from the overview or
-    // from a preview mid-flight alike, it's the same dilation, just carried to full depth. The
-    // camera is the only geometry, so what's under the cursor is exactly what you land on.
-    m.flyTo(anchoredPose(from.z));
+    // Dive: land on a FIXED fit zoom of the aimed card (diveZoom — fit-to-screen for large cards, capped
+    // at actual size so small cards aren't over-magnified), anchored at the cursor and framed so the card
+    // sits comfortably in view — independent of the pre-press zoom. The card is read straight from the
+    // pointer, so a quick aim-and-release dives correctly even if no preview settled. Aimed at bare canvas
+    // (no card): fall back to the pre-press zoom at the cursor.
+    const l = cardUnderCursor();
+    // A settled preview already sits AT this pose (PREVIEW_DEPTH=1), so this is motionless; the gentle
+    // duration only shapes the quick aim-and-release case, where it's the full zoom-in — keep it unhurried
+    // like the way in rather than the default 300 snap.
+    m.flyTo(l ? framedPose(anchoredPose(diveZoom(l, from.z)), l) : anchoredPose(from.z), {
+      durationMs: PREVIEW_FLIGHT_MS,
+    });
     opts.onDive?.(from);
   };
 

@@ -3075,15 +3075,12 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   stroke-width: 2px;
   vector-effect: non-scaling-stroke;
 }
-/* Numbered saved-view frames, shown only while Alt summons the HUD. Each is clickable to fly there. */
-.minimap-view {
-  cursor: pointer;
-}
-.minimap-view text {
-  user-select: none;
-  paint-order: stroke;
-  stroke: #ffffffcc;
-  stroke-width: 0.5px;
+/* Board edges, drawn under the card rects — thin neutral links so the graph structure reads at minimap
+   scale without competing with the cards. Constant 1px screen regardless of the viewBox scale. */
+.minimap-edge {
+  stroke: #94a3b8;
+  stroke-opacity: 0.55;
+  stroke-width: 1px;
   vector-effect: non-scaling-stroke;
 }
 
