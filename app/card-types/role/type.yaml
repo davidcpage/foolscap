@@ -12,8 +12,11 @@
 #   • `roleSave` — the serialize-back ACTION: a per-card bound fn taking {name, colour, charter} that the host
 #     serialises (renderRoleFile) and writes back to role.md through the file path (POST /api/file). The
 #     watcher then refreshes `roleDoc` here and pings the roles list. An edit is a file write, not a log event.
+#   • `treeState` — per-card EPHEMERAL view state (never logged, gone on reload): holds the edit⇄preview flag
+#     so the charter renders as FORMATTED MARKDOWN by default and only flips to the raw <textarea> on edit,
+#     the same prose-by-default/click-to-edit split the notebook card uses.
 #
 # No `chrome` flag: an editor wants its frame (like the sticky / notebook card).
 name: role
 contract: 1
-capabilities: [roleDoc, roleSave]
+capabilities: [roleDoc, roleSave, treeState]

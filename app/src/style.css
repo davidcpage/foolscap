@@ -1281,6 +1281,16 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   border-color: #a5b4fc;
   background: #fff;
 }
+/* The formatted (default) charter view: the same box as the textarea, but the markdown is rendered as prose
+   (.md-prose supplies the per-block spacing) and the body scrolls when it overflows the card. */
+.role-charter-view {
+  overflow-y: auto;
+  background: #fff;
+}
+.role-charter-empty {
+  color: #a1a1aa;
+  font-style: italic;
+}
 
 /* ── feed cards (off-log bodies: git HEAD, HN) ───────────── */
 .node.feed {

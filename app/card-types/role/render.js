@@ -8,6 +8,7 @@
 // already-spawned cards' @-tags (agreed with the backend). COLOUR + CHARTER are editable. Colour clicks save
 // at once; the charter saves on blur / the Save button (no-op guarded, like the notebook card's commit).
 import { html } from "/vendor/lit-html.js";
+import { renderMd } from "/vendor/markdown.js";
 
 // The note palette, hardcoded (a template can't import core's NOTE_COLORS) — the same keys the sticky card
 // uses, so the swatch row matches the rest of the board.
@@ -24,6 +25,13 @@ export default {
     const doc = card.signals.roleDoc;
     const save = card.signals.roleSave;
     const canEdit = Boolean(save);
+    // The charter is markdown PROSE, so it renders formatted by default (the shared /vendor/markdown.js codec,
+    // the same one the file / session / notebook cards use) and only flips to a raw <textarea> when the user
+    // clicks edit — the notebook card's prose-by-default / click-to-edit split. `editing` is per-card ephemeral
+    // view state (treeState): never logged, gone on reload. A read-only mount (no save) can never edit, so it
+    // always shows formatted prose — which was the whole bug: the charter used to be a bare textarea.
+    const editState = card.signals.treeState;
+    const editing = canEdit && editState?.get() === true;
 
     if (!doc) return html`<div class="role-card"><div class="dir-empty">loading…</div></div>`;
 
@@ -43,6 +51,12 @@ export default {
       if (same(charter.trim(), (doc.charter ?? "").trim())) return; // no-op guard
       save({ roleId: doc.roleId, name: doc.name, colour: doc.colour ?? null, charter });
     };
+    // Save (if changed) and drop back to the formatted-prose view. Reads the textarea before it's unmounted,
+    // so the toggle click never discards an in-progress edit.
+    const saveAndClose = (root) => {
+      saveCharter(root);
+      editState?.set(false);
+    };
 
     return html`
       <div class="role-card">
@@ -50,17 +64,25 @@ export default {
           <span class="role-swatch role-head-swatch c-${doc.colour || "blue"}"></span>
           <span class="role-name" title=${`role id: ${doc.roleId} · name is fixed (rename is a later story)`}>${doc.name}</span>
           ${canEdit
-            ? html`<button
-                class="role-save"
-                type="button"
-                title="save the charter"
-                @mousedown=${(e) => e.preventDefault()}
-                @click=${(e) => saveCharter(e.currentTarget.closest(".role-card"))}
-              >save</button>`
+            ? editing
+              ? html`<button
+                  class="role-save"
+                  type="button"
+                  title="save the charter and return to the formatted view"
+                  @mousedown=${(e) => e.preventDefault()}
+                  @click=${(e) => saveAndClose(e.currentTarget.closest(".role-card"))}
+                >done</button>`
+              : html`<button
+                  class="role-save"
+                  type="button"
+                  title="edit the charter markdown"
+                  @mousedown=${(e) => e.preventDefault()}
+                  @click=${() => editState?.set(true)}
+                >edit</button>`
             : ""}
         </div>
 
-        ${canEdit
+        ${canEdit && editing
           ? html`<div class="role-swatch-row" title="role colour">
               ${COLOURS.map(
                 (c) => html`<button
@@ -75,15 +97,18 @@ export default {
           : ""}
 
         <div class="role-charter-label">charter</div>
-        <textarea
-          class="role-charter"
-          data-interactive="1"
-          ?readonly=${!canEdit}
-          placeholder="Describe this role — the charter is appended to a session's prompt when it's launched as this role."
-          .value=${doc.charter ?? ""}
-          @keydown=${(e) => e.stopPropagation()}
-          @blur=${(e) => saveCharter(e.currentTarget.closest(".role-card"))}
-        ></textarea>
+        ${editing
+          ? html`<textarea
+              class="role-charter"
+              data-interactive="1"
+              placeholder="Describe this role — the charter is appended to a session's prompt when it's launched as this role."
+              .value=${doc.charter ?? ""}
+              @keydown=${(e) => e.stopPropagation()}
+              @blur=${(e) => saveCharter(e.currentTarget.closest(".role-card"))}
+            ></textarea>`
+          : doc.charter?.trim()
+            ? html`<div class="role-charter role-charter-view md-prose" data-text>${renderMd(doc.charter)}</div>`
+            : html`<div class="role-charter role-charter-view role-charter-empty">${canEdit ? "No charter yet — click edit to describe this role." : "No charter."}</div>`}
       </div>
     `;
   },

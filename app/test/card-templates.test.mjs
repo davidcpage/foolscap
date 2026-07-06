@@ -1311,29 +1311,48 @@ test("roles template lists roles with colour swatches, a derived live count, and
 // agent-roles.md 2b: the role EDIT card — a structured view over role.md. The HOST parses role.md with the
 // shared codec and hands the card a `roleDoc` ({roleId,name,colour,charter}); the card renders name (read-only),
 // a colour swatch row (current ringed), and an editable charter, saving edits back through `roleSave`.
-test("role template edits a parsed role doc: read-only name, colour swatches, editable charter, save", async () => {
+test("role template renders the charter as formatted markdown by default, flips to an editor on edit", async () => {
   const mod = await loadTemplate("role");
   assert.equal(mod.contract, 1);
+
+  // A tiny stand-in for the per-card `treeState` ephemeral view-state signal (get/set), so the test can drive
+  // the edit⇄preview toggle exactly as a click would.
+  const editState = (init) => {
+    let v = init;
+    return { get: () => v, set: (n) => (v = n) };
+  };
 
   let saved = null;
   const card = {
     fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" },
     signals: {
-      roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "Answer in file:line." },
+      roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "# Oracle\n\nAnswer in file:line." },
       roleSave: (doc) => (saved = doc),
+      treeState: editState(undefined),
     },
   };
-  const out = flatten(mod.render(card));
 
-  assert.ok(out.includes("Oracle"), "the role name is shown");
-  assert.ok(out.includes("role-name"), "name rendered as a (read-only) heading, not an input");
-  assert.ok(out.includes("Answer in file:line."), "the charter text rides into the textarea");
-  assert.ok(out.includes("role-charter"), "an editable charter textarea");
-  assert.ok(out.includes("role-swatch-row"), "the colour swatch row renders with the save grant");
+  // Default (not editing): the charter is rendered PROSE, not a raw textarea — the markdown heading became an
+  // <h1>, and the editor chrome (textarea / colour swatches) is absent until the user clicks edit.
+  const preview = flatten(mod.render(card));
+  assert.ok(preview.includes("Oracle"), "the role name is shown");
+  assert.ok(preview.includes("role-name"), "name rendered as a (read-only) heading, not an input");
+  assert.ok(preview.includes("Answer in file:line."), "the charter text is shown");
+  assert.ok(preview.includes("role-charter-view") && preview.includes("md-prose"), "charter rendered as formatted markdown");
+  assert.ok(preview.includes("md-h1"), "the markdown # heading is formatted (md-h1), not left as raw text");
+  assert.ok(!preview.includes("<textarea"), "no raw textarea in the default (preview) view");
+  assert.ok(!preview.includes("role-swatch-row"), "colour picker hidden until editing");
+  assert.ok(preview.includes("role-save"), "an edit button with the save grant");
+
+  // Editing: treeState true → the raw textarea + colour swatches appear so the markdown can be edited.
+  card.signals.treeState.set(true);
+  const editView = flatten(mod.render(card));
+  assert.ok(editView.includes("<textarea"), "editing → the raw charter textarea");
+  assert.ok(editView.includes("Answer in file:line."), "the charter text rides into the textarea");
+  assert.ok(editView.includes("role-swatch-row"), "the colour swatch row renders while editing");
   for (const c of ["yellow", "pink", "blue", "green", "orange", "purple"])
-    assert.ok(out.includes(`c-${c}`), `a swatch for ${c}`);
-  assert.ok(out.includes("c-purple selected"), "the current colour (purple) is marked selected");
-  assert.ok(out.includes("role-save"), "an explicit save button with the grant");
+    assert.ok(editView.includes(`c-${c}`), `a swatch for ${c}`);
+  assert.ok(editView.includes("c-purple selected"), "the current colour (purple) is marked selected");
 
   // Direct dispatch through the capability (the DOM-gathering click handlers aren't exercised headless, but
   // the capability is the contract): a save carries the {roleId,name,colour,charter} shape the host serialises.
@@ -1344,14 +1363,15 @@ test("role template edits a parsed role doc: read-only name, colour swatches, ed
   const loading = flatten(mod.render({ fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" }, signals: {} }));
   assert.ok(loading.includes("loading…"), "no doc yet → loading placeholder");
 
-  // No roleSave grant (a read-only mount) → the charter is read-only and the editing chrome is absent, but the
-  // doc still renders (never throw for a missing capability — the sticky card's degrade rule).
+  // No roleSave grant (a read-only mount) → always the formatted view, no editing chrome, but the doc still
+  // renders (never throw for a missing capability — the sticky card's degrade rule).
   const ro = flatten(mod.render({
     fields: { title: ".canvas/roles/oracle/role.md", text: "", color: "orange" },
-    signals: { roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "x" } },
+    signals: { roleDoc: { roleId: "oracle", name: "Oracle", colour: "purple", charter: "# x" } },
   }));
-  assert.ok(ro.includes("?readonly=true"), "charter read-only without the save grant");
+  assert.ok(ro.includes("role-charter-view") && ro.includes("md-h1"), "read-only mount still renders formatted markdown");
+  assert.ok(!ro.includes("<textarea"), "no editable textarea without the save grant");
   assert.ok(ro.includes("Oracle") && ro.includes("role-name"), "still shows the role read-only");
   assert.ok(!ro.includes("role-swatch-row"), "no colour picker without the save grant");
-  assert.ok(!ro.includes("role-save"), "no save button without the grant");
+  assert.ok(!ro.includes("role-save"), "no edit/save button without the grant");
 });
