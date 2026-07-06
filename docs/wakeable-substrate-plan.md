@@ -61,7 +61,7 @@ dep) can run in parallel sessions.
 | W12 | **doc-edit optimistic-concurrency** (`baseVersion`→409) | SME-lessons Idea 2 | annotations (built) | S | DONE `09e5205` |
 | W13 | **doc-jobs** (standing jobs on DOC markers) | W6 drop-in | W6 | S | DONE `1c6ac13` |
 | W14 | **wake-live loop-migration** (Coordinator heartbeat → standing job) | W6 dogfood | W6 | M | DONE `f8cb1a9` (enable human-gated) |
-| W15 | **suggestion track-changes** (`kind:"suggestion"` propose/accept/reject) | Idea 1, doc-annotations §4 | annotations (built), W5 | M | DONE `PENDING` |
+| W15 | **suggestion track-changes** (`kind:"suggestion"` propose/accept/reject) | Idea 1, doc-annotations §4 | annotations (built), W5 | M | DONE `9add3b8` |
 
 ### W1 — anchored-async-ask record layer (pull-mode)
 - `create` gains `kind:"note"|"question"`, `options:[{label,description?}]`, `blocking:true`; new `answer`
