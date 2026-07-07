@@ -1974,7 +1974,12 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
     .readFileSync(path.join(here, "harness.md"), "utf8")
     .replaceAll("{{base}}", base)
     .replaceAll("{{boardId}}", boardId)
-    .replaceAll("{{sessionId}}", sessionId);
+    .replaceAll("{{sessionId}}", sessionId)
+    // Absolute path of the dir holding harness.md (= the app/ dir). Lets the core brief point at the
+    // on-demand leaf recipes (`{{harnessDir}}/harness/thread-comms.md`) with a path a worker can Read
+    // from any board's cwd. Leaves are Read RAW — collabBrief does NOT interpolate them, so they carry
+    // no {{...}} tokens of their own.
+    .replaceAll("{{harnessDir}}", here);
 }
 
 const MAX_SESSION_FEED_BYTES = 512 * 1024; // bound the live buffer — a derived stream stays bounded
