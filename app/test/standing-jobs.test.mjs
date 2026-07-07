@@ -18,8 +18,9 @@ import {
   jobDue,
   dueJobs,
   jobClaimKey,
+  sessionHasScheduledWake,
 } from "../standing-jobs.js";
-import { readThreadMeta, fillSeat } from "../thread-ledger.js";
+import { readThreadMeta, fillSeat, listThreads } from "../thread-ledger.js";
 
 function tmpRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "standing-jobs-"));
@@ -138,6 +139,38 @@ test("jobClaimKey: a role-named job keys by SEAT; a bare job keys by its own id"
   assert.equal(jobClaimKey(TID, { id: "j1", role: "Coordinator" }), `thread:${TID}#Coordinator`);
   // Bare job → its own id, so two bare jobs on one thread run independently.
   assert.equal(jobClaimKey(TID, { id: "j2", role: null }), `job:${TID}#j2`);
+});
+
+test("sessionHasScheduledWake: an idle looping session reads 'scheduled' ONLY with a live job on its seat", () => {
+  const repo = tmpRepo();
+  const SID = "sid-coord-1";
+  // The Coordinator holds a seat but there is NO standing job yet — jobs are human-gated and often absent.
+  // A looping role with no job will never wake on a timer, so no wake is scheduled (the bug: it showed
+  // "scheduled" anyway off the static `loops` flag).
+  fillSeat(repo, TID, "Coordinator", SID, 1000);
+  assert.equal(sessionHasScheduledWake(listThreads(repo), SID), false, "seat but no job ⇒ NOT scheduled → 'waiting'");
+  // Add a live standing job targeting the Coordinator seat → a wake IS scheduled for its occupant.
+  upsertJob(repo, TID, { instruction: "sweep", role: "Coordinator", intervalMs: 60_000 });
+  assert.equal(sessionHasScheduledWake(listThreads(repo), SID), true, "job on the occupied seat ⇒ scheduled");
+  // A different session, not in the seat, gets no wake from this job.
+  assert.equal(sessionHasScheduledWake(listThreads(repo), "other-sid"), false, "job fires into the SEAT, not any sid");
+});
+
+test("sessionHasScheduledWake: a BARE (roleless) job never schedules a wake for an existing session", () => {
+  const repo = tmpRepo();
+  const SID = "sid-x";
+  fillSeat(repo, TID, "Coordinator", SID, 1000);
+  // A bare job always spawns a FRESH worker (jobClaimKey keys by its own id, standingJobsTick respawns) — it
+  // targets no existing session, so it must NOT flip an idle session to "scheduled".
+  upsertJob(repo, TID, { instruction: "bare sweep", role: null, intervalMs: 60_000 });
+  assert.equal(sessionHasScheduledWake(listThreads(repo), SID), false, "bare job targets no seat ⇒ NOT scheduled");
+});
+
+test("sessionHasScheduledWake: defensive on empty/absent input", () => {
+  assert.equal(sessionHasScheduledWake([], "sid"), false, "no markers ⇒ false");
+  assert.equal(sessionHasScheduledWake(null, "sid"), false, "null markers ⇒ false, not a throw");
+  assert.equal(sessionHasScheduledWake([{ jobs: [{ role: "R" }], seats: {} }], ""), false, "no sid ⇒ false");
+  assert.equal(sessionHasScheduledWake([{}], "sid"), false, "marker with no jobs/seats ⇒ false");
 });
 
 test("jobs coexist with seats/intents/pins on the same marker (no clobber)", () => {

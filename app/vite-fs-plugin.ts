@@ -21,7 +21,7 @@ import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, suggestionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
+import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
@@ -1286,6 +1286,19 @@ type SessionBand =
 function endReasonBand(reason: string | undefined): SessionBand {
   return reason === "done" ? "done" : reason === "crashed" ? "crashed" : "ended";
 }
+// Is a wake ACTUALLY scheduled for this session? The `loops` role flag is static legibility ("this is a
+// looping-TYPE role") and asserts nothing about a timer — real wakes come from live standing JOBS on a thread
+// (standing-jobs.js), which are human-gated and often absent. So an idle looping session reads the calm teal
+// "scheduled" band only when some thread carries a live job whose ROLE-SEAT this session currently occupies
+// (sessionHasScheduledWake); otherwise it's genuinely "waiting", not asleep on a heartbeat. Only consulted for
+// idle looping sessions (callers gate on `loops` first), so the listThreads marker read stays off the hot path.
+function hasScheduledWake(repoPath: string, id: string): boolean {
+  try {
+    return sessionHasScheduledWake(listThreads(repoPath), id);
+  } catch {
+    return false;
+  }
+}
 function sessionStatus(repoPath: string, id: string): SessionBand {
   const live = liveSessions.get(id);
   if (live) {
@@ -1294,9 +1307,13 @@ function sessionStatus(repoPath: string, id: string): SessionBand {
     if (live.status !== "exited" && [...pendingPermissions.values()].some((p) => p.sid === id)) return "waiting";
     if (live.status === "running") return "working";
     // Idle: blocked on a peer (blue) > asleep on the loop heartbeat (calm teal `scheduled`, a looping role
-    // between ticks — no human demand) > the default loud amber "your turn".
+    // between ticks — no human demand) > the default loud amber "your turn". `scheduled` is gated on an ACTUAL
+    // live scheduled wake (hasScheduledWake), not the static `loops` flag — a looping role with no standing job
+    // will never wake on a timer, so it's "waiting" (a real demand on you), not asleep.
     if (live.status === "idle") {
-      return live.waitingOn?.length ? "waiting-agent" : live.loops ? "scheduled" : "waiting";
+      if (live.waitingOn?.length) return "waiting-agent";
+      if (live.loops && hasScheduledWake(repoPath, id)) return "scheduled";
+      return "waiting";
     }
     if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
   }
@@ -2117,7 +2134,12 @@ function publishSession(s: LiveSession): void {
     usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
-    loops: s.loops || undefined, // looping role: idle + no waitingOn ⇒ calm teal "scheduled", not amber
+    // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:
+    // an idle looping session with no held waitingOn AND a live standing job on its seat (hasScheduledWake).
+    // Computed only for that narrow case (short-circuits on status/loops/waitingOn first) so the marker read
+    // stays off the hot path — publishSession fires on every delta burst. Replaces the old raw `loops` flag,
+    // which asserted "scheduled" for any looping role even when nothing would ever wake it.
+    scheduled: (s.status === "idle" && !s.waitingOn?.length && s.loops && hasScheduledWake(s.repoPath, s.id)) || undefined,
     // Held permission prompts: the card renders allow/deny buttons and paints the loud waiting band —
     // the process is mid-turn ("running") but blocked on a HUMAN, and only the server knows that.
     permissions: (() => { const p = permissionsOf(s.id); return p.length ? p : undefined; })(),
