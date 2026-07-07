@@ -9,16 +9,30 @@ import os from "node:os";
 import path from "node:path";
 import {
   canvasRolesDir,
+  bundledRolesDir,
+  bundledRoleFileFor,
   createRole,
   readRole,
   listRoles,
   isValidRoleName,
   roleIdFor,
-  seedDefaultRole,
 } from "../role-ledger.js";
+
+// Isolate the BUNDLED-DEFAULT layer from the real `app/default-roles/` for the bulk of these tests, so a
+// unit assertion about the board layer isn't perturbed by whatever ships. Point it at an empty dir here;
+// the layering tests below re-point it at a controlled set and restore it.
+process.env.CANVAS_DEFAULT_ROLES_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "role-bundled-empty-"));
 
 function tmpRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "role-"));
+}
+
+/** A throwaway "bundled defaults" dir holding the given roles, for the layering tests. */
+function tmpBundled(roles) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "role-bundled-"));
+  for (const { name, colour, charter, loops } of roles) createRole(dir, { name, colour, charter, loops });
+  // createRole writes under `<dir>/.canvas/roles/`, but the bundled layer is a bare role-dir root.
+  return canvasRolesDir(dir);
 }
 
 test("createRole writes role.md under .canvas/roles/ and round-trips through readRole", () => {
@@ -101,20 +115,66 @@ test("listRoles ignores stray non-directory entries in the roles dir", () => {
   assert.deepEqual(listRoles(repo).map((r) => r.roleId), ["real"]);
 });
 
-test("seedDefaultRole seeds one role on an empty board and is idempotent", () => {
-  const repo = tmpRepo();
-  seedDefaultRole(repo);
-  const after = listRoles(repo);
-  assert.equal(after.length, 1, "exactly one role seeded");
-  assert.equal(after[0].name, "Generalist");
-  // Running again does NOT add a second or clobber — the board already has a role.
-  seedDefaultRole(repo);
-  assert.equal(listRoles(repo).length, 1, "idempotent");
+test("the SHIPPED bundled defaults resolve on a fresh board with no .canvas/roles/", () => {
+  // The real `app/default-roles/` is the base layer every board inherits. Temporarily un-isolate to assert
+  // the packaged set is present (this is what an external repo now sees without any per-board seed).
+  const saved = process.env.CANVAS_DEFAULT_ROLES_DIR;
+  delete process.env.CANVAS_DEFAULT_ROLES_DIR;
+  try {
+    const repo = tmpRepo(); // no board-layer roles at all
+    const ids = listRoles(repo).map((r) => r.roleId);
+    assert.ok(ids.includes("generalist"), "Generalist ships as a bundled default");
+    assert.ok(ids.includes("oracle"), "Oracle ships as a bundled default");
+    assert.ok(ids.includes("pm"), "Coordinator ships as a bundled default");
+    // And a bundled role is fully readable (charter included) without any board file.
+    assert.equal(readRole(repo, "generalist")?.name, "Generalist");
+  } finally {
+    process.env.CANVAS_DEFAULT_ROLES_DIR = saved;
+  }
 });
 
-test("seedDefaultRole leaves an already-populated board untouched", () => {
+test("listRoles merges bundled defaults with board roles, board WINS on an id collision", () => {
+  process.env.CANVAS_DEFAULT_ROLES_DIR = tmpBundled([
+    { name: "Generalist", colour: "blue", charter: "shipped generalist" },
+    { name: "Oracle", colour: "purple", charter: "shipped oracle" },
+  ]);
   const repo = tmpRepo();
-  createRole(repo, { name: "Oracle" });
-  seedDefaultRole(repo);
-  assert.deepEqual(listRoles(repo).map((r) => r.roleId), ["oracle"], "no default added when roles exist");
+  // Board OVERRIDES the shipped Generalist and ADDS a board-only role.
+  createRole(repo, { name: "Generalist", colour: "red", charter: "this board's generalist" });
+  createRole(repo, { name: "Specialist", charter: "board-only" });
+
+  const roles = listRoles(repo);
+  assert.deepEqual(roles.map((r) => r.roleId).sort(), ["generalist", "oracle", "specialist"]);
+  // The override wins: colour comes from the BOARD file, not the bundled default.
+  assert.equal(roles.find((r) => r.roleId === "generalist").colour, "red");
+  assert.equal(readRole(repo, "generalist").charter, "this board's generalist");
+  // A non-overridden default still resolves from the bundled layer.
+  assert.equal(readRole(repo, "oracle").charter, "shipped oracle");
+  // A board-only role resolves from the board layer.
+  assert.equal(readRole(repo, "specialist").charter, "board-only");
+});
+
+test("bundledRoleFileFor resolves a role.md path to its bundled default, else null", () => {
+  process.env.CANVAS_DEFAULT_ROLES_DIR = tmpBundled([{ name: "Oracle", charter: "bundled" }]);
+  // A role path that HAS a bundled default → the absolute bundled file (this is what the file endpoint
+  // serves read-only so the card mirrors the shipped role until the board overrides it).
+  const hit = bundledRoleFileFor(".canvas/roles/oracle/role.md");
+  assert.ok(hit && hit.endsWith(path.join("oracle", "role.md")), "resolves to the bundled oracle role.md");
+  assert.equal(fs.readFileSync(hit, "utf8").includes("bundled"), true);
+  // A role path with NO bundled default → null (a board-only role has its real file; nothing to mirror).
+  assert.equal(bundledRoleFileFor(".canvas/roles/specialist/role.md"), null);
+  // Not a role path at all → null (the fallback must never fire for arbitrary files).
+  assert.equal(bundledRoleFileFor("docs/notes.md"), null);
+  assert.equal(bundledRoleFileFor(".canvas/roles/oracle/notes.md"), null, "only role.md, not siblings");
+  assert.equal(bundledRoleFileFor(".canvas/roles/oracle"), null, "the dir itself is not a file");
+  assert.equal(bundledRoleFileFor(""), null);
+});
+
+test("readRole prefers the board layer, then falls back to the bundled default, else null", () => {
+  process.env.CANVAS_DEFAULT_ROLES_DIR = tmpBundled([{ name: "Oracle", charter: "bundled" }]);
+  const repo = tmpRepo();
+  assert.equal(readRole(repo, "oracle").charter, "bundled", "falls back to bundled when board has none");
+  createRole(repo, { name: "Oracle", charter: "board override" });
+  assert.equal(readRole(repo, "oracle").charter, "board override", "board layer wins once present");
+  assert.equal(readRole(repo, "nonesuch"), null, "unknown in both layers → null");
 });

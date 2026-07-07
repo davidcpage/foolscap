@@ -24,7 +24,7 @@ import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, rele
 import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
-import { canvasRolesDir, createRole, listRoles, readRole, seedDefaultRole } from "./role-ledger.js";
+import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
 import { boardMemoryBrief } from "./board-memory.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
@@ -565,7 +565,17 @@ function handleFile(res: ServerResponse, root: string, rel: string): void {
   const allowed =
     !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
   const r = allowed ? readText(abs!) : null;
-  if (!r) return sendJson(res, 404, { error: "not found" });
+  if (!r) {
+    // Role cards read `.canvas/roles/<id>/role.md` through this endpoint. On a board with no override the
+    // file exists only as a bundled default (app/default-roles/) — serve that read-only so the card mirrors
+    // the shipped role instead of hanging on "loading…", until an edit writes the board copy (copy-on-write).
+    // Same text gates already applied via `allowed`; the fallback is only reached on a genuine miss.
+    const bundled = allowed ? bundledRoleFileFor(rel) : null;
+    const br = bundled ? readText(bundled) : null;
+    if (bundled && br)
+      return sendJson(res, 200, { path: rel, content: br.content, truncated: br.truncated, version: fileVersion(bundled) });
+    return sendJson(res, 404, { error: "not found" });
+  }
   // W12: stamp the content version so a card can echo it back as `baseVersion` on write (optimistic lock).
   sendJson(res, 200, { path: rel, content: r.content, truncated: r.truncated, version: fileVersion(abs!) });
 }
@@ -3686,7 +3696,6 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   migrateChannelLedger(repoPath); // one-time §8 step 2 rename: `.canvas/channels/` → `.canvas/threads/`
   seedThreadLogs(repoPath); // restore thread conversations from `.canvas/threads/` (cold-restart fix)
   startThreadsFeed(boardId, repoPath); // live-push the list rail as threads gain activity
-  seedDefaultRole(repoPath); // ensure the role-picker on "new session" is never empty on a fresh board
   startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
   syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
   startLoopHeartbeat(); // global, idempotent — wakes looping-role (Coordinator) sessions to sweep for stalls

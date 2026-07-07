@@ -10,6 +10,8 @@ export interface Role {
 }
 
 export function canvasRolesDir(repoPath: string): string;
+export function bundledRolesDir(): string;
+export function bundledRoleFileFor(relPath: string): string | null;
 export function isValidRoleName(name: unknown): boolean;
 export function roleIdFor(name: string): string;
 export function readRole(repoPath: string, roleId: string): Role | null;
@@ -20,4 +22,3 @@ export function createRole(
 export function listRoles(
   repoPath: string,
 ): Array<{ roleId: string; name: string; colour: string | null; loops: boolean }>;
-export function seedDefaultRole(repoPath: string): void;
