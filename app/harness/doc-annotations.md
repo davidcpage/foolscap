@@ -43,3 +43,9 @@ reply-and-resolve someone else's question — a resolved comment is hidden from 
 resolving it buries your reply before the asker has read it. Reply, leave it **open**, and let the author
 resolve once satisfied (resolve another author's comment only when they explicitly say so). "Answer the
 comments on `<file>`" means: reply per annotation, and where the right answer is "fix the doc", fix the doc.
+
+**Sweep & gotchas.** The board sweep `GET /api/annotations?board=<board>` (no path) returns per-file counts
+`{ total, open, orphaned, awaiting, answered }` — `awaiting` = a question needing a human, `answered` = one
+needing an agent to apply. `create` needs the file to exist and 404s on non-servable (binary/internal)
+paths; anchors resolve against the 128KB head-capped read, so a quoted span beyond the cap reads as
+orphaned by design.

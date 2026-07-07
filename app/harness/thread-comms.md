@@ -70,3 +70,32 @@ keeps the board honest about whose turn it is.
 **pinned** so it stays head context. Declaring `done` is not enough on its own — accompany it with a
 thread message posting **proof** against that condition (test output, a diff, a link — evidence, not
 assertion), so a reviewer checks proof against the pinned condition instead of trusting the flag.
+
+## Seats & thread state
+
+A **role-spawned** session that joins a thread fills the role's **seat** on the thread marker — the durable
+per-thread participant that survives a respawn (a fresh session of the same role RE-FILLS it, so address
+work by seat, not sid). Plain unnamed sessions take no seat and stay sid-identified.
+
+`GET /api/threads` lists thread markers with their `seats`, `intents`, and a derived `state`: **active**
+(someone running, or live + `working`) / **waiting** (nobody active, ≥1 `blocked:human`) / **dormant** (all
+done/exited, or unstaffed). State is computed at read time, never stored.
+
+## Standing jobs — the server-fired heartbeat
+
+`POST /api/thread/<threadId>/job` `{ from, instruction, intervalMs?, role?, jobId? }` declares a periodic
+worker on the thread marker (a `claude -p` session can't self-schedule, so the SERVER fires it). `jobId`
+edits in place; a named `role` fires into that role's seat (else a bare worker); `intervalMs` has a 60s
+floor. Remove with `{ from, jobId, remove:true }`; list with `GET /api/thread/<threadId>/jobs`. CLI:
+`scripts/canvas job add|list|rm`. On fire it wakes a live seat (cheap, context intact) or respawns a
+dormant one (wake-live-else-respawn), single-flight. The Coordinator heartbeat is one such job — a human
+enables it with `scripts/canvas job coordinator <thread>` (the human-gated autonomy switch). Norm: "skip
+days with nothing" — a firing that finds nothing to report posts nothing.
+
+## Gotchas
+
+- The thread id carries a colon — **percent-encode it** in the URL path (the `scripts/canvas` CLI does this
+  for you).
+- Membership must be in the **saved** snapshot before `ask`/`message` accept it (saved ~400ms after the
+  join's `addEdge`); poll `/api/canvas` for the `member:open` edge first, or get a spurious `403`.
+- `ask`/`reply` are a separate in-memory RPC keyed by `askId`; don't add a `to` field to `/message`.
