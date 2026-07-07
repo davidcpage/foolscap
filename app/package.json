@@ -12,7 +12,7 @@
     "session-host:stop": "node session-host.js --stop",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "node --test test/*.test.mjs",
+    "test": "node --test --test-concurrency=4 test/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

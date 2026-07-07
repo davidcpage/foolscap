@@ -40,7 +40,7 @@ function startMcp(env) {
     }
   });
   return {
-    call: (msg, timeoutMs = 8000) =>
+    call: (msg, timeoutMs = 15000) =>
       new Promise((resolve, reject) => {
         const t = setTimeout(() => reject(new Error(`timeout waiting for reply ${msg.id}`)), timeoutMs);
         waiters.set(msg.id, (m) => {
