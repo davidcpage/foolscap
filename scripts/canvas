@@ -27,11 +27,22 @@ usage() {
   cat <<USAGE
 canvas — session/coordination verbs over the agent bus
   scripts/canvas spawn [--thread THREAD] [--role ROLE] [--card] [--prompt TEXT] [--board ID]
+                       [--worktree [--base REF] [--worktree-key KEY]]
         spawn a new session; prints {"id":...,"carded":bool}. With --thread the SERVER cards it, joins
         it, positions the card next to the thread, and onboards it to AWAIT its task on the thread —
         then POST the task as a thread message tagging it (do NOT put the task in --prompt; --prompt is
         only a generic first turn). --role spawns under a role. --card = standalone card, no membership.
         (--channel is the pre-rename alias for --thread and keeps working.)
+        --worktree runs the session in an ISOLATED git worktree (its own branch under .canvas/worktrees/)
+        instead of the shared board root, so concurrent agents don't clobber each other. Needs --thread
+        (the durable work-item key). --base sets the branch base (default HEAD). The worktree is keyed by
+        WORK ITEM (role seat if --role, else the thread, or --worktree-key), so a RESPAWN re-attaches to
+        the same tree/branch — never a fresh cut. Prints a "worktree":{path,branch,reused,linked} block.
+  scripts/canvas worktree list <THREAD>                list a thread's work-item worktrees (key→path/branch)
+  scripts/canvas worktree rm <THREAD> [--key KEY | --role ROLE] [--force] [--from ID]
+        tear down a work-item's worktree on COMPLETION (not session exit). Guarded: skips+warns if the tree
+        is dirty or the branch is unmerged unless --force. Key defaults to the thread (bare worker); pass
+        --role for a role-seat worktree, or --key for an explicit key.
   scripts/canvas input <sid> <text>                   send a turn to a live session's stdin (reads AS the human)
   scripts/canvas done <sid>                            mark a session done + terminate it
   scripts/canvas terminate <sid>                       kill a live session, free its slot
@@ -506,30 +517,67 @@ PY
 cmd="${1:-}"; shift || true
 case "$cmd" in
   spawn)
-    prompt=""; thread=""; role=""; card=""
+    prompt=""; thread=""; role=""; card=""; worktree=""; base=""; wtkey=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --prompt)  prompt="${2:-}"; shift 2 ;;
-        --thread)  thread="${2:-}"; shift 2 ;;
-        --channel) thread="${2:-}"; shift 2 ;; # pre-rename alias
-        --role)    role="${2:-}"; shift 2 ;;
-        --card)    card="1"; shift ;;
-        --board)   BOARD="${2:-}"; shift 2 ;;
+        --prompt)       prompt="${2:-}"; shift 2 ;;
+        --thread)       thread="${2:-}"; shift 2 ;;
+        --channel)      thread="${2:-}"; shift 2 ;; # pre-rename alias
+        --role)         role="${2:-}"; shift 2 ;;
+        --card)         card="1"; shift ;;
+        --worktree)     worktree="1"; shift ;;
+        --base)         base="${2:-}"; shift 2 ;;
+        --worktree-key) wtkey="${2:-}"; shift 2 ;;
+        --board)        BOARD="${2:-}"; shift 2 ;;
         *) echo "spawn: unexpected arg '$1'" >&2; exit 2 ;;
       esac
     done
-    body=$(python3 - "$prompt" "$thread" "$role" "$card" <<'PY'
+    body=$(python3 - "$prompt" "$thread" "$role" "$card" "$worktree" "$base" "$wtkey" <<'PY'
 import json, sys
-prompt, thread, role, card = sys.argv[1:5]
+prompt, thread, role, card, worktree, base, wtkey = sys.argv[1:8]
 o = {}
-if prompt: o["prompt"] = prompt
-if thread: o["thread"] = thread
-if role:   o["roleId"] = role
-if card:   o["card"] = True
+if prompt:   o["prompt"] = prompt
+if thread:   o["thread"] = thread
+if role:     o["roleId"] = role
+if card:     o["card"] = True
+if worktree: o["worktree"] = True
+if base:     o["base"] = base
+if wtkey:    o["worktreeKey"] = wtkey
 print(json.dumps(o))
 PY
 )
     post "$SERVER/api/session/spawn?board=$BOARD" "$body"; echo ;;
+  worktree)
+    sub="${1:?usage: canvas worktree list|rm <thread> ...}"; shift
+    case "$sub" in
+      list)
+        thread="${1:?usage: canvas worktree list <thread>}"
+        curl -sS "$SERVER/api/thread/$(enc "$thread")/worktrees?board=$BOARD"; echo ;;
+      rm)
+        thread="${1:?usage: canvas worktree rm <thread> [--key K|--role R] [--force] [--from ID]}"; shift
+        from="human"; key=""; role=""; force=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --key)   key="${2:-}"; shift 2 ;;
+            --role)  role="${2:-}"; shift 2 ;;
+            --force) force="1"; shift ;;
+            --from)  from="${2:-}"; shift 2 ;;
+            *) echo "worktree rm: unexpected arg '$1'" >&2; exit 2 ;;
+          esac
+        done
+        body=$(python3 - "$from" "$key" "$role" "$force" <<'PY'
+import json, sys
+frm, key, role, force = sys.argv[1:5]
+o = {"from": frm, "op": "remove"}
+if key:   o["key"] = key
+if role:  o["roleId"] = role
+if force: o["force"] = True
+print(json.dumps(o))
+PY
+)
+        post "$SERVER/api/thread/$(enc "$thread")/worktree?board=$BOARD" "$body"; echo ;;
+      *) echo "worktree: unknown subcommand '$sub' (list|rm)" >&2; exit 2 ;;
+    esac ;;
   input)
     sid="${1:?usage: canvas input <sid> <text>}"; text="${2:?usage: canvas input <sid> <text>}"
     post "$SERVER/api/session/$sid/input" "{\"text\":$(jstr "$text")}"; echo ;;

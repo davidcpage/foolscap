@@ -25,6 +25,7 @@ import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired,
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
+import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, workItemKey } from "./worktrees.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -160,6 +161,17 @@ function sessionsDir(repoPath: string): string {
   return path.join(os.homedir(), ".claude", "projects", repoPath.replace(/\//g, "-"));
 }
 
+// Map a session's process cwd back to its CANONICAL board root. A worktree session runs in
+// `<canonical>/.canvas/worktrees/<key>` (a deterministic location we own), so its board home — where the
+// `.canvas/` markers/threads/memory live — is the path before `/.canvas/worktrees/`. Any other cwd IS the
+// board root. Used on adoption after a restart, where the sidecar hands back the process cwd (the worktree)
+// but the marker/threads must still resolve against the canonical checkout.
+function boardRootForCwd(cwd: string): string {
+  const marker = `${path.sep}.canvas${path.sep}worktrees${path.sep}`;
+  const i = cwd.indexOf(marker);
+  return i === -1 ? cwd : cwd.slice(0, i);
+}
+
 // Resolve the board a request targets (?board=<id>, default board if omitted), or null if unknown.
 function reqBoard(url: URL): (BoardInfo & { boardId: string }) | null {
   const id = url.searchParams.get("board") ?? DEFAULT_BOARD.boardId;
@@ -230,9 +242,13 @@ function listWorktrees(canonicalPath: string): RootInfo[] {
   // board rooted at a LINKED worktree must drop the matching entry by realpath, not by position. Every
   // other entry (the main checkout included, seen from a worktree board) becomes a sibling root.
   const canon = realpath(canonicalPath);
+  // Agent worktrees (`spawn --worktree`) live under the board's own `.canvas/worktrees/` home. They are
+  // ISOLATED workspaces, not sibling checkouts to browse, so they must NOT become board roots (that would
+  // flood the file tree with one full tree per live agent). Drop anything under this board's `.canvas/`.
+  const canvasHome = realpath(path.join(canonicalPath, ".canvas")) + path.sep;
   return raw
     .map((r) => ({ real: realpath(r.path!), branch: r.branch ?? "", head: r.head ?? "" }))
-    .filter((r) => r.real !== canon)
+    .filter((r) => r.real !== canon && !r.real.startsWith(canvasHome))
     .map((r) => {
       let id = slug(path.basename(r.real));
       if (id === "repo") id = "repo-wt"; // never shadow the canonical id (a worktree dir literally named "repo")
@@ -1994,7 +2010,12 @@ interface ContentBlock {
 
 interface LiveSession {
   id: string;
-  repoPath: string; // the board's repo — the process's cwd, and how seedFromTranscript finds its .jsonl
+  repoPath: string; // the board's CANONICAL repo — where its `.canvas/` home (markers, threads, memory) lives
+  // The process's working directory. Equals repoPath for an ordinary session; for a WORKTREE session
+  // (`spawn --worktree`) it's the isolated worktree checkout under `.canvas/worktrees/`, while repoPath
+  // stays the canonical board home so markers/threads/memory/boardIdentity all resolve there. seedFromTranscript
+  // keys the transcript dir off cwd (Claude Code stores transcripts per working dir), so a --resume finds them.
+  cwd: string;
   // The process, behind the SessionProc seam (session-proc.js): local = we spawned and own it (dies with
   // the dev server), remote = the session-host sidecar owns it (survives a dev-server restart).
   proc: SessionProc;
@@ -2208,7 +2229,9 @@ function foldSessionEvent(s: LiveSession, e: any): void {
 // static fields.text). The registry "materialising"/pinning the transcript for the live tail
 // (session-timelines.md §5). Same shape foldSessionEvent stores: one {type,message} string per turn.
 function seedFromTranscript(s: LiveSession): void {
-  const r = readSessionFile(sessionsDir(s.repoPath), s.id);
+  // Claude Code stores transcripts per PROCESS working dir, so key off cwd (the worktree for a --worktree
+  // session), not the canonical board root — else a worktree session's transcript wouldn't be found.
+  const r = readSessionFile(sessionsDir(s.cwd), s.id);
   if (!r) return;
   for (const line of r.content.split("\n")) {
     if (!line.trim()) continue;
@@ -2248,6 +2271,7 @@ function ensureLiveSession(
   origin = "localhost:5173",
   roleId: string | null = null,
   threadId: string | null = null,
+  cwd: string = repoPath, // the process working dir — a worktree checkout for `spawn --worktree`, else the board root
 ): LiveSession {
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
@@ -2321,7 +2345,7 @@ function ensureLiveSession(
   // MCP_TOOL_TIMEOUT must OUTLAST the server's permission hold, or the CLI gives up on the relay first
   // and the prompt dies with an opaque client-side error instead of our honest hold-timeout deny.
   const spawnSpec = {
-    cmd: "claude", args, cwd: repoPath,
+    cmd: "claude", args, cwd, // worktree checkout for a --worktree session; the board root otherwise
     env: { MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000) },
   };
   const proc =
@@ -2333,7 +2357,7 @@ function ensureLiveSession(
     // a `result`, until it's first prompted), so "running" would be a turn that never ends — and the inbox,
     // which flushes idle-immediately / at a turn boundary, would queue forever with no boundary to drain at.
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
-    id, repoPath, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
+    id, repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
     // Cursors revive from the marker (persistSessionState) so a --resume / sidecar adoption doesn't reset
     // them to 0 and re-deliver every joined thread's backlog as unread.
     read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
@@ -2349,6 +2373,7 @@ function ensureLiveSession(
   markCanvasSession(repoPath, id, {
     spawnedAt: Date.now(),
     origin,
+    ...(cwd !== repoPath ? { cwd } : {}), // durable note of a worktree cwd (legibility; boardRootForCwd re-derives repoPath)
     ...(effectiveRoleId
       ? {
           roleId: effectiveRoleId,
@@ -2409,8 +2434,9 @@ async function attachSessionHost(): Promise<void> {
   for (const info of sessions) adoptSession(client, info);
   // Deaths while no dev server was attached: stamp them so the cards read crashed/ended, not status-less.
   for (const ex of exits) {
-    if (!readCanvasSession(ex.cwd, ex.id)?.endReason)
-      recordSessionEnd(ex.cwd, ex.id, ex.reason === "self" ? "crashed" : "terminated");
+    const boardRoot = boardRootForCwd(ex.cwd); // a worktree cwd → its canonical board home (where the marker lives)
+    if (!readCanvasSession(boardRoot, ex.id)?.endReason)
+      recordSessionEnd(boardRoot, ex.id, ex.reason === "self" ? "crashed" : "terminated");
   }
   await client.ackExits(exits.map((e) => e.id));
   if (sessions.length || exits.length)
@@ -2425,7 +2451,10 @@ async function attachSessionHost(): Promise<void> {
 // (a rare duplicate of the newest turn is cosmetic and self-heals on the next resume).
 function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
   if (liveSessions.has(info.id)) return; // pinned across a re-eval — already ours
-  const marker = readCanvasSession(info.cwd, info.id) ?? {};
+  // The sidecar hands back the process cwd; for a worktree session that's the worktree, so derive the
+  // canonical board root (where the marker/threads/memory live) before reading the marker.
+  const boardRoot = boardRootForCwd(info.cwd);
+  const marker = readCanvasSession(boardRoot, info.id) ?? {};
   const hooks = wireSessionHooks(() => s);
   const pending: string[] = [];
   let buffering = true;
@@ -2434,7 +2463,7 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
     onExit: (x) => hooks.onExit(x),
   });
   const s: LiveSession = {
-    id: info.id, repoPath: info.cwd, proc, lines: [], inflight: null,
+    id: info.id, repoPath: boardRoot, cwd: info.cwd, proc, lines: [], inflight: null,
     status: info.busy ? "running" : "idle", skills: null, verb: info.busy ? "Working" : null,
     usage: null, turnOut: 0,
     read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
@@ -2813,6 +2842,23 @@ function placeWorkerCard(
   return { x: 80 + n * CASCADE, y: 80 + n * CASCADE, w: WORKER_CARD_W, h: WORKER_CARD_H };
 }
 
+// Resolve the working directory a spawn runs in: an isolated git worktree when `--worktree` was requested
+// OR the work item already HAS one (so a respawn re-attaches to the same tree/branch rather than cutting a
+// fresh one — the whole reason worktrees are keyed by work item, not sid), else the canonical board root.
+// Throws when a worktree is needed but the work item can't be durably keyed (no thread) — surfaced as a 400.
+function resolveSpawnCwd(
+  repoPath: string,
+  opts: { threadId: string | null; roleId: string | null; worktree: boolean; base: string | null; explicitKey: string | null },
+): { cwd: string; worktree: ReturnType<typeof ensureWorktree> | null; key: string | null } {
+  const key = workItemKey({ threadId: opts.threadId, roleId: opts.roleId, explicitKey: opts.explicitKey });
+  const existing = key && opts.threadId ? listThreadWorktrees(repoPath, opts.threadId)[key] : null;
+  if (!opts.worktree && !existing) return { cwd: repoPath, worktree: null, key: null };
+  if (!key || !opts.threadId)
+    throw new Error("a worktree spawn needs a thread — the thread (or role seat) is the durable work-item key");
+  const wt = ensureWorktree(repoPath, opts.threadId, key, opts.base);
+  return { cwd: wt.path, worktree: wt, key };
+}
+
 async function handleSessionSpawn(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2820,7 +2866,10 @@ async function handleSessionSpawn(
   boardId: string,
   origin: string,
 ): Promise<void> {
-  let body: { prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown } = {};
+  let body: {
+    prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
+    worktree?: unknown; base?: unknown; worktreeKey?: unknown;
+  } = {};
   try {
     const raw = await readBody(req);
     if (raw) body = JSON.parse(raw);
@@ -2846,9 +2895,24 @@ async function handleSessionSpawn(
   // agents and old recipes don't break mid-transition.
   const scope = typeof body.thread === "string" && body.thread ? body.thread : body.channel;
   const threadId = typeof scope === "string" && scope ? scope : null;
+  // Worktree isolation (Stage 1): run this session in its own git worktree instead of the shared board root.
+  // Resolve the cwd BEFORE spawning — a bad request (worktree with no thread) or a git failure must 4xx/5xx,
+  // not leave a live process pointed at the wrong tree.
+  const wantWorktree = body.worktree === true;
+  const base = typeof body.base === "string" && body.base ? body.base : null;
+  const explicitKey = typeof body.worktreeKey === "string" && body.worktreeKey ? body.worktreeKey : null;
+  let cwd = repoPath;
+  let worktree: ReturnType<typeof ensureWorktree> | null = null;
+  try {
+    const resolved = resolveSpawnCwd(repoPath, { threadId, roleId, worktree: wantWorktree, base, explicitKey });
+    cwd = resolved.cwd;
+    worktree = resolved.worktree;
+  } catch (err) {
+    return sendJson(res, 400, { error: "worktree spawn rejected", detail: String(err) });
+  }
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, threadId);
+    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }
@@ -2887,7 +2951,10 @@ async function handleSessionSpawn(
       );
   }
   if (typeof body.prompt === "string" && body.prompt.trim()) sendSessionInput(id, body.prompt);
-  sendJson(res, 200, { id, roleId, roleName, roleColour, carded });
+  sendJson(res, 200, {
+    id, roleId, roleName, roleColour, carded,
+    ...(worktree ? { worktree: { path: worktree.path, branch: worktree.branch, reused: worktree.reused, linked: worktree.linked } } : {}),
+  });
 }
 
 // ── P2/W5: server-spawn-from-a-durable-record (auto-wake.js) ─────────────────────────────────────────
@@ -2922,9 +2989,20 @@ function serverSpawnWorker(opts: {
     return null;
   }
   const id = crypto.randomUUID();
+  // RE-ATTACH on respawn: if the work item this wake targets already has a worktree, land the fresh session
+  // back in it (never cut a new one). worktree:false so we only reuse an existing record, never create here —
+  // a server-fired wake shouldn't newly isolate a work item that wasn't set up for it.
+  let cwd = opts.repoPath;
+  try {
+    cwd = resolveSpawnCwd(opts.repoPath, {
+      threadId: opts.threadId, roleId: opts.roleId, worktree: false, base: null, explicitKey: null,
+    }).cwd;
+  } catch (err) {
+    console.warn(`[auto-wake] worktree re-attach failed for ${opts.claimKey}: ${String(err)}`);
+  }
   let live: LiveSession;
   try {
-    live = ensureLiveSession(id, opts.repoPath, false, opts.origin, opts.roleId, opts.threadId);
+    live = ensureLiveSession(id, opts.repoPath, false, opts.origin, opts.roleId, opts.threadId, cwd);
   } catch (err) {
     console.warn(`[auto-wake] spawn failed for ${opts.claimKey}: ${String(err)}`);
     return null;
@@ -4693,6 +4771,43 @@ async function handleThreadPin(
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
+// POST /api/thread/<id>/worktree — manage the thread's work-item worktrees (Stage 1). `op:"remove"` is the
+// EXPLICIT teardown fired on WORK-ITEM completion (a Coordinator merged the branch), guarded: it skips+warns
+// on a dirty tree or unmerged branch unless `force`. `op:"list"` returns the recorded worktrees. The
+// work-item key is derived like a spawn's: explicit `key`, else `roleId`'s seat, else the thread itself.
+// Consent mirrors pin/intent: a member (or the human at the card) may act.
+async function handleThreadWorktree(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  let body: { from?: unknown; op?: unknown; key?: unknown; roleId?: unknown; force?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  const op = typeof body.op === "string" ? body.op : "list";
+  if (op !== "list" && op !== "remove") return sendJson(res, 400, { error: `unknown op "${op}" (list|remove)` });
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+
+  if (op === "list") return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(repoPath, threadId) });
+  const explicitKey = typeof body.key === "string" && body.key ? body.key : null;
+  const roleId = typeof body.roleId === "string" && body.roleId ? body.roleId : null;
+  const key = workItemKey({ threadId, roleId, explicitKey });
+  const result = removeWorktree(repoPath, threadId, key!, { force: body.force === true });
+  publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a removed worktree drops off the marker)
+  return sendJson(res, result.removed ? 200 : 409, { thread: threadId, key, ...result });
+}
+
 // POST /api/thread/<id>/job — create/update or remove a STANDING JOB (R6, W6, standing-jobs.js). A standing
 // job is a periodic server-fired worker on this thread's durable marker: every `intervalMs` the server spawns
 // a fresh worker (the one serverSpawnWorker primitive, single-flight) seeded with `instruction`, then it acts
@@ -4953,7 +5068,7 @@ export function fsApi(): Plugin {
         // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
         // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
         // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|job)$/.exec(url.pathname);
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|job|worktree)$/.exec(url.pathname);
         if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -4967,6 +5082,7 @@ export function fsApi(): Plugin {
           if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
           if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
           if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
+          if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);
           return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
         }
         // GET /api/thread/<id>/jobs — read this thread's standing jobs (R6/W6, for the CLI + smoke test).
@@ -4976,6 +5092,14 @@ export function fsApi(): Plugin {
           if (!b) return sendJson(res, 400, { error: "unknown board" });
           const threadId = decodeURIComponent(threadJobsMatch[1]!);
           return sendJson(res, 200, { thread: threadId, jobs: readJobs(b.repoPath, threadId) });
+        }
+        // GET /api/thread/<id>/worktrees — read this thread's recorded work-item worktrees (Stage 1, for the CLI).
+        const threadWorktreesMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/worktrees$/.exec(url.pathname);
+        if (threadWorktreesMatch && req.method === "GET") {
+          const b = reqBoard(url);
+          if (!b) return sendJson(res, 400, { error: "unknown board" });
+          const threadId = decodeURIComponent(threadWorktreesMatch[1]!);
+          return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(b.repoPath, threadId) });
         }
         if (url.pathname === "/api/session") {
           const b = reqBoard(url);
