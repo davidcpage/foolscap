@@ -126,6 +126,23 @@ test("tagHit: keyword, sid prefix, and role-name prefix all hit; prose misses", 
   assert.equal(tagHit("a9", MEMBERS), true, "bare-sid members still match");
 });
 
+test("tagHit: @Agent is a reserved spawn keyword — always hits, even with no member named Agent", () => {
+  // @Agent cold-spawns a seatless worker (classifyMentionSpawn), so like @all/@human it always resolves and
+  // must light up regardless of the roster (regression guard for the seq-21 not-highlighted bug).
+  for (const t of ["agent", "Agent", "AGENT"]) {
+    assert.equal(tagHit(t, NAMED), true, `@${t} is the reserved spawn keyword`);
+    assert.equal(tagHit(t, []), true, `@${t} hits even on an empty roster`);
+  }
+});
+
+test("matchTagSpans: @Agent highlights as a reserved keyword", () => {
+  const text = "@Agent please take this";
+  assert.deepEqual(
+    matchTagSpans(text, []).map((s) => text.slice(s.start, s.end)),
+    ["@Agent"],
+  );
+});
+
 test("matchTagSpans: returns the highlight range of each RESOLVING tag only", () => {
   const text = "hey @Oracle and @nobody, ping @all";
   const spans = matchTagSpans(text, NAMED);

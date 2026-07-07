@@ -20,6 +20,10 @@
 
 const ALL_TOKENS = new Set(["all", "everyone", "channel", "here"]);
 const HUMAN_TOKENS = new Set(["human", "user"]);
+// The reserved keyword that summons a fresh SEATLESS plain worker (a new hand per mention), distinct from a
+// role name. Lower-cased because parseTags lower-cases every token. Like @all/@human it ALWAYS resolves (to a
+// cold-spawn, see classifyMentionSpawn), so the highlighter (tagHit) must light it even when no member matches.
+export const AGENT_MENTION_TOKEN = "agent";
 
 // The canonical tag-token grammar, defined ONCE so the resolver (server) and the highlighter (client, which
 // imports this module) can never drift apart — divergence here is exactly the @Coordinator-doesn't-light-up bug.
@@ -48,7 +52,7 @@ function entryMatches(entry, tok) {
  *  (this module is the single source of truth; the client adds no second grammar). `token` may be raw-cased. */
 export function tagHit(token, members) {
   const tok = String(token).toLowerCase();
-  if (ALL_TOKENS.has(tok) || HUMAN_TOKENS.has(tok)) return true;
+  if (ALL_TOKENS.has(tok) || HUMAN_TOKENS.has(tok) || tok === AGENT_MENTION_TOKEN) return true;
   return normEntries(members).some((e) => entryMatches(e, tok));
 }
 
@@ -101,10 +105,6 @@ export function parseTags(text) {
  *   • members — the member SIDS named by a (possibly ambiguous) prefix tag, de-duplicated, in tag order.
  *   • unknown — tags that matched no member and weren't a keyword (left as prose; surfaced for debugging).
  */
-// The reserved keyword that summons a fresh SEATLESS plain worker (a new hand per mention), distinct from a
-// role name. Lower-cased because parseTags lower-cases every token.
-export const AGENT_MENTION_TOKEN = "agent";
-
 /**
  * Classify an UNKNOWN @-tag — one resolveTags left in its `unknown` bucket (it matched no current member and
  * no keyword) — as a COLD-SPAWN target (threads-as-cards roadmap step 5): a mention that names something not
