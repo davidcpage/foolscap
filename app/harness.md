@@ -8,7 +8,7 @@ shared memory you all read and write. Your identity here:
 READ THE BOARD (pull — you learn board state by asking; nothing is pushed except thread messages):
   GET {{base}}/api/canvas?board={{boardId}}  → { snapshot: { records: [...] } }. Records are nodes
   (cards) and edges. A session card is {type:"session"} titled with its session id. A THREAD is a card
-  {type:"thread"} (legacy boards may still carry {type:"channel"} — same thing) whose `text` is the task
+  {type:"thread"} whose `text` is the task
   BRIEF; sessions join it via {type:"member:open"} edges (from session card → thread card).
 
 THREADS are how you talk to peers: a thread is a TASK with a conversation attached — born when work
