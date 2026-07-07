@@ -43,6 +43,12 @@ canvas — session/coordination verbs over the agent bus
         tear down a work-item's worktree on COMPLETION (not session exit). Guarded: skips+warns if the tree
         is dirty or the branch is unmerged unless --force. Key defaults to the thread (bare worker); pass
         --role for a role-seat worktree, or --key for an explicit key.
+  scripts/canvas worktree merge <THREAD> [--key KEY | --role ROLE] [--base REF] [--no-verify] [--force] [--from ID]
+        MERGE-ON-GREEN: green-gate the work-item's branch in its worktree (npm test + typecheck for the
+        packages it touched, always incl. app), then git merge --no-ff into --base (default main) from the
+        canonical checkout and tear the worktree down — one command. Refuses a dirty worktree, a dirty or
+        wrong-branch canonical checkout, or a failing gate; aborts cleanly on a merge conflict. --no-verify
+        skips the gate; --force forwards to teardown. Key/role resolve like `rm`.
   scripts/canvas input <sid> <text>                   send a turn to a live session's stdin (reads AS the human)
   scripts/canvas done <sid>                            mark a session done + terminate it
   scripts/canvas terminate <sid>                       kill a live session, free its slot
@@ -576,7 +582,34 @@ print(json.dumps(o))
 PY
 )
         post "$SERVER/api/thread/$(enc "$thread")/worktree?board=$BOARD" "$body"; echo ;;
-      *) echo "worktree: unknown subcommand '$sub' (list|rm)" >&2; exit 2 ;;
+      merge)
+        thread="${1:?usage: canvas worktree merge <thread> [--key K|--role R] [--base REF] [--no-verify] [--force] [--from ID]}"; shift
+        from="human"; key=""; role=""; base=""; noverify=""; force=""
+        while [ $# -gt 0 ]; do
+          case "$1" in
+            --key)       key="${2:-}"; shift 2 ;;
+            --role)      role="${2:-}"; shift 2 ;;
+            --base)      base="${2:-}"; shift 2 ;;
+            --no-verify) noverify="1"; shift ;;
+            --force)     force="1"; shift ;;
+            --from)      from="${2:-}"; shift 2 ;;
+            *) echo "worktree merge: unexpected arg '$1'" >&2; exit 2 ;;
+          esac
+        done
+        body=$(python3 - "$from" "$key" "$role" "$base" "$noverify" "$force" <<'PY'
+import json, sys
+frm, key, role, base, noverify, force = sys.argv[1:7]
+o = {"from": frm, "op": "merge"}
+if key:      o["key"] = key
+if role:     o["roleId"] = role
+if base:     o["base"] = base
+if noverify: o["noVerify"] = True
+if force:    o["force"] = True
+print(json.dumps(o))
+PY
+)
+        post "$SERVER/api/thread/$(enc "$thread")/worktree?board=$BOARD" "$body"; echo ;;
+      *) echo "worktree: unknown subcommand '$sub' (list|rm|merge)" >&2; exit 2 ;;
     esac ;;
   input)
     sid="${1:?usage: canvas input <sid> <text>}"; text="${2:?usage: canvas input <sid> <text>}"

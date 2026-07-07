@@ -25,7 +25,7 @@ import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired,
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
-import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, workItemKey } from "./worktrees.js";
+import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey } from "./worktrees.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -4771,18 +4771,21 @@ async function handleThreadPin(
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
-// POST /api/thread/<id>/worktree — manage the thread's work-item worktrees (Stage 1). `op:"remove"` is the
-// EXPLICIT teardown fired on WORK-ITEM completion (a Coordinator merged the branch), guarded: it skips+warns
-// on a dirty tree or unmerged branch unless `force`. `op:"list"` returns the recorded worktrees. The
-// work-item key is derived like a spawn's: explicit `key`, else `roleId`'s seat, else the thread itself.
-// Consent mirrors pin/intent: a member (or the human at the card) may act.
+// POST /api/thread/<id>/worktree — manage the thread's work-item worktrees. `op:"remove"` (Stage 1) is the
+// EXPLICIT teardown fired on WORK-ITEM completion, guarded: it skips+warns on a dirty tree or unmerged branch
+// unless `force`. `op:"merge"` (Stage 3) is merge-on-green: green-gate the branch in its worktree (skip with
+// `noVerify`), then `git merge --no-ff` into `base` (default main) from the canonical checkout and tear the
+// worktree down — refusing on a dirty worktree / dirty|wrong-branch canonical / a failing gate, and aborting
+// cleanly on a merge conflict. `op:"list"` returns the recorded worktrees. The work-item key is derived like
+// a spawn's: explicit `key`, else `roleId`'s seat, else the thread itself. Consent mirrors pin/intent: a
+// member (or the human at the card) may act.
 async function handleThreadWorktree(
   req: IncomingMessage,
   res: ServerResponse,
   boardId: string,
   threadId: string,
 ): Promise<void> {
-  let body: { from?: unknown; op?: unknown; key?: unknown; roleId?: unknown; force?: unknown };
+  let body: { from?: unknown; op?: unknown; key?: unknown; roleId?: unknown; force?: unknown; base?: unknown; noVerify?: unknown };
   try {
     body = JSON.parse(await readBody(req));
   } catch {
@@ -4790,7 +4793,7 @@ async function handleThreadWorktree(
   }
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   const op = typeof body.op === "string" ? body.op : "list";
-  if (op !== "list" && op !== "remove") return sendJson(res, 400, { error: `unknown op "${op}" (list|remove)` });
+  if (op !== "list" && op !== "remove" && op !== "merge") return sendJson(res, 400, { error: `unknown op "${op}" (list|remove|merge)` });
   const records = boardSnapshotRecords(boardId);
   if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
   if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
@@ -4803,6 +4806,14 @@ async function handleThreadWorktree(
   const explicitKey = typeof body.key === "string" && body.key ? body.key : null;
   const roleId = typeof body.roleId === "string" && body.roleId ? body.roleId : null;
   const key = workItemKey({ threadId, roleId, explicitKey });
+
+  if (op === "merge") {
+    const base = typeof body.base === "string" && body.base ? body.base : "main";
+    const result = mergeWorktree(repoPath, threadId, key!, { base, noVerify: body.noVerify === true, force: body.force === true });
+    publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a merged worktree drops off the marker)
+    return sendJson(res, result.merged ? 200 : 409, { thread: threadId, key, ...result });
+  }
+
   const result = removeWorktree(repoPath, threadId, key!, { force: body.force === true });
   publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a removed worktree drops off the marker)
   return sendJson(res, result.removed ? 200 : 409, { thread: threadId, key, ...result });

@@ -1,6 +1,9 @@
-// Worktree spawn primitive (Stage 1 of the worktree-based multi-agent workflow, thread node:thread:e1784729):
+// Worktree workflow (worktree-based multi-agent workflow, thread node:thread:e1784729):
 // give a server-spawned session its OWN git worktree — an isolated checkout on its own branch — instead of
 // the shared board root, so concurrent agents stop clobbering each other's files, tests, and commits.
+// Stage 1 = the spawn primitive (ensureWorktree / removeWorktree, keyed by work item). Stage 3 =
+// merge-on-green (mergeWorktree, at the bottom): green-gate the branch in its worktree, then merge into main
+// and tear down in one act.
 //
 // KEYED BY WORK-ITEM, NOT SESSION. Sessions are ephemeral (fresh sid every respawn — see the
 // never-resume-sessions norm), so keying a worktree by sid would leak it or lose it on respawn. Instead the
@@ -270,4 +273,110 @@ function dropRecord(repoPath, threadId, key) {
   const prior = readThreadMeta(repoPath, threadId)?.worktrees ?? {};
   const { [key]: _gone, ...rest } = prior;
   upsertThreadMeta(repoPath, threadId, { worktrees: rest });
+}
+
+// ── merge-on-green (Stage 3) ────────────────────────────────────────────────────────────────────────
+
+// The canonical checkout's current branch (the merge lands HERE, so it must equal the merge target).
+function currentBranch(repoPath) {
+  try {
+    return git(repoPath, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Which packages a branch's changes touch, among the buildable ones — the green gate runs each. `app` is
+// ALWAYS included (it's the integration surface + the primary dev package, and it imports the sibling
+// engines); `core`/`interaction` join only when the branch diff touched their dirs. Ordered deps-first so a
+// core break surfaces before the app run that depends on it.
+function gatePackages(repoPath, base, branch) {
+  const touched = new Set(["app"]);
+  let out = "";
+  try {
+    out = git(repoPath, ["diff", "--name-only", `${base}...${branch}`]);
+  } catch {
+    return [...touched]; // can't diff (e.g. no merge-base) → fall back to the app baseline
+  }
+  for (const line of out.split("\n")) {
+    const top = line.split("/")[0];
+    if (top === "core" || top === "interaction") touched.add(top);
+  }
+  return ["core", "interaction", "app"].filter((p) => touched.has(p));
+}
+
+const tail = (s, n) => (s.length > n ? "…" + s.slice(-n) : s);
+
+// Run the green gate for a set of packages IN THE WORKTREE (the branch checkout): `npm test` then
+// `npm run typecheck` per package, against the symlinked node_modules. First non-zero step aborts the whole
+// gate and is reported. This is the real gate the docs/CLI promise — it exercises the branch's own scripts.
+function runGate(wtPath, pkgs) {
+  for (const pkg of pkgs) {
+    const cwd = path.join(wtPath, pkg);
+    for (const step of [["test"], ["run", "typecheck"]]) {
+      try {
+        execFileSync("npm", step, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+      } catch (err) {
+        const output = tail(String(err.stdout || "") + String(err.stderr || ""), 4000);
+        return { ok: false, pkg, step: `npm ${step.join(" ")}`, code: err.status ?? 1, output };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/**
+ * Merge a work item's worktree branch into `base` and tear the worktree down — the one-command merge-on-green
+ * a builder fires when its work is complete. The explicit act (like teardown), NOT auto-fired on /done.
+ *
+ * Order: resolve record → PRECONDITIONS (refuse a dirty worktree — a merge only carries COMMITTED work; refuse
+ * a dirty or wrong-branch canonical checkout — never merge into an unclean/unexpected tree) → GREEN GATE (the
+ * touched packages' `npm test` + `npm run typecheck` in the worktree; skipped by `noVerify`; any non-zero
+ * aborts the whole op) → MERGE (`git merge --no-ff` into `base` from the canonical checkout; a conflict is
+ * `git merge --abort`ed so the canonical index is never left conflicted) → TEARDOWN (reuse removeWorktree —
+ * its unmerged guard is now a no-op since the branch is in HEAD; `force` forwards to it).
+ *
+ * Returns { merged, branch, base?, testsRun, testsPassed, removed?, teardown?, gate?, conflict?, dirty?, reason? }.
+ * Never throws for an expected refusal/conflict — those come back as merged:false with a reason.
+ */
+export function mergeWorktree(repoPath, threadId, key, { base = "main", noVerify = false, force = false } = {}) {
+  const record = listWorktrees(repoPath, threadId)[key];
+  if (!record?.path) return { merged: false, testsRun: [], testsPassed: null, reason: "no worktree recorded for this work item" };
+  const { path: wtPath, branch } = record;
+  if (!worktreeExists(repoPath, wtPath))
+    return { merged: false, branch, testsRun: [], testsPassed: null, reason: "worktree is gone on disk — nothing to merge (run teardown to clear the stale record)" };
+
+  // PRECONDITIONS — never merge from/into an unclean or unexpected state. Clear, actionable messages.
+  if (isDirty(wtPath))
+    return { merged: false, branch, dirty: true, testsRun: [], testsPassed: null, reason: "worktree has uncommitted changes — commit them in the worktree first (a merge only carries committed work)" };
+  const canon = currentBranch(repoPath);
+  if (canon !== base)
+    return { merged: false, branch, testsRun: [], testsPassed: null, reason: `canonical checkout is on "${canon}", not the merge target "${base}" — check out ${base} there first` };
+  if (isDirty(repoPath))
+    return { merged: false, branch, testsRun: [], testsPassed: null, reason: `canonical checkout (${base}) has uncommitted changes — commit or stash them before merging` };
+
+  // GREEN GATE — the touched packages' tests + typecheck, run in the worktree (skip with noVerify).
+  const gatePkgs = gatePackages(repoPath, base, branch);
+  let testsRun = [];
+  if (!noVerify) {
+    linkNodeModules(repoPath, wtPath); // heal any missing dep link before the run resolves imports
+    const gate = runGate(wtPath, gatePkgs);
+    testsRun = gatePkgs;
+    if (!gate.ok)
+      return { merged: false, branch, testsRun, testsPassed: false, gate, reason: `green gate failed: ${gate.pkg} \`${gate.step}\` exited ${gate.code} — fix in the worktree and re-merge (or --no-verify to skip)` };
+  }
+
+  // MERGE — --no-ff for a legible merge commit; a conflict is aborted so the canonical tree is never left
+  // with a conflicted index (the builder rebases/resolves and re-merges).
+  try {
+    git(repoPath, ["merge", "--no-ff", "-m", `Merge ${branch} into ${base} (worktree merge-on-green)`, branch]);
+  } catch (err) {
+    gitOk(repoPath, ["merge", "--abort"]);
+    const output = tail(String(err.stdout || "") + String(err.stderr || ""), 2000);
+    return { merged: false, branch, base, testsRun, testsPassed: noVerify ? null : true, conflict: true, output, reason: `merge into ${base} conflicted — aborted (canonical tree left clean); resolve on the branch and re-merge` };
+  }
+
+  // TEARDOWN — the branch is merged now, so removeWorktree's dirty/unmerged guard passes cleanly.
+  const teardown = removeWorktree(repoPath, threadId, key, { force });
+  return { merged: true, branch, base, testsRun, testsPassed: noVerify ? null : true, removed: teardown.removed, teardown };
 }

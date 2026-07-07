@@ -12,6 +12,7 @@ import { execFileSync } from "node:child_process";
 import {
   ensureWorktree,
   removeWorktree,
+  mergeWorktree,
   listWorktrees,
   workItemKey,
   worktreesDir,
@@ -19,13 +20,15 @@ import {
 } from "../worktrees.js";
 import { readThreadMeta } from "../thread-ledger.js";
 
-// A throwaway git repo with the three package dirs committed (so a worktree checkout HAS them) and a
-// canonical node_modules on disk in each (gitignored — as in the real repo — so it never lands in the
-// worktree and must be symlinked). Returns the repo path.
+// A throwaway git repo (on `main`) with the three package dirs committed (so a worktree checkout HAS them)
+// and a canonical node_modules on disk in each (gitignored — as in the real repo — so it never lands in the
+// worktree and must be symlinked). Each package carries a package.json with trivially-green `test` +
+// `typecheck` scripts (`node -e ""`), so the merge-on-green gate can run for real in the throwaway repo (a
+// branch overrides its own script to test the red path). Returns the repo path.
 function tmpRepo() {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "worktrees-"));
   const git = (...args) => execFileSync("git", args, { cwd: repo });
-  git("init", "-q");
+  git("init", "-q", "-b", "main");
   git("config", "user.email", "t@t");
   git("config", "user.name", "t");
   git("config", "commit.gpgsign", "false");
@@ -33,6 +36,10 @@ function tmpRepo() {
   for (const pkg of ["core", "interaction", "app"]) {
     fs.mkdirSync(path.join(repo, pkg), { recursive: true });
     fs.writeFileSync(path.join(repo, pkg, "index.js"), `// ${pkg}\n`);
+    fs.writeFileSync(
+      path.join(repo, pkg, "package.json"),
+      JSON.stringify({ name: pkg, version: "0.0.0", private: true, scripts: { test: 'node -e ""', typecheck: 'node -e ""' } }, null, 2) + "\n",
+    );
     fs.mkdirSync(path.join(repo, pkg, "node_modules", "dep"), { recursive: true });
     fs.writeFileSync(path.join(repo, pkg, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
   }
@@ -41,6 +48,13 @@ function tmpRepo() {
   return repo;
 }
 const gitOut = (repo, ...args) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+// Commit a change on a worktree's branch (helper for the merge tests).
+function commitInWorktree(wtPath, relPath, contents, msg) {
+  fs.mkdirSync(path.dirname(path.join(wtPath, relPath)), { recursive: true });
+  fs.writeFileSync(path.join(wtPath, relPath), contents);
+  execFileSync("git", ["add", "-A"], { cwd: wtPath });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-qm", msg], { cwd: wtPath });
+}
 
 test("workItemKey: explicit key wins, then role seat, then thread, else null", () => {
   assert.equal(workItemKey({ threadId: "node:thread:t", roleId: "pm", explicitKey: "K" }), "K");
@@ -156,4 +170,147 @@ test("linkNodeModules is idempotent and skips an already-present link", () => {
   const wt = ensureWorktree(repo, "node:thread:abc", "node:thread:abc");
   const again = linkNodeModules(repo, wt.path); // links already exist from ensureWorktree
   assert.deepEqual(again, [], "no re-link when the symlink is already there");
+});
+
+// ── merge-on-green (Stage 3) ────────────────────────────────────────────────────────────────────────
+
+test("merge-on-green: green gate passes → merges --no-ff into main and tears down", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "app/feature.js", "export const feature = 1;\n", "add feature");
+  const before = gitOut(repo, "rev-parse", "HEAD");
+
+  const r = mergeWorktree(repo, thread, key); // real gate: app package.json scripts are green
+  assert.equal(r.merged, true);
+  assert.equal(r.testsPassed, true);
+  assert.deepEqual(r.testsRun, ["app"], "only app touched → only app gated");
+  assert.equal(r.removed, true);
+  // main advanced with a merge commit that carries the feature.
+  assert.notEqual(gitOut(repo, "rev-parse", "HEAD"), before, "main advanced");
+  assert.ok(fs.existsSync(path.join(repo, "app", "feature.js")), "feature landed on main");
+  assert.match(gitOut(repo, "log", "-1", "--pretty=%s"), /Merge agent\/node-thread-abc into main/);
+  // worktree + branch + record all gone.
+  assert.ok(!fs.existsSync(wt.path), "worktree dir removed");
+  assert.deepEqual(listWorktrees(repo, thread), {}, "record dropped");
+  assert.doesNotMatch(gitOut(repo, "worktree", "list"), /agent\//, "git no longer lists the worktree");
+});
+
+test("merge-on-green: also gates core/interaction when the branch touched them", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "core/added.ts", "export const x = 1;\n", "touch core");
+  const r = mergeWorktree(repo, thread, key);
+  assert.equal(r.merged, true);
+  assert.deepEqual(r.testsRun, ["core", "app"], "core touched → core + app gated, deps-first");
+});
+
+test("merge --no-verify: skips the gate, still merges + tears down", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "app/feature.js", "export const f = 1;\n", "feature");
+  const r = mergeWorktree(repo, thread, key, { noVerify: true });
+  assert.equal(r.merged, true);
+  assert.equal(r.testsPassed, null, "gate skipped → testsPassed null");
+  assert.deepEqual(r.testsRun, [], "no packages gated");
+  assert.equal(r.removed, true);
+  assert.ok(!fs.existsSync(wt.path));
+});
+
+test("merge ABORTS on a red gate: no merge, worktree preserved, main untouched", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  // The branch ships a failing test script — the gate runs the BRANCH's scripts, so it must fail.
+  const redPkg = JSON.stringify(
+    { name: "app", version: "0.0.0", private: true, scripts: { test: 'node -e "process.exit(1)"', typecheck: 'node -e ""' } },
+    null, 2,
+  ) + "\n";
+  commitInWorktree(wt.path, "app/package.json", redPkg, "break the test");
+  const before = gitOut(repo, "rev-parse", "HEAD");
+
+  const r = mergeWorktree(repo, thread, key);
+  assert.equal(r.merged, false);
+  assert.equal(r.testsPassed, false);
+  assert.equal(r.gate.pkg, "app");
+  assert.match(r.gate.step, /npm test/);
+  assert.match(r.reason, /green gate failed/);
+  // Nothing merged, nothing torn down.
+  assert.equal(gitOut(repo, "rev-parse", "HEAD"), before, "main untouched");
+  assert.ok(fs.existsSync(wt.path), "worktree preserved");
+  assert.ok(listWorktrees(repo, thread)[key], "record preserved");
+});
+
+test("merge REFUSES a dirty worktree (commit first)", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  fs.writeFileSync(path.join(wt.path, "app", "wip.js"), "uncommitted\n");
+  const r = mergeWorktree(repo, thread, key, { noVerify: true });
+  assert.equal(r.merged, false);
+  assert.equal(r.dirty, true);
+  assert.match(r.reason, /uncommitted/);
+  assert.ok(fs.existsSync(wt.path), "worktree preserved");
+});
+
+test("merge REFUSES a dirty canonical checkout", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "app/feature.js", "1\n", "feature");
+  fs.writeFileSync(path.join(repo, "app", "dirty.js"), "uncommitted in canonical\n"); // dirty main
+  const r = mergeWorktree(repo, thread, key, { noVerify: true });
+  assert.equal(r.merged, false);
+  assert.match(r.reason, /canonical checkout \(main\) has uncommitted/);
+  assert.ok(fs.existsSync(wt.path), "worktree preserved");
+});
+
+test("merge REFUSES when the canonical checkout is on the wrong branch", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "app/feature.js", "1\n", "feature");
+  execFileSync("git", ["checkout", "-q", "-b", "sidebar"], { cwd: repo }); // canonical off main
+  const r = mergeWorktree(repo, thread, key, { base: "main", noVerify: true });
+  assert.equal(r.merged, false);
+  assert.match(r.reason, /on "sidebar", not the merge target "main"/);
+});
+
+test("merge conflict → git merge --abort, canonical left clean, worktree preserved", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  // Both the branch and main edit the SAME line of the SAME file → a real conflict at merge.
+  commitInWorktree(wt.path, "app/index.js", "// branch edit\n", "branch edits index");
+  fs.writeFileSync(path.join(repo, "app", "index.js"), "// main edit\n");
+  execFileSync("git", ["add", "-A"], { cwd: repo });
+  execFileSync("git", ["-c", "commit.gpgsign=false", "commit", "-qm", "main edits index"], { cwd: repo });
+  const before = gitOut(repo, "rev-parse", "HEAD");
+
+  const r = mergeWorktree(repo, thread, key, { noVerify: true });
+  assert.equal(r.merged, false);
+  assert.equal(r.conflict, true);
+  assert.match(r.reason, /conflicted/);
+  // The abort left the canonical tree clean (no conflict markers / no MERGE_HEAD) and HEAD unmoved.
+  assert.equal(gitOut(repo, "status", "--porcelain"), "", "canonical tree clean after abort");
+  assert.equal(gitOut(repo, "rev-parse", "HEAD"), before, "main HEAD unmoved");
+  assert.ok(!fs.existsSync(path.join(repo, ".git", "MERGE_HEAD")), "no in-progress merge left behind");
+  assert.ok(fs.existsSync(wt.path), "worktree preserved for a re-merge after resolution");
+});
+
+test("merge with no worktree recorded is a no-op refusal, not a throw", () => {
+  const repo = tmpRepo();
+  const r = mergeWorktree(repo, "node:thread:abc", "node:thread:abc");
+  assert.equal(r.merged, false);
+  assert.match(r.reason, /no worktree/);
 });

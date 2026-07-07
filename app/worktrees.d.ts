@@ -27,6 +27,30 @@ export interface RemoveResult {
   branch?: string;
 }
 
+// A failing green-gate step (which package + `npm ...` step exited non-zero, with a bounded output tail).
+export interface GateFailure {
+  ok: false;
+  pkg: string;
+  step: string;
+  code: number;
+  output: string;
+}
+
+export interface MergeResult {
+  merged: boolean;
+  branch?: string;
+  base?: string;
+  testsRun: string[]; // packages the gate ran (empty when skipped)
+  testsPassed: boolean | null; // true green, false red, null when skipped (noVerify)
+  removed?: boolean; // teardown outcome on a merged worktree
+  teardown?: RemoveResult;
+  gate?: GateFailure; // present when the gate failed
+  conflict?: boolean; // present (true) when the merge conflicted and was aborted
+  dirty?: boolean; // present (true) when refused for a dirty worktree
+  output?: string; // conflict output tail
+  reason?: string;
+}
+
 export function worktreesDir(repoPath: string): string;
 export function workItemKey(opts?: {
   threadId?: string | null;
@@ -47,4 +71,10 @@ export function removeWorktree(
   key: string,
   opts?: { force?: boolean },
 ): RemoveResult;
+export function mergeWorktree(
+  repoPath: string,
+  threadId: string,
+  key: string,
+  opts?: { base?: string; noVerify?: boolean; force?: boolean },
+): MergeResult;
 export function linkNodeModules(canonicalPath: string, wtPath: string): string[];
