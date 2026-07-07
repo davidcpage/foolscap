@@ -33,12 +33,15 @@ const MOVE_THRESHOLD_PX = 4; // cursor travel below this doesn't count as aiming
 const PREVIEW_DEPTH = 1; // how far toward the final pose a hover flies (log-zoom fraction). 1 = the
 // preview IS the final view and releasing z is motionless confirmation — a partial depth (0.65 was
 // tried) left a residual zoom on release that read as unexpected movement, not context
-const HOVER_DELAY_MS = 220; // settle on a card this long before the preview flies. Deliberately generous:
+const HOVER_DELAY_MS = 300; // settle on a card this long before the preview flies. Deliberately generous:
 // a card you merely CROSS while sweeping the cursor toward your real target must not grab focus — only a
-// card you come to rest on should. (Was 60ms, which let a mid-move crossing steal the zoom target.)
-const PREVIEW_FLIGHT_MS = 500; // the preview / backout / dive flight, deliberately slower than flyTo's
-// default 300 — its eased start (easeInOutQuad) doubles as the hover warning, so the delay above could shrink
-const PEEK_OUT_MS = 520; // the OPENING fly-out on z-down — the gesture's very first motion, so the most
+// card you come to rest on should. (Was 60ms, which let a mid-move crossing steal the zoom target; raised
+// 220→300 alongside the slower flights below, since a slower flight leaves a card longer under a
+// stationary cursor as the camera moves, and the longer settle keeps that transit from grabbing focus.)
+const PREVIEW_FLIGHT_MS = 650; // the preview / backout / dive flight, deliberately slower than flyTo's
+// default 300 — its eased start (easeInOutQuad) doubles as the hover warning. Raised 500→650: the human
+// found the movement still too fast/aggressive, losing focus on the target card; a gentler flight settles.
+const PEEK_OUT_MS = 700; // the OPENING fly-out on z-down — the gesture's very first motion, so the most
 // unhurried of all: over flyTo's fixed ease-in a longer flight ramps the zoom-out up gently instead of
 // snapping (the default 300 read as too aggressive a START). A touch longer than the preview since it
 // covers the whole zoom-out range from wherever the camera happened to be.
@@ -96,12 +99,15 @@ export function bindPeek(
   // the next card. (Without it, deep retargeting was a flight to nowhere: anchoring the point under
   // the cursor at the zoom you're already at is exactly where the camera stands.)
   const framedPose = (pose: CameraState, l: LayoutRecord): CameraState => {
-    // The margin is a generous fraction of the viewport, not a sliver: "framed" means COMFORTABLY in
-    // view. With a thin margin a card hugging the screen edge counted as already framed and hover
-    // moved nothing — technically correct, felt dead. Cards already inside the comfort zone still
-    // draw no motion (they're where focus would put them), which is the natural no-op.
+    // The margin is now a thin SLIVER, not a comfort zone: the frame nudge exists only to stop a card
+    // CLIPPING off the viewport edge, not to pull a comfortably-visible card toward centre. The old
+    // generous 12% comfort pad recentred any card aimed near the edge, which slid the aimed card out
+    // from under the STATIONARY cursor as the camera zoomed — the cursor fell onto bare canvas, focus
+    // was lost, and a backout jerked the view to the overview (the human's exact report). With
+    // cursor-anchored zoom (anchoredPose keeps the aimed point pinned under the pointer), the card must
+    // stay under the cursor; a wide comfort pad fights that, so we only correct genuine clipping.
     const axis = (start: number, size: number, view: number): number => {
-      const pad = view * 0.12;
+      const pad = view * 0.02;
       if (size > view - 2 * pad) return (view - size) / 2 - start; // doesn't fit: centre it
       if (start < pad) return pad - start;
       if (start + size > view - pad) return view - pad - (start + size);

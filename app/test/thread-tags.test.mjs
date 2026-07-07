@@ -3,7 +3,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseTags, resolveTags, tagHit, matchTagSpans } from "../thread-tags.js";
+import { parseTags, resolveTags, tagHit, matchTagSpans, classifyMentionSpawn } from "../thread-tags.js";
 
 const MEMBERS = ["a927e694-839d-4aea-b0a4-39353072a4e9", "83adfb9c-73ab-468b-9c4c-4bef636cf997"];
 
@@ -149,4 +149,55 @@ test("matchTagSpans: a Name.sid handle highlights whole; a trailing full stop st
 
 test("matchTagSpans: an email-ish @ is not a tag (no span)", () => {
   assert.deepEqual(matchTagSpans("mail foo@bar.com please", NAMED), []);
+});
+
+// ── classifyMentionSpawn (threads-as-cards roadmap step 5): an UNKNOWN @-tag (one resolveTags left in its
+// `unknown` bucket) is classified for COLD-SPAWN — @Agent → a seatless plain worker, a known role → its
+// first seat, anything else → prose (null). Pure: no server, no spawn — just the routing decision.
+const ROLES = [
+  { roleId: "pm", name: "Coordinator" },
+  { roleId: "generalist", name: "Generalist" },
+  { roleId: "oracle", name: "Oracle" },
+];
+
+test("classifyMentionSpawn: @Agent (any case) → a seatless plain worker", () => {
+  for (const tok of ["agent", "Agent", "AGENT"]) {
+    // parseTags lower-cases, but the classifier is defensive about case either way.
+    assert.deepEqual(classifyMentionSpawn(tok, ROLES), { kind: "agent" });
+  }
+});
+
+test("classifyMentionSpawn: a known role by display NAME → its first seat", () => {
+  assert.deepEqual(classifyMentionSpawn("coordinator", ROLES), { kind: "role", roleId: "pm", name: "Coordinator" });
+  assert.deepEqual(classifyMentionSpawn("oracle", ROLES), { kind: "role", roleId: "oracle", name: "Oracle" });
+});
+
+test("classifyMentionSpawn: a known role by roleId slug also matches", () => {
+  // `@pm` names the Coordinator role by its filesystem slug, not its display name.
+  assert.deepEqual(classifyMentionSpawn("pm", ROLES), { kind: "role", roleId: "pm", name: "Coordinator" });
+});
+
+test("classifyMentionSpawn: an unknown token → null (stays prose, no spawn)", () => {
+  assert.equal(classifyMentionSpawn("nobody", ROLES), null);
+  assert.equal(classifyMentionSpawn("coord", ROLES), null, "partial role name does NOT match (exact only)");
+  assert.equal(classifyMentionSpawn("scribe", ROLES), null);
+});
+
+test("classifyMentionSpawn: @Agent wins over a role literally named Agent", () => {
+  const withAgentRole = [...ROLES, { roleId: "agent", name: "Agent" }];
+  assert.deepEqual(classifyMentionSpawn("agent", withAgentRole), { kind: "agent" }, "reserved keyword takes precedence");
+});
+
+test("classifyMentionSpawn: tolerates an empty/absent role roster", () => {
+  assert.deepEqual(classifyMentionSpawn("agent", undefined), { kind: "agent" });
+  assert.equal(classifyMentionSpawn("coordinator", undefined), null);
+  assert.equal(classifyMentionSpawn("coordinator", []), null);
+});
+
+test("classifyMentionSpawn composes with resolveTags: the unknown bucket is what gets classified", () => {
+  // A message @-tagging a role with no current member: resolveTags leaves it unknown, classify routes it.
+  const r = resolveTags("@Generalist can you take this?", MEMBERS);
+  assert.deepEqual(r.members, [], "no member matched");
+  assert.deepEqual(r.unknown, ["generalist"]);
+  assert.deepEqual(classifyMentionSpawn(r.unknown[0], ROLES), { kind: "role", roleId: "generalist", name: "Generalist" });
 });

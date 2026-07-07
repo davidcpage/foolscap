@@ -199,7 +199,15 @@ function Board({ m, undo, persistence }: Engine) {
     const down = (e: KeyboardEvent) => {
       if (e.key === "Alt") {
         if (!e.repeat) pristine = true;
-      } else pristine = false; // any other key → the Alt press is a combo, not a tap
+      } else if (e.code !== "KeyZ") {
+        // Any other key → the Alt press is a combo, not a tap. The peek key (z, peek.ts) is EXEMPT so
+        // the minimap can still be toggled mid-peek: holding z auto-repeats keydown, and each repeat
+        // would otherwise reset pristine and swallow the Alt-tap. Match e.CODE (the physical key), not
+        // e.key — while Alt/Option is held the repeating z arrives as an Option-MODIFIED character
+        // (e.key "Ω" on macOS), not "z"/"Z", so an e.key check misses it and the toggle stays broken.
+        // z carries no modifier as a real gesture (peek bails on any altKey), so exempting it is safe.
+        pristine = false;
+      }
     };
     const up = (e: KeyboardEvent) => {
       if (e.key !== "Alt") return;

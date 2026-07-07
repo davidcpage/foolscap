@@ -101,6 +101,33 @@ export function parseTags(text) {
  *   • members — the member SIDS named by a (possibly ambiguous) prefix tag, de-duplicated, in tag order.
  *   • unknown — tags that matched no member and weren't a keyword (left as prose; surfaced for debugging).
  */
+// The reserved keyword that summons a fresh SEATLESS plain worker (a new hand per mention), distinct from a
+// role name. Lower-cased because parseTags lower-cases every token.
+export const AGENT_MENTION_TOKEN = "agent";
+
+/**
+ * Classify an UNKNOWN @-tag — one resolveTags left in its `unknown` bucket (it matched no current member and
+ * no keyword) — as a COLD-SPAWN target (threads-as-cards roadmap step 5): a mention that names something not
+ * yet in the thread SUMMONS it. Given the token (already lower-cased by parseTags) and the board's role
+ * roster (`listRoles` shape: `[{ roleId, name }]`):
+ *   • `@Agent` (reserved, case-insensitive) → `{ kind: "agent" }` — a seatless plain worker; each mention is
+ *     a new hand. Takes precedence over a role literally named "Agent".
+ *   • a KNOWN ROLE, matched EXACTLY (case-insensitive) on its `roleId` or display `name` → `{ kind: "role",
+ *     roleId, name }` — the caller cold-spawns into the role's first seat on the thread. Exact (not prefix)
+ *     so a typo/partial token never silently spawns the wrong role.
+ *   • neither → `null` — the token stays prose (no regression; the current silent-discard behaviour).
+ * A token that ALREADY resolved to a member (a live or dormant seated role) never reaches here — it's in
+ * resolveTags' `members`, so this is first-contact-only; existing-seat wakes ride the member/respawn path.
+ */
+export function classifyMentionSpawn(token, roles) {
+  const tok = String(token).toLowerCase();
+  if (tok === AGENT_MENTION_TOKEN) return { kind: "agent" };
+  const role = (roles ?? []).find(
+    (r) => r && (String(r.roleId).toLowerCase() === tok || String(r.name).toLowerCase() === tok),
+  );
+  return role ? { kind: "role", roleId: role.roleId, name: role.name } : null;
+}
+
 export function resolveTags(text, members) {
   const entries = normEntries(members);
   let wakeAll = false;

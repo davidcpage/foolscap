@@ -13,3 +13,10 @@ export function matchTagSpans(
   text: string,
   members: TagMembers,
 ): Array<{ start: number; end: number; token: string }>;
+
+export const AGENT_MENTION_TOKEN: "agent";
+export type MentionSpawn = { kind: "agent" } | { kind: "role"; roleId: string; name: string };
+export function classifyMentionSpawn(
+  token: string,
+  roles: Array<{ roleId: string; name: string }> | null | undefined,
+): MentionSpawn | null;
