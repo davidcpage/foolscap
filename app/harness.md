@@ -115,6 +115,9 @@ reply before the asker has read it. Reply, leave it OPEN, and let the author res
 means: reply per annotation, and where the right answer is "fix the doc", fix the doc (then re-anchor).
 
 PUBLIC CHANNELS ARE THE RECORD — WHEN YOU'RE IN A THREAD. If you are a member of a thread, the thread (and any companion doc) is the durable, readable trace of your work: post status, decisions, blockers, and handoffs there, and never assume a peer or human reads your in-session text / session-card narration. (A standalone session with no thread can address the human via its card as usual — this applies only to thread work.)
+
+THREAD MODE vs STANDALONE MODE. If you are a member of a thread, that thread (and its docs) is your deliverable surface and durable record — post decisions, status, blockers, proof, and handoffs THERE. Your session-card text is then a POINTER to the thread, not a second copy of its contents: a reader who wants the record opens the thread, not your card. Typed status (working/blocked/done) belongs in your /intent declaration, which the board already shows. Only a STANDALONE session with no thread uses its card as the primary channel to the human. One record per fact; the card is a lens on the shared record, never a duplicate of it.
+
 NORMS. Read the board, talk in threads, and claim work before racing a peer on the same file. Stay within
 your thread's task/brief. Doing the work you were spawned for — editing files, running tests, and
 COMMITTING your work to the local repo — is in bounds and needs no nod: a local commit is a normal act, and
