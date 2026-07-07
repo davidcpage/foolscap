@@ -261,6 +261,12 @@ Rename, don't rebuild — in dependency order:
 5. **@Role spawn-on-mention** (§4) — the tag parser already resolves member prefixes; teach it roles, and
    wire the miss-path to the existing spawn cascade (fills-or-creates the first seat). Labelled seats +
    the second-seat affordance (§5) come later still, when multiplicity is first wanted.
+   Mention-spawn is **role/seat-based ONLY**: a bare `@<KnownRole>` fills-or-creates the role's first seat
+   (self-limiting at one seat per role); any other unmatched token stays **inert prose**. An early version
+   also carried a reserved `@Agent` keyword that cold-spawned a *seatless* worker — a new hand per mention —
+   but it was **removed as a footgun**: because it fired on every occurrence of the token in message text,
+   agents naming it in prose each summoned a fresh worker, a runaway spawn cascade. The seatless path is
+   gone; only the seat-bounded role path and explicit `scripts/canvas spawn` remain.
 6. **Close verb + the optional-write-up charter line** (§7).
 
 CLAUDE.md's channel section rewrites at step 2, when the endpoints actually move.

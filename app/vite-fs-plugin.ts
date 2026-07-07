@@ -4261,26 +4261,26 @@ async function handleThreadMessage(
   // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an untagged
   // post is ambient (neither — wakes no one).
   const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin: originOf(req) });
-  // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role or the
-  // reserved @Agent COLD-SPAWNS a fresh session into the thread — the mention itself is the summons.
-  const spawned = spawnMentionedWorkers(boardId, threadId, unknown, msg.seq, originOf(req));
+  // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role
+  // COLD-SPAWNS a fresh session into the thread — the mention itself is the summons (role/seat-based only).
+  const spawned = spawnMentionedWorkers(boardId, threadId, unknown, originOf(req));
   sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified, spawned });
 }
 
-// §step5 (threads-as-cards roadmap: @Role/@Agent mention → cold-spawn). Each UNKNOWN @-tag (one resolveTags
-// left unmatched — no member, no keyword) that NAMES A KNOWN ROLE or the reserved @Agent summons a fresh
-// session INTO this thread, reusing the seat-creating serverSpawnWorker cascade (card + member:open edge +
-// server-side placement). A known role gets its FIRST seat here (the member:open onboarding fills it from the
-// card name); @Agent gets a seatless plain worker — a new hand per mention. A token that is neither stays
-// prose (no spawn — the pre-existing silent-discard behaviour, no regression). The worker is seeded from the
-// thread's FULL backlog, so the triggering message replays on its first inbox read: it wakes onto the task.
-// NOT the dormant-seat path — an existing seat (live or dormant) resolves to a MEMBER and rides
+// §step5 (threads-as-cards roadmap: @Role mention → cold-spawn). Each UNKNOWN @-tag (one resolveTags left
+// unmatched — no member, no keyword) that NAMES A KNOWN ROLE summons a fresh session INTO this thread,
+// reusing the seat-creating serverSpawnWorker cascade (card + member:open edge + server-side placement). The
+// role gets its FIRST seat here (the member:open onboarding fills it from the card name), self-limiting at one
+// seat per role. A token that is not a known role stays inert prose (no spawn — the pre-existing silent
+// discard, no regression). (A seatless reserved-keyword path once cold-spawned a plain worker per mention; it
+// was REMOVED as a footgun — naming the token in prose triggered a runaway spawn cascade.) The worker is
+// seeded from the thread's FULL backlog, so the triggering message replays on its first inbox read: it wakes
+// onto the task. NOT the dormant-seat path — an existing seat (live or dormant) resolves to a MEMBER and rides
 // maybeRespawnDormantSeat; this is first-contact only. Returns the spawns for the response (legibility/tests).
 function spawnMentionedWorkers(
   boardId: string,
   threadId: string,
   unknownTags: string[],
-  seq: number,
   origin: string,
 ): Array<{ token: string; sid: string; role: string | null }> {
   const spawned: Array<{ token: string; sid: string; role: string | null }> = [];
@@ -4292,29 +4292,27 @@ function spawnMentionedWorkers(
   const title = (records ? threadNode(records, threadId) : null)?.title || threadId;
   for (const tok of unknownTags) {
     const hit = classifyMentionSpawn(tok, roles);
-    if (!hit) continue; // neither a known role nor @Agent — leave as prose (no regression)
-    // A role summons into its named seat (single-flight per seat so a duplicate tag in the same burst doesn't
-    // race a second worker onto it); @Agent is a NEW hand each time, so its claim key is per-message-unique.
-    const claimKey = hit.kind === "role" ? seatSurfaceKey(threadId, hit.name) : `agent-mention:${threadId}:${seq}`;
+    if (!hit) continue; // not a known role — leave as inert prose (no regression)
+    // A role summons into its named seat, single-flight per seat so a duplicate tag in the same burst doesn't
+    // race a second worker onto it.
+    const claimKey = seatSurfaceKey(threadId, hit.name);
     if (isSurfaceClaimed(claimKey)) continue;
     const sid = serverSpawnWorker({
       boardId, repoPath, origin,
-      roleId: hit.kind === "role" ? hit.roleId : null,
+      roleId: hit.roleId,
       threadId, anchorNodeId: threadId, claimKey,
-      firstPrompt: mentionSpawnBrief(origin, hit.kind === "role" ? hit.name : null, title),
+      firstPrompt: mentionSpawnBrief(origin, hit.name, title),
     });
-    if (sid) spawned.push({ token: tok, sid, role: hit.kind === "role" ? hit.name : null });
+    if (sid) spawned.push({ token: tok, sid, role: hit.name });
   }
   return spawned;
 }
 
 // The first-turn brief for a session COLD-SPAWNED by an @-mention (spawnMentionedWorkers). A fresh session
 // (not a resume): its thread cursor is seeded to the full backlog, so the summoning message replays on the
-// first inbox read below. `role` names the seat it occupies, or null for an @Agent seatless worker.
-function mentionSpawnBrief(origin: string, role: string | null, threadTitle: string): string {
-  const who = role
-    ? `the ${role} for thread "${threadTitle}" — your role's seat on this thread is now yours`
-    : `a worker (@Agent) summoned into thread "${threadTitle}"`;
+// first inbox read below. `role` names the seat it occupies.
+function mentionSpawnBrief(origin: string, role: string, threadTitle: string): string {
+  const who = `the ${role} for thread "${threadTitle}" — your role's seat on this thread is now yours`;
   return (
     `[canvas] You've been SUMMONED into a thread by an @-mention — you are ${who}. This is a FRESH session (not a resume); read the thread to catch up on the task.\n` +
     `- Read your inbox: GET http://${origin}/api/inbox?session=<your session id> — the message that summoned you is there (the full backlog replays on this first read).\n` +

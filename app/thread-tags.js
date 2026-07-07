@@ -20,10 +20,6 @@
 
 const ALL_TOKENS = new Set(["all", "everyone", "channel", "here"]);
 const HUMAN_TOKENS = new Set(["human", "user"]);
-// The reserved keyword that summons a fresh SEATLESS plain worker (a new hand per mention), distinct from a
-// role name. Lower-cased because parseTags lower-cases every token. Like @all/@human it ALWAYS resolves (to a
-// cold-spawn, see classifyMentionSpawn), so the highlighter (tagHit) must light it even when no member matches.
-export const AGENT_MENTION_TOKEN = "agent";
 
 // The canonical tag-token grammar, defined ONCE so the resolver (server) and the highlighter (client, which
 // imports this module) can never drift apart — divergence here is exactly the @Coordinator-doesn't-light-up bug.
@@ -52,7 +48,7 @@ function entryMatches(entry, tok) {
  *  (this module is the single source of truth; the client adds no second grammar). `token` may be raw-cased. */
 export function tagHit(token, members) {
   const tok = String(token).toLowerCase();
-  if (ALL_TOKENS.has(tok) || HUMAN_TOKENS.has(tok) || tok === AGENT_MENTION_TOKEN) return true;
+  if (ALL_TOKENS.has(tok) || HUMAN_TOKENS.has(tok)) return true;
   return normEntries(members).some((e) => entryMatches(e, tok));
 }
 
@@ -108,20 +104,19 @@ export function parseTags(text) {
 /**
  * Classify an UNKNOWN @-tag — one resolveTags left in its `unknown` bucket (it matched no current member and
  * no keyword) — as a COLD-SPAWN target (threads-as-cards roadmap step 5): a mention that names something not
- * yet in the thread SUMMONS it. Given the token (already lower-cased by parseTags) and the board's role
- * roster (`listRoles` shape: `[{ roleId, name }]`):
- *   • `@Agent` (reserved, case-insensitive) → `{ kind: "agent" }` — a seatless plain worker; each mention is
- *     a new hand. Takes precedence over a role literally named "Agent".
+ * yet in the thread SUMMONS it. Spawn is ROLE/SEAT-BASED ONLY. Given the token (already lower-cased by
+ * parseTags) and the board's role roster (`listRoles` shape: `[{ roleId, name }]`):
  *   • a KNOWN ROLE, matched EXACTLY (case-insensitive) on its `roleId` or display `name` → `{ kind: "role",
  *     roleId, name }` — the caller cold-spawns into the role's first seat on the thread. Exact (not prefix)
- *     so a typo/partial token never silently spawns the wrong role.
- *   • neither → `null` — the token stays prose (no regression; the current silent-discard behaviour).
+ *     so a typo/partial token never silently spawns the wrong role. Self-limiting: one seat per role.
+ *   • anything else → `null` — the token stays inert prose (no spawn; the pre-existing silent-discard).
+ * (A seatless reserved-keyword path once summoned a fresh plain worker per mention; it was REMOVED as a
+ * footgun — naming the token in prose triggered a runaway spawn cascade — so only role/seat spawn remains.)
  * A token that ALREADY resolved to a member (a live or dormant seated role) never reaches here — it's in
  * resolveTags' `members`, so this is first-contact-only; existing-seat wakes ride the member/respawn path.
  */
 export function classifyMentionSpawn(token, roles) {
   const tok = String(token).toLowerCase();
-  if (tok === AGENT_MENTION_TOKEN) return { kind: "agent" };
   const role = (roles ?? []).find(
     (r) => r && (String(r.roleId).toLowerCase() === tok || String(r.name).toLowerCase() === tok),
   );

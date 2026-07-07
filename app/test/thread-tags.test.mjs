@@ -126,21 +126,18 @@ test("tagHit: keyword, sid prefix, and role-name prefix all hit; prose misses", 
   assert.equal(tagHit("a9", MEMBERS), true, "bare-sid members still match");
 });
 
-test("tagHit: @Agent is a reserved spawn keyword — always hits, even with no member named Agent", () => {
-  // @Agent cold-spawns a seatless worker (classifyMentionSpawn), so like @all/@human it always resolves and
-  // must light up regardless of the roster (regression guard for the seq-21 not-highlighted bug).
+test("tagHit: @agent is NOT a reserved keyword — misses unless a member is named", () => {
+  // The seatless reserved-keyword spawn path was removed (footgun: prose mentions triggered a spawn cascade).
+  // @agent is now ordinary prose — it hits only if it prefix-matches a member's sid/name, like any other tag.
   for (const t of ["agent", "Agent", "AGENT"]) {
-    assert.equal(tagHit(t, NAMED), true, `@${t} is the reserved spawn keyword`);
-    assert.equal(tagHit(t, []), true, `@${t} hits even on an empty roster`);
+    assert.equal(tagHit(t, NAMED), false, `@${t} is plain prose, not a keyword`);
+    assert.equal(tagHit(t, []), false, `@${t} misses on an empty roster`);
   }
 });
 
-test("matchTagSpans: @Agent highlights as a reserved keyword", () => {
-  const text = "@Agent please take this";
-  assert.deepEqual(
-    matchTagSpans(text, []).map((s) => text.slice(s.start, s.end)),
-    ["@Agent"],
-  );
+test("matchTagSpans: @agent does not highlight (no longer a reserved keyword)", () => {
+  const text = "@agent please take this";
+  assert.deepEqual(matchTagSpans(text, []), [], "the removed keyword is inert prose");
 });
 
 test("matchTagSpans: returns the highlight range of each RESOLVING tag only", () => {
@@ -169,18 +166,19 @@ test("matchTagSpans: an email-ish @ is not a tag (no span)", () => {
 });
 
 // ── classifyMentionSpawn (threads-as-cards roadmap step 5): an UNKNOWN @-tag (one resolveTags left in its
-// `unknown` bucket) is classified for COLD-SPAWN — @Agent → a seatless plain worker, a known role → its
-// first seat, anything else → prose (null). Pure: no server, no spawn — just the routing decision.
+// `unknown` bucket) is classified for COLD-SPAWN — role/seat-based ONLY: a known role → its first seat,
+// anything else → inert prose (null). Pure: no server, no spawn — just the routing decision. (The seatless
+// reserved-keyword path was removed as a footgun; there is no longer any non-role spawn.)
 const ROLES = [
   { roleId: "pm", name: "Coordinator" },
   { roleId: "generalist", name: "Generalist" },
   { roleId: "oracle", name: "Oracle" },
 ];
 
-test("classifyMentionSpawn: @Agent (any case) → a seatless plain worker", () => {
+test("classifyMentionSpawn: the removed reserved keyword → null (inert prose, spawns nothing)", () => {
+  // Regression guard for the spawn-cascade footgun: naming the token in message text must summon NOTHING.
   for (const tok of ["agent", "Agent", "AGENT"]) {
-    // parseTags lower-cases, but the classifier is defensive about case either way.
-    assert.deepEqual(classifyMentionSpawn(tok, ROLES), { kind: "agent" });
+    assert.equal(classifyMentionSpawn(tok, ROLES), null, `@${tok} is inert prose — no spawn`);
   }
 });
 
@@ -200,13 +198,13 @@ test("classifyMentionSpawn: an unknown token → null (stays prose, no spawn)", 
   assert.equal(classifyMentionSpawn("scribe", ROLES), null);
 });
 
-test("classifyMentionSpawn: @Agent wins over a role literally named Agent", () => {
+test("classifyMentionSpawn: a role literally named Agent now spawns (no reserved keyword shadows it)", () => {
   const withAgentRole = [...ROLES, { roleId: "agent", name: "Agent" }];
-  assert.deepEqual(classifyMentionSpawn("agent", withAgentRole), { kind: "agent" }, "reserved keyword takes precedence");
+  assert.deepEqual(classifyMentionSpawn("agent", withAgentRole), { kind: "role", roleId: "agent", name: "Agent" });
 });
 
 test("classifyMentionSpawn: tolerates an empty/absent role roster", () => {
-  assert.deepEqual(classifyMentionSpawn("agent", undefined), { kind: "agent" });
+  assert.equal(classifyMentionSpawn("agent", undefined), null, "no roster → nothing to match → prose");
   assert.equal(classifyMentionSpawn("coordinator", undefined), null);
   assert.equal(classifyMentionSpawn("coordinator", []), null);
 });
