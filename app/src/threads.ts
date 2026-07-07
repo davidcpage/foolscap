@@ -44,7 +44,7 @@ export function createThread(editor: Editor, at: { x: number; y: number }, title
   editor.commit({
     type: "addNode",
     actor: "user",
-    payload: { id, type: "thread", title, text: brief, color: "purple", x: at.x, y: at.y, w: 300, h: 240 },
+    payload: { id, type: "thread", title, text: brief, color: "purple", x: at.x, y: at.y, w: 460, h: 420 },
   });
   return id;
 }

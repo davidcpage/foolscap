@@ -9,7 +9,7 @@ import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadHistory, setThreadPin } from "./threads";
-import { openCanvasLink, resolveCanvasLink } from "./loader";
+import { openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { intentGlyph } from "../work-intent.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
@@ -557,17 +557,19 @@ function ThreadView({
               </div>
             ) : (
               <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}>
-                <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-                <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-                <button
-                  className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
-                  data-interactive
-                  title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
-                  onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
-                >
-                  📌
-                </button>
-                <div className="chan-msg-text">{renderTaggedText(mm.text, openEntries, m)}</div>
+                <div className="chan-msg-head">
+                  <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                  <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                  <button
+                    className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
+                    data-interactive
+                    title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
+                    onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
+                  >
+                    📌
+                  </button>
+                </div>
+                <div className="chan-msg-text">{renderMessageBody(mm.text, openEntries, m)}</div>
               </div>
             ),
           )
@@ -683,6 +685,58 @@ function highlightTags(text: string, entries: TagEntry[]): React.ReactNode {
 // `.chan-msg-text { white-space: pre-wrap }`, so `\n` stays plain text — no <br> needed.
 function renderTaggedText(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
   return renderInline(text, m, (run) => highlightTags(run, entries));
+}
+
+// Render a message body as readable BLOCKS rather than one pre-wrapped wall of text — the single biggest
+// legibility lift for long agent posts, which tend to run on. Blank-line-separated runs become paragraphs
+// with real spacing between them; consecutive `- `/`* `/`N.` lines become a bullet/number list. Inline
+// markdown + @-tag highlighting still run per block via renderInline, so the tag-inside-bold protection
+// documented on renderTaggedText is preserved. Kept deliberately small (paragraphs + lists) — headings and
+// tables are rare in a thread post; the shared lit-html codec (vendor/markdown.js) is the wrong renderer
+// here (raw target=_blank links, no canvas-link/tag handling).
+function renderMessageBody(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
+  const render = (run: string) => renderInline(run, m, (r) => highlightTags(r, entries));
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const blocks: React.ReactNode[] = [];
+  let para: string[] = [];
+  let list: { ordered: boolean; items: string[] } | null = null;
+  let key = 0;
+  const flushPara = () => {
+    if (para.length) {
+      blocks.push(<div className="chan-p" key={key++}>{render(para.join("\n"))}</div>);
+      para = [];
+    }
+  };
+  const flushList = () => {
+    if (list) {
+      const items = list.items.map((it, i) => <li key={i}>{render(it)}</li>);
+      blocks.push(
+        list.ordered
+          ? <ol className="chan-md-list" key={key++}>{items}</ol>
+          : <ul className="chan-md-list" key={key++}>{items}</ul>,
+      );
+      list = null;
+    }
+  };
+  for (const line of lines) {
+    const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
+    const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (bullet || numbered) {
+      flushPara();
+      const ordered = !!numbered;
+      if (!list || list.ordered !== ordered) { flushList(); list = { ordered, items: [] }; }
+      list.items.push((bullet ?? numbered)![1]);
+    } else if (line.trim() === "") {
+      flushPara();
+      flushList();
+    } else {
+      flushList();
+      para.push(line);
+    }
+  }
+  flushPara();
+  flushList();
+  return blocks;
 }
 
 // A tight, focused inline markdown renderer for the channel charter (Channel UI improvements). Deliberately
@@ -1470,13 +1524,39 @@ function TemplateCard({
       // not a stale closure.
       if (host.classList.contains("selected") && t.closest("[data-text]")) e.stopPropagation();
     };
+    // A markdown link in a FILE/DOC card opens its target as a card on the canvas (materialize + focus)
+    // instead of letting the <a target=_blank> navigate the browser to `/some.md` — which the SPA reads as
+    // a board mount (the "new board with a filename in the URL" bug). Only IN-REPO links are intercepted:
+    // resolveDocLink returns null for external/anchor hrefs, so those keep their default new-tab behavior.
+    // A relative href resolves against THIS card's own directory; the root comes from its (root,path) id.
+    const onClick = (e: MouseEvent) => {
+      const t = e.target;
+      if (!(t instanceof Element)) return;
+      const a = t.closest("a");
+      if (!a || !host.contains(a)) return;
+      const n = store.get<"node">(id);
+      if (n?.type !== "file") return; // only file/doc cards route their links to cards
+      const rest = id.startsWith("node:") ? id.slice(5) : ""; // node:<root>:<path>
+      const ci = rest.indexOf(":");
+      if (ci < 0) return;
+      const root = rest.slice(0, ci);
+      const selfPath = n.title; // authoritative path (re-keyed with the id on rename)
+      const baseDir = selfPath.includes("/") ? selfPath.slice(0, selfPath.lastIndexOf("/")) : "";
+      const target = resolveDocLink(root, baseDir, a.getAttribute("href") ?? "");
+      if (!target) return; // external / anchor → let the <a> do its default
+      e.preventDefault();
+      e.stopPropagation();
+      void openDocLink(m, id, target.root, target.path);
+    };
     host.addEventListener("wheel", onWheel, { passive: false });
     host.addEventListener("keydown", onKeyDown);
     host.addEventListener("pointerdown", onPointerDown);
+    host.addEventListener("click", onClick);
     return () => {
       host.removeEventListener("wheel", onWheel);
       host.removeEventListener("keydown", onKeyDown);
       host.removeEventListener("pointerdown", onPointerDown);
+      host.removeEventListener("click", onClick);
     };
   }, []);
   // lit owns .tpl-interior's children and React never reconciles past it (display:contents keeps

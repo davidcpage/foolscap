@@ -25,7 +25,6 @@ import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, stampFired,
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
-import { boardMemoryBrief } from "./board-memory.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -440,13 +439,12 @@ const MAX_SESSION_BYTES = 4 * 1024 * 1024; // whole sessions, bounded against a 
 
 const EXCLUDE_DIRS = new Set([
   "node_modules", ".git", "dist", "build", ".vite", ".cache", "coverage",
-  // `.canvas` is the canvas's own filesystem (docs/canvas-home.md): images, channel logs, artefacts, and the
-  // shadow ledger all live here. It stays in this set for the BROWSE LISTING (handleLs / Rule A) so the
-  // file-tree card isn't cluttered with canvas internals — `.canvas` content is addressed directly by
-  // (root, path), not browsed. The WATCHERS and CONTENT ENDPOINTS instead use isInternalPath (Rule B) below,
-  // which treats only the shadow git-dirs under `.canvas/roots/` as off-limits (the one feedback-loop hazard)
-  // and lets the rest of `.canvas/` through — so a dropped image / file-backed body is watched and servable.
-  ".canvas",
+  // `.canvas` is DELIBERATELY NOT here: the canvas's own filesystem (docs/canvas-home.md — memory, roles,
+  // threads, annotations, images) is BROWSABLE so a human can navigate to a file (e.g. `.canvas/memory/`)
+  // and drag it onto the board as an editable/annotatable card. The browse listing (handleLs / Rule A) is
+  // kept in lock-step with servability by ALSO filtering on isInternalPath (Rule B) — so it shows exactly
+  // what the content endpoint will serve, hiding only the two off-limits `.canvas` subtrees (`board`, the
+  // churny record store; `roots`, the shadow git-dirs / feedback-loop hazard). No dead rows that 404 on open.
 ]);
 // Rule B (docs/canvas-home.md §3/§5): is this path INTERNAL to the watchers + content endpoints? Excluded if
 // any segment is a generated/internal dir — EXCEPT `.canvas`, whose CONTENT must be reachable; under `.canvas`
@@ -545,8 +543,8 @@ function handleLs(res: ServerResponse, root: string, sub: string): void {
   for (const e of entries) {
     const rel = path.relative(root, path.join(base, e.name));
     if (e.isDirectory()) {
-      if (!EXCLUDE_DIRS.has(e.name)) dirs.push(rel);
-    } else if (e.isFile() && TEXT_EXT.has(path.extname(e.name).toLowerCase())) {
+      if (!EXCLUDE_DIRS.has(e.name) && !isInternalPath(rel)) dirs.push(rel);
+    } else if (e.isFile() && TEXT_EXT.has(path.extname(e.name).toLowerCase()) && !isInternalPath(rel)) {
       files.push(rel);
     }
   }
@@ -2262,12 +2260,13 @@ function ensureLiveSession(
   const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
 
   // Appended system prompt = the ```ask convention + the canvas collaboration brief (env + protocol +
-  // norms) + the board's curated memory (R4/W3 — settled facts + the memory convention, embedded so it's
-  // head context on every wake) + the role charter if this session has one + a worker brief if spawned into
-  // a thread, with this session's own identity baked in. One --append-system-prompt flag, all blocks.
+  // norms) + the role charter if this session has one + a worker brief if spawned into a thread, with this
+  // session's own identity baked in. One --append-system-prompt flag, all blocks. Board MEMORY is no longer
+  // injected here — it IS Claude Code's built-in file memory, pointed at `.canvas/memory` via
+  // `autoMemoryDirectory` (below), so the built-in system handles both recall (MEMORY.md index) and the
+  // save-a-durable-fact instructions; a second custom injection only duplicated and fought that prompt.
   const appendPrompt =
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
-    "\n\n" + boardMemoryBrief(repoPath) +
     (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
     (threadId ? "\n\n" + workerBrief(threadId) : "");
   // The permission relay (see PERMISSION_HOLD_MS): a per-session stdio MCP server whose one tool the
@@ -2283,6 +2282,14 @@ function ensureLiveSession(
       },
     },
   };
+  // Board MEMORY = Claude Code's built-in file memory pointed at this board's `.canvas/memory` home, so a
+  // worker's recalled facts AND its saved durable facts live in the shared, shadow-versioned board store
+  // rather than the per-user `~/.claude/projects/<cwd>/memory` default. MUST be ABSOLUTE — a relative value
+  // is silently ignored and falls back to the default (verified on CC 2.1.202); `autoMemoryDirectory` names
+  // the memory dir DIRECTLY (no `<encoded-cwd>/memory` suffix, unlike older CLI builds). Per-board via
+  // repoPath, so every mounted board gets its own store. (This repo's INTERACTIVE sessions are pointed at
+  // the same dir via `.claude/settings.local.json`; --settings here covers spawned workers on any board.)
+  const settingsOverride = { autoMemoryDirectory: path.join(repoPath, ".canvas", "memory") };
   const args = [
     "-p",
     resume ? "--resume" : "--session-id",
@@ -2295,6 +2302,7 @@ function ensureLiveSession(
     "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
     "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
     "--mcp-config", JSON.stringify(mcpConfig),
+    "--settings", JSON.stringify(settingsOverride), // built-in memory → .canvas/memory (additive over project settings)
     "--permission-prompt-tool", PERMISSION_TOOL, // gate hits → the card's allow/deny, not silent denial
     "--append-system-prompt", appendPrompt,
   ];

@@ -268,6 +268,43 @@ body {
   white-space: normal;
 }
 
+/* Frontmatter "properties" strip (card-types/file/render.js): a compact key/value panel above the prose
+   for markdown files that open with YAML frontmatter (memory files, role.md, …), instead of the raw
+   `---` fence rendering as an <hr> + run-on paragraph. Muted, monospace keys — reads as metadata, not body. */
+.file-frontmatter {
+  margin: 6px 10px 0;
+  padding: 5px 8px;
+  border: 1px solid #0000000f;
+  border-radius: 5px;
+  background: #00000005;
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #52525b;
+  flex: 0 0 auto;
+}
+.file-frontmatter .fm-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.file-frontmatter .fm-key {
+  flex: 0 0 auto;
+  min-width: 84px;
+  color: #a1a1aa;
+}
+.file-frontmatter .fm-val {
+  flex: 1 1 auto;
+  color: #3f3f46;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.file-frontmatter .fm-nest {
+  flex-direction: column;
+  gap: 1px;
+}
+.file-frontmatter .fm-children {
+  padding-left: 12px;
+}
+
 /* ── doc annotations (docs/doc-annotations.md; the AnnotationsLayer in NodeView.tsx) ─────────────
    In-text highlights paint through the CSS Custom Highlight API (no marker spans in lit's DOM):
    open = a marker-yellow wash, active (popover open) = stronger, resolved = a faint grey only shown
@@ -2616,36 +2653,60 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   overflow-y: auto;
   overscroll-behavior: contain;
   margin: 2px 4px;
-  padding: 2px 6px;
+  padding: 0 6px;
   display: flex;
   flex-direction: column;
-  gap: 5px;
 }
 .chan-log::-webkit-scrollbar { width: 8px; }
 .chan-log::-webkit-scrollbar-thumb { background: #00000022; border-radius: 4px; }
+/* Each entry is a self-contained block: a quiet header row (who / when / pin) over the body, with a hairline
+   divider between successive entries so a long conversation reads as discrete turns rather than one run-on
+   column. The divider is barely-there on purpose — separation without the noise of a boxed-message look. */
 .chan-msg {
   font-size: 11px;
-  line-height: 1.35;
+  line-height: 1.5;
+  padding: 6px 2px;
+}
+.chan-log > * + * {
+  border-top: 1px solid #0000000d;
+}
+.chan-msg-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 2px;
 }
 .chan-msg-from {
   font: 10px ui-monospace, Menlo, monospace;
   font-weight: 600;
-  color: #6b21a8;
+  color: #52525b;
 }
 .chan-msg-time {
-  margin-left: 6px;
   font-size: 9px;
   color: #a1a1aa;
 }
 .chan-msg-text {
-  color: #3f3f46;
+  color: #27272a;
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Message body blocks (renderMessageBody): paragraphs get real spacing between them; lists read as lists.
+   These are what lift a long agent post toward a session turn's readability. */
+.chan-p {
+  margin: 0 0 6px;
+  white-space: pre-wrap;
+}
+.chan-p:last-child { margin-bottom: 0; }
+.chan-md-list {
+  margin: 0 0 6px;
+  padding-left: 18px;
+}
+.chan-md-list:last-child { margin-bottom: 0; }
+.chan-md-list li { margin: 1px 0; }
 /* a resolved @-tag inside a message (one that names a member / @all / @human) — tinted so the eye finds
    "who this was for" at a glance. Cosmetic; the server decides who a tag actually wakes. */
 .chan-tag {
-  color: #2563eb;
+  color: #6366f1;
   font-weight: 600;
 }
 /* inline markdown inside a message (renderInline via renderTaggedText) — mirrors the charter's
@@ -2656,7 +2717,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   padding: 0 3px;
   border-radius: 3px;
 }
-.chan-msg-text a { color: #2563eb; }
+.chan-msg-text a { color: #6366f1; }
 .chan-msg-text .canvas-link {
   color: #7c3aed;
   text-decoration: underline;
@@ -2664,11 +2725,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   text-underline-offset: 2px;
   cursor: pointer;
 }
-.chan-msg.sys {
-  opacity: 0.7;
-  font-style: italic;
-}
-.chan-msg.sys .chan-msg-from { color: #71717a; }
+/* system notices (server-authored joins/leaves/onboarding) — quieted so they recede behind the human/agent
+   conversation, without an italic that would add yet another font style to the card. */
+.chan-msg.sys { opacity: 0.6; }
+.chan-msg.sys .chan-msg-from { color: #a1a1aa; }
+.chan-msg.sys .chan-msg-text { color: #71717a; }
 /* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
    keeps its place in the log and shows its 📌 lit; the collapsible pinned tray above is the head-context
    surface (re-read on every wake — mirrored server-side into /inbox's `pinned`). */
@@ -2719,10 +2780,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font-size: 10px;
   line-height: 1.35;
   color: #71717a;
+  padding: 4px 2px;
 }
 .chan-intent .chan-msg-from { color: #71717a; }
 .chan-intent-glyph { margin-right: 4px; }
-.chan-intent-text { margin-left: 6px; font-style: italic; }
+.chan-intent-text { margin-left: 6px; }
 .chan-intent.i-blocked-human { color: #b45309; }
 .chan-intent.i-blocked-human .chan-msg-from { color: #b45309; }
 .chan-intent.i-blocked-peer { color: #2563eb; }

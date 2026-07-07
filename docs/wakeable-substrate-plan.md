@@ -109,17 +109,21 @@ dep) can run in parallel sessions.
   stays the shared charter. No separate role-notes store.
 - **Done when:** a `memory.md` card exists, rides the spawn brief, and links at least one role-memory file
   pulled into context on demand.
-- **Shipped:** `.canvas/memory.md` exists (a curated index — one fact per line, newest-first — of this
-  board's settled norms) and renders as an ordinary file card (`node:repo:.canvas/memory.md`, dropped on the
-  board). It's **embedded in every spawned session's brief**: `board-memory.js` (`boardMemoryBrief(repoPath)`,
-  read fresh at spawn, HEAD-capped 32KB, `truncated` flag) → `ensureLiveSession` in `vite-fs-plugin.ts`.
-  Role memory hangs off the index as linked leaves under `.canvas/memory/` loaded **on demand**:
-  `.canvas/memory/pm.md` (PM/Coordinator role memory) + `.canvas/memory/board-memory.md` (how it's wired).
-  Convention (one fact/line, newest-first, links to lazy leaves, `role.md` stays the charter) stated in the
-  brief block, not enforced code. Tests: `test/board-memory.test.mjs` (null/embed/HEAD-cap/truncation). The
-  brief wiring is server code — it reaches sessions on the next dev-server restart; verified now by unit
-  tests + an integration check of the real `memory.md`. **Note:** `.canvas/` is git-ignored (shadow-
-  versioned), so the memory files persist on disk/board but aren't in the git commit — only the code is.
+- **Shipped**, then **REVISED 2026-07-07 to use Claude Code's built-in file memory** rather than a bespoke
+  index + custom brief injection. Board memory is now the built-in memory store, pointed at `.canvas/memory/`
+  via `--settings '{"autoMemoryDirectory":"<repoPath>/.canvas/memory"}'` in `ensureLiveSession`
+  (`vite-fs-plugin.ts`) — an absolute, per-board path (a relative one is ignored). The built-in system injects
+  the `MEMORY.md` index and recalls per-fact files on demand, and instructs the agent how to save durable
+  facts — so the bespoke `board-memory.js` / `boardMemoryBrief` injection (which duplicated and fought that
+  prompt) was **removed**. The store follows the built-in schema exactly: `.canvas/memory/MEMORY.md` (index) +
+  one `<slug>.md` per fact with `name`/`description`/`metadata` frontmatter, bodies cross-linked with
+  `[[slug]]`. Role memory is per-fact files like everything else (`coordinator.md`, `board-memory.md`, the
+  curated `board-decisions.md` digest). This repo's interactive sessions share the same store via
+  `.claude/settings.local.json` (git-ignored; absolute path). The old `.canvas/memory.md` single-file index
+  and `test/board-memory.test.mjs` were retired. **Note:** `.canvas/` is git-ignored (shadow-versioned), so
+  the memory files persist on disk/board but aren't in the git commit — only the code is. (The `Done when:`
+  above is still met — the store rides the spawn and links role memory pulled on demand — just via the
+  built-in mechanism instead of a custom one.)
 
 ### W4 — P1: seats + notification levels
 - Generalize the seat onto any surface; each seat carries `level ∈ {all, mentions, paused}`. The **watch

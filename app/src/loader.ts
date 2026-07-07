@@ -728,8 +728,8 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
 // a card for this thread is already on the board, FLY to it (select + fitSelection) instead of littering a
 // duplicate; otherwise add it (at the drop point, else viewport-centred) and select it. actor "user" (like
 // createThread / addSessionsCard) so a reopen is an undoable, attributed act.
-const THREAD_CARD_W = 300;
-const THREAD_CARD_H = 240;
+const THREAD_CARD_W = 460;
+const THREAD_CARD_H = 420;
 export function openChannel(m: InteractionManager, threadId: string, title: string, text: string, at?: Pos): void {
   const id = threadId as Id<"node">;
   if (m.editor.store.get<"node">(id)) {
@@ -792,6 +792,53 @@ export async function openCanvasLink(m: InteractionManager, href: string): Promi
   if (link.external) { window.open(link.href, "_blank", "noopener,noreferrer"); return; }
   if (link.path !== undefined) { await openFileByPath(m, link.path); return; }
   if (m.editor.store.get<"node">(link.nodeId)) { m.selection.set([link.nodeId]); m.fitSelection(); }
+}
+
+// Resolve a markdown link's href against the DOC's OWN location — a relative link in a file means
+// "relative to this file's directory" (`board-decisions.md` inside `.canvas/memory/MEMORY.md` →
+// `.canvas/memory/board-decisions.md`), and a leading-slash href is repo-root-relative. This is the
+// piece resolveCanvasLink lacks (it only ever resolves against the repo root). Returns the target
+// (root, path) for an in-repo file link, or null for links that keep their default browser behavior:
+// external (any URL scheme — http:, https:, mailto:, node: — or protocol-relative `//host`) and in-page
+// anchors (`#section`). Query/hash suffixes are stripped before resolving. Same root as the source card,
+// so a link opens within the same checkout/worktree.
+export function resolveDocLink(root: RootId, baseDir: string, href: string): { root: RootId; path: string } | null {
+  const h = href.trim();
+  if (!h || h.startsWith("#")) return null; // empty or in-page anchor
+  if (h.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(h)) return null; // protocol-relative or any scheme → external
+  const clean = h.replace(/[?#].*$/, ""); // drop ?query / #fragment
+  const joined = clean.startsWith("/") ? clean.slice(1) : baseDir ? baseDir + "/" + clean : clean;
+  const path = normalizeRelPath(joined);
+  return path ? { root, path } : null;
+}
+
+// Collapse `.`/`..`/empty segments of a POSIX-style relative path (browser-side — no node:path). A leading
+// `..` that escapes the root just pops nothing, so the result stays within the root.
+function normalizeRelPath(p: string): string {
+  const out: string[] = [];
+  for (const seg of p.split("/")) {
+    if (seg === "" || seg === ".") continue;
+    if (seg === "..") { out.pop(); continue; }
+    out.push(seg);
+  }
+  return out.join("/");
+}
+
+// Open the file a DOC-card link points at, placed cascaded off the SOURCE card so it lands right by the
+// link you clicked. The (root, path) → id scheme makes a repeat click on the same link re-select the
+// existing card instead of duplicating it; materializeAt picks the prose vs preview footprint. Deliberately
+// does NOT move the camera (no fitSelection): the source card is already in view and the target cascades
+// off it, so holding the current view keeps both visible — flying would be disorienting for a near hop.
+// A link to a file that doesn't exist still cards the path — the file card then shows its own
+// missing/tombstone state, which reads as "this link is broken" rather than failing silently.
+export async function openDocLink(m: InteractionManager, sourceId: Id<"node">, root: RootId, path: string): Promise<void> {
+  const id = fileNodeId(root, path);
+  if (!m.editor.store.get<"node">(id)) {
+    const prose = /\.(md|markdown)$/i.test(path);
+    const { x, y } = cascadeFrom(m, sourceId, prose ? PROSE_CARD_W : CARD_W, prose ? PROSE_CARD_H : CARD_H);
+    await materializeAt(m, root, path, "file", x, y);
+  }
+  m.selection.set([id]);
 }
 
 // Open a ROLE's charter card to EDIT it (agent-roles.md phase 2b) — the channels card's edit-twin. A role is

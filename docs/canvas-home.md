@@ -186,17 +186,17 @@ status was verified 2026-06-26: **none of these is "move a folder."**
 - **Effort:** medium–high. The codec is routine (notebook shows how); the undo-semantics + migration decisions
   are the real work. Depends on nothing infra-wise.
 
-### Memories — `.canvas/memory/` (partly gated on roles)
-- **Today:** agent memories live in `~/.claude/projects/<encoded-cwd>/memory/` (the auto-memory store).
-  `autoMemoryDirectory` is **not wired** in this repo. Per [[headless-session-memory]] the knob *can* relocate
-  the store (replaces the projects base, keyed by encoded-cwd, works under `-p`), and the **write** side must
-  be made explicit in the spawn's append-system-prompt.
-- **Open decisions:** (a) **semantics** — board-SHARED memory (one `.canvas/memory/` all sessions read/write,
-  aligned with "the board is shared memory") vs per-role/per-session stores; concurrency + ownership follow
-  from this; (b) wire `autoMemoryDirectory` in `ensureLiveSession` to point at `.canvas/memory/` + make the
-  write side explicit; (c) relationship to roles — a *role's* memory vs ambient session memory.
-- **Effort:** medium — mostly spawn-config + one semantics call. Relocating into `.canvas/` makes memory
-  shadow-versioned **and** board-shared: a real shift, decide deliberately. Somewhat entangled with roles.
+### Memories — `.canvas/memory/` (SHIPPED 2026-07-07)
+- **Done:** agent memory is Claude Code's built-in file memory, pointed at `.canvas/memory/`.
+  `ensureLiveSession` passes `--settings '{"autoMemoryDirectory":"<repoPath>/.canvas/memory"}'` (absolute,
+  per-board — a relative path is ignored; the knob names the memory dir directly on CC 2.1.202). The built-in
+  system handles both recall (injects `MEMORY.md`, recalls per-fact files) and the save-a-fact instructions,
+  so no explicit write-side brief and no custom injection are needed — the earlier bespoke `boardMemoryBrief`
+  block was removed. This repo's interactive sessions share the store via `.claude/settings.local.json`.
+- **Semantics decided:** board-SHARED memory — one `.canvas/memory/` all sessions read/write, aligned with
+  "the board is shared memory." A *role's* memory is just a per-fact file in the same store (`coordinator.md`),
+  not a separate tier. Relocating into `.canvas/` makes memory shadow-versioned **and** board-shared as
+  intended. See [[headless-session-memory]] for the CLI mechanics and [[board-memory]] for the wiring.
 
 ### Roles — `.canvas/roles/` (a subsystem, not a move)
 - **Today:** **doc-only** — `docs/agent-roles.md` (durable ROLES = charter+memory+presence vs ephemeral

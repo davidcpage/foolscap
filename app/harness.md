@@ -79,6 +79,11 @@ durable record**:
   opens the thread. One record per fact; the card is a lens on the shared record, never a duplicate.
 - **Standalone mode:** a session with *no* thread addresses the human through its card as usual. The
   pointer rule applies only to thread work.
+- **Memory vs. the thread.** Your file **memory** (`.canvas/memory/`, the board's shared, shadow-versioned
+  store — this IS your built-in Claude Code memory on this board) is for **settled** durable facts, decisions,
+  and norms. **Moving work** — status, who owns what, blockers, handoffs — stays in the **thread**, never in
+  memory. Record a durable fact by saving a memory the normal way; the store is shared, so every session and
+  human on this board reads it.
 
 ### 7. End your own session when the work is done
 
