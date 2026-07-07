@@ -594,9 +594,11 @@ export default {
     // it stays bandless (neutral) until it produces output and goes idle again, which IS your turn.
     const neverRun = status === "idle" && raw.trim() === "";
     // A looping ROLE (the Coordinator) idle between server heartbeats isn't waiting on YOU — it's asleep on a timer.
-    // The feed carries `loops`; render it calm teal "scheduled", not the loud amber "your turn". Ranks below
-    // waiting-on-agent (a named peer-wait is the more specific signal) and never overrides neverRun.
-    const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.loops);
+    // The feed carries a server-derived `scheduled` (an ACTUAL live standing job on this session's seat — NOT the
+    // static `loops` role flag, which asserted "scheduled" even with no job to ever wake it); render it calm teal
+    // "scheduled", not the loud amber "your turn". Ranks below waiting-on-agent (a named peer-wait is the more
+    // specific signal) and never overrides neverRun.
+    const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.scheduled);
     const frameState =
       needsPermission
         ? "waiting"

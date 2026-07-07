@@ -50,3 +50,10 @@ export function jobClaimKey(threadId: string, job: StandingJob): string;
 export function planRoleJobFire(
   occupantStatus: "idle" | "running" | "exited" | null | undefined,
 ): "nudge" | "skip" | "respawn";
+
+// Is a wake ACTUALLY scheduled for `sid`? True iff some thread marker (the listThreads meta list) carries a
+// role-job whose seat is currently occupied by `sid`. Loose marker shape — only jobs[].role + seats[].sid matter.
+export function sessionHasScheduledWake(
+  markers: ReadonlyArray<{ jobs?: StandingJob[]; seats?: Record<string, { sid?: string } | undefined> }> | null | undefined,
+  sid: string,
+): boolean;

@@ -155,6 +155,28 @@ export function jobClaimKey(threadId, job) {
 }
 
 /**
+ * PURE — is a wake ACTUALLY scheduled for session `sid`, given the thread markers `markers` (listThreads)?
+ * A role-seat job fires INTO its role's seat every interval (standingJobsTick nudges or respawns the seat's
+ * current occupant), so a live standing job schedules a wake for `sid` exactly when some marker carries a job
+ * with a `role` whose seat is currently occupied by `sid`. A BARE (roleless) job always spawns a FRESH worker
+ * — it targets no existing session — so it never schedules a wake for an already-live `sid`. This is the gate
+ * behind the calm "scheduled" band: the static `loops` role flag means only "this is a looping-TYPE role", not
+ * that any timer will fire (jobs are human-gated and often absent), so an idle looping session must consult
+ * THIS before claiming it's asleep on a heartbeat rather than genuinely "waiting".
+ */
+export function sessionHasScheduledWake(markers, sid) {
+  if (!sid) return false;
+  for (const m of markers ?? []) {
+    const jobs = Array.isArray(m?.jobs) ? m.jobs : [];
+    const seats = m?.seats ?? {};
+    for (const job of jobs) {
+      if (job?.role && seats[job.role]?.sid === sid) return true;
+    }
+  }
+  return false;
+}
+
+/**
  * PURE — the WAKE-LIVE-ELSE-RESPAWN decision for a role-seat job's fire, given the current liveness of the
  * seat's occupant. This is the efficiency norm (W6 seq 104) factored out of standingJobsTick so it can be
  * unit-tested (a "mocked tick") and shared: a job whose seat is occupied by a LIVE, IDLE session is served by
