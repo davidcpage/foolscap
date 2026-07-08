@@ -142,10 +142,23 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
     connect: (from, to) => connectToThread(editor, from, to),
   });
   restoreAndPersistCamera(m.camera, boardId);
+  seedHud(m); // the HUD chrome (usage + clock) isn't menu-spawnable, so ensure it exists on every board
   persistence.attach(editor.store);
   await persistence.flush();
   const undo = new UndoManager(editor.store);
   return { m, undo, persistence };
+}
+
+// Ensure the HUD chrome exists on this board. Usage + clock are HUD-only elements now (hud.ts) — removed
+// from the Add menu — so a board that never had them (a fresh one, or one cleared) still gets the corner
+// chrome. Idempotent: addUsageCard/addClock use stable singleton ids, and we skip them if the node is
+// already present, so a returning board neither duplicates nor re-logs. Seeded hidden — the HUD group is
+// off until the Alt tap, exactly like the minimap; the cards' stored x/y are a headless fallback the
+// corner geometry overrides at render.
+function seedHud(m: InteractionManager): void {
+  const store = m.editor.store;
+  if (!store.get<"node">("node:usage" as Id<"node">)) addUsageCard(m);
+  if (!store.get<"node">("node:clock" as Id<"node">)) addClock(m);
 }
 
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.
@@ -926,10 +939,10 @@ function CanvasMenu({
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>
         <div className="menu-section">Notes &amp; widgets</div>
         <button onClick={() => run(() => addStickyNote(m, at))}>Sticky note</button>
-        <button onClick={() => run(() => addClock(m, at))}>Clock</button>
+        {/* Clock + Usage are HUD-only elements now (hud.ts) — corner-pinned chrome seeded at boot
+            (seedHud) and toggled with the minimap by the Alt tap, not spawnable world cards. */}
         <button onClick={() => run(() => addGitHeadCard(m, at))}>Git HEAD</button>
         <button onClick={() => run(() => addHnCard(m, at))}>Hacker News</button>
-        <button onClick={() => run(() => addUsageCard(m, at))}>Usage</button>
         <button onClick={() => run(() => addWeatherCard(m, at))}>Weather</button>
         <button onClick={() => run(() => addComputedCard(m, at))}>Computed</button>
         <button onClick={() => run(() => addProvenanceCard(m, at))}>Intent log</button>

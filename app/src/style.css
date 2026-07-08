@@ -3479,17 +3479,27 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   height: 100%;
 }
 
-/* A corner-locked HUD card (usage / clock — hud.ts): anchored to the viewport's top-right corner via
-   top/right (set inline from the HUD stack), so it tracks a window resize with no JS. Unlike a floating
+/* A corner-locked HUD card (usage / clock — hud.ts): anchored to the viewport's top-left corner via
+   top/left (set inline from the HUD stack), so it tracks a window resize with no JS. Unlike a floating
    card it isn't draggable (no grab cursor, no move gesture) — it's chrome, positioned for you. The card
    fills the frame just like a floating one. */
 .hud-frame {
   position: absolute;
   pointer-events: auto;
 }
+/* HUD chrome reads as ONE FAMILY with the minimap: the box, border, blur and shadow below MIRROR
+   `.minimap` exactly, and — being a later rule at equal specificity — override each card's per-kind
+   frame (the usage card's green tint + left rail, the clock's purple one) so every HUD element looks
+   like the same neutral translucent panel rather than a stack of differently-coloured cards. */
 .hud-frame > .node {
   width: 100%;
   height: 100%;
+  background: #ffffffee;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000018;
+  border-radius: 8px;
+  box-shadow: 0 6px 20px #0000001f;
 }
 
 /* The minimap HUD — navigation chrome pinned top-right, OUTSIDE the canvas subtree. It fades in on
