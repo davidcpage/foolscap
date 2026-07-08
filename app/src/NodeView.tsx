@@ -11,7 +11,6 @@ import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from ".
 import { MEMBER_OPEN, postToThread, setThreadHistory, setThreadPin } from "./threads";
 import { openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
-import { intentGlyph } from "../work-intent.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
   annotationsSignal,
@@ -359,18 +358,25 @@ function ThreadView({
   const msgs = feed?.messages ?? [];
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
+  // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
+  // (Thread card UI). Instead each member's *latest* declared intent colours their participant pill. The
+  // feed is ordered, so the last intent act per sid wins. `visible` is the log with intent acts filtered
+  // out — the conversation the walk below renders.
+  const currentIntent = useMemo(() => {
+    const map: Record<string, { intent: string; text: string }> = {};
+    for (const mm of msgs) if (mm.kind === "intent" && mm.intent) map[mm.from] = { intent: mm.intent, text: mm.text };
+    return map;
+  }, [msgs]);
+  const visible = useMemo(() => msgs.filter((mm) => mm.kind !== "intent"), [msgs]);
 
   const [description, setDescription] = useState(node.text);
   // Charter render/edit toggle: read mode shows the rendered markdown (MarkdownInline), a click flips to the
   // textarea, blur (or a record change underneath) commits + returns to read mode (Channel UI improvements).
   const [editingDesc, setEditingDesc] = useState(false);
   const descRef = useRef<HTMLTextAreaElement>(null);
-  // Read-mode brief clamps to a few lines so a long brief can't eat the card's vertical space (Thread card UI);
-  // a "show more/less" toggle expands it. `descOverflows` (measured only while clamped) decides whether the
-  // toggle is needed at all; edit mode still auto-grows (below), unclamped.
-  const [descExpanded, setDescExpanded] = useState(false);
-  const [descOverflows, setDescOverflows] = useState(false);
-  const descViewRef = useRef<HTMLDivElement>(null);
+  // Read-mode brief is always a SINGLE line — a Slack-topic-style one-liner that can't eat the card's
+  // vertical space; the full text shows on hover (title attr). No expand toggle: long briefs are
+  // discouraged, so the UI doesn't accommodate them (Thread card UI). Edit mode still auto-grows (below).
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -397,14 +403,6 @@ function ThreadView({
   // Re-seed the local edit fields when the record changes underneath us (an agent edited the description).
   useEffect(() => setDescription(node.text), [node.text]);
   useEffect(() => setTitle(node.title), [node.title]);
-  // Does the clamped read-mode brief actually overflow (i.e. is there more to "show more")? Measured ONLY
-  // while collapsed — when expanded the box is its full height, so we leave the last measurement standing
-  // (that's what keeps the "show less" affordance visible). Re-runs when the brief text or edit mode changes.
-  useEffect(() => {
-    const el = descViewRef.current;
-    if (!el || editingDesc || descExpanded) return;
-    setDescOverflows(el.scrollHeight - el.clientHeight > 2);
-  }, [description, editingDesc, descExpanded]);
 
   useEffect(() => {
     const host = ref.current;
@@ -519,6 +517,24 @@ function ThreadView({
     }
     setSending(false);
   };
+  // Enter=send can't ride React's synthetic onKeyDown: the card-host keydown seam (onKD, above) calls
+  // stopPropagation so typing never fires the canvas shortcuts — but React 18 delegates all events at the
+  // ROOT container (#root), an ANCESTOR of this card, so that stop also prevents React's synthetic handler
+  // from ever running. Enter then fell through to the textarea's default newline (the human's bug). The fix
+  // is a NATIVE listener on the textarea itself (bound below): it runs at the target phase, BEFORE the host's
+  // bubble-phase stop, so it fires reliably. It reads the freshest send() through a ref (bound once, but
+  // send() closes over post/sending which change every render).
+  const sendRef = useRef(send);
+  sendRef.current = send;
+  useEffect(() => {
+    const el = postInputRef.current;
+    if (!el) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void sendRef.current(); } // Shift+Enter → newline
+    };
+    el.addEventListener("keydown", onKey);
+    return () => el.removeEventListener("keydown", onKey);
+  }, []);
   // Pin/unpin a message as head context (R-PIN). The feed republishes the pins on success, so the tray and
   // the message's pin glyph update from the live feed — no local pin state to keep in sync.
   const togglePin = async (seq: number) => {
@@ -552,9 +568,8 @@ function ThreadView({
       ) : (
         <>
           <div
-            ref={descViewRef}
-            className={`chan-description chan-description-view${descExpanded ? "" : " clamped"}`}
-            title="click to edit the brief"
+            className="chan-description chan-description-view clamped"
+            title={description.trim() ? description : "click to edit the brief"}
             data-interactive
             onClick={() => setEditingDesc(true)}
           >
@@ -564,54 +579,32 @@ function ThreadView({
               <span className="chan-desc-empty">add a brief (markdown — links open canvas cards)</span>
             )}
           </div>
-          {(descOverflows || descExpanded) && description.trim() && (
-            <button
-              className="chan-desc-more"
-              data-interactive
-              onClick={(e) => { e.stopPropagation(); setDescExpanded((v) => !v); }}
-            >
-              {descExpanded ? "show less" : "show more"}
-            </button>
-          )}
         </>
       )}
       <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
         {feed?.truncated && (
           <span className="chan-empty">…earlier messages dropped (showing the most recent {msgs.length})</span>
         )}
-        {msgs.length === 0 ? (
+        {visible.length === 0 ? (
           <span className="chan-empty">no messages yet</span>
         ) : (
           // Walk the log, folding each RUN of consecutive system notices (joins/leaves) into one dim, centered
-          // block so harness chatter recedes behind the human/agent conversation (Thread card UI). Conversation
-          // turns and work-intent lines render individually; the human's own turns get the right-aligned `me`
-          // bubble.
+          // block so harness chatter recedes behind the human/agent conversation (Thread card UI). The human's
+          // own turns get the right-aligned `me` bubble. Work-intent acts are filtered out upstream (`visible`)
+          // — current status lives on the participant pills now, not as transcript history.
           (() => {
             const out: React.ReactNode[] = [];
-            for (let i = 0; i < msgs.length; i++) {
-              const mm = msgs[i];
-              if (mm.kind !== "intent" && mm.from === "system") {
+            for (let i = 0; i < visible.length; i++) {
+              const mm = visible[i];
+              if (mm.from === "system") {
                 const run = [];
-                while (i < msgs.length && msgs[i].kind !== "intent" && msgs[i].from === "system") { run.push(msgs[i]); i++; }
+                while (i < visible.length && visible[i].from === "system") { run.push(visible[i]); i++; }
                 i--; // the for-loop will re-increment
                 out.push(
                   <div key={`sys-${run[0].seq}`} className="chan-sysrun">
                     {run.map((s) => (
                       <div key={s.seq} className="chan-sysline">· {s.text} ·</div>
                     ))}
-                  </div>,
-                );
-                continue;
-              }
-              if (mm.kind === "intent") {
-                // A work-intent typed act (threads-as-cards §6): a small card-only status line — who declared
-                // what stance toward this work — not a conversation turn. The glyph/tint carry the intent.
-                out.push(
-                  <div key={mm.seq} className={`chan-intent i-${(mm.intent ?? "").replace(":", "-")}`}>
-                    <span className="chan-intent-glyph">{intentGlyph(mm.intent)}</span>
-                    <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-                    <span className="chan-intent-text">{mm.text}</span>
-                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
                   </div>,
                 );
                 continue;
@@ -644,8 +637,17 @@ function ThreadView({
         ) : (
           members.map((mem) => {
             const mode = histMode[mem.sid] ?? "full";
+            // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
+            // blocked:peer, green = working, grey = done); fall back to the open/pending styling when they've
+            // declared nothing. The intent line (with its note) rides the pill's hover title.
+            const ci = mem.open ? currentIntent[mem.sid] : undefined;
+            const intentClass = ci ? ` i-${ci.intent.replace(":", "-")}` : "";
             return (
-              <span key={mem.edgeId} className={`chan-member${mem.open ? " open" : " pending"}`} title={mem.sid}>
+              <span
+                key={mem.edgeId}
+                className={`chan-member${mem.open ? " open" : " pending"}${intentClass}`}
+                title={ci ? `${mem.sid} · ${ci.text}` : mem.sid}
+              >
                 {mem.open ? (
                   <button
                     className="chan-member-tag"
@@ -679,11 +681,6 @@ function ThreadView({
           placeholder="post… Enter to send, Shift+Enter for a new line — @tag a member, @all for everyone"
           value={post}
           onChange={(e) => { setPost(e.target.value); autosizePost(e.target); }}
-          onKeyDown={(e) => {
-            // Enter sends; Shift+Enter inserts a newline (so lists/paragraphs compose) — the actual bug the
-            // human hit. preventDefault on the send path so the newline isn't also inserted.
-            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
-          }}
         />
         <button onClick={() => void send()} disabled={sending}>Send</button>
       </div>

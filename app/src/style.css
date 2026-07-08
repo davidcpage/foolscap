@@ -2643,17 +2643,6 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   line-clamp: 1;
   overflow: hidden;
 }
-.chan-desc-more {
-  align-self: flex-start;
-  margin: 0 10px 4px;
-  padding: 0;
-  border: none;
-  background: none;
-  font: 10px ui-monospace, Menlo, monospace;
-  color: #8b5cf6;
-  cursor: pointer;
-}
-.chan-desc-more:hover { text-decoration: underline; }
 /* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
    link (any other href) is a dotted-underline focus affordance — clicking it opens/focuses the target card. */
 .chan-description-view a { color: #2563eb; }
@@ -2684,9 +2673,9 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-log::-webkit-scrollbar { width: 8px; }
 .chan-log::-webkit-scrollbar-thumb { background: #00000022; border-radius: 4px; }
-/* Every message is a soft purple bubble (Thread card UI): the tinted fill is the standard message background
-   broadly, not just the human's turns, so the log reads as a calm chat rather than a run-on column of
-   divider-separated blocks. Agents' turns sit left; the human's own turn (.me) is right-aligned below. */
+/* Every message is the SAME soft purple bubble (Thread card UI) — one uniform fill for agents and the human
+   alike, so the log reads as a calm chat; the too-subtle agent tint is gone. Agents' turns sit left; the
+   human's own turn (.me) is right-aligned below, and that alignment is the only user/agent distinction. */
 .chan-msg {
   font-size: 11px;
   line-height: 1.5;
@@ -2694,7 +2683,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   max-width: 92%;
   padding: 5px 9px;
   border-radius: 10px 10px 10px 2px;
-  background: #f6f3fc;
+  background: #ece5f9;
 }
 .chan-msg-head {
   display: flex;
@@ -2763,13 +2752,12 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   line-height: 1.5;
 }
-/* The human's own turns are the same purple bubble, but right-aligned with a mirrored tail and a slightly
-   deeper fill so "mine vs theirs" still reads at a glance (Thread card UI). */
+/* The human's own turns are the same purple bubble, distinguished ONLY by right-alignment and a mirrored
+   tail (Thread card UI) — no separate fill. */
 .chan-msg.me {
   align-self: flex-end;
   max-width: 85%;
   border-radius: 10px 10px 2px 10px;
-  background: #ece5f9;
 }
 .chan-msg.me .chan-msg-head { justify-content: flex-end; }
 /* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
@@ -2792,26 +2780,6 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 /* Pinned now that every bubble is purple, a fill can't mark "pinned" — a thin left accent does, quietly
    (Thread card UI). The lit 📌 in the header is the other cue. */
 .chan-msg.pinned { box-shadow: inset 3px 0 0 #a78bfa; }
-/* A work-intent typed act (threads-as-cards §6): a slim, DIM card-only status line, not a conversation turn
-   — softened small/quiet so the harness status recedes behind the human/agent turns (Thread card UI). The
-   semantic tints still carry the stance (amber = your turn, blue = in flight elsewhere, green = done) but
-   muted so they don't shout. */
-.chan-intent {
-  font-size: 9px;
-  line-height: 1.3;
-  color: #b0aeb8;
-  padding: 1px 2px;
-}
-.chan-intent .chan-msg-from { color: #b0aeb8; font-weight: 500; }
-.chan-intent-glyph { margin-right: 4px; opacity: 0.7; }
-.chan-intent-text { margin-left: 6px; }
-.chan-intent .chan-msg-time { font-size: 8px; }
-.chan-intent.i-blocked-human { color: #c68a4a; }
-.chan-intent.i-blocked-human .chan-msg-from { color: #c68a4a; }
-.chan-intent.i-blocked-peer { color: #7f95c9; }
-.chan-intent.i-blocked-peer .chan-msg-from { color: #7f95c9; }
-.chan-intent.i-done { color: #6bb082; }
-.chan-intent.i-done .chan-msg-from { color: #6bb082; }
 .chan-members {
   display: flex;
   flex-wrap: wrap;
@@ -2868,6 +2836,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   border: 1px dashed #d4d4d8;
 }
+/* The pill coloured by the member's CURRENT work-intent (Thread card UI) — status where it belongs, on the
+   roster, instead of as inline transcript history. The note rides the pill's hover title. These follow the
+   session-status vocabulary and sit AFTER `.open` so they win at equal specificity: amber = blocked:human
+   (your turn), blue = blocked:peer (in flight elsewhere), green = working, grey = done. A member with no
+   declared intent keeps the neutral open/pending styling above. */
+.chan-member.i-working { background: #eaf7ec; color: #3f7a4c; border-color: #cfe9d3; }
+.chan-member.i-blocked-human { background: #fdf0e0; color: #b45309; border-color: #f3d7b0; }
+.chan-member.i-blocked-peer { background: #e9eefb; color: #3d5bb0; border-color: #cdd9f4; }
+.chan-member.i-done { background: #f2f2f3; color: #8a8a90; border-color: #e0e0e2; }
 .chan-post {
   display: flex;
   gap: 5px;
