@@ -28,6 +28,7 @@ import {
   addThreadMember,
   removeThreadMember,
   threadMembersFromMeta,
+  untaggedSeatNudgeTarget,
 } from "../thread-ledger.js";
 
 function tmpRepo() {
@@ -374,4 +375,44 @@ test("setThreadLevel normalizes an unknown level to `all` and preserves seats/pi
   assert.equal(meta.seats.Coordinator.level, "all", "bad level → all");
   assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat identity intact");
   assert.equal(meta.pins.length, 1, "pins survive a level write");
+});
+
+// ── untaggedSeatNudgeTarget (Option B: untagged post → the thread's LIVE Coordinator seat) ──────────
+const alwaysLive = () => true;
+const neverLive = () => false;
+const coordMeta = { seats: { Coordinator: { role: "Coordinator", sid: "coord-1" } } };
+
+test("untaggedSeatNudgeTarget: an untagged post returns the LIVE Coordinator seat sid", () => {
+  const got = untaggedSeatNudgeTarget(coordMeta, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive });
+  assert.equal(got, "coord-1");
+});
+
+test("untaggedSeatNudgeTarget: a DORMANT Coordinator is NOT returned (no per-post respawn)", () => {
+  const got = untaggedSeatNudgeTarget(coordMeta, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: neverLive });
+  assert.equal(got, null, "dormant seat → catch it on the heartbeat, don't respawn per post");
+});
+
+test("untaggedSeatNudgeTarget: a room broadcast is NOT untagged → null (normal fan-out covers it)", () => {
+  const got = untaggedSeatNudgeTarget(coordMeta, "Coordinator", { broadcast: true, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive });
+  assert.equal(got, null);
+});
+
+test("untaggedSeatNudgeTarget: an @-mentioned post is NOT untagged → null (mention path covers it)", () => {
+  const got = untaggedSeatNudgeTarget(coordMeta, "Coordinator", { broadcast: false, mentioned: new Set(["someone"]), exceptSid: "poster", isLive: alwaysLive });
+  assert.equal(got, null);
+});
+
+test("untaggedSeatNudgeTarget: the Coordinator posting its OWN untagged message does not self-nudge", () => {
+  const got = untaggedSeatNudgeTarget(coordMeta, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "coord-1", isLive: alwaysLive });
+  assert.equal(got, null, "sender === seat occupant → no self-nudge");
+});
+
+test("untaggedSeatNudgeTarget: a thread with no Coordinator seat → null (only stewarded threads fire)", () => {
+  const got = untaggedSeatNudgeTarget({ seats: { Implementer: { role: "Implementer", sid: "imp-1" } } }, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive });
+  assert.equal(got, null);
+});
+
+test("untaggedSeatNudgeTarget: tolerates a null/empty meta → null", () => {
+  assert.equal(untaggedSeatNudgeTarget(null, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive }), null);
+  assert.equal(untaggedSeatNudgeTarget({}, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive }), null);
 });

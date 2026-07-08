@@ -23,6 +23,8 @@ export interface CellAnalysis {
   block: boolean;
   /** True when the block returns an OBJECT keyed by its define names — the runtime maps keys→exports even for one. */
   keyedExports: boolean;
+  /** True when the cell's final statement ends in an explicit `;` — it runs normally but its value is not displayed. */
+  suppress: boolean;
 }
 
 export function analyzeCell(source: string): CellAnalysis;

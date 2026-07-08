@@ -53,7 +53,7 @@ export function analyzeCell(source) {
   } catch {
     // A half-typed / not-yet-valid cell: infer nothing (the explicit declarations, if any, still apply in
     // the runtime; the cell errors at run exactly as today). Never throw — inference is best-effort.
-    return { ok: false, reads: [], defines: [], imports: [], valueSource: src, block: false, keyedExports: false };
+    return { ok: false, reads: [], defines: [], imports: [], valueSource: src, block: false, keyedExports: false, suppress: false };
   }
   // Pass 1: every name BOUND anywhere in the cell (params, declarations, imports, …). A free variable is one
   // referenced but absent from this set — a deliberately COARSE (whole-cell, not scope-precise) rule: a name
@@ -78,6 +78,12 @@ export function analyzeCell(source) {
   // statement with NO imports keeps the single-EXPRESSION path verbatim, so an object literal `{a:1}` (which
   // parses as a block statement) still evaluates as an expression via the worker's paren-wrap (no regression).
   const block = importDecls.length > 0 || rest.length > 1;
+  // OUTPUT SUPPRESSION (Jupyter/MATLAB/Observable `;`): the cell runs normally but DISPLAYS no value when its
+  // final statement ends in a statement-terminating semicolon. AST-based, not string-trim: acorn extends an
+  // ExpressionStatement past its inner expression ONLY for a real `;` terminator, so a `;` inside a string or
+  // comment (never part of the statement node) or a for-loop header (a ForStatement, not an ExpressionStatement)
+  // is immune. Keys off the LAST top-level statement, uniform across the single-expression and block paths.
+  const suppress = endsWithStatementSemicolon(src, ast);
   let defines, valueSource, keyedExports;
   if (block) {
     const b = buildBlockSource(src, importDecls, rest);
@@ -92,7 +98,21 @@ export function analyzeCell(source) {
   }
   const dset = new Set(defines);
   const reads = [...referenced].filter((n) => !bound.has(n) && !dset.has(n));
-  return { ok: true, reads, defines, imports, valueSource, block, keyedExports };
+  return { ok: true, reads, defines, imports, valueSource, block, keyedExports, suppress };
+}
+
+// True when the cell's LAST top-level statement is an ExpressionStatement terminated by an explicit `;` — the
+// output-suppression signal. Acorn sets an ExpressionStatement's `end` to just past its inner expression when
+// there's NO semicolon (ASI), and just past the `;` when there is one; so the span between them contains the
+// terminator iff the user wrote a trailing `;`. Any other last-statement shape (a loop, a declaration, a bare
+// expression with no `;`) suppresses nothing. Whitespace/comments between the expression and `;` don't matter —
+// a `;` there is still a genuine terminator; a `;` living inside a string/comment is never in this span at all.
+function endsWithStatementSemicolon(src, ast) {
+  const body = ast.body;
+  if (!body || !body.length) return false;
+  const last = body[body.length - 1];
+  if (last.type !== "ExpressionStatement") return false;
+  return src.slice(last.expression.end, last.end).includes(";");
 }
 
 // ── pass 1: bound names ─────────────────────────────────────────────────────────────────────────────
@@ -249,19 +269,31 @@ function collectReferencesInDefaults(node, out) {
 // the plain `=` operator and a binding target (an Identifier, or a destructuring pattern → several names).
 // Then the worker evaluates just the RHS and the value maps to the export(s), reusing the explicit-data-out
 // path (1 name → the value IS the export; many → keys picked off the value object). `obj.x = …` is a member
-// write, not a notebook define. Anything else → no define, evaluate the source verbatim.
+// write, not a notebook define. Anything else → no define, evaluate the source verbatim (minus a trailing `;`).
 function detectDefine(ast, src) {
-  const none = { defines: [], valueSource: src };
-  if (!ast.body || ast.body.length !== 1) return none;
+  if (!ast.body || ast.body.length !== 1) return { defines: [], valueSource: src };
   const stmt = ast.body[0];
-  if (stmt.type !== "ExpressionStatement") return none;
+  if (stmt.type !== "ExpressionStatement") return { defines: [], valueSource: src };
   const ex = stmt.expression;
-  if (ex.type !== "AssignmentExpression" || ex.operator !== "=") return none;
-  if (ex.left.type === "MemberExpression") return none;
+  // A non-define expression runs VERBATIM but with any statement-terminating `;` dropped — so `1;` wraps to the
+  // valid `return (1)` instead of the SyntaxError `return (1;)`. We strip only the terminator character (not the
+  // expression's own span) so surrounding parens/comments survive: `({a:1});` → `({a:1})`, not `{a:1}`.
+  if (ex.type !== "AssignmentExpression" || ex.operator !== "=" || ex.left.type === "MemberExpression") {
+    return { defines: [], valueSource: stripTrailingSemicolon(src, stmt) };
+  }
   const names = new Set();
   bindPattern(ex.left, names);
-  if (!names.size) return none;
+  if (!names.size) return { defines: [], valueSource: stripTrailingSemicolon(src, stmt) };
   return { defines: [...names], valueSource: src.slice(ex.right.start, ex.right.end) };
+}
+
+// Drop the explicit statement terminator `;` from a single ExpressionStatement, if present. Acorn ends an
+// ExpressionStatement just past its `;` (or at the expression when ASI applied), so the terminator — when
+// written — is the last character of the statement's span; remove exactly that one char, keeping everything
+// else (leading comments, wrapping parens) intact.
+function stripTrailingSemicolon(src, stmt) {
+  if (src[stmt.end - 1] === ";") return src.slice(0, stmt.end - 1) + src.slice(stmt.end);
+  return src;
 }
 
 // ── step-4b: cross-notebook imports from `import` statements ────────────────────────────────────────
@@ -425,5 +457,5 @@ export function compileMarkdown(source) {
 export function analyzeMarkdown(source) {
   const { templateSource, count } = compileMarkdown(source);
   const a = analyzeCell(templateSource); // reuse free-var inference over the template literal
-  return { ...a, interpolated: count > 0 && a.ok, defines: [], imports: [], valueSource: templateSource };
+  return { ...a, interpolated: count > 0 && a.ok, defines: [], imports: [], valueSource: templateSource, suppress: false };
 }

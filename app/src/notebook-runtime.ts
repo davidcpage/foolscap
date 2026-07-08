@@ -17,6 +17,24 @@ import { analyzeCell, analyzeMarkdown } from "../vendor/notebook-infer.js";
 
 export type Policy = { kind: "auto" | "manual" | "debounced"; ms: number };
 
+// A function export can't be structured-cloned, so it travels as a SOURCE descriptor (built by cloneSafe in
+// notebook-worker.js) that the consumer worker rebuilds into a callable. The runtime carries it through
+// exportsVal like any other value; it attaches the `closure` snapshot (see snapshotClosure) and renders the
+// descriptor as its source string wherever a cell value is displayed or relayed.
+interface FnDescriptor {
+  __fn__: true;
+  source: string;
+  closure?: Record<string, unknown>;
+}
+function isFnDescriptor(v: unknown): v is FnDescriptor {
+  return (
+    !!v &&
+    typeof v === "object" &&
+    (v as { __fn__?: unknown }).__fn__ === true &&
+    typeof (v as { source?: unknown }).source === "string"
+  );
+}
+
 // One declared import (the `data-in` grammar, §11.2). `path` null = a LOCAL sibling-cell export named
 // `name` (the step-1 form). `path` set = a cross-card import resolved against THIS notebook's directory:
 // a notebook (object of its exports, or one export when `export` is set) or a data file (its text). The
@@ -40,6 +58,7 @@ export interface CellSpec {
   runSource?: string; // the code the worker runs (RHS of a `name = …` define / a rewritten block / === source)
   block?: boolean; // runSource is a statement BLOCK (step-4b) — the worker runs it as a body, not an expression
   keyedExports?: boolean; // the block returns an object keyed by define names → map keys→exports even for one
+  suppress?: boolean; // the cell's final statement ended in `;` — run normally but DISPLAY no value (Jupyter `;`)
   reExports?: string[]; // local names this cell republishes from its cross-card imports (Observable's import-cell)
   inferredIn?: boolean; // imports were inferred from the code (no explicit data-in present)
   inferredOut?: boolean; // outNames were inferred from a `name = …` define (no explicit data-out present)
@@ -68,6 +87,7 @@ export interface CellOutput {
   error?: string; // the error string, for an "error" run
   running?: boolean; // a run is queued or in flight
   stale?: boolean; // inputs changed since the last run; awaiting a trigger (manual click / debounce timer)
+  suppressed?: boolean; // the cell ran fine but its final statement ended in `;` → the pane shows no value
   // Inferred wiring (step-4a/4b) for the card to DISPLAY as a muted hint where no explicit declaration was
   // written — so a cell that auto-wired by its code shows what it reads/defines, not an empty box.
   inReads?: string[]; // LOCAL reads inferred from free variables (only when data-in was absent)
@@ -212,6 +232,7 @@ const pushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // Render one value for the blob: keep the native (JSON-ish, already clone-safe) value when small so an
 // agent gets real structure; clamp to a string prefix + `truncated` when it would blow the cap.
 function clampValue(v: unknown): { value: unknown; truncated?: boolean } {
+  if (isFnDescriptor(v)) v = v.source; // a function export relays as its source string, not [object Object]
   let s: string;
   try {
     s = typeof v === "string" ? v : JSON.stringify(v);
@@ -229,6 +250,7 @@ function buildOutputsBlob(cardKey: string): string {
   const cells = Object.entries(out).map(([id, o]) => {
     const cell: Record<string, unknown> = { id, status: o.status, running: !!o.running, stale: !!o.stale };
     if (o.status === "error") cell.error = o.error;
+    else if (o.suppressed) cell.suppressed = true; // output suppressed by a trailing `;` — no value to relay
     else if (o.status === "ok") {
       const c = clampValue(o.value);
       cell.value = c.value;
@@ -430,6 +452,7 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
       runSource: a.valueSource,
       block: a.block,
       keyedExports: a.keyedExports,
+      suppress: a.suppress,
       inferredIn,
       inferredOut: c.outNames.length === 0,
     };
@@ -785,7 +808,13 @@ function onReply(cardKey: string, cellId: string, jobId: number, ok: boolean, va
     // EXPORT map (applyExports picks the per-name atoms off it), but it is NOT what the cell should DISPLAY:
     // Observable-style, a cell shows its FINAL value — here the last defined name's value — not an object of
     // all its bindings. Split the two: exports get the whole object, the pane gets the final value only.
-    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: displayValue(nb.specs.get(cellId), value), error: undefined });
+    //
+    // OUTPUT SUPPRESSION (Jupyter `;`): when the cell's final statement ended in `;`, blank the DISPLAY value
+    // only — exports (applyExports) and side effects derive from the RAW worker `value`, so a named `x = 1;`
+    // still publishes x and downstream cells still update; just the pane shows nothing.
+    const spec = nb.specs.get(cellId);
+    const suppressed = !!spec?.suppress;
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: suppressed ? undefined : displayValue(spec, value), error: undefined, suppressed: suppressed || undefined });
     applyExports(cardKey, cellId, value);
   } else {
     // A failed cell keeps its downstream's last-good values (no cascade) — only its own pane shows the error.
@@ -813,10 +842,23 @@ function applyExports(cardKey: string, producerId: string, value: unknown): void
   const nb = nbs.get(cardKey);
   const spec = nb?.specs.get(producerId);
   if (!nb || !spec) return;
-  for (const [name, val] of computeExports(spec, value)) publishExport(cardKey, nb, producerId, name, val);
+  for (const [name, val] of computeExports(spec, value)) publishExport(cardKey, nb, producerId, name, snapshotClosure(nb, spec, val));
   // Re-exports (Observable's import-cell): an imported binding becomes a notebook-local export whose value is
   // the resolved import. It tracks the upstream because a change there re-dirties this cell (wireExternal).
   for (const imp of importsOf(spec)) if (imp.path) publishExport(cardKey, nb, producerId, imp.name, resolveInput(nb, imp));
+}
+
+// A function export travels as a source descriptor built in the worker. Attach the closure snapshot HERE —
+// the runtime is the only place that holds the producing cell's resolved input VALUES — so a function that
+// reads a sibling/imported export (`g = x => x + a`) carries `a`'s current value and stays callable in the
+// consumer worker (case B). The closure is the cell's resolved inputs; inputs that are themselves function
+// descriptors ride along and rehydrate recursively (case D). A no-free-var function (case A) gets an empty
+// closure. Non-descriptor values pass through untouched.
+function snapshotClosure(nb: NB, spec: CellSpec, val: unknown): unknown {
+  if (!isFnDescriptor(val)) return val;
+  const closure: Record<string, unknown> = {};
+  for (const imp of importsOf(spec)) closure[imp.name] = resolveInput(nb, imp);
+  return { ...val, closure };
 }
 
 // Publish one export value; on a real change, re-dirty its importers — local (this card) and cross-card
@@ -835,7 +877,8 @@ function publishExport(cardKey: string, nb: NB, producerId: string, name: string
 // map for wiring. Show the `value` half. Falls back to the whole value if the shape is unexpected, so display
 // never throws.
 function displayValue(spec: CellSpec | undefined, value: unknown): unknown {
-  return spec?.keyedExports && value && typeof value === "object" ? (value as { value: unknown }).value : value;
+  const v = spec?.keyedExports && value && typeof value === "object" ? (value as { value: unknown }).value : value;
+  return isFnDescriptor(v) ? v.source : v; // a function export shows its source, not [object Object]
 }
 
 // Map a cell's value to its declared exports: 0 outputs → none (a display-only cell); a keyedExports block →

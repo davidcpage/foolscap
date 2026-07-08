@@ -256,3 +256,75 @@ test("compileMarkdown counts only real interpolations", () => {
   assert.equal(compileMarkdown("a ${x} b ${y} c").count, 2, "two real interpolations");
   assert.equal(compileMarkdown("price $9.99, no expr").count, 0, "a bare $ is not an interpolation");
 });
+
+// ── output suppression: a trailing `;` runs the cell but shows no value (Jupyter/MATLAB/Observable `;`) ──
+// analyzeCell reports `suppress` (AST-based: the last top-level statement is an ExpressionStatement ending in a
+// real `;`). The runtime blanks only the DISPLAY value on suppress; exports still flow. Detection is on the
+// tree, so a `;` inside a string/comment or a for-header never triggers it.
+
+test("a single expression ending in `;` suppresses output AND runs as a valid expression (crash fix)", () => {
+  const a = analyzeCell("1;");
+  assert.equal(a.suppress, true, "the trailing ; asks for output suppression");
+  assert.equal(a.block, false, "still a single-expression cell");
+  assert.equal(a.valueSource, "1", "the ; is stripped — the worker wraps `return (1)`, not the SyntaxError `return (1;)`");
+  // Confirm the worker's wrap actually evaluates now (previously `return (1;)` threw a SyntaxError).
+  assert.equal(new Function("return (" + a.valueSource + ")")(), 1, "the stripped expression evaluates to 1");
+});
+
+test("a parenthesized single expression ending in `;` also runs without error and suppresses", () => {
+  const a = analyzeCell("(1);");
+  assert.equal(a.suppress, true);
+  assert.equal(a.valueSource, "(1)", "only the trailing ; is dropped; the author's parens survive");
+  assert.equal(new Function("return (" + a.valueSource + ")")(), 1);
+});
+
+test("a single expression WITHOUT a trailing `;` is unchanged (no suppression)", () => {
+  const a = analyzeCell("x * 2");
+  assert.equal(a.suppress, false, "no trailing ; → normal output");
+  assert.equal(a.valueSource, "x * 2", "runs verbatim, exactly as before");
+});
+
+test("a `name = expr;` cell suppresses display but still defines its export (data-out still flows)", () => {
+  const a = analyzeCell("x = 21;");
+  assert.equal(a.suppress, true, "display suppressed by the trailing ;");
+  assert.deepEqual(a.defines, ["x"], "x is still exported so downstream cells update");
+  assert.equal(a.valueSource, "21", "the worker runs the RHS (the ; is not part of it)");
+});
+
+test("suppression is AST-based: a `;` inside a string is NOT a terminator", () => {
+  const a = analyzeCell('"a;"');
+  assert.equal(a.suppress, false, "the ; lives inside the string literal, not at statement end");
+  const b = analyzeCell('"a;";');
+  assert.equal(b.suppress, true, "a genuine terminator after the string DOES suppress");
+});
+
+test("suppression is AST-based: a `;` inside a trailing comment does NOT suppress", () => {
+  const a = analyzeCell("1 // ok;");
+  assert.equal(a.suppress, false, "the ; is in a comment, not part of the statement");
+  // The source runs verbatim (the ; is only inside the comment, so there's no terminator to strip); the
+  // worker's `return (…)` wrap still evaluates it to 1 — the comment can't leak out and break the wrap.
+  assert.equal(new Function("return (\n" + a.valueSource + "\n)")(), 1, "still evaluates to 1");
+});
+
+test("a for-loop header's semicolons never trigger suppression (not an ExpressionStatement)", () => {
+  const a = analyzeCell("for (let i = 0; i < 3; i++) console.log(i)");
+  assert.equal(a.suppress, false, "the ; are loop-header separators; the last statement is a ForStatement");
+});
+
+test("a statement BLOCK ending in `;` suppresses its display value (last expression stripped of the ;)", () => {
+  const a = analyzeCell("let a = 1;\na + 1;");
+  assert.equal(a.block, true, "more than one statement → a block");
+  assert.equal(a.suppress, true, "the final statement ends in ;");
+  assert.ok(/return \(a \+ 1\)/.test(a.valueSource), "the block returns its last expression (the ; is dropped)");
+});
+
+test("a block whose final statement has NO trailing `;` does not suppress", () => {
+  const a = analyzeCell("let a = 1;\na + 1");
+  assert.equal(a.block, true);
+  assert.equal(a.suppress, false, "earlier statements' ; don't matter — only the final statement's terminator");
+});
+
+test("a markdown cell never suppresses (its compiled template is not a `;`-terminated statement)", () => {
+  const a = analyzeMarkdown("Total: ${total};");
+  assert.equal(a.suppress, false, "a literal ; in prose is not a statement terminator");
+});

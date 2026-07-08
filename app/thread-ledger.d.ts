@@ -87,6 +87,11 @@ export function ownBlockedIntentKeys(
   intents: Record<string, DeclaredIntent> | undefined,
   sid: string,
 ): string[];
+export function untaggedSeatNudgeTarget(
+  meta: ThreadMetaMarker | null | undefined,
+  role: string,
+  opts: { broadcast: boolean; mentioned?: Set<string>; exceptSid?: string; isLive?: (sid: string) => boolean },
+): string | null;
 export function setThreadLevel(
   repoPath: string,
   threadId: string,

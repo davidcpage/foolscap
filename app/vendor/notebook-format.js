@@ -74,11 +74,25 @@ export function deserialize(html) {
   const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(src);
   const title = tm ? tm[1].trim() : "";
   const cells = [];
+  // Cell ids MUST be unique: they're the per-cell handle every structural op in the card keys on
+  // (delete/move/edit/convert-type in render.js) and the DOM `data-cellid`. A source file can carry
+  // COLLIDING ids two ways — an explicit `id` that matches another cell's positional fallback (`c${n}`),
+  // or two literal duplicate `id`s — and a collision made delete-by-id remove EVERY matching cell (a
+  // silent data-loss bug: "deleting one cell also deletes the one below"). Guarantee uniqueness at the
+  // parse boundary so no downstream op has to. Ids are internal handles (wiring is by data-in/out NAMES,
+  // not ids), so minting a fresh id for a clash is safe and self-consistent within a render.
+  const used = new Set();
   SCRIPT_RE.lastIndex = 0;
   let m;
   while ((m = SCRIPT_RE.exec(src))) {
     const attrs = m[1] || "";
-    const id = attr(attrs, "id") || `c${cells.length + 1}`;
+    let id = attr(attrs, "id") || `c${cells.length + 1}`;
+    if (used.has(id)) {
+      let n = cells.length + 1;
+      while (used.has(`c${n}`)) n++;
+      id = `c${n}`;
+    }
+    used.add(id);
     const type = attr(attrs, "type") || "module";
     const source = dedent(m[2]).replace(/<\\\/script>/g, "</script>");
     const imports = parseImports(attr(attrs, "data-in"));

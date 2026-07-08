@@ -114,6 +114,45 @@ test("serialize → deserialize round-trips the step-2 import grammar", () => {
   assert.deepEqual(back.cells[0].inNames, ["df", "prices", "t"]);
 });
 
+test("deserialize guarantees UNIQUE cell ids — the cell-delete data-loss root fix", () => {
+  // A file can carry colliding ids two ways. Both broke delete-by-id (filter removes EVERY match →
+  // deleting one cell also removed its collision twin, the "deletes the cell below" bug). The parser now
+  // mints a fresh `c<n>` on any clash so no downstream op (delete/move/edit/convert, all id-keyed) can
+  // touch the wrong cell.
+
+  // (a) an explicit id that collides with the NEXT cell's positional fallback `c${n}`.
+  const collideWithFallback = [
+    "<notebook><title>T</title>",
+    '<script id="c2" type="module">first</script>', // explicit "c2"
+    "<script type=\"module\">second</script>", // no id → fallback would be c2 → COLLISION
+    "</notebook>",
+  ].join("");
+  const a = deserialize(collideWithFallback);
+  assert.equal(a.cells.length, 2);
+  assert.equal(new Set(a.cells.map((c) => c.id)).size, 2, "colliding fallback id is re-minted unique");
+  assert.equal(a.cells[0].source, "first");
+  assert.equal(a.cells[1].source, "second");
+
+  // (b) two LITERAL duplicate explicit ids.
+  const dupExplicit = [
+    "<notebook><title>T</title>",
+    '<script id="dup" type="module">one</script>',
+    '<script id="dup" type="module">two</script>',
+    '<script id="dup" type="module">three</script>',
+    "</notebook>",
+  ].join("");
+  const b = deserialize(dupExplicit);
+  assert.equal(b.cells.length, 3);
+  assert.equal(new Set(b.cells.map((c) => c.id)).size, 3, "all three duplicate ids become distinct");
+  assert.deepEqual(b.cells.map((c) => c.source), ["one", "two", "three"], "no cell dropped or merged");
+
+  // The delete op reduces to filter-by-id. With unique ids it removes EXACTLY the target — never a neighbour.
+  const target = b.cells[1].id;
+  const afterDelete = b.cells.filter((c) => c.id !== target);
+  assert.equal(afterDelete.length, 2, "delete-by-id removes exactly one cell");
+  assert.deepEqual(afterDelete.map((c) => c.source), ["one", "three"], "the adjacent cells survive");
+});
+
 test("deserialize tolerates empty/garbage input without throwing", () => {
   assert.deepEqual(deserialize("").cells, []);
   assert.deepEqual(deserialize(undefined).cells, []);
