@@ -215,6 +215,31 @@ export function seatForSid(seats, sid) {
 }
 
 /**
+ * The intent-slot keys on a marker that hold a `blocked:*` THIS session itself declared — the detection
+ * half of the work-intent self-freshen (vite-fs-plugin.ts clearBlockedIntents, part 2): when a session
+ * resumes running, these are the slots to auto-transition back to `working`.
+ *
+ * "Its own" is matched by the record's `sid` stamp (which covers a sid-keyed AND a seat-keyed
+ * self-declaration — recordThreadIntent always stamps the declarer) or a bare sid key. DELIBERATELY not a
+ * `key === seatForSid(sid)` match: a `blocked:*` a DIFFERENT (now-exited) occupant left on a seat this
+ * session later re-filled is the sacred waiting state that must survive its asker's crash (thread-state.js
+ * §5) — a fresh occupant resuming must never silently retire another agent's unanswered question. Pure;
+ * callers pass `meta.intents`.
+ *
+ * @param {Record<string, {intent?: string, sid?: string}>|undefined} intents
+ * @param {string} sid
+ * @returns {string[]} the keys whose intent should be freshened to `working`
+ */
+export function ownBlockedIntentKeys(intents, sid) {
+  const keys = [];
+  for (const [key, rec] of Object.entries(intents ?? {})) {
+    const mine = key === sid || rec?.sid === sid;
+    if (mine && typeof rec?.intent === "string" && rec.intent.startsWith("blocked")) keys.push(key);
+  }
+  return keys;
+}
+
+/**
  * The occupant sid of a thread's `role` seat that an UNTAGGED post should NUDGE, or null (untagged→Coordinator,
  * Option B). An untagged post (neither a room `broadcast` nor an @-`mentioned` post) wakes no member by the
  * normal seat-level fan-out — the ambient case principle 3 keeps quiet. But a role like the Coordinator is the

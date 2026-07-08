@@ -23,7 +23,8 @@ import {
   textOffsetOf,
   type AnnotationInfo,
 } from "./annotations";
-import { fileContentSignal } from "./content";
+import { fileContentSignal, sessionListSignal } from "./content";
+import { memberDisplayIntent } from "../thread-state.js";
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -369,6 +370,18 @@ function ThreadView({
   const youWaitingMore = feed?.youWaitingMore ?? 0;
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
+  // Observed process-state per member, for the pill fusion (part 1 — process-state overrides a stale
+  // declaration). The server's session band (SessionMeta.status) rides /api/sessions keyed by sid = the
+  // session node's `title` (the same node↔session join Minimap/App use). `working` ⟺ the process is
+  // RUNNING; every other band (waiting / waiting-agent / scheduled / done / crashed / ended) or an absent
+  // row ⟺ NOT running. memberDisplayIntent collapses running → 'working', so a declared intent that has
+  // gone stale can't paint a 'blocked' pill on a green/running card.
+  const sessions = useSignal(sessionListSignal);
+  const runningBySid = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of sessions ?? []) if (s.status === "working") set.add(s.id);
+    return set;
+  }, [sessions]);
   // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
   // (Thread card UI). Instead each member's *latest* declared intent colours their participant pill. The
   // feed is ordered, so the last intent act per sid wins. `visible` is the log with intent acts filtered
@@ -747,18 +760,28 @@ function ThreadView({
           members.map((mem) => {
             // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
             // blocked:peer, green = working, grey = done); fall back to the open/pending styling when they've
-            // declared nothing.
+            // declared nothing. But FUSE the declared intent with the observed process-state first
+            // (memberDisplayIntent): a RUNNING process reads 'working' regardless of what it last declared —
+            // the declaration goes stale mid-turn, and a 'blocked' pill on a green/running card is the exact
+            // contradiction this kills. Only an idle/exited member shows its raw declared intent.
             const ci = mem.open ? currentIntent[mem.sid] : undefined;
-            const intentClass = ci ? ` i-${ci.intent.replace(":", "-")}` : "";
+            const running = mem.open && runningBySid.has(mem.sid);
+            const displayIntent: string | null = mem.open
+              ? memberDisplayIntent(running ? "running" : "idle", ci?.intent ?? null)
+              : null;
+            // Keep the declared note ONLY while it still describes the shown intent; when process-state
+            // overrode a declaration to 'working', its note ("blocked on X") is now misleading — drop it.
+            const displayNote = displayIntent && displayIntent === ci?.intent ? ci?.note : "";
+            const intentClass = displayIntent ? ` i-${displayIntent.replace(":", "-")}` : "";
             const tag = mem.open ? tagFor(mem, openMembers) : null;
             // A fast custom hover tooltip (no native-title delay, Thread card UI) surfaces the member's
             // current STATUS — the common thing — plus a hint that RIGHT-CLICK inserts the @-tag (the rarer,
             // deliberate act; no cursor change now). The intent word is bold + status-coloured to set it
             // apart from its note. Lines are dropped when there's nothing to say.
-            const statusNode: React.ReactNode = ci ? (
+            const statusNode: React.ReactNode = displayIntent ? (
               <>
-                <b className={`chan-tip-intent i-${ci.intent.replace(":", "-")}`}>{ci.intent}</b>
-                {ci.note && ` — ${ci.note}`}
+                <b className={`chan-tip-intent i-${displayIntent.replace(":", "-")}`}>{displayIntent}</b>
+                {displayNote && ` — ${displayNote}`}
               </>
             ) : mem.open ? "no status declared" : "invited — not yet joined";
             const tipNodes: React.ReactNode[] = [statusNode];

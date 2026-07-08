@@ -83,6 +83,10 @@ export function fillSeat(
 ): { seat: SeatRecord; refilled: boolean; blocked?: boolean; heldBy?: string };
 export function releaseSeat(repoPath: string, threadId: string, sid: string): string | null;
 export function seatForSid(seats: Record<string, SeatRecord> | undefined, sid: string): string | null;
+export function ownBlockedIntentKeys(
+  intents: Record<string, DeclaredIntent> | undefined,
+  sid: string,
+): string[];
 export function untaggedSeatNudgeTarget(
   meta: ThreadMetaMarker | null | undefined,
   role: string,

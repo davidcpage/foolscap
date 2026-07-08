@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -2217,7 +2217,7 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       if (e.message) s.lines.push(JSON.stringify({ type: e.type, message: e.message }));
       foldShadowEdits(s, e); // assistant tool_use → claim path; user tool_result → attributed commit (doc §6)
       s.inflight = null;
-      s.status = "running";
+      resumeRunning(s); // idle→running: fold the transition (auto-freshen any blocked:* intent, part 2)
       // Bank this message's authoritative usage into the turn total (a `user` event mid-turn is a
       // tool_result — it carries no usage and must not reset the counter; the turn resets only when WE
       // inject the next prompt, in sendSessionInput). `verb` is left alone: between an assistant
@@ -2255,7 +2255,7 @@ function foldSessionEvent(s: LiveSession, e: any): void {
         // turn's completed-message total so the live counter ticks up across a multi-message turn.
         s.usage.output = s.turnOut + (Number(ev.usage.output_tokens) || 0);
       }
-      if (ev?.type === "message_start" || ev?.type === "content_block_start") s.status = "running";
+      if (ev?.type === "message_start" || ev?.type === "content_block_start") resumeRunning(s);
       break;
     }
     // system / rate_limit_event / anything else: framing only, nothing to render
@@ -2565,7 +2565,7 @@ function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boo
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
   s.lines.push(JSON.stringify({ type: "user", message: { role: "user", content: text } }));
-  s.status = "running";
+  resumeRunning(s); // a prompt/nudge resumes the process → auto-freshen any blocked:* intent (part 2)
   s.idleSince = undefined; // back to work — reset the auto-wake keep-alive clock (no-op for a normal session)
   // A real prompt is the turn boundary we own (tool_result `user` events are mid-turn) — reset the
   // turn's token accrual and show a neutral verb until the first stream frame names the activity.
@@ -4856,29 +4856,81 @@ async function handleThreadIntent(
     return sendJson(res, 403, { error: "sender is not a member of this channel" });
 
   const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
-  const msg = appendThreadMsg(boardId, threadId, body.from, intentLine(body.intent, note), {
-    kind: "intent",
-    intent: body.intent,
-  });
-  // The latest-per-participant index: full-object replace onto the meta marker (appendThreadMsg's own meta
-  // upsert shallow-merges around it, so activity bumps never clobber it — pinned by the ledger test).
-  // Keyed by the declarer's SEAT when it holds one (§5: the declared state must survive an occupant
-  // respawn — the fresh session re-fills the seat and inherits/overwrites the same slot), else by sid;
-  // `sid` inside the record says which occupant actually spoke.
+  const { msg, seat } = recordThreadIntent(boardId, threadId, body.from, body.intent, note);
+  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
+}
+
+// Record a work-intent typed act — the shared core of a declaration (the HTTP handler above) AND the
+// server's own auto-freshen (clearBlockedIntents below): append the card entry (kind:"intent", so it
+// renders on the thread and the roster pill reads it, but never wakes the room) AND replace the
+// latest-per-participant slot on the meta marker. Full-object replace onto the marker — appendThreadMsg's
+// own meta upsert shallow-merges around it, so activity bumps never clobber it (pinned by the ledger test).
+// Keyed by the declarer's SEAT when it holds one (§5: the declared state must survive an occupant respawn —
+// a fresh session re-fills the seat and inherits/overwrites the same slot), else by sid; the record's own
+// `sid` field says which occupant actually spoke.
+function recordThreadIntent(
+  boardId: string,
+  threadId: string,
+  from: string,
+  intent: WorkIntent,
+  note?: string,
+): { msg: ThreadMsg; seat: string | null } {
+  const msg = appendThreadMsg(boardId, threadId, from, intentLine(intent, note), { kind: "intent", intent });
   const repoPath = boards.get(boardId)?.repoPath;
   let seat: string | null = null;
   if (repoPath) {
     const meta = readThreadMeta(repoPath, threadId);
-    seat = seatForSid(meta?.seats, body.from);
+    seat = seatForSid(meta?.seats, from);
     const prior = meta?.intents ?? {};
     upsertThreadMeta(repoPath, threadId, {
-      intents: {
-        ...prior,
-        [seat ?? body.from]: { intent: body.intent, ts: msg.ts, sid: body.from, ...(note ? { note } : {}) },
-      },
+      intents: { ...prior, [seat ?? from]: { intent, ts: msg.ts, sid: from, ...(note ? { note } : {}) } },
     });
   }
-  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
+  return { msg, seat };
+}
+
+// Part 2 — the work-intent self-freshen. A session going idle→running means a wake landed and it is
+// computing again: the block (if any) has been ANSWERED, so no agent action is needed to retire it. Sweep
+// every thread this session participates in and auto-transition any `blocked:*` it declared → `working`.
+// Recording it as a real intent act (a kind:"intent" log entry + the marker slot) freshens BOTH surfaces
+// uniformly — the roster pill (reads the log) and the rail state / deriveThreadState (reads the marker) —
+// with a provenance note, and it converges (the next resume finds nothing). Part 1's pill fusion shows 'working'
+// WHILE running; this makes the durable record honest so it doesn't snap back to a stale 'blocked' the
+// moment the process idles again. Best-effort: a failure just leaves the (live-covered) view to part 1.
+function clearBlockedIntents(repoPath: string, sid: string): void {
+  const boardId = boardIdentity(repoPath).boardId;
+  for (const meta of listThreads(repoPath)) {
+    // ownBlockedIntentKeys is the pure (unit-tested) detection half — which of this thread's intent slots
+    // hold a block THIS session itself declared (never another occupant's sacred, seat-inherited block).
+    const keys = ownBlockedIntentKeys(meta.intents, sid);
+    if (!keys.length) continue;
+    const threadId = meta.threadId;
+    // Append the freshening as a real intent act (kind:"intent" → renders on the thread + roster pill,
+    // wakes no one) so the pill (which reads the log) un-stales; then overwrite the SAME marker slot(s) the
+    // block sat in — the exact keys, not a re-derived seat key, so a sid-keyed block can't be stranded —
+    // so the rail state / deriveThreadState (which reads the marker) agrees. Both surfaces freshen
+    // uniformly, with a provenance note. Converges: the next resume finds nothing left to clear.
+    const msg = appendThreadMsg(boardId, threadId, sid, intentLine("working", "auto: resumed — block answered"), {
+      kind: "intent",
+      intent: "working",
+    });
+    const next = { ...(readThreadMeta(repoPath, threadId)?.intents ?? {}) };
+    for (const key of keys) next[key] = { intent: "working", ts: msg.ts, sid };
+    upsertThreadMeta(repoPath, threadId, { intents: next });
+  }
+}
+
+// Flip a live session to `running`, firing the idle→running side effects exactly ONCE on the transition
+// (the guard makes a mid-turn running-set — every assistant/stream event — a no-op, so the thread sweep
+// runs at most once per turn-start, not per event). The single chokepoint for "the process resumed".
+function resumeRunning(s: LiveSession): void {
+  if (s.status === "running") return;
+  s.status = "running";
+  try {
+    clearBlockedIntents(s.repoPath, s.id);
+  } catch {
+    /* best-effort — part 1's live pill fusion already covers the running view */
+  }
 }
 
 // POST /api/thread/<id>/level { from, level } — set the caller's notification LEVEL on this thread (P1/W4,

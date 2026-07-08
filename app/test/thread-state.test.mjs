@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveThreadState, isThreadState, THREAD_STATES } from "../thread-state.js";
+import { deriveThreadState, isThreadState, memberDisplayIntent, THREAD_STATES } from "../thread-state.js";
 
 const p = (processState, intent = null) => ({ processState, intent });
 
@@ -70,4 +70,28 @@ test("isThreadState / THREAD_STATES", () => {
   for (const s of THREAD_STATES) assert.ok(isThreadState(s));
   assert.ok(!isThreadState("archived"));
   assert.ok(!isThreadState(null));
+});
+
+// memberDisplayIntent — the per-pill fusion (part 1). A running process is unambiguously 'working' and its
+// declared intent is ignored (it can't refresh mid-turn and goes stale); idle/exited shows the declaration.
+test("memberDisplayIntent: running collapses to 'working', ignoring ANY stale declaration", () => {
+  assert.equal(memberDisplayIntent("running", "blocked:human"), "working");
+  assert.equal(memberDisplayIntent("running", "blocked:peer"), "working");
+  assert.equal(memberDisplayIntent("running", "done"), "working");
+  assert.equal(memberDisplayIntent("running", null), "working");
+  assert.equal(memberDisplayIntent("running", undefined), "working");
+});
+
+test("memberDisplayIntent: idle/exited shows the raw declared intent (that's when it adds information)", () => {
+  assert.equal(memberDisplayIntent("idle", "blocked:human"), "blocked:human");
+  assert.equal(memberDisplayIntent("idle", "blocked:peer"), "blocked:peer");
+  assert.equal(memberDisplayIntent("idle", "done"), "done");
+  assert.equal(memberDisplayIntent("idle", "working"), "working");
+  assert.equal(memberDisplayIntent("exited", "blocked:human"), "blocked:human");
+});
+
+test("memberDisplayIntent: idle/exited + no declaration → null (never fabricate a status on a pill)", () => {
+  assert.equal(memberDisplayIntent("idle", null), null);
+  assert.equal(memberDisplayIntent("idle", undefined), null);
+  assert.equal(memberDisplayIntent("exited", null), null);
 });

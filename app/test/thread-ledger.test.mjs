@@ -19,6 +19,7 @@ import {
   fillSeat,
   releaseSeat,
   seatForSid,
+  ownBlockedIntentKeys,
   setThreadLevel,
   threadLevelForSid,
   readPins,
@@ -171,6 +172,43 @@ test("seats: fillSeat creates once, is idempotent for the same occupant, and re-
   assert.equal(seatForSid(seats, "sid-c"), "Reviewer");
   assert.equal(seatForSid(seats, "sid-a"), null);
   assert.equal(seatForSid(undefined, "sid-b"), null, "no seats map → null, not a throw");
+});
+
+// ownBlockedIntentKeys — the detection half of the work-intent self-freshen (part 2). Which intent slots
+// hold a `blocked:*` THIS session itself declared, so a resume can auto-transition them to `working`.
+test("ownBlockedIntentKeys: finds a session's own blocks (sid-keyed OR seat-keyed via the record's sid stamp)", () => {
+  const intents = {
+    // sid-keyed self-declaration
+    "sid-a": { intent: "blocked:human", ts: 1, sid: "sid-a" },
+    // seat-keyed self-declaration (recordThreadIntent stamps the declarer's sid)
+    Reviewer: { intent: "blocked:peer", ts: 2, sid: "sid-a" },
+    // this session's non-block slot — not returned
+    Extra: { intent: "working", ts: 3, sid: "sid-a" },
+  };
+  assert.deepEqual(ownBlockedIntentKeys(intents, "sid-a").sort(), ["Reviewer", "sid-a"]);
+});
+
+test("ownBlockedIntentKeys: both blocked:human and blocked:peer count; working/done never do", () => {
+  const intents = {
+    a: { intent: "blocked:human", ts: 1, sid: "s" },
+    b: { intent: "blocked:peer", ts: 1, sid: "s" },
+    c: { intent: "working", ts: 1, sid: "s" },
+    d: { intent: "done", ts: 1, sid: "s" },
+  };
+  assert.deepEqual(ownBlockedIntentKeys(intents, "s").sort(), ["a", "b"]);
+});
+
+test("ownBlockedIntentKeys: NEVER a seat-inherited block another (exited) occupant left — the sacred waiting state", () => {
+  // A prior occupant (sid-old) asked the human and crashed; the seat still carries its blocked:human. A
+  // fresh occupant (sid-new) re-filled the seat and is now resuming — it must NOT retire the old question.
+  const intents = { Coordinator: { intent: "blocked:human", ts: 1, sid: "sid-old" } };
+  assert.deepEqual(ownBlockedIntentKeys(intents, "sid-new"), [], "another agent's block is left untouched");
+  assert.deepEqual(ownBlockedIntentKeys(intents, "sid-old"), ["Coordinator"], "the original asker would clear it");
+});
+
+test("ownBlockedIntentKeys: empty/absent intents → [], not a throw", () => {
+  assert.deepEqual(ownBlockedIntentKeys(undefined, "s"), []);
+  assert.deepEqual(ownBlockedIntentKeys({}, "s"), []);
 });
 
 test("seats: the live-occupancy guard never displaces a LIVE seat, but an EXITED one still re-fills", () => {
