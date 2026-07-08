@@ -35,7 +35,20 @@ import { memberDisplayIntent } from "../thread-state.js";
 // are migrating to runtime-loaded templates (card-types/, doc §7): clock, note, and file live
 // there now; the remaining hardcoded views below each go the same way as their capabilities
 // (inputs, log view) land in the contract, until this file is just box + dispatch.
-export const NodeView = memo(function NodeView({ m, id, screen }: { m: InteractionManager; id: Id<"node">; screen?: boolean }) {
+export const NodeView = memo(function NodeView({
+  m,
+  id,
+  screen,
+  hud,
+}: {
+  m: InteractionManager;
+  id: Id<"node">;
+  screen?: boolean;
+  // When set (only in the screen layer), the card is corner-LOCKED HUD chrome (hud.ts) instead of a
+  // free-floating pinned card: rendered in HudFrame at this screen position rather than the draggable
+  // FloatingFrame. `top`/`right` anchor it to the viewport's top-right corner so it tracks a resize.
+  hud?: { top: number; right: number };
+}) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
   const nodeSub = useMemo(() => store.getSignal<"node">(id), [store, id]);
@@ -100,8 +113,44 @@ export const NodeView = memo(function NodeView({ m, id, screen }: { m: Interacti
     );
   }
 
-  return screen ? <FloatingFrame m={m} id={id} layout={layout}>{card}</FloatingFrame> : card;
+  if (!screen) return card;
+  // A HUD card is corner-locked chrome (HudFrame); every other screen card is a draggable pinned card
+  // (FloatingFrame). Both wrap the SAME card render above — the frame only owns placement + drag.
+  return hud ? (
+    <HudFrame id={id} layout={layout} placement={hud}>{card}</HudFrame>
+  ) : (
+    <FloatingFrame m={m} id={id} layout={layout}>{card}</FloatingFrame>
+  );
 });
+
+// The wrapper for a corner-locked HUD card (usage / clock — see hud.ts). Unlike FloatingFrame it is NOT
+// draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (from the top-right
+// corner + the HUD stack, passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS
+// top/right on the full-viewport .screen-layer means a window resize re-lays it out with no JS. Like the
+// minimap, a mousedown preventDefaults so a press on the card doesn't blur the canvas (keeping the
+// number-key / Alt-tap shortcuts live). The card fills the frame exactly as a floating card does.
+function HudFrame({
+  id,
+  layout,
+  placement,
+  children,
+}: {
+  id: Id<"node">;
+  layout: LayoutRecord;
+  placement: { top: number; right: number };
+  children: React.ReactNode;
+}) {
+  return (
+    <div
+      data-node-id={id}
+      className="hud-frame"
+      style={{ top: placement.top, right: placement.right, width: layout.w, height: layout.h, zIndex: layout.z }}
+      onMouseDown={(e) => e.preventDefault()}
+    >
+      {children}
+    </div>
+  );
+}
 
 // The wrapper for a floating (screen-anchored) card: a screen-positioned box that the card fills. It
 // owns the things the engine does for a WORLD card but won't for chrome — moving it, and keeping the

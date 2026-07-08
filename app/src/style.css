@@ -3392,6 +3392,19 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   height: 100%;
 }
 
+/* A corner-locked HUD card (usage / clock — hud.ts): anchored to the viewport's top-right corner via
+   top/right (set inline from the HUD stack), so it tracks a window resize with no JS. Unlike a floating
+   card it isn't draggable (no grab cursor, no move gesture) — it's chrome, positioned for you. The card
+   fills the frame just like a floating one. */
+.hud-frame {
+  position: absolute;
+  pointer-events: auto;
+}
+.hud-frame > .node {
+  width: 100%;
+  height: 100%;
+}
+
 /* The minimap HUD — navigation chrome pinned top-right, OUTSIDE the canvas subtree. It fades in on
    camera activity / held-Alt (the .show class) and out otherwise; pointer-transparent while hidden so
    it never blocks the canvas under it. */

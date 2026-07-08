@@ -189,11 +189,12 @@ function Board({ m, undo, persistence }: Engine) {
   const views = useMemo(() => new ViewStore(), []);
   const [toast, setToast] = useState<{ text: string; seq: number } | null>(null);
   const toastSeq = useRef(0);
-  // TAP Alt/Option to toggle the minimap On ↔ Off. A simple explicit toggle, no auto-show/fade — the
-  // minimap is just in the state you put it in. "Tap" = Alt pressed and released ALONE — if another key
-  // OR a pointer press happens while Alt is down it's a combo (an alt-drag wire, …) and must not toggle.
-  // Tracked window-wide; a click or blur clears the pending tap so it never fires spuriously.
-  const [minimapMode, setMinimapMode] = useState<0 | 1>(0);
+  // TAP Alt/Option to toggle the whole HUD GROUP On ↔ Off: the minimap plus the corner-pinned usage +
+  // clock cards (hud.ts) show/hide as one. A simple explicit toggle, no auto-show/fade — the HUD is just
+  // in the state you put it in. "Tap" = Alt pressed and released ALONE — if another key OR a pointer press
+  // happens while Alt is down it's a combo (an alt-drag wire, …) and must not toggle. Tracked window-wide;
+  // a click or blur clears the pending tap so it never fires spuriously.
+  const [hudMode, setHudMode] = useState<0 | 1>(0);
   useEffect(() => {
     let pristine = false; // Alt is down with nothing else since → still a tap candidate
     const down = (e: KeyboardEvent) => {
@@ -201,7 +202,7 @@ function Board({ m, undo, persistence }: Engine) {
         if (!e.repeat) pristine = true;
       } else if (e.code !== "KeyZ") {
         // Any other key → the Alt press is a combo, not a tap. The peek key (z, peek.ts) is EXEMPT so
-        // the minimap can still be toggled mid-peek: holding z auto-repeats keydown, and each repeat
+        // the HUD can still be toggled mid-peek: holding z auto-repeats keydown, and each repeat
         // would otherwise reset pristine and swallow the Alt-tap. Match e.CODE (the physical key), not
         // e.key — while Alt/Option is held the repeating z arrives as an Option-MODIFIED character
         // (e.key "Ω" on macOS), not "z"/"Z", so an e.key check misses it and the toggle stays broken.
@@ -211,7 +212,7 @@ function Board({ m, undo, persistence }: Engine) {
     };
     const up = (e: KeyboardEvent) => {
       if (e.key !== "Alt") return;
-      if (pristine) setMinimapMode((v) => (v ? 0 : 1));
+      if (pristine) setHudMode((v) => (v ? 0 : 1));
       pristine = false;
     };
     const cancel = () => {
@@ -662,12 +663,13 @@ function Board({ m, undo, persistence }: Engine) {
         onDragEnd={onDragEnd}
         onContextMenu={onContextMenu}
       >
-        <CanvasView m={m} />
+        <CanvasView m={m} hudShown={!!hudMode} />
       </div>
 
       {/* The minimap HUD — a sibling of the canvas (so its pointer events never reach the interaction
-          engine). Tap Alt to cycle Off → On → Frames (+ numbered view frames). */}
-      <MinimapHud m={m} mode={minimapMode} />
+          engine). Tap Alt to toggle the whole HUD group (minimap + the corner-pinned usage/clock cards,
+          which render in the ScreenLayer inside CanvasView) On ↔ Off together. */}
+      <MinimapHud m={m} mode={hudMode} />
 
       {/* The only standing chrome: a faint cue on an empty board, since right-click is otherwise invisible. */}
       {nodes.length === 0 && (
