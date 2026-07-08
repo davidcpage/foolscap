@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { deserialize } from "../vendor/notebook-format.js";
 
 // The headless contract test (card-types-as-data.md §5.5): the replacement for the dual-renderer
 // guard, run for EVERY type folder. A template that renders against a plain mock `card` in node —
@@ -1161,6 +1162,105 @@ test("notebook template renders a reactive markdown cell's INTERPOLATED output a
   );
   assert.ok(pristine.includes("nb-md-prose"), "a not-yet-run interpolated cell still renders (its raw source)");
 });
+
+test("notebook cell delete: removes EXACTLY the target (even with colliding source ids) and is UNDOable", async () => {
+  const mod = await loadTemplate("notebook");
+  // The data-loss bug: two cells could share an id (an explicit id colliding with the next cell's `c${n}`
+  // fallback), and delete-by-id (`filter(c => c.id !== cellId)`) then removed BOTH — "deleting one cell also
+  // deletes the one below". Here the 1st cell's explicit id "c2" collides with the 2nd's fallback "c2".
+  const htmlSrc = [
+    "<!doctype html>",
+    "<notebook>",
+    "  <title>Collide</title>",
+    '  <script id="c2" type="text/markdown">alpha</script>',
+    "  <script type=\"text/markdown\">beta</script>", // no id → would fall back to "c2" → COLLISION pre-fix
+    '  <script id="c9" type="text/markdown">gamma</script>',
+    "</notebook>",
+  ].join("\n");
+
+  let written = null;
+  let editing = new Set();
+  const card = {
+    root: "repo",
+    fields: { title: "notebooks/collide.html", text: "", color: "green" },
+    signals: {
+      fileContent: htmlSrc,
+      writeFile: (s) => (written = s),
+      treeState: { get: () => editing, set: (v) => (editing = v) },
+    },
+  };
+
+  // deserialize dedupes the ids at parse, so the three cells are distinct in the rendered view.
+  const tpl1 = mod.render(card);
+  const ids = [...flatten(tpl1).matchAll(/data-cellid=([^\s"'>]+)/g)].map((m) => m[1]);
+  assert.equal(ids.length, 3, "three cells rendered");
+  assert.equal(new Set(ids).size, 3, "the colliding ids were made unique on parse");
+  const target = ids[0]; // "alpha" — its pre-fix collision twin is "beta" (the cell below)
+
+  // Drive the command-mode delete (x) on the first cell's wrapper — the only delete path (no mouse toolbar).
+  const w = {}; // a fake wrapper: target === currentTarget, no tagName → command mode, not editor mode
+  const del = cellKeydown(tpl1, target);
+  assert.ok(del, "found the first cell's command-mode keydown handler");
+  del({ key: "x", target: w, currentTarget: w, preventDefault() {}, stopPropagation() {} });
+
+  assert.ok(written, "delete wrote the file");
+  const afterDelete = deserialize(written);
+  assert.deepEqual(afterDelete.cells.map((c) => c.source), ["beta", "gamma"], "ONLY alpha removed — beta (the cell below) survives");
+
+  // The delete is recoverable: re-render on the new content → the in-card undo strip appears.
+  card.signals.fileContent = written;
+  const tpl2 = mod.render(card);
+  const flat2 = flatten(tpl2);
+  assert.ok(flat2.includes("nb-undo") && flat2.includes("Cell deleted."), "the undo affordance shows while a delete is stashed");
+
+  // Invoke undo → the deleted cell is restored at its original index, with its source intact.
+  written = null;
+  const undo = findFn(tpl2, "undoDelete");
+  assert.ok(undo, "found the undo handler");
+  undo({ preventDefault() {} });
+  assert.ok(written, "undo wrote the file");
+  const restored = deserialize(written);
+  assert.deepEqual(restored.cells.map((c) => c.source), ["alpha", "beta", "gamma"], "alpha is back at index 0 — no data lost");
+
+  // Once undone, the stash is cleared → the undo strip is gone.
+  card.signals.fileContent = written;
+  assert.ok(!flatten(mod.render(card)).includes("nb-undo"), "the undo strip clears after a restore");
+});
+
+// Walk a TemplateResult into its leaf bindings ({pre, val}) in document order — pre is the literal string
+// immediately before the binding (so it carries the attribute name, e.g. "…@keydown="). Nested templates
+// and arrays recurse in place, preserving order. Lets a test locate + invoke a specific event handler.
+function leafBindings(value, out = []) {
+  if (value == null) return out;
+  if (Array.isArray(value)) {
+    for (const v of value) leafBindings(v, out);
+    return out;
+  }
+  if (value.strings && value.values) {
+    value.values.forEach((v, i) => {
+      if (v != null && (Array.isArray(v) || (v.strings && v.values))) leafBindings(v, out);
+      else out.push({ pre: value.strings[i], val: v });
+    });
+    return out;
+  }
+  return out;
+}
+// The command-mode keydown handler for a given cell: the `@keydown=` binding that follows that cell's
+// `data-cellid=` and routes through onCellKeydown (the wrapper's, not the textarea's shift-enter handler).
+function cellKeydown(tpl, cellId) {
+  let cur = null;
+  for (const { pre, val } of leafBindings(tpl)) {
+    if (pre.trimEnd().endsWith("data-cellid=")) cur = val;
+    if (typeof val === "function" && pre.trimEnd().endsWith("@keydown=") && cur === cellId && String(val).includes("onCellKeydown"))
+      return val;
+  }
+  return null;
+}
+// The first handler function whose source mentions `needle` (e.g. "undoDelete") — for single-instance ops.
+function findFn(tpl, needle) {
+  const hit = leafBindings(tpl).find((b) => typeof b.val === "function" && String(b.val).includes(needle));
+  return hit ? hit.val : null;
+}
 
 // Reassemble a TemplateResult (and nested results/arrays in its values) into a flat string.
 function flatten(value) {
