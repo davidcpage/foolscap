@@ -83,6 +83,11 @@ export function fillSeat(
 ): { seat: SeatRecord; refilled: boolean; blocked?: boolean; heldBy?: string };
 export function releaseSeat(repoPath: string, threadId: string, sid: string): string | null;
 export function seatForSid(seats: Record<string, SeatRecord> | undefined, sid: string): string | null;
+export function untaggedSeatNudgeTarget(
+  meta: ThreadMetaMarker | null | undefined,
+  role: string,
+  opts: { broadcast: boolean; mentioned?: Set<string>; exceptSid?: string; isLive?: (sid: string) => boolean },
+): string | null;
 export function setThreadLevel(
   repoPath: string,
   threadId: string,

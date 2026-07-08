@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -24,6 +24,7 @@ import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionSta
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
+import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
@@ -2808,6 +2809,28 @@ function wakeThreadMembers(
     s.nudge = true;
     woken++;
     if (s.status === "idle") flushNudge(s);
+  }
+  // Untagged → the thread's Coordinator seat (Option B). An untagged post wakes no member above (neither
+  // broadcast nor a mention — principle 3's ambient case). But the Coordinator is the thread's STEWARD and is
+  // expected to sweep its state, so it should learn of untagged activity on a thread it owns without waiting
+  // for the next heartbeat. So nudge the Coordinator seat here — but ONLY when it is LIVE (the same cheap
+  // content-free stdin nudge an @-tag gives a live idle seat). A DORMANT Coordinator is deliberately NOT
+  // respawned per untagged post: that per-message spawn is the exact cost principle 3 guards against, and it
+  // is unnecessary — the Coordinator is already a member, so the message is logged to its inbox and it catches
+  // it on its next heartbeat sweep. Scope is strictly the Coordinator seat; every OTHER member's untagged
+  // semantics stay unchanged. The pure decision (untagged? seat present? not the sender? live?) lives in
+  // untaggedSeatNudgeTarget — here we just apply the nudge to the sid it returns (null when it shouldn't fire).
+  const coordSid = untaggedSeatNudgeTarget(meta, COORDINATOR_ROLE, {
+    broadcast: opts.broadcast,
+    mentioned: opts.mentioned,
+    exceptSid,
+    isLive: (sid) => { const cs = liveSessions.get(sid); return !!cs && cs.status !== "exited"; },
+  });
+  if (coordSid) {
+    const cs = liveSessions.get(coordSid)!;
+    cs.nudge = true;
+    woken++;
+    if (cs.status === "idle") flushNudge(cs);
   }
   return woken;
 }
