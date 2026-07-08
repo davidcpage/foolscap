@@ -501,6 +501,36 @@ test("delete-card-keep-session: a real leave (edge removed, card still present) 
   assert.equal(after.members, 0, "a real leave (card present, edge gone) drops membership");
 });
 
+// Slice 2 (create new file cards) leans entirely on POST /api/file to CREATE a not-yet-existing file:
+// addTextFileCard writes empty content to `.canvas/docs/<slug>.md`, and only drops a card if the write
+// succeeds. So the two facts it depends on are (a) a POST to a fresh, text-extension path under `.canvas/`
+// creates the file and returns ok+version, and (b) a non-text extension is gated (404, the same way a
+// blocked read is) so the client leaves the board unchanged rather than carding a file that isn't there.
+test("POST /api/file creates a new text file under .canvas (Slice 2 create-path)", { skip: !up && "no dev server on 5173" }, async () => {
+  const rel = `.canvas/docs/new-doc-${runTag}.md`;
+  const fileUrl = (p) => `${HOST}/api/file?board=${boardId}&root=repo&path=${encodeURIComponent(p)}`;
+  // The path does not exist yet — a create, not an overwrite.
+  const abs = path.join(scratch, rel);
+  assert.equal(fs.existsSync(abs), false, "precondition: file absent before create");
+  const res = await fetch(fileUrl(rel), j({ content: "" }));
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  assert.equal(out.ok, true);
+  assert.equal(out.path, rel);
+  assert.ok(out.version, "returns a version for chained edits");
+  assert.equal(fs.readFileSync(abs, "utf8"), "", "empty file written to disk");
+  // The card's read path (fileContent) sees it immediately.
+  const read = await fetch(fileUrl(rel));
+  assert.equal(read.status, 200);
+});
+
+test("POST /api/file gates a non-text extension with 404 (Slice 2 leaves board unchanged)", { skip: !up && "no dev server on 5173" }, async () => {
+  const rel = `.canvas/docs/nope-${runTag}.exe`;
+  const res = await fetch(`${HOST}/api/file?board=${boardId}&root=repo&path=${encodeURIComponent(rel)}`, j({ content: "x" }));
+  assert.equal(res.status, 404, "a blocked extension is 404, never confirmed");
+  assert.equal(fs.existsSync(path.join(scratch, rel)), false, "nothing written for a rejected path");
+});
+
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {
   const res = await fetch(`${HOST}/api/board/persist?board=${boardId}`, { method: "DELETE" });
   assert.equal(res.status, 200);

@@ -650,6 +650,56 @@ async function nextNotebookName(m: InteractionManager): Promise<string> {
   return `notebook${max + 1}`;
 }
 
+// Slugify a user-entered title into a filename stem: lowercase, non-alnum runs → a single hyphen, trim
+// leading/trailing hyphens. Empty (or all-punctuation) → "untitled" so the default path is always a valid,
+// writeable name rather than a bare "/.md".
+export function slugifyTitle(title: string): string {
+  return title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "untitled";
+}
+
+// The default create-path for a new markdown file from a title (Slice 2). Lives under `.canvas/docs/`
+// rather than a bare `docs/`: `.canvas` is the canvas's own home so it exists in EVERY repo the board is
+// mounted on (a bare `docs/` doesn't), and its content is reachable through the file endpoints (only the
+// internal `.canvas/roots` + `.canvas/board` dirs are excluded). The user retargets it freely in the path
+// field — e.g. to `docs/foo.md` in a repo that has one.
+export function defaultDocPath(title: string): string {
+  return `.canvas/docs/${slugifyTitle(title)}.md`;
+}
+
+// Create a NEW text/markdown file on disk and drop a file card viewing it (Slice 2 — create-new). Mirrors
+// addNotebookCard's write-first discipline: write an EMPTY file first (bail without touching the board if
+// the write-back is unavailable OR the extension is rejected — the /api/file gate 404s a non-TEXT_EXT path,
+// so writeFileContent returns false and we leave the board unchanged) then commit the file card. The card
+// is a plain `type: "file"` node, so it inherits the Slice-1 in-card edit toggle for free — the user opens
+// it, hits Edit, and starts writing. Deterministic (root, path) id → idempotent: re-creating the same path
+// refreshes its card in place. Returns true on success, false if the create was rejected.
+export async function addTextFileCard(m: InteractionManager, rawPath: string, at?: Pos): Promise<boolean> {
+  const path = rawPath.trim().replace(/^\/+/, ""); // root-relative — a leading slash would escape the root
+  if (!path) return false;
+  if (!(await writeFileContent("repo", path, ""))) return false;
+  const kindInfo = fileKind(path);
+  const prose = kindInfo.kind === "md"; // markdown opens at the roomier reading footprint, like materializeAt
+  const id = fileNodeId("repo", path);
+  const { x, y } = at ?? spawnAt(m, prose ? PROSE_CARD_W : CARD_W, prose ? PROSE_CARD_H : CARD_H);
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: {
+      id,
+      type: "file",
+      title: path,
+      text: "",
+      color: kindInfo.color,
+      x,
+      y,
+      w: prose ? PROSE_CARD_W : CARD_W,
+      h: prose ? PROSE_CARD_H : CARD_H,
+    },
+  });
+  m.selection.set([id]);
+  return true;
+}
+
 export async function addNotebookCard(m: InteractionManager, at?: Pos): Promise<void> {
   const path = `notebooks/${await nextNotebookName(m)}.html`;
   // Write the file FIRST (off-log content tier): if the write-back endpoint is unavailable, leave the

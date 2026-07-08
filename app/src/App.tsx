@@ -31,6 +31,8 @@ import {
   addHnCard,
   addFolderCard,
   addNotebookCard,
+  addTextFileCard,
+  defaultDocPath,
   addProvenanceCard,
   addSessionsCard,
   addChannelsCard,
@@ -787,6 +789,94 @@ function NewSessionItem({
   );
 }
 
+// The "New file" affordance (Slice 2 — create a markdown/text file from the canvas). Shares the role
+// picker's expandable shell: the row expands to a title input and an editable path field pre-filled with
+// `.canvas/docs/<slug>.md` (slug from the title). The path auto-tracks the title UNTIL the user edits it by
+// hand (pathEdited), after which the title stops overwriting their choice — the common "type a title, take
+// the default path" flow stays one gesture, and retargeting to e.g. `docs/foo.md` sticks. Confirm (Create
+// or ↵) writes an empty file via addTextFileCard and drops the card, which gets the Slice-1 edit toggle for
+// free; the menu closes only on success, so a rejected path (bad/blocked extension → 404) keeps the form
+// open with an error instead of silently doing nothing.
+function NewFileItem({
+  m,
+  at,
+  onClose,
+}: {
+  m: InteractionManager;
+  at: Pos;
+  onClose: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [title, setTitle] = useState("");
+  const [path, setPath] = useState(defaultDocPath(""));
+  const [pathEdited, setPathEdited] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const titleRef = useRef<HTMLInputElement>(null);
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next) setTimeout(() => titleRef.current?.focus(), 0);
+  };
+  const onTitle = (v: string) => {
+    setTitle(v);
+    if (!pathEdited) setPath(defaultDocPath(v)); // path tracks the title until the user takes it over
+    setError(null);
+  };
+  const onPath = (v: string) => {
+    setPath(v);
+    setPathEdited(true);
+    setError(null);
+  };
+  const create = async () => {
+    if (busy || !path.trim()) return;
+    setBusy(true);
+    setError(null);
+    const ok = await addTextFileCard(m, path, at);
+    setBusy(false);
+    if (ok) onClose();
+    else setError("Couldn’t create that file — check the path uses a text extension (.md, .txt, …).");
+  };
+  const onKey = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void create();
+    }
+  };
+  return (
+    <div className="menu-roles">
+      <button className="menu-expand" aria-expanded={open} onClick={toggle}>
+        <span>New file</span>
+        <span className="menu-caret">{open ? "▾" : "▸"}</span>
+      </button>
+      {open && (
+        <div className="menu-rolelist menu-fileform">
+          <input
+            ref={titleRef}
+            className="menu-fileinput"
+            placeholder="Title"
+            value={title}
+            onChange={(e) => onTitle(e.target.value)}
+            onKeyDown={onKey}
+          />
+          <input
+            className="menu-fileinput"
+            placeholder="Path"
+            value={path}
+            onChange={(e) => onPath(e.target.value)}
+            onKeyDown={onKey}
+            spellCheck={false}
+          />
+          <button className="menu-filecreate" disabled={busy || !path.trim()} onClick={() => void create()}>
+            {busy ? "Creating…" : "Create"}
+          </button>
+          {error && <div className="menu-fileerror">{error}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // The board switcher (multi-canvas). "Board: <name>" expands into every board the server knows — live
 // mounts plus the durable registry it remounted on boot, so repos opened before a restart are still
 // offered — with "Open repo…" to mount a new one by absolute path. Switching NAVIGATES: one tab is
@@ -920,6 +1010,7 @@ function CanvasMenu({
         <button onClick={() => run(() => void createThread(m.editor, at))}>New thread</button>
         <button onClick={() => run(() => addChannelsCard(m, at))}>Threads</button>
         <div className="menu-section">Files</div>
+        <NewFileItem m={m} at={at} onClose={onClose} />
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>
         <div className="menu-section">Notes &amp; widgets</div>
