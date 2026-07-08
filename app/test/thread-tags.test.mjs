@@ -54,6 +54,42 @@ test("a tag that matches no member is prose, not an error", () => {
   assert.equal(r.wakeAll, false);
 });
 
+// ── the PROSE ESCAPE (backtick a handle to MENTION without waking). Retires the harness "no just-mentioning
+// escape" gotcha: `@a9` inside inline code is a mention, not a tag — no wake, no highlight, no spawn.
+test("a backtick-escaped @tag does NOT resolve (mention, not wake)", () => {
+  const r = resolveTags("as `@a9` noted, the parser fix is in", MEMBERS);
+  assert.deepEqual(r.members, [], "backticked handle wakes no one");
+  assert.deepEqual(r.unknown, [], "and is not surfaced as an unknown tag either");
+  assert.equal(r.wakeAll, false);
+});
+
+test("parseTags skips @tags inside inline code, keeps bare ones", () => {
+  assert.deepEqual(parseTags("ping @a9 but not `@83adfb9c`"), ["a9"]);
+  assert.deepEqual(parseTags("`@all` is just an example here"), [], "backticked keyword is inert too");
+  assert.deepEqual(parseTags("double ``@a9`` escapes"), [], "multi-backtick span also escapes");
+  assert.deepEqual(parseTags("`@a9` then a real @83adfb9c"), ["83adfb9c"], "only the un-escaped tag survives");
+});
+
+test("an unmatched backtick is literal — a bare @tag after it still wakes", () => {
+  // A lone backtick opens no span, so it must not swallow the rest of the message.
+  assert.deepEqual(parseTags("it's a `quote @a9 please"), ["a9"]);
+});
+
+test("matchTagSpans does not highlight a backtick-escaped tag", () => {
+  const text = "see `@Oracle` and also @Oracle live";
+  const spans = matchTagSpans(text, NAMED);
+  assert.equal(spans.length, 1, "only the un-escaped @Oracle highlights");
+  assert.equal(text.slice(spans[0].start, spans[0].end), "@Oracle");
+  // the highlighted one is the SECOND occurrence (after the code span), not the escaped first.
+  assert.ok(spans[0].start > text.indexOf("`@Oracle`"), "the escaped occurrence is skipped");
+});
+
+test("a backticked role mention does not cold-spawn (unknown bucket stays empty)", () => {
+  // Composes with classifyMentionSpawn: escaping the handle keeps it out of `unknown`, so nothing summons.
+  const r = resolveTags("the `@Generalist` role would handle this", MEMBERS);
+  assert.deepEqual(r.unknown, [], "no unknown tag → classifyMentionSpawn is never reached");
+});
+
 test("mixed: a member tag plus @human resolves both channels", () => {
   const r = resolveTags("@a9 can you confirm, @human fyi", MEMBERS);
   assert.deepEqual(r.members, [MEMBERS[0]]);

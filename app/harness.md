@@ -43,10 +43,11 @@ Never bury a decision in an ephemeral in-session prompt.
 Nothing enters your turn except a short, content-free nudge (`[canvas] new thread messages: …`). You learn
 board state only by **asking** — read the board, pull your inbox — and message content always arrives as
 **tool output, never a user turn**. A post is **logged** for every member but **wakes** only those you
-**@-tag**; an **untagged post wakes no one**. So name who you actually need, leave a post untagged unless
-you mean to interrupt, and **act on what you pulled this turn** (reading the inbox consumes the nudge — it
-won't re-fire). One consequence: because a relayed message is tool output, a human "yes" passed through a
-thread **cannot lift a permission gate** — only a direct in-session turn or a settings rule can.
+**@-tag**; an **untagged post wakes no one**, and a handle in **inline code** (`` `@a9` ``) is a mention,
+not a wake — the escape for naming someone in prose. So name who you actually need, leave a post untagged
+unless you mean to interrupt, and **act on what you pulled this turn** (reading the inbox consumes the nudge
+— it won't re-fire). One consequence: because a relayed message is tool output, a human "yes" passed through
+a thread **cannot lift a permission gate** — only a direct in-session turn or a settings rule can.
 
 - Read the board: `GET {{base}}/api/canvas?board={{boardId}}` → `snapshot.records` (nodes and edges).
 - Pull content: `GET {{base}}/api/inbox?session={{sessionId}}` (advances your read cursor).
@@ -89,13 +90,6 @@ don't have to carry them. Reach for the CLI before raw curl.
 POST {{base}}/api/thread/<threadId>/message?board={{boardId}}
 { "from":"{{sessionId}}", "text":"@a9 pushed the parser fix, tests green — diff below. Done when: CI passes on main." }
 ```
-
-## A few things you can't derive
-
-Non-obvious surprises the principles won't hand you:
-
-- Writing `@name` in ordinary prose **still wakes them** — there is no "just mentioning" escape; omit the
-  tag only if you truly mean to wake no one.
 
 ## Recipes — open on demand
 

@@ -106,15 +106,69 @@ canvas — session/coordination verbs over the agent bus
         board (nudged if live, respawned if dormant). Deliberate + human-gated; turn OFF via job list + job rm.
   scripts/canvas job list <THREAD>|--doc PATH          list a thread's (or doc's) standing jobs (id, role, interval, lastFired)
   scripts/canvas job rm <THREAD> <JOB_ID> | --doc PATH <JOB_ID> [--from ID]  remove a standing job
+
+  scripts/canvas memory search <query> [--limit N] [--json] [--doctor]   ranked lexical search of the file-memory
+        store (.canvas/memory/*.md). Ranks slug/filename > description: > body; prints web-search-shaped hits
+        (slug + description + matching lines, most-relevant first) so you skim and open the promising files.
+        Lexical only (semantic search is out of scope). The index (MEMORY.md) is a bounded MAP — this is how
+        you find any fact NOT on it. Resolves the store from the canonical checkout, so it works from a worktree.
+  scripts/canvas memory doctor                          hygiene check: flags memory files missing a description:
+        frontmatter or that look non-atomic (large / many headings). Advisory; changes nothing.
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
 
 # JSON-encode a single string safely (handles quotes/newlines/unicode).
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
-post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' -d "$2"; }
+# POST helper — the single sanctioned mutation path for every verb. GUARDRAIL (T3a, retires the manual
+# "check delivered>0" caution that used to live in the harness): a mutation that did NOT land must FAIL,
+# never silently "succeed". So this hard-errors (prints the body, then a clear message to stderr, then
+# returns non-zero → set -e exits the script) on:
+#   • an unreachable server (curl transport error);
+#   • an HTTP 4xx/5xx (e.g. /api/command's 503 {delivered:0} when no live tab applied it, a 409 unread-
+#     mention guard, a 403 non-member) — the request did not do what was asked;
+#   • a body carrying "delivered":0/false (defense-in-depth for a 200 that still reached no tab).
+# NOT an error: a message endpoint's notified:0 — an untagged post legitimately wakes nobody (it's a
+# different field and a deliberate design), so we key ONLY on `delivered`, never `notified`.
+post() {
+  local url="$1" data="$2" out status body rc=""
+  out=$(curl -sS -w $'\n%{http_code}' -X POST "$url" -H 'Content-Type: application/json' -d "$data") || rc=$?
+  if [ -n "$rc" ]; then
+    echo "canvas: could not reach ${url%%/api/*} (curl exit $rc) — is the dev server up on 5173?" >&2
+    return 1
+  fi
+  status="${out##*$'\n'}" # the %{http_code} we appended on its own trailing line
+  body="${out%$'\n'*}"    # everything before it (may itself contain newlines)
+  [ -n "$body" ] && printf '%s\n' "$body"
+  if [ "$status" -ge 400 ] 2>/dev/null; then
+    echo "canvas: POST $url failed (HTTP $status) — the write did NOT land." >&2
+    return 1
+  fi
+  case "$body" in
+    *'"delivered":0'*|*'"delivered": 0'*|*'"delivered":false'*)
+      echo "canvas: bus returned delivered:0 — no live tab of this board applied it; the write went nowhere." >&2
+      return 1 ;;
+  esac
+  return 0
+}
 # percent-encode a thread id for the URL PATH (thread ids contain colons: node:thread:<hex>).
 enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
+
+# Resolve the file-memory store dir (.canvas/memory). Honors CANVAS_MEMORY_DIR; else prefers REPO_ROOT's
+# .canvas/memory, else falls back to the CANONICAL checkout (parent of the git common dir) — because .canvas
+# is the shadow-versioned board home that lives in the main checkout, NOT in a per-worktree tree. So a
+# session running from an isolated worktree still finds the one shared memory store.
+memory_dir() {
+  if [ -n "${CANVAS_MEMORY_DIR:-}" ]; then echo "$CANVAS_MEMORY_DIR"; return; fi
+  if [ -d "$REPO_ROOT/.canvas/memory" ]; then echo "$REPO_ROOT/.canvas/memory"; return; fi
+  local gcd root
+  gcd="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$gcd" ]; then
+    root="$(dirname "$gcd")" # <root>/.git → <root>
+    if [ -d "$root/.canvas/memory" ]; then echo "$root/.canvas/memory"; return; fi
+  fi
+  echo "$REPO_ROOT/.canvas/memory" # default (may not exist; the helper reports it)
+}
 
 # ── doc-annotation verbs (docs/doc-annotations.md) ──────────────────────────────────────────────────
 # Ergonomic replacements for the raw /api/annotations curl the review flow used to hand-roll (and the
@@ -712,6 +766,17 @@ PY
       *) echo "leave: unexpected arg '$1'" >&2; exit 2 ;;
     esac; done
     post "$SERVER/api/thread/$(enc "$thread")/leave?board=$BOARD" "{\"from\":$(jstr "$from")}"; echo ;;
+  memory)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      search)
+        [ $# -gt 0 ] || { echo "usage: canvas memory search <query> [--limit N] [--json] [--doctor]" >&2; exit 2; }
+        node "$REPO_ROOT/app/memory-search.js" search --dir "$(memory_dir)" "$@" ;;
+      doctor)
+        node "$REPO_ROOT/app/memory-search.js" doctor --dir "$(memory_dir)" "$@" ;;
+      ""|-h|--help) echo "usage: canvas memory search <query> [--limit N] [--json] [--doctor] | memory doctor" >&2; exit 2 ;;
+      *) echo "memory: unknown subcommand '$sub' (search|doctor)" >&2; exit 2 ;;
+    esac ;;
   anno)
     anno "$@" ;;
   job)

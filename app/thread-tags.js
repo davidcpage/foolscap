@@ -28,6 +28,35 @@ function tagRe() {
   return /(?<![\w@])@([A-Za-z0-9][\w.-]*)/g;
 }
 
+// The PROSE ESCAPE: a `@handle` inside a markdown inline-code span (backticks) is a MENTION, not a wake —
+// you can name someone in prose without interrupting them by backticking the handle (`@a9`). This is the
+// one intentional "mention without waking" convention; it also means the `@a9`-in-backticks examples that
+// pepper the harness/docs never fire. Returns the [start,end) char ranges of text sitting inside inline
+// code so both the resolver and the highlighter can skip tags there in lockstep (no client/server drift).
+// A run of N backticks opens a span closed by the next run of EXACTLY N backticks (CommonMark's rule), so
+// `` `@a9` `` and ``` ``@a9`` ``` both escape; an unmatched run is literal text, not a span.
+function codeSpanRanges(text) {
+  const runs = [];
+  const re = /`+/g;
+  let m;
+  while ((m = re.exec(text))) runs.push({ index: m.index, len: m[0].length });
+  const ranges = [];
+  for (let i = 0; i < runs.length; i++) {
+    let j = i + 1;
+    while (j < runs.length && runs[j].len !== runs[i].len) j++;
+    if (j >= runs.length) continue; // no matching close run — this open run is literal, not a span
+    ranges.push([runs[i].index, runs[j].index + runs[j].len]);
+    i = j; // resume after the close run (the loop's ++ moves past it)
+  }
+  return ranges;
+}
+
+// Is char index `idx` inside any [start,end) range? (used to drop backtick-escaped @-tags)
+function inAnyRange(idx, ranges) {
+  for (const [s, e] of ranges) if (idx >= s && idx < e) return true;
+  return false;
+}
+
 // Normalize the members arg to `{ sid, name }` entries — bare sid strings (the original shape) still accepted.
 function normEntries(members) {
   return (members ?? []).map((m) =>
@@ -59,10 +88,12 @@ export function tagHit(token, members) {
 export function matchTagSpans(text, members) {
   const entries = normEntries(members);
   const s = String(text);
+  const code = codeSpanRanges(s); // backtick-escaped tags don't highlight (mirrors the wake path)
   const re = tagRe();
   const spans = [];
   let m;
   while ((m = re.exec(s))) {
+    if (inAnyRange(m.index, code)) continue; // a `@handle` in inline code is a mention, not a tag
     const raw = m[1].replace(/[.-]+$/, ""); // drop trailing `.`/`-` (sentence punctuation), as parseTags does
     if (!raw || !tagHit(raw, entries)) continue;
     spans.push({ start: m.index, end: m.index + 1 + raw.length, token: raw.toLowerCase() }); // +1 for the `@`
@@ -75,9 +106,12 @@ export function matchTagSpans(text, members) {
  *  keywords (all/human/…). The dot lets a role handle `@Oracle.a8` parse as one tag, not `oracle` + stray. */
 export function parseTags(text) {
   const out = [];
+  const s = String(text);
+  const code = codeSpanRanges(s); // a `@handle` in inline code is the prose escape — mention, don't wake
   const re = tagRe();
   let m;
-  while ((m = re.exec(String(text)))) {
+  while ((m = re.exec(s))) {
+    if (inAnyRange(m.index, code)) continue; // backtick-escaped: skip (no wake, no unknown-bucket spawn)
     // The grammar admits a DOT (for a `Name.sid` handle) and a hyphen, so a tag at the end of a sentence —
     // `@26.` or `@Oracle.` — absorbs the trailing punctuation into the token (`26.`), which then fails to
     // prefix-match the dot-free sid and the tagged member is never woken. A real handle never ENDS in a dot
