@@ -2697,10 +2697,26 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   pointer-events: none;
 }
 .chan-tip-up { bottom: calc(100% + 4px); left: 0; }   /* pills sit low → open upward, over the log */
-.chan-tip-down { top: calc(100% + 2px); left: 8px; }  /* brief sits high → open downward */
-/* The brief tooltip is prose — give it a wider floor so it's never narrower than the (content-sized) pill
-   tooltips, which the human flagged (Thread card UI). Same 260px ceiling. */
-.chan-tip-brief { min-width: 240px; }
+/* Brief opens downward. NO gap to the trigger (was `+2px`): the brief tooltip is interactive (see
+   .chan-tip-brief below), and a gap is dead space the pointer must cross — crossing it drops
+   :hover and dismisses the tooltip before you can reach it (Issue #4, Thread card UI). */
+.chan-tip-down { top: 100%; left: 8px; }
+/* The brief tooltip is prose holding the FULL thread brief — it can be arbitrarily long, but it lives
+   INSIDE the card's .node overflow:hidden box, so it CANNOT grow past the card without being clipped
+   (confirmed visually — a taller/wider box is cut at the card edge, not shown). So: give it a readable
+   width and a generous height that still fit a default (460×420) card, then let a genuinely long brief
+   SCROLL inside that box. `max-width: min(400px, …)` and `pointer-events:auto` are the two halves of the
+   fix — the width never exceeds the card (no horizontal clip on a resized-narrow card), and interactivity
+   makes the scrollbar reachable, which it wasn't while pointer-events:none dismissed on the first move off
+   the one-line trigger (Issue #4, Thread card UI). It stays hover-visible because the tooltip is a DOM
+   descendant of .chan-desc-wrap, so hovering it keeps .chan-desc-wrap:hover true. */
+.chan-tip-brief {
+  min-width: 240px;
+  max-width: min(400px, calc(100% - 12px));
+  max-height: 300px;
+  overflow-y: auto;
+  pointer-events: auto;
+}
 .chan-member:hover .chan-tip-up { display: block; }
 .chan-desc-wrap:hover .chan-tip-brief { display: block; }
 .chan-tip-line { display: block; }
