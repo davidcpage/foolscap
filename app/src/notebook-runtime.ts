@@ -58,6 +58,7 @@ export interface CellSpec {
   runSource?: string; // the code the worker runs (RHS of a `name = …` define / a rewritten block / === source)
   block?: boolean; // runSource is a statement BLOCK (step-4b) — the worker runs it as a body, not an expression
   keyedExports?: boolean; // the block returns an object keyed by define names → map keys→exports even for one
+  suppress?: boolean; // the cell's final statement ended in `;` — run normally but DISPLAY no value (Jupyter `;`)
   reExports?: string[]; // local names this cell republishes from its cross-card imports (Observable's import-cell)
   inferredIn?: boolean; // imports were inferred from the code (no explicit data-in present)
   inferredOut?: boolean; // outNames were inferred from a `name = …` define (no explicit data-out present)
@@ -86,6 +87,7 @@ export interface CellOutput {
   error?: string; // the error string, for an "error" run
   running?: boolean; // a run is queued or in flight
   stale?: boolean; // inputs changed since the last run; awaiting a trigger (manual click / debounce timer)
+  suppressed?: boolean; // the cell ran fine but its final statement ended in `;` → the pane shows no value
   // Inferred wiring (step-4a/4b) for the card to DISPLAY as a muted hint where no explicit declaration was
   // written — so a cell that auto-wired by its code shows what it reads/defines, not an empty box.
   inReads?: string[]; // LOCAL reads inferred from free variables (only when data-in was absent)
@@ -248,6 +250,7 @@ function buildOutputsBlob(cardKey: string): string {
   const cells = Object.entries(out).map(([id, o]) => {
     const cell: Record<string, unknown> = { id, status: o.status, running: !!o.running, stale: !!o.stale };
     if (o.status === "error") cell.error = o.error;
+    else if (o.suppressed) cell.suppressed = true; // output suppressed by a trailing `;` — no value to relay
     else if (o.status === "ok") {
       const c = clampValue(o.value);
       cell.value = c.value;
@@ -449,6 +452,7 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
       runSource: a.valueSource,
       block: a.block,
       keyedExports: a.keyedExports,
+      suppress: a.suppress,
       inferredIn,
       inferredOut: c.outNames.length === 0,
     };
@@ -804,7 +808,13 @@ function onReply(cardKey: string, cellId: string, jobId: number, ok: boolean, va
     // EXPORT map (applyExports picks the per-name atoms off it), but it is NOT what the cell should DISPLAY:
     // Observable-style, a cell shows its FINAL value — here the last defined name's value — not an object of
     // all its bindings. Split the two: exports get the whole object, the pane gets the final value only.
-    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: displayValue(nb.specs.get(cellId), value), error: undefined });
+    //
+    // OUTPUT SUPPRESSION (Jupyter `;`): when the cell's final statement ended in `;`, blank the DISPLAY value
+    // only — exports (applyExports) and side effects derive from the RAW worker `value`, so a named `x = 1;`
+    // still publishes x and downstream cells still update; just the pane shows nothing.
+    const spec = nb.specs.get(cellId);
+    const suppressed = !!spec?.suppress;
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: suppressed ? undefined : displayValue(spec, value), error: undefined, suppressed: suppressed || undefined });
     applyExports(cardKey, cellId, value);
   } else {
     // A failed cell keeps its downstream's last-good values (no cascade) — only its own pane shows the error.

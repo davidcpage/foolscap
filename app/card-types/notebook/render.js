@@ -88,6 +88,7 @@ function display(out) {
   if (!out || (!out.status && !out.running)) return "";
   if (out.running) return "running…";
   if (out.status === "error") return out.error ?? "error";
+  if (out.suppressed) return ""; // final statement ended in `;` — the cell ran but shows no value (Jupyter `;`)
   return typeof out.value === "string" ? out.value : JSON.stringify(out.value);
 }
 

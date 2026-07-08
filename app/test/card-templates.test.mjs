@@ -1069,6 +1069,16 @@ test("notebook template views a .html file: prose, module cells with wiring/poli
   );
   assert.ok(errOut.includes("oops is not defined") && errOut.includes("nb-out-error"), "error output shown, styled");
 
+  // Output suppression (a trailing `;`): the runtime marks the cell `suppressed` and blanks its display value,
+  // so the output PANE shows nothing even though the run was ok. (Target the `data-text>…</pre>` pane, not a
+  // bare `>21<` — the source textarea also contains "21".) Un-suppressed, the same value renders in the pane.
+  assert.ok(out.includes("data-text>21</pre>"), "un-suppressed, a2's value renders in the output pane");
+  const suppressed = flatten(
+    mod.render({ ...card, signals: { ...card.signals, cellOutputs: { a2: { status: "ok", value: 21, suppressed: true } } } }),
+  );
+  assert.ok(!suppressed.includes("data-text>21</pre>"), "a suppressed cell shows no value in its output pane");
+  assert.ok(suppressed.includes("nb-out-ok"), "the pane still reflects an ok run (the cell ran, just displays nothing)");
+
   // No signals at all → falls back to fields.text, renders headlessly (no syncCells call), never throws.
   const empty = flatten(mod.render({ fields: { title: "x.html", text: "", color: "green" }, signals: {} }));
   assert.ok(empty.includes('file-ext">notebook<'), "renders the head without any signals");
