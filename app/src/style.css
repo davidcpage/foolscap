@@ -2778,7 +2778,13 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-time-float {
   position: absolute;
   right: 9px;
-  bottom: 4px;
+  /* Sit ON the last text line's baseline, not dropped below it (Thread card UI item 5). `bottom: 4px`
+     anchored the meta to the bubble bottom, ~4px under the baseline (the "dropped below" the human flagged).
+     Anchoring the meta's line-box bottom to the bubble's bottom padding (5px — where the last line box also
+     ends) and giving it the message line-height makes the two baselines coincide, so the float reads as fully
+     inline on the last line for any line count. */
+  bottom: 5px;
+  line-height: 1.5;
 }
 .chan-msg-timespace {
   display: inline-block;
