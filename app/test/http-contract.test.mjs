@@ -15,7 +15,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const HOST = "http://127.0.0.1:5173";
+// Default to the canonical dev port; CANVAS_TEST_HOST points the contract net at another running server
+// (e.g. a worktree's server on an alternate port, so a change can be verified end-to-end before it merges).
+const HOST = process.env.CANVAS_TEST_HOST || "http://127.0.0.1:5173";
 
 async function serverUp() {
   try {
@@ -447,6 +449,56 @@ test("standing job (R6/W6): create → GET jobs → update in place → remove; 
   const removed = await (await fetch(url("job"), j({ from: "human", remove: true, jobId: created.job.id }))).json();
   assert.ok(removed.ok && removed.removed);
   assert.equal((await (await fetch(url("jobs"), { method: "GET" })).json()).jobs.length, 0, "list empty after remove");
+});
+
+test("delete-card-keep-session: deleting a session card keeps its thread membership", { skip: !up && "no dev server on 5173" }, async () => {
+  const threadId = `node:thread:keep-${runTag}`;
+  const sid = `keep-sess-${runTag}`;
+  const sessionNode = `node:live:${sid}`;
+  const edge = `edge:member:${sid}:${threadId}`;
+  const snap = `${HOST}/api/board/persist/snapshot?board=${boardId}`;
+  const msgUrl = `${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`;
+  // 1) A thread with one session card JOINED by a member:open edge. The persist-diff onboarding records the
+  //    DURABLE membership. On this path the emitted-bridge stays empty (a snapshot save never dispatches a bus
+  //    addEdge), so threadMemberSids counts this sid ONLY via the durable set — no 60s TTL masking the result.
+  assert.equal((await fetch(snap, j({ snapshot: { seq: 60, version: 4, records: [
+    { typeName: "node", id: threadId, type: "thread", title: "Keep" },
+    { typeName: "node", id: sessionNode, type: "session", title: sid },
+    { typeName: "edge", id: edge, from: sessionNode, to: threadId, type: "member:open" },
+  ] } }))).status, 200);
+  const before = await (await fetch(msgUrl, j({ from: "human", text: "hi" }))).json();
+  assert.equal(before.members, 1, "the joined session counts as a member");
+  // 2) DELETE THE CARD: persist a snapshot with the session node AND its member edge gone — exactly what
+  //    select+delete produces (removeNode cascades the wire). Only the thread node remains. The membership
+  //    edge and its node vanish together, so the diff reads this as a card delete, not a leave.
+  assert.equal((await fetch(snap, j({ snapshot: { seq: 61, version: 5, records: [
+    { typeName: "node", id: threadId, type: "thread", title: "Keep" },
+  ] } }))).status, 200);
+  const after = await (await fetch(msgUrl, j({ from: "human", text: "still a member?" }))).json();
+  assert.equal(after.members, 1, "membership SURVIVES the card delete — the card was only a view");
+});
+
+test("delete-card-keep-session: a real leave (edge removed, card still present) DOES drop membership", { skip: !up && "no dev server on 5173" }, async () => {
+  const threadId = `node:thread:leave-${runTag}`;
+  const sid = `leave-sess-${runTag}`;
+  const sessionNode = `node:live:${sid}`;
+  const edge = `edge:member:${sid}:${threadId}`;
+  const snap = `${HOST}/api/board/persist/snapshot?board=${boardId}`;
+  const msgUrl = `${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`;
+  assert.equal((await fetch(snap, j({ snapshot: { seq: 62, version: 6, records: [
+    { typeName: "node", id: threadId, type: "thread", title: "Leave" },
+    { typeName: "node", id: sessionNode, type: "session", title: sid },
+    { typeName: "edge", id: edge, from: sessionNode, to: threadId, type: "member:open" },
+  ] } }))).status, 200);
+  assert.equal((await (await fetch(msgUrl, j({ from: "human", text: "hi" }))).json()).members, 1, "joined");
+  // Remove ONLY the edge; the session CARD stays (the UI remove-member / disconnect action) → a deliberate
+  // leave. The node's presence in the after-snapshot is the honest discriminator vs. a card delete.
+  assert.equal((await fetch(snap, j({ snapshot: { seq: 63, version: 7, records: [
+    { typeName: "node", id: threadId, type: "thread", title: "Leave" },
+    { typeName: "node", id: sessionNode, type: "session", title: sid },
+  ] } }))).status, 200);
+  const after = await (await fetch(msgUrl, j({ from: "human", text: "left?" }))).json();
+  assert.equal(after.members, 0, "a real leave (card present, edge gone) drops membership");
 });
 
 test("cleanup: scratch board store cleared", { skip: !up && "no dev server on 5173" }, async () => {

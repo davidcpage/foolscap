@@ -52,6 +52,7 @@ export interface ThreadMetaMarker {
   seats?: Record<string, SeatRecord>;
   levels?: Record<string, NotificationLevel>; // sid-keyed wake preference for seatless members (P1/W4)
   pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
+  members?: Record<string, { joinedAt: number }>; // durable membership — survives the card/edge (delete-card-keep-session)
 }
 
 // A pinned message (R-PIN, W7): a SNAPSHOT of a thread message flagged as head context — re-read on every
@@ -98,3 +99,15 @@ export function pinMessage(
   ts: number,
 ): PinnedMsg[];
 export function unpinMessage(repoPath: string, threadId: string, seq: number): PinnedMsg[];
+export function addThreadMember(
+  repoPath: string,
+  threadId: string,
+  sid: string,
+  ts: number,
+): Record<string, { joinedAt: number }>;
+export function removeThreadMember(
+  repoPath: string,
+  threadId: string,
+  sid: string,
+): Record<string, { joinedAt: number }>;
+export function threadMembersFromMeta(meta: ThreadMetaMarker | null | undefined): string[];

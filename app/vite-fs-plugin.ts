@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
 import { connectedEdgeIds } from "./node-cascade.js";
@@ -1644,6 +1644,7 @@ interface CanvasFsState {
   // rootsCache) are the deliberate exception — a re-eval only costs them a recompute.
   persistTimers?: Map<string, ReturnType<typeof setTimeout>>; // session-marker debounce (timers are process-bound, so handles stay valid across re-evals)
   emittedMembers?: Map<string, { thread: string; sid: string; ts: number }>; // server-emitted memberships awaiting the snapshot
+  durableMembers?: Map<string, Set<string>>; // threadId → member sids that survive card/edge removal (marker-backed)
   shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher
   busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
@@ -2646,12 +2647,30 @@ function appendThreadMsg(
 function seedThreadLogs(repoPath: string): void {
   for (const meta of listThreads(repoPath)) {
     const threadId = meta.threadId as string;
+    // Rehydrate durable membership from the marker (survives a cold restart — the in-memory index doesn't).
+    // Done before the threadLogs short-circuit: a hot re-eval keeps threadLogs but may have dropped the index.
+    const durable = threadMembersFromMeta(meta);
+    if (durable.length) {
+      const set = durableMembers.get(threadId) ?? new Set<string>();
+      for (const sid of durable) set.add(sid);
+      durableMembers.set(threadId, set);
+    }
     if (threadLogs.has(threadId)) continue; // pinned from before a hot re-eval — keep the live one
     let log = readThreadLog(repoPath, threadId);
     if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS); // keep the recent tail
     threadLogs.set(threadId, log);
     if (log.length) publishThreadFeed(repoPath ? boardIdentity(repoPath).boardId : "", threadId, log, false);
   }
+  // Backfill durable membership from the persisted snapshot's live member:open EDGES — so a member that
+  // joined BEFORE this became marker-backed (its marker has no `members` yet) is still adopted as durable
+  // on boot. Without this, such a member counts only while its edge lives, and a card delete would drop it
+  // — the migration gap for memberships that predate the fix. Idempotent; writes the marker as it adopts.
+  const snap = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
+  for (const r of snap?.records ?? [])
+    if (r.typeName === "edge" && String(r.type) === "member:open") {
+      const sid = sidFromSessionNode(String(r.from));
+      if (sid) recordDurableMember(repoPath, String(r.to), sid, Date.now());
+    }
 }
 
 // The thread ids a session is an OPEN member of (the reverse of threadMemberSids), for nudge/read.
@@ -2689,6 +2708,28 @@ function trackEmittedMembership(cmd: { type: string; payload?: Record<string, un
     emittedMembers.set(p.id, { thread: p.to, sid, ts: Date.now() });
 }
 
+// DURABLE membership (delete-card-keep-session): the sids that JOINED a thread and haven't LEFT, keyed by
+// threadId. The `member:open` edge is the canvas VIEW of a membership and dies with the session's card
+// (removeNode cascades its wires; core is deliberately blind to member semantics). This index is the
+// membership ITSELF — unioned into threadMemberSids / sessionThreads so a cardless session still counts as
+// a member (still logged, still wakeable by @-tag, still in the roster). Marker-backed (thread-ledger's
+// `members`): this in-memory map is the fast read side, the marker the durable tier a cold restart rehydrates
+// from (seedThreadLogs). Recorded on every member:open sighting; dropped only on a REAL leave (not card delete).
+const durableMembers = (fsState.durableMembers ??= new Map<string, Set<string>>());
+// Record sid as a durable member of a thread (in-memory + marker). Idempotent; needs the board's repoPath.
+function recordDurableMember(repoPath: string | undefined, threadId: string, sid: string, ts: number): void {
+  let set = durableMembers.get(threadId);
+  if (!set) durableMembers.set(threadId, (set = new Set<string>()));
+  set.add(sid);
+  if (repoPath) addThreadMember(repoPath, threadId, sid, ts);
+}
+// Forget a durable membership (in-memory + marker) — the REAL-leave companion, never called on a card delete.
+function forgetDurableMember(repoPath: string | undefined, threadId: string, sid: string): void {
+  const set = durableMembers.get(threadId);
+  if (set) { set.delete(sid); if (set.size === 0) durableMembers.delete(threadId); }
+  if (repoPath) removeThreadMember(repoPath, threadId, sid);
+}
+
 function sessionThreads(records: Array<Record<string, unknown>>, sid: string): string[] {
   const out: string[] = [];
   const node = sessionNodeForSid(records, sid);
@@ -2697,6 +2738,8 @@ function sessionThreads(records: Array<Record<string, unknown>>, sid: string): s
       if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && threadNode(records, String(r.to)))
         out.push(String(r.to));
   for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
+  // Durable members whose card/edge is gone: still a member of these threads (the card was only a view).
+  for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
   return out;
 }
 
@@ -4029,8 +4072,20 @@ function announceNewMemberships(
     if (beforeEdges.get(id)?.type === e.type) continue; // unchanged phase — already onboarded (or baseline-seeded)
     maybeAnnounceMembership(boardId, { type: "addEdge", payload: { id, from: e.from, to: e.to, type: e.type } }, origin);
   }
-  for (const [id] of beforeEdges)
-    if (!afterEdges.has(id)) maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
+  for (const [id, e] of beforeEdges) {
+    if (afterEdges.has(id)) continue;
+    maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
+    // Decouple the CARD (a view) from MEMBERSHIP (durable). A member:open edge can vanish two ways:
+    //   • the session's CARD was deleted — its node is ALSO gone from `after` → KEEP the membership (the
+    //     session stays logged + wakeable, just cardless: the delete-card-keep-session fix).
+    //   • a real LEAVE — the card still stands, only the edge was disconnected → DROP the membership.
+    // The node's presence in `after` is the honest discriminator (the /leave endpoint drops it directly).
+    if (e.type === "member:open") {
+      const nodeGone = !(after ?? []).some((r) => r.typeName === "node" && r.id === e.from);
+      const sid = sidFromSessionNode(e.from);
+      if (!nodeGone && sid) forgetDurableMember(boards.get(boardId)?.repoPath, e.to, sid);
+    }
+  }
 }
 
 // The agents' board read, served from the DURABLE store (unification: the browser used to push a
@@ -4191,6 +4246,9 @@ function threadMemberSids(records: Array<Record<string, unknown>>, threadId: str
     }
   }
   for (const m of liveEmittedMembers()) if (m.thread === threadId && !out.includes(m.sid)) out.push(m.sid);
+  // Durable members whose session card was deleted keep their membership (the card was only a view) — a
+  // surviving member here with no edge is exactly the delete-card-keep-session case.
+  for (const sid of durableMembers.get(threadId) ?? []) if (!out.includes(sid)) out.push(sid);
   return out;
 }
 
@@ -4290,6 +4348,11 @@ function maybeAnnounceMembership(
     return;
   }
   if (type === "member:open") {
+    // Record the DURABLE membership on EVERY sighting (idempotent), ahead of the onboarding dedup: this is
+    // the single funnel every join path reaches — a bus addEdge (spawn/join/invite-accept) AND a human-drawn
+    // join replayed here from the snapshot diff. The membership now outlives the card/edge (deleting the card
+    // removes the view, not this record); it's dropped only by a real leave (announceNewMemberships / /leave).
+    recordDurableMember(boards.get(boardId)?.repoPath, thread.id, sid, Date.now());
     if (announcedMemberships.has(announceKey(String(p.id), type))) return;
     announcedMemberships.add(announceKey(String(p.id), type));
     const others = threadMemberSids(records, thread.id).filter((m) => m !== sid);
@@ -4544,8 +4607,10 @@ async function handleThreadMembership(
     // Release the seat this leaver holds (§5): a seat survives a process EXIT (respawn re-fills it), but an
     // explicit LEAVE is a deliberate departure — give the seat back so the next same-role join fills fresh,
     // and self-heal a seat stuck to a departed sid. Best-effort; keyed on the leaver's sid, not the role.
+    // Drop the durable membership too: THIS is a real leave (unlike a card delete, which keeps membership).
     const repoPath = boards.get(boardId)?.repoPath;
     if (repoPath) releaseSeat(repoPath, threadId, body.from);
+    forgetDurableMember(repoPath, threadId, body.from);
   } else {
     const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
     const type = action === "join" ? "member:open" : "member:pending";
