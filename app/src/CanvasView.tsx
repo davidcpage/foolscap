@@ -4,6 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
+import { HUD_CARDS, HUD_RIGHT, hudTopFor, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -32,7 +33,7 @@ const camZ = (c: CameraState) => c.z;
 // O(cards) pass per pan frame that changed nothing but the transform. The camera subscription lives
 // in the leaf `Page` below instead: when only Page re-renders, its `children` prop is the SAME element
 // array from CanvasView's last render, so React bails out of the whole subtree by identity.
-export function CanvasView({ m }: { m: InteractionManager }) {
+export function CanvasView({ m, hudShown }: { m: InteractionManager; hudShown: boolean }) {
   const nodeQuery = useMemo(() => m.editor.store.query({ typeName: "node" }), [m]);
   const nodes = useSignal(nodeQuery);
   // Which agent attention-edge is selected for actions (accept / sever / send). App-local state, not the
@@ -50,7 +51,7 @@ export function CanvasView({ m }: { m: InteractionManager }) {
         <SelectionOverlay m={m} />
         <MarqueeOverlay m={m} />
       </Page>
-      <ScreenLayer m={m} />
+      <ScreenLayer m={m} hudShown={hudShown} />
       <EdgeActions m={m} edgeId={selectedEdge} onClose={() => setSelectedEdge(null)} />
     </>
   );
@@ -81,17 +82,31 @@ function Page({ m, onPointerDown, children }: { m: InteractionManager; onPointer
 // the layout query so a card that gets pinned/unpinned hops layers, and so a floating card it owns
 // re-renders live as it's dragged. The layer itself is pointer-transparent (empty space falls through
 // to the canvas); each floating card re-enables pointer events on itself.
-function ScreenLayer({ m }: { m: InteractionManager }) {
+function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean }) {
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
   const floating = layouts.filter((l) => l.anchor === "screen");
-  if (floating.length === 0) return null;
+  // Two kinds of screen-anchored card share this layer: HUD chrome (usage/clock — hud.ts), which is
+  // corner-locked and toggled as a group with the minimap, and ordinary user-PINNED cards (the `p` key),
+  // which are draggable and always shown. Split them so the HUD toggle only touches the former.
+  const free = floating.filter((l) => !isHudCard(l.nodeId));
+  // HUD cards in the fixed stack order (hud.ts), each placed below the minimap and the cards above it.
+  const hud = hudShown
+    ? HUD_CARDS.map((id) => floating.find((l) => l.nodeId === id)).filter((l): l is NonNullable<typeof l> => !!l)
+    : [];
+  if (free.length === 0 && hud.length === 0) return null;
+  const heightsAbove: number[] = [];
   return (
     <div className="screen-layer">
-      {floating.map((l) => (
+      {free.map((l) => (
         <NodeView key={l.nodeId} m={m} id={l.nodeId} screen />
       ))}
+      {hud.map((l) => {
+        const top = hudTopFor(heightsAbove);
+        heightsAbove.push(l.h);
+        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={{ top, right: HUD_RIGHT }} />;
+      })}
     </div>
   );
 }

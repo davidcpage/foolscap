@@ -397,10 +397,12 @@ export function addFolderCard(m: InteractionManager, path: string, at?: Pos): vo
   void materializeAt(m, root, path, "dir", x, y); // dir branch commits synchronously (no await before it)
 }
 
-// Drop a single clock card on the board. It's an ordinary node (logged spatial state, draggable like any
-// card) whose CONTENT is not stored — NodeView reads the time from the off-log `nowSignal` instead of
-// node.text. So this addNode is the ONLY thing the clock ever puts on the log; the per-second ticks never
-// commit. Stable id → idempotent across reloads/StrictMode, same as the file cards.
+// Drop the clock as a corner-pinned HUD element (hud.ts). It's an ordinary node (logged spatial state)
+// whose CONTENT is not stored — NodeView reads the time from the off-log `nowSignal` instead of node.text.
+// So this addNode is the ONLY thing the clock ever puts on the log; the per-second ticks never commit.
+// anchor:"screen" routes it to the ScreenLayer, where being a HUD card (hud.ts) corner-locks it below the
+// minimap and toggles it with the HUD group — so the stored x/y are a headless fallback only, overridden
+// by the derived corner position at render. Stable id → idempotent across reloads/StrictMode.
 export function addClock(m: InteractionManager, at?: Pos): void {
   m.editor.commit({
     type: "addNode",
@@ -411,6 +413,7 @@ export function addClock(m: InteractionManager, at?: Pos): void {
       title: "clock",
       text: "",
       color: "purple",
+      anchor: "screen",
       ...(at ?? spawnAt(m, 180, 210)),
       w: 180,
       h: 210,
@@ -531,11 +534,13 @@ export function addStickyNote(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
-// The usage card (card-types/usage) — the canvas mirror of /usage. Its body reads the off-log `usage`
-// feed (account plan windows, polled server-side) plus, if titled with a live session id, that
-// session's token gauge. Like the clock/feed cards, this addNode is the only thing it ever logs; the
-// polled values never commit. A stable singleton id → idempotent: re-adding is a no-op rather than
-// littering the board. Left untitled so it shows the plan bars alone.
+// The usage card (card-types/usage) — the canvas mirror of /usage, pinned as a corner HUD element
+// (hud.ts). Its body reads the off-log `usage` feed (account plan windows, polled server-side) plus, if
+// titled with a live session id, that session's token gauge. Like the clock/feed cards, this addNode is
+// the only thing it ever logs; the polled values never commit. anchor:"screen" routes it to the
+// ScreenLayer, where being a HUD card corner-locks it below the minimap and toggles it with the HUD group
+// (the stored x/y are a headless fallback, overridden by the derived corner position). A stable singleton
+// id → idempotent. Left untitled so it shows the plan bars alone.
 export function addUsageCard(m: InteractionManager, at?: Pos): void {
   m.editor.commit({
     type: "addNode",
@@ -546,6 +551,7 @@ export function addUsageCard(m: InteractionManager, at?: Pos): void {
       title: "",
       text: "",
       color: "green",
+      anchor: "screen",
       ...(at ?? spawnAt(m, 300, 320)),
       w: 300,
       h: 320,
