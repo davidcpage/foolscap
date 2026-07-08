@@ -1010,6 +1010,17 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 }
 .nb-output.nb-out-error { color: #b91c1c; background: #fef2f2; }
 .nb-output.nb-out-empty { color: #c4c4c8; }
+/* A DOM/SVG chart output (Phase-2 B2): a LIVE node mounted in the output pane (an Observable Plot chart, a d3
+   selection). Reset the <pre> path's monospace + pre-wrap text styling (a chart brings its own type), and
+   contain a wide chart with a horizontal scroll rather than clipping it or pushing the card open. Deliberately
+   NO forced sizing on the mounted svg/canvas — a chart keeps its real dimensions so it renders CORRECTLY (the
+   layout fidelity that motivated the main-thread realm over a layout-less worker shim). */
+.nb-output.nb-view {
+  white-space: normal;
+  font: inherit;
+  overflow-x: auto;
+  padding: 6px 7px;
+}
 /* The per-cell hover toolbar (type-switch / reorder / delete) was removed — those actions are the keyboard
    layer's now (t / ↑↓ / x in command mode), and on a small card the floating bar flickered as the pointer
    crossed cells. See render.js. The between-cell insert strips below stay (the mouse path for adding cells). */

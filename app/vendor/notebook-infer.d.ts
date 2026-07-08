@@ -25,6 +25,9 @@ export interface CellAnalysis {
   keyedExports: boolean;
   /** True when the cell's final statement ends in an explicit `;` — it runs normally but its value is not displayed. */
   suppress: boolean;
+  /** True when the cell MAY build a DOM node (imports an external lib, or free-reads `document`/`window`) and
+   *  so must run on the MAIN THREAD realm (Phase-2 B2 DOM/SVG output), not the DOM-less worker. */
+  domCandidate: boolean;
 }
 
 /** Options for {@link analyzeCell}. `cdnBase` overrides the ESM CDN base a BARE import specifier resolves to

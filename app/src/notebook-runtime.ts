@@ -2,6 +2,7 @@ import type { Subscribable } from "./lib";
 import { fileContentSignal } from "./content";
 import { activeBoardId } from "./board";
 import { analyzeCell, analyzeMarkdown } from "../vendor/notebook-infer.js";
+import { runMainThreadCell, isNode, serializeView, cloneSafe } from "./notebook-main-exec.js";
 
 // The notebook RUNTIME (docs/notebook-card.md §3/§5/§6) — an app subsystem, NOT the card template
 // (templates stay pure render, §2/§6). This is the ONLY place a Worker is created. It is the reactive
@@ -59,6 +60,7 @@ export interface CellSpec {
   block?: boolean; // runSource is a statement BLOCK (step-4b) — the worker runs it as a body, not an expression
   keyedExports?: boolean; // the block returns an object keyed by define names → map keys→exports even for one
   suppress?: boolean; // the cell's final statement ended in `;` — run normally but DISPLAY no value (Jupyter `;`)
+  domCandidate?: boolean; // may build a DOM node → run on the MAIN-THREAD realm, not the worker (B2, step-4)
   reExports?: string[]; // local names this cell republishes from its cross-card imports (Observable's import-cell)
   inferredIn?: boolean; // imports were inferred from the code (no explicit data-in present)
   inferredOut?: boolean; // outNames were inferred from a `name = …` define (no explicit data-out present)
@@ -84,6 +86,11 @@ function isScheduled(c: CellSpec): boolean {
 export interface CellOutput {
   status?: "ok" | "error"; // the last completed run's kind (absent = never run)
   value?: unknown; // the value (already structured-clone-safe), for an "ok" run
+  // A DOM/SVG output (Phase-2 B2): a cell that ran on the main-thread realm and returned a live DOM node (an
+  // Observable Plot chart, a d3 selection). The `node` is LIVE and in-browser only — the template mounts it
+  // directly (lit-html renders a raw Node child); it is NEVER serialized. `markup` is the node's outerHTML,
+  // the SERIALIZABLE form that rides the outputs relay so an agent still sees the chart (§7 agent-legibility).
+  view?: { kind: "svg" | "html" | "dom"; node?: unknown; markup: string };
   error?: string; // the error string, for an "error" run
   running?: boolean; // a run is queued or in flight
   stale?: boolean; // inputs changed since the last run; awaiting a trigger (manual click / debounce timer)
@@ -251,7 +258,13 @@ function buildOutputsBlob(cardKey: string): string {
     const cell: Record<string, unknown> = { id, status: o.status, running: !!o.running, stale: !!o.stale };
     if (o.status === "error") cell.error = o.error;
     else if (o.suppressed) cell.suppressed = true; // output suppressed by a trailing `;` — no value to relay
-    else if (o.status === "ok") {
+    else if (o.status === "ok" && o.view) {
+      // A DOM/SVG output (B2): the live node is browser-only, but its markup IS serializable — relay it so an
+      // agent reading the outputs sees the chart's SVG/HTML. Bounded by the same clampValue cap as any value.
+      const c = clampValue(o.view.markup);
+      cell.view = { kind: o.view.kind, html: c.value };
+      if (c.truncated) cell.truncated = true;
+    } else if (o.status === "ok") {
       const c = clampValue(o.value);
       cell.value = c.value;
       if (c.truncated) cell.truncated = true;
@@ -287,6 +300,11 @@ function scheduleOutputsPush(cardKey: string): void {
 }
 
 // ── the worker (a single shared, stateless worker) ────────────────────────────────────────────────
+// SINGLE-WORKER INVARIANT, with ONE deliberate exception (Phase-2 B2). Pure-compute cells run here, on the
+// one shared, DOM-less worker. A DOM-PRODUCING cell (spec.domCandidate) instead runs on the MAIN-THREAD realm
+// (notebook-main-exec.js), because Plot/d3 need a real document + the real layout engine that a worker lacks.
+// The main-thread realm re-establishes statelessness identically (scoped new Function, inputs as params), so
+// the exception is about WHERE a cell runs, not a relaxation of the stateless/DAG-only-dataflow model.
 let worker: Worker | null = null;
 let nextJob = 0;
 const pending = new Map<number, { cardKey: string; cellId: string }>();
@@ -453,6 +471,7 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
       block: a.block,
       keyedExports: a.keyedExports,
       suppress: a.suppress,
+      domCandidate: a.domCandidate, // route DOM-producing cells to the main-thread realm (startRun)
       inferredIn,
       inferredOut: c.outNames.length === 0,
     };
@@ -770,7 +789,7 @@ function startRun(cardKey: string, cellId: string): void {
   const runSrc = spec.runSource ?? spec.source ?? "";
   if (!runSrc.trim()) {
     setState(cardKey, cellId, "idle");
-    patchOutput(cardKey, cellId, { running: false, stale: false, status: undefined, value: undefined, error: undefined });
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: undefined, value: undefined, view: undefined, error: undefined });
     applyExports(cardKey, cellId, undefined);
     afterRun(cardKey, cellId);
     return;
@@ -781,17 +800,66 @@ function startRun(cardKey: string, cellId: string): void {
   patchOutput(cardKey, cellId, { running: true, stale: false });
   const jobId = ++nextJob;
   nb.job.set(cellId, jobId);
+  const src = spec.runSource ?? spec.source;
+  // TWO EXECUTION REALMS (B2, invariant #3). A DOM-producing cell (spec.domCandidate — imports an external lib
+  // or reads document/window) runs on the MAIN THREAD, where a real document + the real layout engine let Plot
+  // measure text and size margins correctly; a live node comes back and is mounted. Every other cell runs on
+  // the shared, DOM-less worker as before. Statelessness holds in both: each runs via a scoped new Function with
+  // inputs injected as named params only (notebook-main-exec.js / notebook-worker.js) — no shared namespace.
+  if (spec.domCandidate) {
+    // runMainThreadCell never rejects (it catches internally); the onRejected arm is belt-and-braces.
+    runMainThreadCell({ source: src, inputs, block: spec.block }).then(
+      (r) => onMainReply(cardKey, cellId, jobId, r),
+      (err) => onMainReply(cardKey, cellId, jobId, { ok: false, error: String(err) }),
+    );
+    return;
+  }
   pending.set(jobId, { cardKey, cellId });
   try {
     // `runSource` is what the worker evaluates: the RHS for a `name = …` named-cell define, a rewritten
     // statement block (imports stripped, last expression returned — step-4b), or the source verbatim; `block`
     // tells the worker which (§11.4a/4b). The bare define assignment never leaks a global into the worker.
-    ensureWorker().postMessage({ jobId, source: spec.runSource ?? spec.source, inputs, block: spec.block });
+    ensureWorker().postMessage({ jobId, source: src, inputs, block: spec.block });
   } catch (err) {
     pending.delete(jobId);
     setState(cardKey, cellId, "idle");
     patchOutput(cardKey, cellId, { running: false, status: "error", error: String(err) });
   }
+}
+
+// Completion for a MAIN-THREAD run (the DOM realm, B2) — the twin of onReply. Same supersede + state handling,
+// but the value is RAW (not worker clone-safed): a live DOM node becomes a `view` output (the template mounts
+// the live node; its markup rides the relay), while any OTHER value takes the identical clone-safe text/JSON
+// path a worker reply would, so exports and downstream cells behave the same across realms.
+function onMainReply(cardKey: string, cellId: string, jobId: number, r: { ok: boolean; value?: unknown; error?: string }): void {
+  const nb = nbs.get(cardKey);
+  if (!nb) return;
+  if (nb.job.get(cellId) !== jobId) {
+    afterRun(cardKey, cellId); // superseded — inputs changed mid-run; drop this stale (possibly node) result
+    return;
+  }
+  setState(cardKey, cellId, "idle");
+  if (r.ok) {
+    const spec = nb.specs.get(cellId);
+    const suppressed = !!spec?.suppress;
+    if (!suppressed && isNode(r.value)) {
+      // A DOM/SVG node: mount the LIVE node + relay its markup (agent-legibility, §7). A view cell's export
+      // (rare) degrades to the markup string — a node can't structured-clone to a downstream worker cell,
+      // matching the existing non-clone-safe→string rule. Clear any prior text `value` (a value→node switch).
+      const view = serializeView(r.value as Node);
+      patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: undefined, view: { ...view, node: r.value }, error: undefined, suppressed: undefined });
+      applyExports(cardKey, cellId, view.markup);
+    } else {
+      // A plain value (or a suppressed node): the existing text/JSON path. Clone-safe it exactly as the worker
+      // would so exportsVal stays transportable; clear any prior `view` (a node→value switch, or a fresh run).
+      const value = cloneSafe(r.value);
+      patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: suppressed ? undefined : displayValue(spec, value), view: undefined, error: undefined, suppressed: suppressed || undefined });
+      applyExports(cardKey, cellId, value);
+    }
+  } else {
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "error", value: undefined, view: undefined, error: String(r.error) });
+  }
+  afterRun(cardKey, cellId);
 }
 
 function onReply(cardKey: string, cellId: string, jobId: number, ok: boolean, value: unknown, error: unknown): void {
@@ -814,11 +882,13 @@ function onReply(cardKey: string, cellId: string, jobId: number, ok: boolean, va
     // still publishes x and downstream cells still update; just the pane shows nothing.
     const spec = nb.specs.get(cellId);
     const suppressed = !!spec?.suppress;
-    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: suppressed ? undefined : displayValue(spec, value), error: undefined, suppressed: suppressed || undefined });
+    // Clear any prior `view`: a cell edited from DOM-producing → plain reroutes here (worker), and its old
+    // chart node must not linger under the new text value.
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "ok", value: suppressed ? undefined : displayValue(spec, value), view: undefined, error: undefined, suppressed: suppressed || undefined });
     applyExports(cardKey, cellId, value);
   } else {
     // A failed cell keeps its downstream's last-good values (no cascade) — only its own pane shows the error.
-    patchOutput(cardKey, cellId, { running: false, stale: false, status: "error", error: String(error) });
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: "error", view: undefined, error: String(error) });
   }
   afterRun(cardKey, cellId);
 }

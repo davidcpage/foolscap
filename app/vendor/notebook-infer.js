@@ -58,7 +58,7 @@ export function analyzeCell(source, opts) {
   } catch {
     // A half-typed / not-yet-valid cell: infer nothing (the explicit declarations, if any, still apply in
     // the runtime; the cell errors at run exactly as today). Never throw — inference is best-effort.
-    return { ok: false, reads: [], defines: [], imports: [], valueSource: src, block: false, keyedExports: false, suppress: false };
+    return { ok: false, reads: [], defines: [], imports: [], valueSource: src, block: false, keyedExports: false, suppress: false, domCandidate: false };
   }
   // Pass 1: every name BOUND anywhere in the cell (params, declarations, imports, …). A free variable is one
   // referenced but absent from this set — a deliberately COARSE (whole-cell, not scope-precise) rule: a name
@@ -103,8 +103,23 @@ export function analyzeCell(source, opts) {
   }
   const dset = new Set(defines);
   const reads = [...referenced].filter((n) => !bound.has(n) && !dset.has(n));
-  return { ok: true, reads, defines, imports, valueSource, block, keyedExports, suppress };
+  // domCandidate (Phase-2 B2 DOM/SVG output): does this cell MAYBE build a DOM node, so it must run on the
+  // MAIN THREAD (real document + real layout) rather than the DOM-less worker? Two static signals, both free
+  // here: (1) it imports an EXTERNAL lib (a non-relative specifier — Plot/d3, the viz path; relative imports
+  // stay local edges), or (2) it free-reads a DOM global (`document`/`window` — the hand-rolled node path).
+  // A worker-first-then-detect approach is impossible: Plot throws in the DOM-less worker BEFORE any Node
+  // could be observed, so routing must be decided ahead of the run. Over-routing a pure-compute cell that
+  // imports a lib (e.g. `d3.max`) is harmless — it returns a plain value and takes the existing text path.
+  const externalImports = importDecls.some(
+    (d) => d.source && typeof d.source.value === "string" && !isRelativeSpecifier(d.source.value),
+  );
+  const domCandidate = externalImports || reads.some((n) => DOM_GLOBALS.has(n));
+  return { ok: true, reads, defines, imports, valueSource, block, keyedExports, suppress, domCandidate };
 }
+
+// DOM globals whose presence as a free read routes a cell to the main-thread realm (see domCandidate). Kept
+// deliberately small — `document`/`window` are the roots every hand-rolled DOM/SVG build goes through.
+const DOM_GLOBALS = new Set(["document", "window"]);
 
 // True when the cell's LAST top-level statement is an ExpressionStatement terminated by an explicit `;` — the
 // output-suppression signal. Acorn sets an ExpressionStatement's `end` to just past its inner expression when
@@ -531,5 +546,7 @@ export function compileMarkdown(source) {
 export function analyzeMarkdown(source) {
   const { templateSource, count } = compileMarkdown(source);
   const a = analyzeCell(templateSource); // reuse free-var inference over the template literal
-  return { ...a, interpolated: count > 0 && a.ok, defines: [], imports: [], valueSource: templateSource, suppress: false };
+  // A markdown cell's value is always the interpolated prose STRING, never a DOM node — force domCandidate
+  // false so an interpolation that happens to read `window`/`document` never routes prose to the main thread.
+  return { ...a, interpolated: count > 0 && a.ok, defines: [], imports: [], valueSource: templateSource, suppress: false, domCandidate: false };
 }

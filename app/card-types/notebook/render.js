@@ -82,8 +82,9 @@ function basename(p) {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
-// One cell's output for display. The worker made the value clone-safe: strings show verbatim, everything
-// else as JSON (DOM/SVG/rich rendering is a later step). No completed run yet → empty.
+// One cell's output for display — the TEXT/JSON path. The worker (or the main-thread realm) made the value
+// clone-safe: strings show verbatim, everything else as JSON. A DOM/SVG node is NOT handled here — a `view`
+// output is mounted as a live node by the branch in renderCell (Phase-2 B2). No completed run yet → empty.
 function display(out) {
   if (!out || (!out.status && !out.running)) return "";
   if (out.running) return "running…";
@@ -645,7 +646,15 @@ function renderCell(cell, out, ctx) {
                   : ""}
           </div>`
         : ""}
-      <pre class="nb-output nb-out-${out && out.status ? out.status : "empty"}" data-text>${display(out)}</pre>
+      ${out && out.view && out.view.node
+        ? // DOM/SVG OUTPUT (Phase-2 B2): the cell ran on the main-thread realm and returned a LIVE node (an
+          // Observable Plot chart, a d3 selection). lit-html renders a raw DOM Node passed as a child binding,
+          // so we mount the live node directly — no import needed (template contract intact). data-interactive
+          // keeps a pointer press on the chart off the canvas-drag seam; the @keydown stopPropagation keeps a
+          // key typed while a chart element holds focus (a brush/zoom control) from bubbling to the canvas and
+          // deleting the card / switching tools (the host onKD seam only contains input/textarea).
+          html`<div class="nb-output nb-view" data-interactive="1" @keydown=${(e) => e.stopPropagation()}>${out.view.node}</div>`
+        : html`<pre class="nb-output nb-out-${out && out.status ? out.status : "empty"}" data-text>${display(out)}</pre>`}
     </div>
   `;
 }
