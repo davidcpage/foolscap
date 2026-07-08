@@ -17,6 +17,24 @@ import { analyzeCell, analyzeMarkdown } from "../vendor/notebook-infer.js";
 
 export type Policy = { kind: "auto" | "manual" | "debounced"; ms: number };
 
+// A function export can't be structured-cloned, so it travels as a SOURCE descriptor (built by cloneSafe in
+// notebook-worker.js) that the consumer worker rebuilds into a callable. The runtime carries it through
+// exportsVal like any other value; it attaches the `closure` snapshot (see snapshotClosure) and renders the
+// descriptor as its source string wherever a cell value is displayed or relayed.
+interface FnDescriptor {
+  __fn__: true;
+  source: string;
+  closure?: Record<string, unknown>;
+}
+function isFnDescriptor(v: unknown): v is FnDescriptor {
+  return (
+    !!v &&
+    typeof v === "object" &&
+    (v as { __fn__?: unknown }).__fn__ === true &&
+    typeof (v as { source?: unknown }).source === "string"
+  );
+}
+
 // One declared import (the `data-in` grammar, §11.2). `path` null = a LOCAL sibling-cell export named
 // `name` (the step-1 form). `path` set = a cross-card import resolved against THIS notebook's directory:
 // a notebook (object of its exports, or one export when `export` is set) or a data file (its text). The
@@ -212,6 +230,7 @@ const pushTimers = new Map<string, ReturnType<typeof setTimeout>>();
 // Render one value for the blob: keep the native (JSON-ish, already clone-safe) value when small so an
 // agent gets real structure; clamp to a string prefix + `truncated` when it would blow the cap.
 function clampValue(v: unknown): { value: unknown; truncated?: boolean } {
+  if (isFnDescriptor(v)) v = v.source; // a function export relays as its source string, not [object Object]
   let s: string;
   try {
     s = typeof v === "string" ? v : JSON.stringify(v);
@@ -813,10 +832,23 @@ function applyExports(cardKey: string, producerId: string, value: unknown): void
   const nb = nbs.get(cardKey);
   const spec = nb?.specs.get(producerId);
   if (!nb || !spec) return;
-  for (const [name, val] of computeExports(spec, value)) publishExport(cardKey, nb, producerId, name, val);
+  for (const [name, val] of computeExports(spec, value)) publishExport(cardKey, nb, producerId, name, snapshotClosure(nb, spec, val));
   // Re-exports (Observable's import-cell): an imported binding becomes a notebook-local export whose value is
   // the resolved import. It tracks the upstream because a change there re-dirties this cell (wireExternal).
   for (const imp of importsOf(spec)) if (imp.path) publishExport(cardKey, nb, producerId, imp.name, resolveInput(nb, imp));
+}
+
+// A function export travels as a source descriptor built in the worker. Attach the closure snapshot HERE —
+// the runtime is the only place that holds the producing cell's resolved input VALUES — so a function that
+// reads a sibling/imported export (`g = x => x + a`) carries `a`'s current value and stays callable in the
+// consumer worker (case B). The closure is the cell's resolved inputs; inputs that are themselves function
+// descriptors ride along and rehydrate recursively (case D). A no-free-var function (case A) gets an empty
+// closure. Non-descriptor values pass through untouched.
+function snapshotClosure(nb: NB, spec: CellSpec, val: unknown): unknown {
+  if (!isFnDescriptor(val)) return val;
+  const closure: Record<string, unknown> = {};
+  for (const imp of importsOf(spec)) closure[imp.name] = resolveInput(nb, imp);
+  return { ...val, closure };
 }
 
 // Publish one export value; on a real change, re-dirty its importers — local (this card) and cross-card
@@ -835,7 +867,8 @@ function publishExport(cardKey: string, nb: NB, producerId: string, name: string
 // map for wiring. Show the `value` half. Falls back to the whole value if the shape is unexpected, so display
 // never throws.
 function displayValue(spec: CellSpec | undefined, value: unknown): unknown {
-  return spec?.keyedExports && value && typeof value === "object" ? (value as { value: unknown }).value : value;
+  const v = spec?.keyedExports && value && typeof value === "object" ? (value as { value: unknown }).value : value;
+  return isFnDescriptor(v) ? v.source : v; // a function export shows its source, not [object Object]
 }
 
 // Map a cell's value to its declared exports: 0 outputs → none (a display-only cell); a keyedExports block →
