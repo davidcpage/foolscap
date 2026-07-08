@@ -13,6 +13,14 @@
 #     from here for a colour swatch matching the session-card dots + the tree (worktree-activity slice C).
 #   • `gone` — true once this file is deleted on disk (or its root removed). The card shows a tombstone
 #     instead of vanishing, so a pinned card is never silently dropped (worktree-activity slice D).
+#   • `writeFile` — the serialize-back: a per-card action that POSTs the edited raw source to disk (POST
+#     /api/file), reusing the notebook card's grant. An in-card Edit toggle flips the rendered view to a
+#     raw-source <textarea>; Save writes through this (the watcher then refreshes `fileContent`, and the
+#     server re-anchors doc annotations on the same write), Cancel discards. Source lives in the FILE, not
+#     record.text — an edit is a file write, never a setText on the durable log.
+#   • `treeState` — (ephemeral view state) whether this card is in raw-source EDIT mode. The rendered view
+#     is the default; a click on Edit flips to the textarea. Per-card, off-log, gone on reload, never
+#     committed — the directory card's expand-set shape, the role/notebook edit-mode idiom.
 name: file
 contract: 1
-capabilities: [fileContent, roots, gone]
+capabilities: [fileContent, roots, gone, writeFile, treeState]

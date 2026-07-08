@@ -268,6 +268,81 @@ body {
   white-space: normal;
 }
 
+/* In-card raw-source edit (card-types/file/render.js): the `edit` toggle in the head flips the rendered
+   body to a <textarea> over the same off-log content signal. A subtle head affordance — muted until hover,
+   like the channel pin toggle — so it doesn't clutter a read-only card. */
+.file-edit-toggle {
+  flex: none;
+  padding: 1px 7px;
+  font: inherit;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #71717a;
+  background: #00000008;
+  border: 1px solid #00000014;
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0.65;
+}
+.file-edit-toggle:hover {
+  opacity: 1;
+  color: #3730a3;
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+/* Edit mode: the raw source fills the card body (reusing .file-body's scroll/monospace box) with a Save /
+   Cancel bar pinned below it. .file-edit is the container both the textarea and the buttons live in, so a
+   Save reads the sibling textarea via closest('.file-edit'). */
+.file-edit {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+textarea.file-source {
+  flex: 1 1 auto;
+  min-height: 120px;
+  margin: 6px 0 0;
+  resize: none;
+  box-sizing: border-box;
+  border: none;
+  border-top: 1px solid #00000008;
+  outline: none;
+  color: #27272a;
+  background: #fff;
+}
+.file-edit-bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 10px;
+  border-top: 1px solid #00000008;
+}
+.file-edit-btn {
+  padding: 3px 12px;
+  font: inherit;
+  font-size: 11px;
+  border-radius: 6px;
+  border: 1px solid #e4e4e7;
+  cursor: pointer;
+}
+.file-edit-save {
+  color: #3730a3;
+  background: #eef2ff;
+  border-color: #c7d2fe;
+}
+.file-edit-save:hover {
+  background: #e0e7ff;
+}
+.file-edit-cancel {
+  color: #52525b;
+  background: #fafafa;
+}
+.file-edit-cancel:hover {
+  background: #f4f4f5;
+}
+
 /* Frontmatter "properties" strip (card-types/file/render.js): a compact key/value panel above the prose
    for markdown files that open with YAML frontmatter (memory files, role.md, …), instead of the raw
    `---` fence rendering as an <hr> + run-on paragraph. Muted, monospace keys — reads as metadata, not body. */

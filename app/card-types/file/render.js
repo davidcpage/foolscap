@@ -134,10 +134,86 @@ export default {
     // Off-log content first, the static field as the pre-signal fallback. Reading the capability is
     // what subscribes the card to it, so a disk change re-renders just this body — no setText, no log.
     const text = card.signals.fileContent ?? card.fields.text;
+
+    // ── in-card raw-source EDIT (the role/notebook edit idiom) ────────────────────────────────────────
+    // The rendered view (prose / raw preview) is a READ projection; the anticipated "editable mode" is a
+    // raw-source <textarea> over the SAME off-log signal, not a second view. Editing needs BOTH grants:
+    // `writeFile` (serialize-back → POST /api/file, the notebook card's action) to persist, and `treeState`
+    // (per-card ephemeral view state) to hold the edit flag — without either the card stays read-only (the
+    // headless mock, or the pre-grant beat). Save writes through the UNCHANGED /api/file path, so the
+    // server's on-save doc-annotation re-anchor still runs; Cancel just drops back to the rendered view.
+    //
+    // TRUNCATION GUARD (CLAUDE.md size-cap rule): `fileContent` is a MAX_BYTES *preview* — content.ts marks
+    // a clipped body with a trailing `\n…` sentinel. Editing that preview and saving would write it back
+    // over the whole file, silently dropping everything past the cap. So a truncated file is NEVER editable
+    // (no Edit affordance) — the user still reads it, they just can't clobber the tail.
+    const write = card.signals.writeFile;
+    const editState = card.signals.treeState;
+    const truncated = typeof text === "string" && text.endsWith("\n…");
+    const canEdit = Boolean(write && editState) && !truncated;
+    const editing = canEdit && editState.get() === true;
+
+    // Read the live textarea from the edit container, persist if changed (a no-op save doesn't churn the
+    // file + watcher), and drop back to the rendered view. Cancel discards: the textarea is rebuilt from
+    // `text` on the next render, so leaving edit mode without a write throws the in-progress buffer away.
+    const saveEdit = (editRoot) => {
+      const ta = editRoot?.querySelector("textarea.file-source") ?? null;
+      if (ta && write && ta.value !== (text ?? "")) write(ta.value);
+      editState?.set(false);
+    };
+    const cancelEdit = () => editState?.set(false);
+
+    if (editing) {
+      return html`
+        <div class="file-head">
+          ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
+          <span class="file-name">${base}</span>
+          <span class="file-ext">${kind}</span>
+        </div>
+        ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}
+        <div class="file-edit">
+          <textarea
+            class="file-body file-source"
+            data-interactive="1"
+            spellcheck="false"
+            .value=${text ?? ""}
+            @keydown=${(e) => {
+              // Contain typing from the canvas shortcuts (belt-and-suspenders with the host seam), then map
+              // the commit/discard chords: ⌘/Ctrl+Enter saves, Escape discards. Plain Enter is a newline.
+              e.stopPropagation();
+              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault();
+                saveEdit(e.currentTarget.closest(".file-edit"));
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                cancelEdit();
+              }
+            }}
+          ></textarea>
+          <div class="file-edit-bar">
+            <button
+              class="file-edit-btn file-edit-save"
+              type="button"
+              title="save to disk (⌘⏎)"
+              @mousedown=${(e) => e.preventDefault()}
+              @click=${(e) => saveEdit(e.currentTarget.closest(".file-edit"))}
+            >Save</button>
+            <button
+              class="file-edit-btn file-edit-cancel"
+              type="button"
+              title="discard changes (Esc)"
+              @mousedown=${(e) => e.preventDefault()}
+              @click=${() => cancelEdit()}
+            >Cancel</button>
+          </div>
+        </div>
+      `;
+    }
+
     // A markdown file is PROSE, so render it as such (the shared /vendor/markdown.js codec — the same
     // one the session card uses for turn text) instead of dumping the source into a <pre>. Every other
     // kind stays a raw, whitespace-preserving preview. This is a READ projection of the off-log content
-    // signal; an eventual editable mode would be a raw-source toggle over the same signal, not this view.
+    // signal; the editable mode above is the raw-source toggle over the same signal.
     // YAML frontmatter is peeled off into a structured strip (renderFrontmatter) so the prose element —
     // and the [data-text] coordinate space annotations resolve against — holds only the body.
     const { frontmatter, body: mdBody } =
@@ -154,6 +230,15 @@ export default {
         ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
         <span class="file-name">${base}</span>
         <span class="file-ext">${kind}</span>
+        ${canEdit
+          ? html`<button
+              class="file-edit-toggle"
+              type="button"
+              title="edit the raw source"
+              @mousedown=${(e) => e.preventDefault()}
+              @click=${() => editState.set(true)}
+            >edit</button>`
+          : ""}
       </div>
       ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}
       ${body}
