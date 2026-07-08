@@ -609,11 +609,23 @@ function ThreadView({
                 );
                 continue;
               }
+              const isMe = mm.from === "human";
               out.push(
-                <div key={mm.seq} className={`chan-msg${mm.from === "human" ? " me" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}>
-                  <div className="chan-msg-head">
-                    <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                <div
+                  key={mm.seq}
+                  className={`chan-msg${isMe ? " me" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}
+                >
+                  {/* WhatsApp-style (Thread card UI): the sender label is dropped on the human's OWN turns —
+                      right-alignment already says "you"; it's kept for every other participant. */}
+                  {!isMe && (
+                    <div className="chan-msg-head">
+                      <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                    </div>
+                  )}
+                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m)}</div>
+                  {/* Bottom-right meta cluster: the timestamp (WhatsApp-style inline meta, not a header line)
+                      and the faint pin toggle. */}
+                  <div className="chan-msg-meta">
                     <button
                       className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
                       data-interactive
@@ -622,8 +634,8 @@ function ThreadView({
                     >
                       📌
                     </button>
+                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
                   </div>
-                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m)}</div>
                 </div>,
               );
             }
@@ -639,30 +651,31 @@ function ThreadView({
             const mode = histMode[mem.sid] ?? "full";
             // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
             // blocked:peer, green = working, grey = done); fall back to the open/pending styling when they've
-            // declared nothing. The intent line (with its note) rides the pill's hover title.
+            // declared nothing.
             const ci = mem.open ? currentIntent[mem.sid] : undefined;
             const intentClass = ci ? ` i-${ci.intent.replace(":", "-")}` : "";
+            const tag = mem.open ? tagFor(mem, openMembers) : null;
+            // HOVER surfaces the member's current status (the common thing); the @-tag insert is the rarer,
+            // deliberate act, so it's on RIGHT-CLICK (contextmenu), not the hover/click payload (Thread card
+            // UI). Title leads with status, then the right-click hint, then the full sid.
+            const title = [ci?.text, tag ? `right-click to @-tag @${tag}` : null, mem.sid]
+              .filter(Boolean)
+              .join(" · ");
             return (
               <span
                 key={mem.edgeId}
                 className={`chan-member${mem.open ? " open" : " pending"}${intentClass}`}
-                title={ci ? `${mem.sid} · ${ci.text}` : mem.sid}
+                title={title}
+                data-interactive
+                onContextMenu={tag ? (e) => { e.preventDefault(); e.stopPropagation(); insertTag(tag); } : undefined}
               >
-                {mem.open ? (
-                  <button
-                    className="chan-member-tag"
-                    title={`tag @${tagFor(mem, openMembers)} — notify this member`}
-                    onClick={() => insertTag(tagFor(mem, openMembers))}
-                  >
-                    {displayHandle(mem.name, mem.sid)}
-                  </button>
-                ) : (
-                  <>{displayHandle(mem.name, mem.sid)} (invited)</>
-                )}
+                <span className="chan-member-name">
+                  {displayHandle(mem.name, mem.sid)}{!mem.open && " (invited)"}
+                </span>
                 {mem.open && (
                   <button
                     className="chan-hist"
-                    title={`history: ${mode === "full" ? "full backlog" : "future only"} — click to ${mode === "full" ? "limit to new messages" : "replay the full backlog"}`}
+                    title={`history for this member: ${mode === "full" ? "showing the full backlog" : "future messages only"} — click to ${mode === "full" ? "limit to new messages only" : "replay the full backlog"}`}
                     onClick={(e) => { e.stopPropagation(); void toggleHistory(mem.sid); }}
                   >
                     {mode === "full" ? "all" : "new"}
