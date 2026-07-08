@@ -4,7 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
-import { HUD_CARDS, HUD_RIGHT, hudTopFor, isHudCard } from "./hud";
+import { HUD_CARDS, HUD_LEFT, hudTopFor, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -105,7 +105,7 @@ function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean
       {hud.map((l) => {
         const top = hudTopFor(heightsAbove);
         heightsAbove.push(l.h);
-        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={{ top, right: HUD_RIGHT }} />;
+        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={{ top, left: HUD_LEFT }} />;
       })}
     </div>
   );

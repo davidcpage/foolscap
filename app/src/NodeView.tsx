@@ -46,8 +46,8 @@ export const NodeView = memo(function NodeView({
   screen?: boolean;
   // When set (only in the screen layer), the card is corner-LOCKED HUD chrome (hud.ts) instead of a
   // free-floating pinned card: rendered in HudFrame at this screen position rather than the draggable
-  // FloatingFrame. `top`/`right` anchor it to the viewport's top-right corner so it tracks a resize.
-  hud?: { top: number; right: number };
+  // FloatingFrame. `top`/`left` anchor it to the viewport's top-left corner so it tracks a resize.
+  hud?: { top: number; left: number };
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -124,9 +124,9 @@ export const NodeView = memo(function NodeView({
 });
 
 // The wrapper for a corner-locked HUD card (usage / clock — see hud.ts). Unlike FloatingFrame it is NOT
-// draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (from the top-right
+// draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (from the top-left
 // corner + the HUD stack, passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS
-// top/right on the full-viewport .screen-layer means a window resize re-lays it out with no JS. Like the
+// top/left on the full-viewport .screen-layer means a window resize re-lays it out with no JS. Like the
 // minimap, a mousedown preventDefaults so a press on the card doesn't blur the canvas (keeping the
 // number-key / Alt-tap shortcuts live). The card fills the frame exactly as a floating card does.
 function HudFrame({
@@ -137,14 +137,14 @@ function HudFrame({
 }: {
   id: Id<"node">;
   layout: LayoutRecord;
-  placement: { top: number; right: number };
+  placement: { top: number; left: number };
   children: React.ReactNode;
 }) {
   return (
     <div
       data-node-id={id}
       className="hud-frame"
-      style={{ top: placement.top, right: placement.right, width: layout.w, height: layout.h, zIndex: layout.z }}
+      style={{ top: placement.top, left: placement.left, width: layout.w, height: layout.h, zIndex: layout.z }}
       onMouseDown={(e) => e.preventDefault()}
     >
       {children}
