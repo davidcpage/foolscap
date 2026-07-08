@@ -1208,6 +1208,41 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #6366f11a;
   box-shadow: inset 0 0 0 1px #6366f159;
 }
+/* WAITING (user waiting-state + you-pill, Phase 2 — the threads-list card): a thread with an unaddressed
+   @you/@human mention. Amber — the same "your turn" hue as the thread card's "you" pill (.chan-member-you
+   .waiting) and an agent's blocked:human — so the list and the open card read the same. A waiting row is
+   single-click-to-transport (see render.js), hence the pointer cursor. position:relative anchors the count
+   badge. Server-derived (handleThreads → humanWaiting); sets/clears live as messages/replies re-pull the list. */
+.ses-row.waiting {
+  position: relative;
+  cursor: pointer;
+  background: #fdf0e0;
+  border-left-color: #f59e0b;
+}
+.ses-row.waiting:hover {
+  background: #fbe6cf;
+}
+.ses-row.waiting .ses-row-title {
+  color: #b45309;
+  font-weight: 600;
+  padding-right: 22px; /* clear the corner badge */
+}
+/* The count badge: how many mentions await, pinned top-right like a notification dot. */
+.ses-row-wait {
+  position: absolute;
+  top: 4px;
+  right: 8px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  color: #fff;
+  background: #d97706;
+  border-radius: 8px;
+}
 /* The title line: an optional role chip then the session title, on one row (the chip never shrinks, the
    title takes the rest and ellipsises). */
 .ses-row-line {

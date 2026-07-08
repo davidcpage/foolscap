@@ -287,6 +287,57 @@ test("sessions template lists the off-log session list, each row draggable, with
   assert.ok(empty.includes("no sessions on disk"), "an empty list → empty marker");
 });
 
+test("channels template highlights a WAITING thread (user waiting-state + you-pill, Phase 2) and offers click-to-transport", async () => {
+  const mod = await loadTemplate("channels");
+  assert.equal(mod.contract, 1);
+
+  // channelList is the off-log /api/threads projection (content.ts). Phase 2 adds the board owner's
+  // per-thread waiting signal — youWaiting / youWaitingCount, server-derived (handleThreads → humanWaiting),
+  // the same signal the thread card's "you" pill uses. A waiting row is highlighted (the `waiting` class,
+  // amber in CSS) and carries a count badge; a click on it transports the human to that thread card via the
+  // channelOpen capability (fly-to-if-present, else open). One waiting + one calm thread in the list.
+  let opened = null;
+  const channels = [
+    { chanId: "node:thread:aa", title: "Needs you", text: "brief a", messages: 6, mtime: Date.now() - 4000, youWaiting: true, youWaitingCount: 2 },
+    { chanId: "node:thread:bb", title: "All quiet", text: "brief b", messages: 3, mtime: Date.now() - 90_000, youWaiting: false, youWaitingCount: 0 },
+  ];
+  const card = {
+    fields: { title: "", text: "", color: "purple" },
+    signals: { channelList: channels, channelRefresh: () => {}, channelOpen: (id) => { opened = id; } },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("threads"), "header label");
+  assert.ok(out.includes("Needs you") && out.includes("All quiet"), "both threads listed by title");
+
+  // Exactly the waiting row wears the `waiting` class and the count badge — the calm one does not.
+  assert.equal((out.match(/ses-row waiting/g) || []).length, 1, "only the waiting thread gets the waiting highlight");
+  assert.equal((out.match(/ses-row-wait/g) || []).length, 1, "only the waiting thread shows a count badge");
+  assert.ok(out.includes('ses-row-wait" title="messages awaiting you">2<'), "the badge shows the awaiting count");
+
+  // The waiting row's tooltip documents the one-click transport (the calm row keeps the double-click hint).
+  assert.ok(out.includes("2 messages await you — click to go to this thread"), "waiting row documents click-to-transport");
+  assert.ok(out.includes("double-click or drag onto the canvas to open this thread"), "calm row keeps the double-click/drag hint");
+
+  // The transport routes through the channelOpen capability (loader.openChannel flies to the card if it
+  // already exists, else opens it) — the same action the double-click open uses. Drive it directly, as the
+  // sessions test drives sessionRefresh, since the render-string path doesn't fire lit event bindings.
+  card.signals.channelOpen("node:thread:aa", "Needs you", "brief a");
+  assert.equal(opened, "node:thread:aa", "channelOpen transports to the clicked thread");
+
+  // Singular count wording, and a thread with no waiting fields at all (older server) draws no highlight.
+  const one = flatten(mod.render({
+    fields: { title: "", text: "", color: "purple" },
+    signals: { channelList: [{ chanId: "node:thread:cc", title: "One", text: "", messages: 1, mtime: Date.now(), youWaiting: true, youWaitingCount: 1 }], channelOpen: () => {} },
+  }));
+  assert.ok(one.includes("1 message await you — click to go to this thread"), "singular 'message' wording");
+  const legacy = flatten(mod.render({
+    fields: { title: "", text: "", color: "purple" },
+    signals: { channelList: [{ chanId: "node:thread:dd", title: "Legacy", text: "", messages: 2, mtime: Date.now() }], channelOpen: () => {} },
+  }));
+  assert.ok(!legacy.includes("ses-row waiting") && !legacy.includes("ses-row-wait"), "a thread without the youWaiting field is not highlighted");
+});
+
 test("session template applies the jsonl codec: turns, tool calls with results, thinking", async () => {
   const mod = await loadTemplate("session");
   assert.equal(mod.contract, 1);

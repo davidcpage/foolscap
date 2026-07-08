@@ -399,6 +399,12 @@ export interface ChannelMeta {
   text: string; // the thread's task brief, blank by default
   messages: number; // total posts (the marker's last seq) — a "how much activity" proxy, like the session turn count
   mtime: number; // last-activity ms (the marker's lastTs), for the "how long ago" line + newest-first ordering
+  // The board owner's per-thread waiting signal (user waiting-state + you-pill, Phase 2): true when an
+  // @you/@human mention sits unaddressed, so the threads-list card highlights this row. Server-derived
+  // (handleThreads → humanWaiting), the same signal the thread:<id> feed's "you" pill uses — no client
+  // re-derivation. Optional: an older server/board that predates the field simply omits it (no highlight).
+  youWaiting?: boolean;
+  youWaitingCount?: number; // how many mentions await (for the badge/tooltip); 0 when not waiting
 }
 
 let channelListValue: ChannelMeta[] | undefined;
