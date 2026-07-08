@@ -371,12 +371,12 @@ function ThreadView({
   const [descExpanded, setDescExpanded] = useState(false);
   const [descOverflows, setDescOverflows] = useState(false);
   const descViewRef = useRef<HTMLDivElement>(null);
-  // The pinned tray is a compact "📌 N" chip in the header that pops open a panel (Thread card UI) — never a
-  // full-width amber block stranded mid-card below a long brief.
-  const [pinsOpen, setPinsOpen] = useState(false);
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  // Guards the composer against a double-send: while a post is in flight `sending` is true, which disables
+  // the Send button and short-circuits a second send() (a transient bus delay let a repeat click through).
+  const [sending, setSending] = useState(false);
   // The history visibility last chosen for each member (sid → mode), for the per-member toggle's label.
   // It's the human's last action, not a read-back of the server cursor (which only "means" a mode at the
   // seeding instant), so it resets to the "full" default on reload — honest as a control, not a mirror.
@@ -411,7 +411,16 @@ function ThreadView({
     if (!host) return;
     const interactive = (t: EventTarget | null) =>
       t instanceof Element && t.closest("input, textarea, button, [data-interactive]");
-    const onPD = (e: PointerEvent) => { if (interactive(e.target)) e.stopPropagation(); };
+    const onPD = (e: PointerEvent) => {
+      // Alt-drag is the canvas wire gesture (join a session to this thread) — never contain it, or a press
+      // on the card's text/controls would swallow the connect-drag before it starts.
+      if (e.altKey) return;
+      if (interactive(e.target)) { e.stopPropagation(); return; }
+      // Read-only message text becomes drag-selectable/copyable only once the card is selected — contain the
+      // press so the native selection runs instead of a card drag (mirrors the session-card seam).
+      if (host.classList.contains("selected") && e.target instanceof Element && e.target.closest("[data-text]"))
+        e.stopPropagation();
+    };
     const onKD = (e: KeyboardEvent) => {
       if (e.target instanceof Element && e.target.closest("input, textarea")) e.stopPropagation();
     };
@@ -494,14 +503,21 @@ function ThreadView({
   };
   const send = async () => {
     const t = post.trim();
-    if (!t) return;
+    if (!t || sending) return; // an in-flight post ignores a repeat send — no double-post on a slow bus
+    setSending(true);
     setStatus("sending…");
+    // Optimistically clear the composer so the send reads as registered the instant it's fired; the message
+    // itself appears from the live feed on success. On failure we restore the text (unless the human has
+    // already started a new one) so a transient error never silently eats what they typed.
+    setPost("");
+    if (postInputRef.current) postInputRef.current.style.height = "auto"; // collapse the grown textarea
     const r = await postToThread(id, "human", t);
-    if (r.ok) {
-      setPost("");
-      if (postInputRef.current) postInputRef.current.style.height = "auto"; // collapse the grown textarea
-      setStatus("posted");
-    } else setStatus(r.error ?? "failed");
+    if (r.ok) setStatus("posted");
+    else {
+      setPost((p) => p || t);
+      setStatus(r.error ?? "failed");
+    }
+    setSending(false);
   };
   // Pin/unpin a message as head context (R-PIN). The feed republishes the pins on success, so the tray and
   // the message's pin glyph update from the live feed — no local pin state to keep in sync.
@@ -521,36 +537,6 @@ function ThreadView({
           onBlur={commitTitle}
           onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
         />
-        {pins.length > 0 && (
-          // The pinned tray as a compact header chip: it reads "📌 N" and pops the pins panel over the card
-          // (absolute, so it never strands as a full-width block mid-card below a long brief — Thread card UI).
-          <div className="chan-pins-chip-wrap" data-interactive>
-            <button
-              className={`chan-pins-chip${pinsOpen ? " open" : ""}`}
-              title="pinned head context — the thread's kept-in-view messages"
-              onClick={() => setPinsOpen((o) => !o)}
-            >
-              📌 {pins.length}
-            </button>
-            {pinsOpen && (
-              <div className="chan-pins-panel">
-                {pins.map((p) => (
-                  <div key={p.seq} className="chan-pin">
-                    <span className="chan-msg-from" title={p.from}>{senderLabel(p.from, nameForSid(p.from))}</span>
-                    <div className="chan-msg-text">{renderTaggedText(p.text, openEntries, m)}</div>
-                    <button
-                      className="chan-pin-toggle on"
-                      title="unpin — remove from head context"
-                      onClick={(e) => { e.stopPropagation(); void togglePin(p.seq); }}
-                    >
-                      📌
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
         <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
@@ -644,7 +630,7 @@ function ThreadView({
                       📌
                     </button>
                   </div>
-                  <div className="chan-msg-text">{renderMessageBody(mm.text, openEntries, m)}</div>
+                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m)}</div>
                 </div>,
               );
             }
@@ -699,7 +685,7 @@ function ThreadView({
             if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
           }}
         />
-        <button onClick={() => void send()}>Send</button>
+        <button onClick={() => void send()} disabled={sending}>Send</button>
       </div>
       {status && <span className="chan-status">{status}</span>}
     </div>
@@ -758,24 +744,15 @@ function highlightTags(text: string, entries: TagEntry[]): React.ReactNode {
   return parts;
 }
 
-// Render channel message text with inline markdown applied AND @-tags highlighted. Markdown is parsed over
-// the WHOLE text (renderInline: [text](href) links, **bold**, `code`), and @-tags are highlighted WITHIN the
-// resulting plain and bold runs. Parsing markdown first is what keeps a tag INSIDE a bold span (e.g.
-// `**…tag @7505562d…**`) from splitting the `**…**` in two — an earlier version highlighted tags first and
-// the split left the bold markers unpaired (literal `**`, runaway bold). Tags inside `code`/link labels stay
-// literal by design (code is verbatim; a link's text is its label). Line breaks come for free from
-// `.chan-msg-text { white-space: pre-wrap }`, so `\n` stays plain text — no <br> needed.
-function renderTaggedText(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
-  return renderInline(text, m, (run) => highlightTags(run, entries));
-}
-
 // Render a message body as readable BLOCKS rather than one pre-wrapped wall of text — the single biggest
 // legibility lift for long agent posts, which tend to run on. Blank-line-separated runs become paragraphs
 // with real spacing between them; consecutive `- `/`* `/`N.` lines become a bullet/number list. Inline
-// markdown + @-tag highlighting still run per block via renderInline, so the tag-inside-bold protection
-// documented on renderTaggedText is preserved. Kept deliberately small (paragraphs + lists) — headings and
-// tables are rare in a thread post; the shared lit-html codec (vendor/markdown.js) is the wrong renderer
-// here (raw target=_blank links, no canvas-link/tag handling).
+// markdown + @-tag highlighting run per block via renderInline: markdown is parsed over each block FIRST so a
+// tag INSIDE a bold span (e.g. `**…tag @7505562d…**`) can't split the `**…**` in two (highlighting tags first
+// left the bold markers unpaired — literal `**`, runaway bold); tags inside `code`/link labels stay literal
+// by design. Kept deliberately small (paragraphs + lists) — headings and tables are rare in a thread post;
+// the shared lit-html codec (vendor/markdown.js) is the wrong renderer here (raw target=_blank links, no
+// canvas-link/tag handling).
 function renderMessageBody(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
   const render = (run: string) => renderInline(run, m, (r) => highlightTags(r, entries));
   const lines = text.replace(/\r\n/g, "\n").split("\n");
