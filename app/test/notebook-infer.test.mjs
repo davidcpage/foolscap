@@ -483,3 +483,44 @@ test("E2E: an import + a named-cell define exports the computed value and displa
   assert.equal(r.ok, true, `should run: ${r.error ?? ""}`);
   assert.deepEqual(r.value, { value: 4, exports: { avg: 4 } }, "avg is exported (=4) and displayed");
 });
+
+// ── domCandidate: the static routing signal for the main-thread realm (Phase-2 B2 DOM/SVG output) ──────────
+// A cell is a "view candidate" (runs on the MAIN THREAD, not the DOM-less worker) when it imports an EXTERNAL
+// lib (a non-relative specifier — Plot/d3) or free-reads a DOM global (`document`/`window`). Purely static, so
+// the runtime routes ahead of the run (Plot throws in the worker before any Node could be detected).
+
+test("domCandidate: an external bare import (Plot/d3) routes to the main thread", () => {
+  assert.equal(analyzeCell('import * as Plot from "@observablehq/plot"\nPlot.plot({})').domCandidate, true);
+  assert.equal(analyzeCell('import { max } from "d3-array"\nmax([1,2,3])').domCandidate, true, "even a pure-compute d3 cell over-routes — harmless (returns a plain value → text path)");
+});
+
+test("domCandidate: an external URL import routes to the main thread", () => {
+  assert.equal(analyzeCell('import { plot } from "https://esm.sh/@observablehq/plot"\nplot({})').domCandidate, true);
+});
+
+test("domCandidate: a RELATIVE import stays local (worker realm)", () => {
+  assert.equal(analyzeCell('import { data } from "./prices"\ndata.length').domCandidate, false, "a relative import is a local edge, not an external lib");
+});
+
+test("domCandidate: free-reading a DOM global routes a hand-rolled node cell to the main thread", () => {
+  assert.equal(analyzeCell("document.createElementNS('http://www.w3.org/2000/svg','svg')").domCandidate, true);
+  assert.equal(analyzeCell("const w = window.innerWidth; w").domCandidate, true);
+});
+
+test("domCandidate: a pure-compute cell stays in the worker", () => {
+  assert.equal(analyzeCell("x * 2").domCandidate, false);
+  assert.equal(analyzeCell("y = Math.sqrt(x) + z").domCandidate, false, "Math is a free read but not a DOM global");
+  assert.equal(analyzeCell("Plot.plot({})").domCandidate, false, "a bare Plot read with NO import isn't a view candidate — the user must import it (it'd error as undefined either way)");
+});
+
+test("domCandidate: a document/window binding that is LOCALLY declared is not a DOM-global read", () => {
+  assert.equal(analyzeCell("const document = fakeDoc; document.q").domCandidate, false, "a locally-bound `document` is not the global (coarse whole-cell binding rule)");
+});
+
+test("domCandidate: an invalid/half-typed cell is false (never routes on a parse failure)", () => {
+  assert.equal(analyzeCell("oops(").domCandidate, false);
+});
+
+test("domCandidate: a markdown interpolation is never a view candidate (it yields a prose string)", () => {
+  assert.equal(analyzeMarkdown("width is ${window.innerWidth}px").domCandidate, false, "prose always produces a string, never a DOM node");
+});
