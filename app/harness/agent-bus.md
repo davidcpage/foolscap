@@ -25,8 +25,9 @@ the board's connected tabs and only land if one is live.
 logged / attributed / persisted path a gesture uses. E.g. remove a card:
 `{ type:"removeNode", actor:"<your-sid>", payload:{ id } }`.
 
-- **Confirm it landed:** a command with no live tab for that board returns **503 `{delivered:0}`** — it
-  went nowhere. Check `delivered>0`. (An unknown `?board=` → 400.)
+- **Delivery:** a command with no live tab for that board returns **503 `{delivered:0}`** — it went
+  nowhere (an unknown `?board=` → 400). `scripts/canvas` hard-errors on both for you, so on the sanctioned
+  path there's nothing to check; only the raw-curl path needs to read these itself.
 - **Removing cards:** just `removeNode` — the server cascades its edges (no dangling wires, no delete-edges-
   first dance). File-card ids are deterministic `node:repo:<path>`, so a removal set can be derived without
   reading the board.
