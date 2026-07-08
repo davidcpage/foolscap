@@ -2648,6 +2648,36 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   line-clamp: 1;
   overflow: hidden;
 }
+.chan-desc-wrap { position: relative; }
+/* Fast custom hover tooltip (Thread card UI) — replaces the native `title` (which has an untunable ~1s
+   browser delay). Instant on hover, styled, and (for the brief) renders markdown. Opens INWARD so the
+   card's overflow:hidden never clips it; pointer-events:none keeps it from stealing the hover. */
+.chan-tip {
+  position: absolute;
+  z-index: 50;
+  display: none;
+  max-width: 240px;
+  max-height: 180px;
+  overflow: hidden;
+  padding: 5px 8px;
+  background: #fff;
+  border: 1px solid #e4e4e7;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+  font: 10px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  color: #3f3f46;
+  white-space: normal;
+  word-break: break-word;
+  pointer-events: none;
+}
+.chan-tip-up { bottom: calc(100% + 4px); left: 0; }         /* pills sit low → open upward, over the log */
+.chan-tip-down { top: calc(100% + 2px); left: 8px; right: 8px; } /* brief sits high → open downward */
+.chan-member:hover .chan-tip-up { display: block; }
+.chan-desc-wrap:hover .chan-tip-brief { display: block; }
+.chan-tip-line { display: block; }
+.chan-tip-line + .chan-tip-line { margin-top: 3px; color: #8b8b93; } /* the right-click hint, dimmer */
+.chan-tip-brief a { color: #2563eb; }
+.chan-tip-brief code { font: 10px ui-monospace, Menlo, monospace; background: #00000010; padding: 0 3px; border-radius: 3px; }
 /* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
    link (any other href) is a dotted-underline focus affordance — clicking it opens/focuses the target card. */
 .chan-description-view a { color: #2563eb; }
@@ -2682,13 +2712,14 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
    alike, so the log reads as a calm chat; the too-subtle agent tint is gone. Agents' turns sit left; the
    human's own turn (.me) is right-aligned below, and that alignment is the only user/agent distinction. */
 .chan-msg {
+  position: relative;
   font-size: 11px;
   line-height: 1.5;
   align-self: flex-start;
   max-width: 92%;
   padding: 5px 9px;
   border-radius: 10px 10px 10px 2px;
-  background: #ece5f9;
+  background: #f2eefb; /* lightened so pinned (deeper fill + gutter, below) stands out by contrast */
 }
 .chan-msg-head {
   display: flex;
@@ -2773,7 +2804,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   align-self: flex-end;
   max-width: 85%;
   border-radius: 10px 10px 2px 10px;
-  background: #dbf1e1;
+  background: #e7f6ec;
 }
 /* R-PIN: a per-message pin toggle, faint until the bubble is hovered so the log stays quiet; it lives in the
    bottom-right meta cluster beside the timestamp. A pinned message shows its 📌 lit + the left accent below. */
@@ -2790,9 +2821,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
-/* Pinned messages stand out with a thin left accent AND a subtle full outline (Thread card UI) — a fill
-   can't mark them since every bubble is already filled. The lit 📌 in the meta row is the other cue. */
-.chan-msg.pinned { box-shadow: inset 3px 0 0 #a78bfa, 0 0 0 1px #d6c6f2; }
+/* Pinned messages stand out by CONTRAST (Thread card UI): a bold solid left GUTTER BAR + a deeper fill than
+   the lightened non-pinned bubbles — obvious at a glance without a heavy full border. The lit 📌 is the
+   other cue. `.me.pinned` keeps the green family so a pinned own-message doesn't turn purple. */
+.chan-msg.pinned { background: #e2d9f4; box-shadow: inset 4px 0 0 #8b5cf6; }
+.chan-msg.me.pinned { background: #d1ecda; }
 .chan-members {
   display: flex;
   flex-wrap: wrap;
@@ -2804,6 +2837,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
 }
 .chan-member {
+  position: relative; /* anchors the pill's custom hover tooltip */
   display: inline-flex;
   align-items: center;
   gap: 4px;
@@ -2818,23 +2852,10 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font: inherit;
   color: inherit;
 }
-/* per-member backlog-visibility toggle (full="all" / future="new") — the human's history control. Neutral
-   so the roster reads calm (Thread card UI): the pills are informational, not a status to be shouted. */
-.chan-hist {
-  font: 9px ui-monospace, Menlo, monospace;
-  padding: 0 4px;
-  border-radius: 6px;
-  border: 1px solid #e4e4e7;
-  background: #ffffffcc;
-  color: #71717a;
-  cursor: pointer;
-}
-.chan-hist:hover { background: #fff; border-color: #a1a1aa; }
 /* An OPEN member reads as a quiet neutral pill; a PENDING (invited) one is dimmer with a dashed border to
    mark "not yet joined" — the distinction carried by weight/border, not by competing saturated colours.
-   The context-menu cursor hints that right-click inserts the @-tag (Thread card UI). */
+   (Right-click inserts the @-tag; that's surfaced in the hover tooltip, not via a cursor change.) */
 .chan-member.open {
-  cursor: context-menu;
   background: #f4f4f5;
   color: #52525b;
   border-color: #e4e4e7;
