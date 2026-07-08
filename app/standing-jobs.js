@@ -11,9 +11,11 @@
 // intents / pins), NOT on the session that created it, so it persists after that session exits AND across a
 // server restart, and re-fires on the next tick.
 //
-// This module is the LEDGER (marker CRUD) + the PURE due-logic; the actual spawning stays in
-// vite-fs-plugin.ts (standingJobsTick), which rides the loop heartbeat and calls serverSpawnWorker — the same
-// separation auto-wake.js keeps (predicates here, ensureLiveSession there). FIRE-NEXT-DUE, never catch-up: a
+// This module is the LEDGER (marker CRUD) + the PURE due-logic; the actual firing stays in vite-fs-plugin.ts
+// (standingJobsTick), which rides the loop heartbeat. TIMERS NUDGE, NEVER SPAWN (human-locked, thread
+// mrcauz0v-f): a fire may only NUDGE an already-live seat occupant, never create a session — session creation
+// is reserved for explicit events (human spawn / reactive @-mention / ask). This structurally removes the
+// endless-Coordinator runaway; see planRoleJobFire. FIRE-NEXT-DUE, never catch-up: a
 // job overdue because the server was down fires ONCE on the next tick (its `lastFiredAt` re-bases to now),
 // never replaying the fires missed while it slept — replaying them is exactly the wake-storm "skip days with
 // nothing" forbids. SINGLE-FLIGHT: a still-running fire is not doubled (the tick skips a claimed surface).
@@ -187,34 +189,33 @@ export function sessionHasScheduledWake(markers, sid) {
 }
 
 /**
- * PURE — the WAKE-LIVE-ELSE-RESPAWN decision for a role-seat job's fire, given the current liveness of the
- * seat's occupant AND the seat's declared work-intent. This is the efficiency norm (W6 seq 104) factored out
- * of standingJobsTick so it can be unit-tested (a "mocked tick") and shared: a job whose seat is occupied by a
- * LIVE, IDLE session is served by NUDGING it (cheap — assembled context intact); a MID-TURN occupant is
- * skipped WITHOUT stamping (retry next tick the moment it's idle, never talk over a working session); a
- * DORMANT/absent occupant pays a fresh respawn seeded from the durable record.
+ * PURE — the fire decision for a role-seat job, given the current liveness of the seat's occupant AND the
+ * seat's declared work-intent. Factored out of standingJobsTick so it can be unit-tested (a "mocked tick").
  *
- * STAND-DOWN GUARD (the endless-Coordinator fix): a seat whose Coordinator has EXPLICITLY declared
- * `intent:"done"` has stood down — its work on this thread is finished. Such a seat must NOT be auto-fired by
- * the timer, in EITHER direction: a dormant done-seat that we blindly respawned every interval was the
- * runaway that spawned a fresh Coordinator every few minutes forever on a stood-down thread (it swept an empty
- * thread, found nothing, exited, and got respawned on the next tick); and even a live+idle done-seat should be
- * left alone rather than nudged back into a sweep it declared finished. This gates ONLY the timer: the seat
- * still re-engages the instant it's genuinely needed — a reactive @-mention / ask wakes or respawns it through
- * a SEPARATE path (auto-wake / seat-nudge), untouched by this guard — and the heartbeat TIMER resumes once the
- * seat's declared intent moves off `done` (the re-engaged occupant declaring its stance per "declare your
- * stance"; note the resume self-freshen clears only `blocked:*`, not `done`). So the guard SUPPRESSES the fire
- * (no spawn, no nudge, no stamp) until the seat declares a non-done stance; it does not remove the job. It runs
- * BEFORE the liveness branches so a stood-down-but-not-yet-exited occupant is also left alone.
+ * TIMERS NUDGE, NEVER SPAWN (human-locked invariant, thread mrcauz0v-f). A standing job may only NUDGE an
+ * already-live seat occupant; it must NEVER create a session. There is deliberately NO "respawn" outcome:
+ * session creation is reserved for explicit EVENTS (a human spawn, a reactive @-mention / ask), never a
+ * periodic timer — which structurally removes the endless-Coordinator runaway (a dormant seat the timer used
+ * to respawn every interval, forever, on a thread with no live work). A wound-down Coordinator is instead kept
+ * PARKED by the reaper (reap-only-on-done, auto-wake.reapKeepAliveMs) so this nudge has a live target; if it
+ * has truly exited it simply waits for a real event to revive it.
  *
- * `occupantStatus` is the LiveSession status of the seat's current sid — `"idle"` / `"running"` (mid-turn) /
- * `"exited"`, or `null` when the seat has no live occupant. `seatIntent` is the seat's declared work-intent
- * (`meta.intents[role].intent`), or null/undefined when none is declared. Returns
- * `"nudge"` | `"skip"` (mid-turn, no stamp) | `"stand-down"` (suppressed, no stamp) | `"respawn"`.
+ * The decision:
+ *   - seat declared `done` (stood down) → `"none"`: don't nudge it back into a sweep it declared finished
+ *     (and — reap-only-on-done — let the reaper reclaim the idle done session rather than the nudge keeping it
+ *     alive forever). Checked FIRST so a stood-down-but-not-yet-exited occupant is left alone.
+ *   - live + `idle` → `"nudge"`: the one action a timer may take (cheap — assembled context intact).
+ *   - live + `running` (mid-turn) → `"skip"`: don't interrupt; retry next tick (caller does NOT stamp).
+ *   - dormant / absent / `exited` → `"none"`: nothing to do — timers never spawn.
+ *
+ * `occupantStatus` is the LiveSession status of the seat's current sid — `"idle"` / `"running"` / `"exited"`,
+ * or `null` when the seat has no live occupant. `seatIntent` is the seat's declared work-intent
+ * (`meta.intents[role].intent`), or null/undefined when none. Returns
+ * `"nudge"` | `"skip"` (mid-turn, no stamp) | `"none"` (nothing to do, no stamp — dormant or stood down).
  */
 export function planRoleJobFire(occupantStatus, seatIntent) {
-  if (seatIntent === "done") return "stand-down"; // seat explicitly stood down → don't auto-fire the timer
+  if (seatIntent === "done") return "none"; // stood down → don't nudge; the reaper reclaims the idle session
   if (occupantStatus === "idle") return "nudge";
   if (occupantStatus === "running") return "skip";
-  return "respawn"; // "exited" or null (no live occupant) → reconstitute fresh
+  return "none"; // dormant / absent / exited → TIMERS NEVER SPAWN, so there is nothing to do
 }

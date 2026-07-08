@@ -77,28 +77,31 @@ test("heartbeatEffectiveInterval: never SHORTENS a base already longer than the 
   assert.equal(heartbeatEffectiveInterval(longBase, "blocked:human"), longBase);
 });
 
-// ── the wake-live-else-respawn decision ─────────────────────────────────────────────────────────
-test("planRoleJobFire — idle nudges, running skips, dormant/absent respawns", () => {
-  assert.equal(planRoleJobFire("idle"), "nudge", "a live+idle seat is nudged (cheap — context intact)");
+// ── the fire decision: TIMERS NUDGE, NEVER SPAWN ────────────────────────────────────────────────
+test("planRoleJobFire — idle nudges, running skips; a dormant/absent seat is NEVER respawned", () => {
+  assert.equal(planRoleJobFire("idle"), "nudge", "a live+idle seat is nudged (the only fire a timer may make)");
   assert.equal(planRoleJobFire("running"), "skip", "a mid-turn seat is skipped (no interrupt, no stamp)");
-  assert.equal(planRoleJobFire("exited"), "respawn", "an exited occupant is reconstituted fresh");
-  assert.equal(planRoleJobFire(null), "respawn", "no live occupant → respawn");
-  assert.equal(planRoleJobFire(undefined), "respawn", "absent status → respawn");
-  // a seat with a non-terminal intent still fires normally across every liveness state
-  for (const intent of ["working", "blocked:peer", "blocked:human", null, undefined]) {
-    assert.equal(planRoleJobFire("exited", intent), "respawn", `intent=${intent}: an exited seat still respawns`);
-    assert.equal(planRoleJobFire("idle", intent), "nudge", `intent=${intent}: a live+idle seat still nudges`);
+  // The invariant: a timer must not create a session. A dormant/absent/exited seat → "none", never a spawn.
+  assert.equal(planRoleJobFire("exited"), "none", "an exited occupant is NOT respawned by the timer");
+  assert.equal(planRoleJobFire(null), "none", "no live occupant → nothing to do (no spawn)");
+  assert.equal(planRoleJobFire(undefined), "none", "absent status → nothing to do (no spawn)");
+  // Holds regardless of the declared intent — no intent value ever yields a spawn outcome.
+  for (const intent of ["working", "blocked:peer", "blocked:human", "done", null, undefined]) {
+    assert.equal(planRoleJobFire("exited", intent), "none", `intent=${intent}: an exited seat is never respawned`);
+    assert.ok(
+      ["nudge", "skip", "none"].includes(planRoleJobFire("idle", intent)),
+      `intent=${intent}: only nudge/skip/none are ever returned — never a spawn`,
+    );
   }
 });
 
-// The endless-Coordinator guard: a seat that STOOD DOWN (intent="done") must not be auto-fired by the timer —
-// in ANY liveness state — so a dormant done-seat is never blindly respawned (the runaway) and a live done-seat
-// is never nudged back into a sweep it declared finished. The stand-down wins over liveness (checked first).
-test("planRoleJobFire — a stood-down seat (intent=done) is suppressed, never respawned or nudged", () => {
-  assert.equal(planRoleJobFire("exited", "done"), "stand-down", "dormant done-seat: no blind respawn (the runaway)");
-  assert.equal(planRoleJobFire(null, "done"), "stand-down", "absent done-seat: still suppressed");
-  assert.equal(planRoleJobFire("idle", "done"), "stand-down", "live+idle done-seat: not nudged back into a sweep");
-  assert.equal(planRoleJobFire("running", "done"), "stand-down", "mid-turn done-seat: suppressed too");
+// A stood-down seat (intent="done") is not nudged either — it declared its work finished, so the timer leaves
+// it alone (and reap-only-on-done lets the reaper reclaim the idle session rather than the nudge keeping it
+// alive). Checked BEFORE liveness, so it holds even for a done-but-not-yet-exited occupant.
+test("planRoleJobFire — a stood-down seat (intent=done) yields 'none' in every liveness state", () => {
+  for (const status of ["exited", null, "idle", "running", undefined]) {
+    assert.equal(planRoleJobFire(status, "done"), "none", `done seat, occupant=${status}: nothing to do`);
+  }
 });
 
 // ── the mocked tick ─────────────────────────────────────────────────────────────────────────────
@@ -117,14 +120,14 @@ test("a Coordinator heartbeat job on a thread: due-logic + seat-keyed single-fli
   assert.equal(persisted.length, 1);
   assert.equal(dueJobs(persisted, t0 + job.intervalMs).length, 1);
 
-  // A role job keys its single-flight claim by the role's SEAT, so a timer fire and a dormant-seat
-  // reconstitution mutually exclude — one Coordinator per thread, never two racing onto the seat.
+  // A role job keys its single-flight claim by the role's SEAT, so a timer fire and a reactive seat wake
+  // mutually exclude — one Coordinator per thread, never two racing onto the seat.
   assert.equal(jobClaimKey(TID, job), seatSurfaceKey(TID, "Coordinator"));
 
   fs.rmSync(repo, { recursive: true, force: true });
 });
 
-test("mocked tick: fire-next-due re-bases only on a real fire (nudge/respawn), never on a mid-turn skip", () => {
+test("mocked tick: fire-next-due re-bases only on a real fire (a nudge), never on a mid-turn skip", () => {
   const repo = tmpRepo();
   const t0 = 5_000_000;
   const { job } = upsertJob(repo, TID, { ...coordinatorHeartbeatJobSpec(), ts: t0 });

@@ -20,7 +20,7 @@ import {
   releaseSeat,
   seatForSid,
   ownBlockedIntentKeys,
-  sessionDeclaredBlock,
+  sessionDeclaredDone,
   setThreadLevel,
   threadLevelForSid,
   readPins,
@@ -199,29 +199,35 @@ test("ownBlockedIntentKeys: both blocked:human and blocked:peer count; working/d
   assert.deepEqual(ownBlockedIntentKeys(intents, "s").sort(), ["a", "b"]);
 });
 
-// sessionDeclaredBlock — the reaper's read (part 2): the STRONGEST block this session holds across threads.
-test("sessionDeclaredBlock: blocked:human wins over blocked:peer, across threads; else the peer/null it finds", () => {
+// sessionDeclaredDone — the reaper's read (reap-only-on-done): true iff the session declared done and is
+// active nowhere. Every other stance parks, so the reaper only needs this one bit.
+test("sessionDeclaredDone: true only when done AND active nowhere; any working/blocked keeps it parked", () => {
   const meta = (intents) => ({ intents });
-  // human on one thread, peer on another → human wins (never idle-reaped)
+  // done on its only thread → done
+  assert.equal(sessionDeclaredDone([meta({ Coordinator: { intent: "done", sid: "s" } })], "s"), true);
+  // done on one thread but still active on another → NOT done (must not reap a session working elsewhere)
   assert.equal(
-    sessionDeclaredBlock([meta({ Coordinator: { intent: "blocked:peer", sid: "s" } }), meta({ x: { intent: "blocked:human", sid: "s" } })], "s"),
-    "blocked:human",
+    sessionDeclaredDone([meta({ Coordinator: { intent: "done", sid: "s" } }), meta({ x: { intent: "working", sid: "s" } })], "s"),
+    false,
   );
-  // only peer anywhere → blocked:peer (the long backstop)
-  assert.equal(sessionDeclaredBlock([meta({ x: { intent: "blocked:peer", sid: "s" } })], "s"), "blocked:peer");
-  // working/done/none → null (the ordinary window applies)
-  assert.equal(sessionDeclaredBlock([meta({ x: { intent: "working", sid: "s" } })], "s"), null);
-  assert.equal(sessionDeclaredBlock([], "s"), null);
-  assert.equal(sessionDeclaredBlock(undefined, "s"), null);
+  assert.equal(
+    sessionDeclaredDone([meta({ Coordinator: { intent: "done", sid: "s" } }), meta({ x: { intent: "blocked:human", sid: "s" } })], "s"),
+    false,
+  );
+  // working / blocked / undeclared / empty → false (parked)
+  assert.equal(sessionDeclaredDone([meta({ x: { intent: "working", sid: "s" } })], "s"), false);
+  assert.equal(sessionDeclaredDone([meta({ x: { intent: "blocked:peer", sid: "s" } })], "s"), false);
+  assert.equal(sessionDeclaredDone([], "s"), false);
+  assert.equal(sessionDeclaredDone(undefined, "s"), false);
 });
 
-test("sessionDeclaredBlock: sid-keyed OR seat-keyed (sid-stamped) self-declaration; never another occupant's seat-inherited block", () => {
+test("sessionDeclaredDone: sid-keyed OR seat-keyed (sid-stamped) self-declaration; never another occupant's seat-inherited intent", () => {
   // matches a bare sid key and a seat-keyed record stamped with this sid
-  assert.equal(sessionDeclaredBlock([{ intents: { "sid-a": { intent: "blocked:peer", sid: "sid-a" } } }], "sid-a"), "blocked:peer");
-  assert.equal(sessionDeclaredBlock([{ intents: { Reviewer: { intent: "blocked:human", sid: "sid-a" } } }], "sid-a"), "blocked:human");
-  // a block a DIFFERENT (exited) occupant left on a seat this session later re-filled is NOT this session's —
-  // the sacred waiting state must not make the fresh occupant un-reapable on the departed's behalf.
-  assert.equal(sessionDeclaredBlock([{ intents: { Coordinator: { intent: "blocked:human", sid: "sid-old" } } }], "sid-new"), null);
+  assert.equal(sessionDeclaredDone([{ intents: { "sid-a": { intent: "done", sid: "sid-a" } } }], "sid-a"), true);
+  assert.equal(sessionDeclaredDone([{ intents: { Reviewer: { intent: "done", sid: "sid-a" } } }], "sid-a"), true);
+  // a `done` a DIFFERENT (exited) occupant left on a seat this session later re-filled is NOT this session's —
+  // the fresh occupant must not be reaped on the departed's behalf.
+  assert.equal(sessionDeclaredDone([{ intents: { Coordinator: { intent: "done", sid: "sid-old" } } }], "sid-new"), false);
 });
 
 test("ownBlockedIntentKeys: NEVER a seat-inherited block another (exited) occupant left — the sacred waiting state", () => {

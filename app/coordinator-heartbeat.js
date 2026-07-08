@@ -3,11 +3,16 @@
 // A looping role (the Coordinator, `agent-roles.md`) needs to sweep the board for STALLS — nothing emits an
 // event when an agent goes silent, so a purely reactive session never wakes to notice. Historically this was
 // a BESPOKE per-session heartbeat baked into `loopTick` (a server timer that nudged every already-live looping
-// session on an adaptive cadence). That path could only ever nudge a session that was ALREADY LIVE — it could
-// not stand a DORMANT Coordinator back up. The standing-job machinery (R6/W6) does strictly more: its
-// WAKE-LIVE-ELSE-RESPAWN fire (standingJobsTick → the one serverSpawnWorker primitive) nudges a live+idle seat
-// AND reconstitutes a dormant one. So the Coordinator heartbeat is now just a standing job on the
-// Coordinator's thread, fired by the same tick as every other job — one driver, no bespoke fork.
+// session on an adaptive cadence). It is now just a standing job on the Coordinator's thread, fired by the
+// same tick as every other job — one driver, no bespoke fork.
+//
+// TIMERS NUDGE, NEVER SPAWN (human-locked, thread mrcauz0v-f). Like the old loopTick, the heartbeat can ONLY
+// nudge a Coordinator that is ALREADY LIVE — it does NOT stand a dormant one back up (an earlier iteration let
+// standingJobsTick respawn a dormant seat, which produced an endless-Coordinator runaway on a stood-down
+// thread; that respawn is removed). What keeps the nudge effective is the REAPER, not a respawn: reap-only-on-
+// done (auto-wake.reapKeepAliveMs) leaves a Coordinator PARKED (idle, no tokens) until it declares `done`, so
+// the heartbeat always has a live seat to nudge. A Coordinator that has truly exited is revived only by a real
+// event (@-mention / ask / human staffing), never by this timer.
 //
 // This module is the SINGLE SOURCE OF TRUTH for what that job looks like: the role it fires into, its default
 // cadence, and the sweep instruction. The CLI enable verb (`scripts/canvas job coordinator <thread>`) and any
@@ -30,13 +35,12 @@ export const COORDINATOR_ROLE = "Coordinator";
 
 // The default cadence — a calm few minutes, deliberately NOT the 60s floor (an idle proactive sweep every
 // minute is eager waste; urgent events don't wait for the heartbeat — they wake instantly via the @-mention/
-// ask INTERRUPT path). Set well INSIDE the idle keep-alive window (IDLE_KEEPALIVE_MS, 15 min) so wake-live-else-
-// respawn favours the CHEAP branch: a heartbeat at this interval finds the last-woken Coordinator still alive
-// (not yet reaped) and NUDGES it (context intact) rather than paying a fresh respawn's context reassembly each
-// sweep. This fast pulse is LOAD-BEARING while working/blocked:peer — it's how the Coordinator detects a peer
-// finishing (a `done` intent wakes no one). It backs off only while the Coordinator is blocked:human (see
-// heartbeatEffectiveInterval). Clamped up to the standing-job floor (MIN_INTERVAL_MS) by normInterval.
-export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 240_000; // 4 min — inside the 15-min keep-alive, nudge-favouring
+// ask INTERRUPT path). The heartbeat is a pure NUDGE of the parked (reap-only-on-done) Coordinator, so the
+// cadence is just how often it re-sweeps, not a race against reaping. This fast pulse is LOAD-BEARING while
+// working/blocked:peer — it's how the Coordinator detects a peer finishing (a `done` intent wakes no one). It
+// backs off only while the Coordinator is blocked:human (see heartbeatEffectiveInterval). Clamped up to the
+// standing-job floor (MIN_INTERVAL_MS) by normInterval.
+export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 240_000; // 4 min — a calm re-sweep pulse for a parked Coordinator
 
 // Part 4 — intent-keyed backoff. A Coordinator that has EXPLICITLY declared `blocked:human` (it escalated and
 // is parked on a human) needn't keep the fast pulse: the human's reply wakes it reactively, so a frequent

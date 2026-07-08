@@ -73,26 +73,28 @@ export function annotationWakeClass(eventKind) {
   return { mentioned: false, broadcast: false };
 }
 
-// A `blocked:peer` session's idleness is EXPLAINED (it's waiting on a peer's work, which routinely outlasts
-// the default idle window), so it gets a long backstop rather than the default reap — long enough not to
-// churn a legitimately-waiting session, but finite so a forgotten block can't leak a process slot forever.
-export const BLOCKED_PEER_KEEPALIVE_MS = 45 * 60_000; // 45 min
-
 /**
- * The keep-alive window to apply to an idle auto-wake worker given its currently DECLARED work-intent — the
- * reaper honours a declared block instead of winding down a session that has SAID why it is idle:
- *   - `blocked:human` → `null` (NEVER reap on the idle timer): a permission gate may be mid-flight and
- *     reaping would lose it; the human's reply wakes it reactively, so nothing is reclaimed by killing it.
- *   - `blocked:peer` → the long backstop (BLOCKED_PEER_KEEPALIVE_MS): waiting on a peer is legitimate, but
- *     bounded so a stale block eventually frees the slot.
- *   - `working` / `done` / undeclared → the caller's `defaultMs` (the ordinary idle window).
- * Pure/unit-testable; the reaper tick supplies the session's intent (thread-ledger.sessionDeclaredBlock) and
- * the default window (IDLE_KEEPALIVE_MS). A `null` return threads through shouldReapIdle as never-reap.
+ * The keep-alive window to apply to an idle auto-wake worker given its currently DECLARED work-intent.
+ *
+ * REAP ONLY WHEN DONE (human-locked, thread mrcauz0v-f). The idle timer winds a worker down ONLY once it has
+ * declared `done` (finished — reclaim the slot after the ordinary grace window). EVERY other stance — and an
+ * undeclared idle — returns `null` (NEVER idle-reap): the session is left PARKED. This is the deliberate flip
+ * from a keep-alive-per-intent policy, and it is the counterpart to the "timers nudge, never spawn" invariant
+ * (standing-jobs.planRoleJobFire): a reaped worker can no longer be revived by any timer (the heartbeat is
+ * nudge-only now), so aggressively reaping a still-relevant Coordinator would silently drop proactive stall
+ * detection until a human noticed. A parked idle session is essentially harmless — it holds a process slot but
+ * burns no tokens — whereas the failure it prevents (a wound-down seat the heartbeat used to respawn in a
+ * loop) was the runaway. So: park by default, reap only the explicitly-finished. A worker that finishes
+ * without declaring `done` parks harmlessly rather than being churned; a real event (@-mention/ask/human)
+ * still wakes any parked session reactively.
+ *
+ * Pure/unit-testable; the reaper tick supplies `"done"` when the session has finished
+ * (thread-ledger.sessionDeclaredDone) else null, and the default window (IDLE_KEEPALIVE_MS). A `null` return
+ * threads through shouldReapIdle as never-reap.
  */
 export function reapKeepAliveMs(intent, defaultMs) {
-  if (intent === "blocked:human") return null;
-  if (intent === "blocked:peer") return BLOCKED_PEER_KEEPALIVE_MS;
-  return defaultMs;
+  if (intent === "done") return defaultMs; // finished — reclaim the slot after the ordinary grace window
+  return null; // every other stance (working / blocked:* / undeclared) → NEVER idle-reap; park it
 }
 
 /**

@@ -18,7 +18,6 @@ import {
   qualifyingWatchers,
   shouldReapIdle,
   reapKeepAliveMs,
-  BLOCKED_PEER_KEEPALIVE_MS,
 } from "../auto-wake.js";
 
 // ── surface keys ────────────────────────────────────────────────────────────────────────────────────
@@ -142,22 +141,25 @@ test("shouldReapIdle: a null keep-alive means NEVER reap (blocked:human threads 
   assert.equal(shouldReapIdle({ autoWake: true, status: "idle", idleSince: NOW - KEEP * 100 }, NOW, undefined), false);
 });
 
-// ── intent-aware reap window (part 2) ─────────────────────────────────────────────────────────────────
-test("reapKeepAliveMs: a declared block overrides the default idle window", () => {
+// ── reap ONLY when done (thread mrcauz0v-f) ─────────────────────────────────────────────────────────────
+test("reapKeepAliveMs: reaps ONLY a done session; every other stance parks (never idle-reaped)", () => {
   const DEFAULT = 15 * 60_000;
-  assert.equal(reapKeepAliveMs("blocked:human", DEFAULT), null); // never idle-reaped
-  assert.equal(reapKeepAliveMs("blocked:peer", DEFAULT), BLOCKED_PEER_KEEPALIVE_MS); // long backstop
-  assert.equal(reapKeepAliveMs("working", DEFAULT), DEFAULT); // ordinary window
-  assert.equal(reapKeepAliveMs("done", DEFAULT), DEFAULT);
-  assert.equal(reapKeepAliveMs(null, DEFAULT), DEFAULT); // undeclared
-  assert.equal(reapKeepAliveMs(undefined, DEFAULT), DEFAULT);
-  assert.ok(BLOCKED_PEER_KEEPALIVE_MS > DEFAULT); // the peer backstop really is longer than the default
+  assert.equal(reapKeepAliveMs("done", DEFAULT), DEFAULT); // finished — reclaim the slot after the grace window
+  // everything else parks: null threads through shouldReapIdle as NEVER reap
+  for (const intent of ["working", "blocked:human", "blocked:peer", "escalated", null, undefined])
+    assert.equal(reapKeepAliveMs(intent, DEFAULT), null, `intent=${intent} → parked, never idle-reaped`);
 });
 
-test("reapKeepAliveMs + shouldReapIdle: a blocked:peer session survives the default window but reaps past its backstop", () => {
+test("reapKeepAliveMs + shouldReapIdle: a working/blocked/undeclared session is PARKED however long it idles; only done reaps", () => {
   const DEFAULT = 15 * 60_000;
-  const ka = reapKeepAliveMs("blocked:peer", DEFAULT);
   const s = (idleAgo) => ({ autoWake: true, status: "idle", idleSince: NOW - idleAgo });
-  assert.equal(shouldReapIdle(s(DEFAULT + 1), NOW, ka), false); // past the default window — but blocked:peer, so kept
-  assert.equal(shouldReapIdle(s(BLOCKED_PEER_KEEPALIVE_MS + 1), NOW, ka), true); // past the backstop — reaped
+  // parked stances: never reaped, even after 100× the default window
+  for (const intent of ["working", "blocked:peer", "blocked:human", null]) {
+    const ka = reapKeepAliveMs(intent, DEFAULT);
+    assert.equal(shouldReapIdle(s(DEFAULT * 100), NOW, ka), false, `intent=${intent}: parked, not reaped`);
+  }
+  // done: kept inside the grace window, reaped once past it
+  const kaDone = reapKeepAliveMs("done", DEFAULT);
+  assert.equal(shouldReapIdle(s(DEFAULT - 1), NOW, kaDone), false, "done but still inside the grace window — kept");
+  assert.equal(shouldReapIdle(s(DEFAULT + 1), NOW, kaDone), true, "done and past the grace window — reaped");
 });

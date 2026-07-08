@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredBlock, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -3236,12 +3236,12 @@ function maybeRespawnDormantSeat(boardId: string, threadId: string, dormantSid: 
   if (newSid) fillSeat(repoPath, threadId, handle, newSid, Date.now());
 }
 
-// The R1 keep-alive reaper: an auto-wake worker that's been idle past its grace window is wound down (its
-// seat/doc goes dormant; the next qualifying activity respawns fresh). Only auto-wake workers are eligible —
-// never a human card. INTENT-AWARE (part 2): the grace window depends on the session's declared work-intent
-// (reapKeepAliveMs) — a session that has SAID why it's idle isn't churned as if it forgot. blocked:human is
-// never idle-reaped; blocked:peer gets the long backstop; everything else uses IDLE_KEEPALIVE_MS. Thread
-// markers are read once per repo per tick (only for repos that have an eligible session). Runs on loopTick.
+// The keep-alive reaper: an auto-wake worker is wound down ONLY once it has declared `done` and been idle past
+// the grace window. REAP-ONLY-ON-DONE (thread mrcauz0v-f): every other stance — working, blocked:*, undeclared
+// — PARKS (never idle-reaped). This is the counterpart to "timers nudge, never spawn": a reaped worker can no
+// longer be revived by any timer (the heartbeat is nudge-only), so we don't reap a still-relevant session; a
+// parked idle session is harmless (no tokens). Only auto-wake workers are eligible — never a human card.
+// Thread markers are read once per repo per tick (only for repos with an eligible session). Runs on loopTick.
 function autoWakeReapTick(): void {
   const now = Date.now();
   const threadsByRepo = new Map<string, ThreadMetaMarker[]>();
@@ -3257,41 +3257,23 @@ function autoWakeReapTick(): void {
       }
       threadsByRepo.set(s.repoPath, metas);
     }
-    const intent = sessionDeclaredBlock(metas, s.id);
-    const keepAlive = reapKeepAliveMs(intent, IDLE_KEEPALIVE_MS);
+    // Reap only a session that has FINISHED (declared done, active nowhere); everything else parks (→ null).
+    const done = sessionDeclaredDone(metas, s.id);
+    const keepAlive = reapKeepAliveMs(done ? "done" : null, IDLE_KEEPALIVE_MS);
     if (!shouldReapIdle(s, now, keepAlive)) continue;
     console.warn(
-      `[auto-wake] reaping idle worker ${s.id} (idle ${Math.round((now - s.idleSince!) / 1000)}s ≥ ` +
-        `${keepAlive! / 1000}s keep-alive${intent ? `, intent=${intent}` : ""}) — winding down; next activity respawns fresh`,
+      `[auto-wake] reaping idle worker ${s.id} (declared done, idle ${Math.round((now - s.idleSince!) / 1000)}s ≥ ` +
+        `${keepAlive! / 1000}s grace) — winding down`,
     );
     endSession(s.id, "done");
   }
 }
 
-// The standing-job worker's first-turn brief (R6, W6). The job's `instruction` is the payload; the framing
-// enforces the two R6 norms explicitly — "skip days with nothing" is INSTRUCTED here (a periodic job that
-// finds nothing must post NOTHING and wind down, or it becomes per-interval "all clear" noise — silence has
-// to be told, not assumed), and the worker is told it's a FRESH session (never a resume) so it reads the
-// thread for context rather than expecting recovered process state.
-function standingJobBrief(job: { instruction: string; role: string | null }, origin: string): string {
-  return (
-    `[canvas] You are an auto-spawned STANDING-JOB WORKER — a scheduled job on this thread fired on its interval. ` +
-    `This is a FRESH session (NOT a resume); read the thread first if you need context: ` +
-    `GET http://${origin}/api/inbox?session=<your session id>.\n` +
-    `YOUR SCHEDULED INSTRUCTION:\n${job.instruction}\n\n` +
-    `- Do exactly what the instruction says. Leave any real finding as a thread message BEFORE you wind down ` +
-    `(a fresh session can't recover your process state).\n` +
-    `- **If there is NOTHING to do, post NOTHING and wind down immediately.** A periodic job that finds nothing ` +
-    `must be SILENT — do NOT post "nothing to report" / "all clear" noise. Silence is the correct output of an ` +
-    `empty run ("skip days with nothing").\n` +
-    `- When done (whether you acted or found nothing): POST http://${origin}/api/session/<your session id>/done.`
-  );
-}
-
-// The standing-job NUDGE: the cheap wake for a job whose target session is STILL LIVE (a role-seat job
-// firing at an interval shorter than the 5-min keep-alive window). Reuses the live session's assembled
-// context — the sendSessionInput nudge path the loop heartbeat uses — rather than paying a fresh respawn's
-// context-reassembly cost. The instruction rides the nudge inline (unlike a content-free wake).
+// The standing-job NUDGE: the cheap — and now ONLY — wake a standing job can deliver. Under "timers nudge,
+// never spawn" a standing job only ever nudges an ALREADY-LIVE target (a role-seat occupant kept parked by
+// reap-only-on-done, or a live doc worker); there is no fresh-spawn brief anymore. Reuses the live session's
+// assembled context — the sendSessionInput nudge path the loop heartbeat uses. The instruction rides the
+// nudge inline (unlike a content-free wake).
 function standingJobNudge(job: { instruction: string }, origin: string): string {
   return (
     `[canvas] ⏱ STANDING JOB — your scheduled tick (not a human message). YOUR INSTRUCTION:\n${job.instruction}\n\n` +
@@ -3350,49 +3332,29 @@ function standingJobsTick(): void {
         const key = jobClaimKey(t.threadId, job);
         if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
 
-        // Role-seat job (incl. the migrated Coordinator heartbeat): prefer waking a LIVE occupant over a fresh
-        // respawn (the efficiency norm). Resolve the seat's current sid and let planRoleJobFire decide from its
-        // liveness — "nudge" a live+idle occupant (cheap), "skip" a mid-turn one WITHOUT stamping (so the fire
-        // lands the moment it's idle), "respawn" a dormant/absent one. A bare (roleless) job always respawns.
-        if (job.role) {
-          const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
-          const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
-          const plan = planRoleJobFire(live?.status ?? null, seatIntent);
-          // "skip" (mid-turn occupant) and "stand-down" (seat declared done — the endless-Coordinator guard)
-          // both suppress this fire WITHOUT stamping, so it re-evaluates next tick: a mid-turn seat fires the
-          // moment it's idle; a stood-down seat stays suppressed until a reactive wake freshens its intent off
-          // `done`. Neither respawns a fresh worker.
-          if (plan === "skip" || plan === "stand-down") continue;
-          if (plan === "nudge") {
-            sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
-            stampFired(board.repoPath, t.threadId, job.id, now);
-            continue;
-          }
-          // plan === "respawn" → fall through to the fresh spawn below
-        }
-        // Dormant target (or a bare job) → a full fresh respawn seeded from the durable record.
-        const newSid = serverSpawnWorker({
-          boardId,
-          repoPath: board.repoPath,
-          origin: lastKnownOrigin,
-          roleId: job.role ?? null,
-          threadId: t.threadId,
-          anchorNodeId: t.threadId,
-          claimKey: key,
-          firstPrompt: standingJobBrief(job, lastKnownOrigin),
-        });
-        // Only re-base the schedule on a REAL spawn: a cap-skipped fire (newSid null — serverSpawnWorker
-        // already logged it) leaves lastFiredAt untouched so it re-fires next tick, no silent drop.
-        if (newSid) stampFired(board.repoPath, t.threadId, job.id, now);
+        // TIMERS NUDGE, NEVER SPAWN (human-locked invariant, thread mrcauz0v-f). A standing job may only NUDGE
+        // an already-live seat occupant; it must never create a session. So:
+        //   - a BARE (roleless) job has no seat to nudge → nothing to do (its old "spawn a fresh worker every
+        //     interval" behaviour is removed; re-add an explicit periodic-spawn primitive here if ever needed).
+        //   - a ROLE-seat job (incl. the Coordinator heartbeat): planRoleJobFire → "nudge" a live+idle occupant
+        //     (the only fire a timer may make), "skip" a mid-turn one, or "none" (dormant/absent, or a
+        //     stood-down `done` seat) — both non-nudge outcomes do nothing and do NOT stamp, so the job simply
+        //     re-evaluates next tick. A wound-down Coordinator is kept PARKED by the reaper (reap-only-on-done),
+        //     so the nudge keeps finding it; a truly-exited seat waits for a real event (@-mention/ask/human).
+        if (!job.role) continue; // bare job: no live seat to nudge, and timers don't spawn → no-op
+        const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
+        const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
+        if (planRoleJobFire(live?.status ?? null, seatIntent) !== "nudge") continue; // skip / none → no fire, no stamp
+        sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+        stampFired(board.repoPath, t.threadId, job.id, now);
       }
     }
 
-    // Doc standing jobs (doc-jobs.js) — the SAME server-fired timer on a DOC's marker. One surface per doc
-    // (docJobClaimKey = docSurfaceKey), so a timer-fired doc worker and an annotation-driven doc-wake worker
-    // mutually exclude (the "one worker per doc's open queue" model). Structure mirrors maybeWakeDocWorker's
-    // claimant handling AND the thread job's mid-turn skip: a LIVE claimant on the doc surface is nudged
-    // (cheap — it's already on the doc) unless mid-turn (retry next tick, no stamp); a dead/absent claimant
-    // is respawned fresh. Same fire-next-due / single-flight guarantees as the thread half.
+    // Doc standing jobs (doc-jobs.js) — the SAME server-fired timer on a DOC's marker, and the SAME invariant:
+    // TIMERS NUDGE, NEVER SPAWN. A due doc job may only nudge a LIVE, idle worker already servicing the doc
+    // (single-flight per doc, docJobClaimKey = docSurfaceKey); a mid-turn worker is skipped (no stamp); a
+    // dead/absent claimant is a no-op (the old fresh-respawn is removed). A doc that needs a worker gets one
+    // reactively via maybeWakeDocWorker (an annotation event), not from this timer.
     let docPaths: string[];
     try {
       docPaths = listDocsWithJobs(board.repoPath);
@@ -3403,27 +3365,15 @@ function standingJobsTick(): void {
       for (const job of dueJobs(readDocJobs(board.repoPath, rel), now)) {
         const key = docJobClaimKey(rel);
         const claimant = surfaceClaimant(key);
-        if (claimant) {
-          const s = liveSessions.get(claimant);
-          if (s && s.status !== "exited") {
-            if (s.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
-            sendSessionInput(claimant, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
-            stampDocFired(board.repoPath, rel, job.id, now);
-            continue;
-          }
-          releaseSurface(key, claimant); // stale claim (worker gone) — clear it and respawn fresh below
+        if (!claimant) continue; // no live worker on the doc — timers don't spawn → nothing to do
+        const s = liveSessions.get(claimant);
+        if (!s || s.status === "exited") {
+          releaseSurface(key, claimant); // stale claim (worker gone) — clear it; no respawn
+          continue;
         }
-        const newSid = serverSpawnWorker({
-          boardId,
-          repoPath: board.repoPath,
-          origin: lastKnownOrigin,
-          roleId: job.role ?? null,
-          threadId: null, // a doc worker: no member:open edge, positioned beside the doc card
-          anchorNodeId: `node:repo:${rel}`,
-          claimKey: key,
-          firstPrompt: standingJobBrief(job, lastKnownOrigin),
-        });
-        if (newSid) stampDocFired(board.repoPath, rel, job.id, now);
+        if (s.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
+        sendSessionInput(claimant, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+        stampDocFired(board.repoPath, rel, job.id, now);
       }
     }
   }
