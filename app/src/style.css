@@ -3444,6 +3444,48 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
 }
 
+/* The "New file" create form (NewFileItem) — a title input, an editable path field, and a Create button,
+   stacked inside the role-picker's indented shell. */
+.menu-fileform {
+  gap: 4px;
+  padding: 4px 8px 6px 6px;
+}
+.menu-fileinput {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  font: inherit;
+  font-size: 12px;
+  border: 1px solid #00000022;
+  border-radius: 4px;
+  background: #fff;
+  color: inherit;
+}
+.menu-fileinput:focus {
+  outline: none;
+  border-color: #7cc4ff;
+}
+.menu-list .menu-filecreate {
+  justify-content: center;
+  padding: 4px 8px;
+  border: 1px solid #00000022;
+  border-radius: 4px;
+  background: #f4f4f5;
+  font-weight: 600;
+}
+.menu-list .menu-filecreate:disabled {
+  cursor: default;
+  color: #a1a1aa;
+}
+.menu-list .menu-filecreate:disabled:hover {
+  background: #f4f4f5;
+}
+.menu-fileerror {
+  font-size: 11px;
+  color: #dc2626;
+  line-height: 1.35;
+}
+
 /* The board switcher (BoardsItem) — shares the role picker's indented-list shell. A row is the board's
    name with a faint "current"/"dev" tag pushed right; the current board's row is inert. */
 .menu-list .menu-boardopt:disabled {
