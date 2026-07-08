@@ -786,6 +786,25 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
 // createThread / addSessionsCard) so a reopen is an undoable, attributed act.
 const THREAD_CARD_W = 460;
 const THREAD_CARD_H = 420;
+// Cross-card jump-to-message (user waiting-state, P3): the threads-list card's preview popover opens a thread
+// AND asks its card to scroll to a specific mention. The two are decoupled in time — a freshly-opened card
+// mounts async and its feed arrives later — so a request is BOTH stashed in a module map (read once by the
+// card on mount, consumePendingJump) AND broadcast as a window event (caught by an already-open card). The
+// ThreadView retries the scroll as its log renders, so a race between the event and mount can't drop the jump.
+export const THREAD_JUMP_EVENT = "canvas:thread-jump";
+const pendingJumps = new Map<string, number>();
+export function requestThreadJump(threadId: string, seq: number): void {
+  pendingJumps.set(threadId, seq);
+  window.dispatchEvent(new CustomEvent(THREAD_JUMP_EVENT, { detail: { threadId, seq } }));
+}
+/** Read + clear a pending jump for a thread (the card consumes it on mount). null when there is none. */
+export function consumePendingJump(threadId: string): number | null {
+  const seq = pendingJumps.get(threadId);
+  if (seq == null) return null;
+  pendingJumps.delete(threadId);
+  return seq;
+}
+
 export function openChannel(m: InteractionManager, threadId: string, title: string, text: string, at?: Pos): void {
   const id = threadId as Id<"node">;
   if (m.editor.store.get<"node">(id)) {

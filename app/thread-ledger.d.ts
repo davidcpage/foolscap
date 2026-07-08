@@ -52,6 +52,7 @@ export interface ThreadMetaMarker {
   seats?: Record<string, SeatRecord>;
   levels?: Record<string, NotificationLevel>; // sid-keyed wake preference for seatless members (P1/W4)
   pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
+  seenMentions?: number[]; // @human mention seqs the human has VIEWED (user waiting-state), sorted
   members?: Record<string, { joinedAt: number }>; // durable membership — survives the card/edge (delete-card-keep-session)
 }
 
@@ -112,6 +113,8 @@ export function pinMessage(
   ts: number,
 ): PinnedMsg[];
 export function unpinMessage(repoPath: string, threadId: string, seq: number): PinnedMsg[];
+export function readSeenMentions(repoPath: string, threadId: string): number[];
+export function markSeenMentions(repoPath: string, threadId: string, seqs: number[]): number[];
 export function addThreadMember(
   repoPath: string,
   threadId: string,

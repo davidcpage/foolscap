@@ -1322,40 +1322,117 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #6366f11a;
   box-shadow: inset 0 0 0 1px #6366f159;
 }
-/* WAITING (user waiting-state + you-pill, Phase 2 — the threads-list card): a thread with an unaddressed
-   @you/@human mention. Amber — the same "your turn" hue as the thread card's "you" pill (.chan-member-you
-   .waiting) and an agent's blocked:human — so the list and the open card read the same. A waiting row is
-   single-click-to-transport (see render.js), hence the pointer cursor. position:relative anchors the count
-   badge. Server-derived (handleThreads → humanWaiting); sets/clears live as messages/replies re-pull the list. */
-.ses-row.waiting {
+/* The threads-list card's TWO differentiated per-row signals (user waiting-state + you-pill), distinct hues:
+   (a) UNSEEN MENTION — a thread with @you/@human mentions the human hasn't viewed. QUIET indigo, an inline
+   count badge that reveals a preview popover on hover. (b) AGENT AWAITING YOU — the thread's fused state is
+   `waiting` (a live participant blocked:human). LOUD amber 'your turn'. Either makes the row single-click-to-
+   transport (pointer cursor); amber (b) wins the row background when both are lit. position:relative anchors
+   the badges/popover. Server-derived (handleThreads); sets/clears live as messages/replies/seen re-pull. */
+.ses-row.unseen,
+.ses-row.your-turn {
   position: relative;
   cursor: pointer;
+}
+/* (a) unseen mentions — the quieter signal: a faint indigo wash + accent rail. */
+.ses-row.unseen {
+  background: #eef0fb;
+  border-left-color: #6366f1;
+}
+.ses-row.unseen:hover { background: #e5e8f9; }
+.ses-row.unseen .ses-row-title { color: #4338ca; }
+/* (b) agent awaiting you — the louder signal: amber, matching an agent's blocked:human pill. Listed AFTER
+   (a) so amber wins the background when a row carries both signals. */
+.ses-row.your-turn {
   background: #fdf0e0;
   border-left-color: #f59e0b;
 }
-.ses-row.waiting:hover {
-  background: #fbe6cf;
-}
-.ses-row.waiting .ses-row-title {
-  color: #b45309;
-  font-weight: 600;
-  padding-right: 22px; /* clear the corner badge */
-}
-/* The count badge: how many mentions await, pinned top-right like a notification dot. */
-.ses-row-wait {
+.ses-row.your-turn:hover { background: #fbe6cf; }
+.ses-row.your-turn .ses-row-title { color: #b45309; font-weight: 600; }
+/* The row is a COLUMN flex (title over meta), so the signals ride an absolutely-positioned corner cluster
+   (like the old single badge did) rather than inline. The title reserves space for it (.ses-row-title-pad). */
+.ses-row-title-pad { padding-right: 74px; }
+.ses-row-signals {
   position: absolute;
   top: 4px;
   right: 8px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+/* (b)'s marker — a small amber 'your turn' chip (no count; a blocked agent is binary). */
+.ses-row-turn {
+  font-size: 9px;
+  font-weight: 700;
+  color: #b45309;
+  background: #fbe2c2;
+  border-radius: 8px;
+  padding: 0 6px;
+  line-height: 15px;
+  white-space: nowrap;
+}
+/* (a)'s count badge — indigo, echoing the row's unseen hue; position:relative anchors the popover. */
+.ses-row-unseen {
+  position: relative;
   min-width: 16px;
   height: 16px;
-  padding: 0 4px;
+  padding: 0 5px;
   font-size: 10px;
   font-weight: 700;
   line-height: 16px;
   text-align: center;
   color: #fff;
-  background: #d97706;
+  background: #6366f1;
   border-radius: 8px;
+  cursor: help;
+}
+/* The unseen-mention PREVIEW popover (Issue #4 pattern): lists the pending mentions, each a cross-card jump.
+   Hidden until the badge is hovered; pointer-events:auto + NO gap to the badge (top-anchored, overlapping) so
+   the cursor can travel from the badge into the list without crossing dead space and dropping :hover. It stays
+   visible while hovered because it's a DOM descendant of the badge (hovering it keeps .ses-row-unseen:hover). */
+.ses-row-preview {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 30;
+  min-width: 210px;
+  max-width: 300px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 6px;
+  background: #fff;
+  border: 1px solid #e4e4e7;
+  border-radius: 7px;
+  box-shadow: 0 6px 20px #0000001f;
+  pointer-events: auto;
+  text-align: left;
+  cursor: default;
+}
+.ses-row-unseen:hover .ses-row-preview { display: block; }
+.ses-row-preview-head { display: block; font-size: 10px; font-weight: 700; color: #4338ca; }
+.ses-row-preview-more { display: block; margin-top: 3px; color: #a1a1aa; font-size: 9px; }
+.ses-row-preview-item {
+  display: block;
+  width: 100%;
+  margin-top: 4px;
+  padding: 4px 6px;
+  border: 1px solid #ececef;
+  border-radius: 5px;
+  background: #fafafa;
+  text-align: left;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.ses-row-preview-item:hover { background: #eef0fb; border-color: #cdd3f4; } /* indigo, echoing the unseen hue */
+.ses-row-preview-from { display: block; font-size: 10px; font-weight: 700; color: #52525b; }
+.ses-row-preview-text {
+  display: block;
+  font-size: 10px;
+  color: #71717a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 /* The title line: an optional role chip then the session title, on one row (the chip never shrinks, the
    title takes the rest and ellipsises). */
@@ -2868,44 +2945,9 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-member:hover .chan-tip-up { display: block; }
 .chan-desc-wrap:hover .chan-tip-brief { display: block; }
-/* The waiting "you" pill's PREVIEW popover (Phase 3): lists the actual waiting messages, each click-to-jump.
-   Interactive like .chan-tip-brief — pointer-events:auto + NO gap to the trigger (bottom:100%, not the
-   default up-variant's +4px), so the cursor can travel from the pill up into the list without crossing dead
-   space and dropping the :hover that shows it. It stays visible while hovered because it's a DOM descendant
-   of .chan-member (hovering it keeps .chan-member:hover true). Wider + scrollable for a multi-row list. */
-.chan-tip-preview {
-  bottom: 100%;
-  min-width: 220px;
-  max-width: 320px;
-  max-height: 220px;
-  overflow-y: auto;
-  pointer-events: auto;
-}
-.chan-tip-preview-more { display: block; margin-top: 3px; color: #a1a1aa; font-size: 9px; }
-.chan-tip-preview-item {
-  display: block;
-  width: 100%;
-  margin-top: 4px;
-  padding: 4px 6px;
-  border: 1px solid #ececef;
-  border-radius: 5px;
-  background: #fafafa;
-  text-align: left;
-  cursor: pointer;
-  font: inherit;
-  color: inherit;
-}
-.chan-tip-preview-item:hover { background: #fdf0e0; border-color: #f3d7b0; } /* amber, echoing the waiting hue */
-.chan-tip-preview-from { display: block; font-weight: 700; color: #52525b; }
-.chan-tip-preview-text {
-  display: block;
-  color: #71717a;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-/* Jump-to-message landing pulse (Phase 3): a brief amber wash so the eye finds the message the log scrolled
-   to. Removed+re-added in jumpToSeq (with a reflow) so a repeat click on the same message re-fires it. */
+/* Jump-to-message landing pulse (user waiting-state): a brief amber wash so the eye finds the message the log
+   scrolled to — fired by jumpToSeq, whether from the pinned-nav or a cross-card jump from the threads-list
+   preview. Removed+re-added (with a reflow) so a repeat jump to the same message re-fires it. */
 @keyframes chan-jump-flash { from { background: #fde9c8; } to { background: transparent; } }
 .chan-msg.jump-flash { animation: chan-jump-flash 1.1s ease-out; }
 .chan-tip-line { display: block; }
@@ -3153,14 +3195,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-color: #d4d4d8;
   font-weight: 600;
 }
-/* Waiting (user waiting-state): an @you/@human mention awaits the human. Amber — the same "your turn" hue
-   as an agent's blocked:human pill (2938) — so the owner's own pill reads as "a message awaits you"; clears
-   when they reply (clear-on-reply, derived server-side by thread-waiting.js). Two classes → wins over the
-   neutral rule above. */
-.chan-member-you.waiting {
-  background: #fdf0e0;
-  color: #b45309;
-  border-color: #f3d7b0;
+/* Presence (user waiting-state + you-pill): the owner's pill is PRESENCE-only — grey (the neutral rule above)
+   when the card isn't focused, a calm green when it is (`.present`, set from the card's `selected` state). No
+   waiting/amber semantics live here anymore (unseen mentions surface on the threads-list card, and clear by
+   being viewed in the log). Green echoes the working/live hue without borrowing a work-intent's exact chip.
+   Two classes → wins over the neutral rule above. */
+.chan-member-you.present {
+  background: #eaf7ec;
+  color: #3f7a4c;
+  border-color: #cfe9d3;
 }
 .chan-post {
   display: flex;

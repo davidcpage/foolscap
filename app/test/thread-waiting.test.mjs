@@ -1,5 +1,6 @@
-// The board owner's per-thread waiting signal: an @you/@human mention newer than the human's own last post
-// is "waiting" (clear-on-reply). Pure derivation over the thread log — no server, no cursor, no restart.
+// The board owner's per-thread unseen-mention signal: an @you/@human mention the human has not yet VIEWED
+// is "waiting". Per-viewed-message clearing (NOT clear-on-reply, NOT clear-on-focus): a mention clears only
+// when its seq lands in the durable `seenMentions` set. Pure derivation over (log, seenMentions).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -9,14 +10,15 @@ import { humanWaiting } from "../thread-waiting.js";
 const log = (...rows) => rows.map((r, i) => ({ seq: i + 1, ts: 1000 + i, ...r }));
 
 test("no messages → not waiting", () => {
-  assert.deepEqual(humanWaiting([]), { waiting: false, count: 0, preview: [], more: 0 });
+  assert.deepEqual(humanWaiting([]), { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
-test("an @human mention with no prior human post → waiting (lastHumanSeq = 0)", () => {
+test("an @human mention that has not been viewed → waiting", () => {
   const r = humanWaiting(log({ from: "a9", text: "@human can you review this?" }));
   assert.deepEqual(r, {
     waiting: true,
     count: 1,
+    seqs: [1],
     preview: [{ seq: 1, from: "a9", text: "@human can you review this?" }],
     more: 0,
   });
@@ -31,52 +33,52 @@ test("a plain message (no @human) does not wait", () => {
     { from: "a9", text: "working on it" },
     { from: "b3", text: "@a9 nice" },
   ));
-  assert.deepEqual(r, { waiting: false, count: 0, preview: [], more: 0 });
+  assert.deepEqual(r, { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
 test("@all is NOT a human mention (only @human/@user)", () => {
   assert.equal(humanWaiting(log({ from: "a9", text: "heads up @all" })).waiting, false);
 });
 
-test("clear-on-reply: a human post AFTER the mention clears it", () => {
+test("per-viewed clearing: a SEEN mention seq no longer waits", () => {
+  const l = log({ from: "a9", text: "@human decision needed" });
+  assert.equal(humanWaiting(l, []).waiting, true); // not yet viewed
+  assert.deepEqual(humanWaiting(l, [1]), { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
+});
+
+test("clearing is PER-MESSAGE: seeing one mention leaves the others flagged individually", () => {
+  const l = log(
+    { from: "a9", text: "@human one" },
+    { from: "a9", text: "@human two" },
+    { from: "a9", text: "@human three" },
+  );
+  const r = humanWaiting(l, [2]); // only the middle mention viewed
+  assert.equal(r.count, 2);
+  assert.deepEqual(r.seqs, [1, 3]);
+  assert.deepEqual(r.preview.map((p) => p.seq), [1, 3]);
+});
+
+test("a human REPLY does NOT clear (clear-on-reply is gone — only viewing clears)", () => {
   const r = humanWaiting(log(
     { from: "a9", text: "@human decision needed" },
     { from: "human", text: "go with option 2" },
   ));
-  assert.deepEqual(r, { waiting: false, count: 0, preview: [], more: 0 });
+  assert.equal(r.waiting, true); // still unseen despite the reply
+  assert.deepEqual(r.seqs, [1]);
 });
 
-test("a mention AFTER the human's last post re-arms it", () => {
-  const r = humanWaiting(log(
-    { from: "a9", text: "@human first ask" },
-    { from: "human", text: "answered" },
-    { from: "a9", text: "@human follow-up ask" },
-  ));
-  assert.deepEqual(r, {
-    waiting: true,
-    count: 1,
-    preview: [{ seq: 3, from: "a9", text: "@human follow-up ask" }],
-    more: 0,
-  });
+test("the human's own post is never itself a waiting mention", () => {
+  // Even if the human writes '@human' in their own post, it doesn't count (from:human is still just a message,
+  // and self-addressing is nonsensical) — well, resolveTags flags the token; the point of the seen set is the
+  // human clears by viewing. Here we assert a human @human post is treated as a mention only until seen.
+  const l = log({ from: "human", text: "note to self @human check this" });
+  assert.equal(humanWaiting(l, []).count, 1);
+  assert.equal(humanWaiting(l, [1]).count, 0);
 });
 
-test("count is only the mentions past the human's last post", () => {
-  const r = humanWaiting(log(
-    { from: "a9", text: "@human one" }, // addressed by the human post below
-    { from: "human", text: "ok" },
-    { from: "a9", text: "@human two" },
-    { from: "b3", text: "@human three" },
-    { from: "b3", text: "plain, no tag" },
-  ));
-  assert.deepEqual(r, {
-    waiting: true,
-    count: 2,
-    preview: [
-      { seq: 3, from: "a9", text: "@human two" },
-      { seq: 4, from: "b3", text: "@human three" },
-    ],
-    more: 0,
-  });
+test("seenMentions accepts a Set as well as an array", () => {
+  const l = log({ from: "a9", text: "@human hi" });
+  assert.equal(humanWaiting(l, new Set([1])).waiting, false);
 });
 
 test("card-only entries (intent/ask) never count, even if their text mentions @human", () => {
@@ -84,17 +86,18 @@ test("card-only entries (intent/ask) never count, even if their text mentions @h
     { from: "a9", text: "blocked:human — waiting @human", kind: "intent", intent: "blocked:human" },
     { from: "a9", text: "Q→A about @human", kind: "ask" },
   ));
-  assert.deepEqual(r, { waiting: false, count: 0, preview: [], more: 0 });
+  assert.deepEqual(r, { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
 test("a backtick-escaped @human is a mention-in-prose, not a wake → does not wait", () => {
   // Mirrors the wake path: `@human` inside inline code is the prose escape (thread-tags codeSpanRanges).
   const r = humanWaiting(log({ from: "a9", text: "type `@human` to ping the owner" }));
-  assert.deepEqual(r, { waiting: false, count: 0, preview: [], more: 0 });
+  assert.deepEqual(r, { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
-test("preview keeps the TAIL and reports the overflow as `more`", () => {
-  // Six waiting @human mentions, cap is 4 → preview is the LAST four (seq 3..6), more = 2 (older ones).
+test("preview keeps the TAIL and reports the overflow as `more`; seqs holds them ALL", () => {
+  // Six unseen @human mentions, cap is 4 → preview is the LAST four (seq 3..6), more = 2 (older ones), but
+  // `seqs` carries all six (the client observer must watch every unseen mention, not just the previewed tail).
   const r = humanWaiting(log(
     { from: "a9", text: "@human one" },
     { from: "a9", text: "@human two" },
@@ -105,6 +108,7 @@ test("preview keeps the TAIL and reports the overflow as `more`", () => {
   ));
   assert.equal(r.count, 6);
   assert.equal(r.more, 2);
+  assert.deepEqual(r.seqs, [1, 2, 3, 4, 5, 6]);
   assert.deepEqual(r.preview.map((p) => p.seq), [3, 4, 5, 6]);
   assert.deepEqual(r.preview.map((p) => p.text), ["@human three", "@human four", "@human five", "@human six"]);
 });

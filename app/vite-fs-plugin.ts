@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, markSeenMentions, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readSeenMentions, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -1415,17 +1415,22 @@ function threadParticipants(boardId: string, threadId: string, marker: ThreadMet
 function handleThreads(res: ServerResponse, boardId: string, repoPath: string): void {
   const threads = listThreads(repoPath).map((m) => {
     const participants = threadParticipants(boardId, m.threadId, m);
-    // The board owner's WAITING signal per thread (user waiting-state + you-pill, Phase 2): an unaddressed
-    // @you/@human mention → the threads-list card highlights this row so the human can find it. Same
-    // server-side derivation as the thread:<id> feed's pill (humanWaiting over the log), so the list and the
-    // open card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
-    // fresh by appendThreadMsg), so this stays a cheap read; the threads:<board> ping re-pulls on any
-    // message or reply, setting/clearing the highlight live.
-    // Only the waiting flag + count here: the threads-list card shows an amber highlight and a count badge,
-    // no per-message preview (you can't select a message from the list — the thread card's "you" pill is
-    // where the preview + jump-to-message lives, off the thread:<id> feed). So we drop preview/more.
-    const { waiting: youWaiting, count: youWaitingCount } =
-      humanWaiting(threadLog(boardId, m.threadId));
+    // The board owner's UNSEEN-MENTION signal per thread (user waiting-state + you-pill): an @you/@human
+    // mention the human has not yet VIEWED (humanWaiting × the durable per-thread `seenMentions`) → the
+    // threads-list row shows signal (a): a quiet count badge + an interactive hover popover of the pending
+    // mentions, each click a cross-card jump to that message. Same derivation the thread card feeds off, so
+    // list and card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
+    // fresh by appendThreadMsg); the threads:<board> ping re-pulls on any message/reply/seen, so the signal
+    // sets and clears live. Unlike the card feed, the rail carries the PREVIEW (sender + snippet) — the rail
+    // is where the human picks a specific message to jump to (the "you" pill is presence-only now). Sender
+    // labels resolve server-side (the rail card can't reach the client name registry): a seated poster shows
+    // its role handle, else a short sid — @human mentions come from seated agents, so the role reads well.
+    const seats = m.seats ?? {};
+    const fromLabel = (sid: string) =>
+      sid === "human" ? "you" : sid === "system" ? "system" : (seatForSid(seats, sid) ?? sid.slice(0, 8));
+    const { waiting: youWaiting, count: youWaitingCount, preview, more: youWaitingMore } =
+      humanWaiting(threadLog(boardId, m.threadId), readSeenMentions(repoPath, m.threadId));
+    const youWaitingPreview = preview.map((p) => ({ ...p, fromLabel: fromLabel(p.from) }));
     return {
       threadId: m.threadId,
       chanId: m.threadId,
@@ -1435,6 +1440,8 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
       youWaiting,
       youWaitingCount,
+      youWaitingPreview,
+      youWaitingMore,
       // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
       // declarer holds one, else sid) — the raw material the state projection derives from.
       intents: m.intents ?? {},
@@ -2620,20 +2627,21 @@ function threadLog(boardId: string, threadId: string): ThreadMsg[] {
 function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean): void {
   const repoPath = boards.get(boardId)?.repoPath;
   const pins: PinnedMsg[] = repoPath ? readPins(repoPath, threadId) : [];
-  // The board owner's waiting signal (user waiting-state + you-pill): an @you/@human mention newer than the
-  // human's own last post is unaddressed → colour the "you" roster pill amber. Clear-on-reply, derived
-  // read-time from the log (no cursor, no durable state — thread-waiting.js). `count` feeds the pill tooltip.
-  // `count` feeds the pill badge; `preview`/`more` feed the pill's hover preview + jump-to-message (Phase 3).
-  const { waiting: youWaiting, count: youWaitingCount, preview: youWaitingPreview, more: youWaitingMore } =
-    humanWaiting(messages);
+  // The board owner's unseen-mention signal (user waiting-state + you-pill): an @you/@human mention the human
+  // has not yet VIEWED (thread-waiting.js × the durable per-thread `seenMentions`). On the OPEN thread card
+  // this no longer paints the "you" pill (that is presence-only now); it drives the client's viewport
+  // observer, which marks a mention seen once it scrolls into view. So the card feed carries only what that
+  // observer needs — `youWaitingSeqs`, EVERY still-unseen mention seq to watch — plus the count for parity
+  // with the rail. The rail popover's preview/more ride /api/threads (handleThreads), not this feed.
+  const seen = repoPath ? readSeenMentions(repoPath, threadId) : [];
+  const { waiting: youWaiting, count: youWaitingCount, seqs: youWaitingSeqs } = humanWaiting(messages, seen);
   publishFeed("thread:" + threadId, {
     messages,
     truncated,
     pins,
     youWaiting,
     youWaitingCount,
-    youWaitingPreview,
-    youWaitingMore,
+    youWaitingSeqs,
   });
 }
 
@@ -5020,6 +5028,43 @@ async function handleThreadPin(
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
+// POST /api/thread/<id>/seen { from, seqs } — mark @you/@human MENTION seqs the human has now VIEWED (user
+// waiting-state + you-pill). Driven by the thread card's viewport observer: when a still-unseen mention
+// scrolls into the log while the card is focused, its seq is POSTed here and unioned into the durable
+// `seenMentions` set (thread-ledger.markSeenMentions), which drops it from the unseen count individually
+// (per-viewed-message clearing — NOT clear-on-reply, NOT clear-on-focus). Idempotent: re-marking a seen seq is
+// a no-op. Consent mirrors handleThreadPin — a member (or the human at the card, who is not a session node)
+// may mark seen. `seqs` must be an array of positive integers.
+async function handleThreadSeen(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  let body: { from?: unknown; seqs?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  if (!Array.isArray(body.seqs) || !body.seqs.every((s) => Number.isInteger(s) && (s as number) >= 1))
+    return sendJson(res, 400, { error: "seqs must be an array of positive integers" });
+  const records = boardSnapshotRecords(boardId);
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  const seen = markSeenMentions(repoPath, threadId, body.seqs as number[]);
+  // Republish the card feed (shrinks youWaitingSeqs) + nudge the rail (clears/decrements signal (a)) so both
+  // surfaces reflect the newly-viewed mentions live, exactly like a pin does.
+  publishThreadFeed(boardId, threadId, threadLog(boardId, threadId), false);
+  publishFeed("threads:" + boardId, { ts: Date.now() });
+  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seen });
+}
+
 // POST /api/thread/<id>/worktree — manage the thread's work-item worktrees. `op:"remove"` (Stage 1) is the
 // EXPLICIT teardown fired on WORK-ITEM completion, guarded: it skips+warns on a dirty tree or unmerged branch
 // unless `force`. `op:"merge"` (Stage 3) is merge-on-green: green-gate the branch in its worktree (skip with
@@ -5328,7 +5373,7 @@ export function fsApi(): Plugin {
         // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
         // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
         // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|job|worktree)$/.exec(url.pathname);
+        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|seen|job|worktree)$/.exec(url.pathname);
         if (threadMatch && req.method === "POST") {
           const b = reqBoard(url);
           if (!b) return sendJson(res, 400, { error: "unknown board" });
@@ -5341,6 +5386,7 @@ export function fsApi(): Plugin {
           if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
           if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
           if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
+          if (action === "seen") return void handleThreadSeen(req, res, b.boardId, threadId);
           if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
           if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);
           return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));

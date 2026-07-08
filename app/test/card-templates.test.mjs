@@ -330,55 +330,74 @@ test("sessions template lists the off-log session list, each row draggable, with
   assert.ok(empty.includes("no sessions on disk"), "an empty list → empty marker");
 });
 
-test("channels template highlights a WAITING thread (user waiting-state + you-pill, Phase 2) and offers click-to-transport", async () => {
+test("channels template renders the two differentiated waiting signals (user waiting-state + you-pill): unseen mentions + agent-awaiting", async () => {
   const mod = await loadTemplate("channels");
   assert.equal(mod.contract, 1);
 
-  // channelList is the off-log /api/threads projection (content.ts). Phase 2 adds the board owner's
-  // per-thread waiting signal — youWaiting / youWaitingCount, server-derived (handleThreads → humanWaiting),
-  // the same signal the thread card's "you" pill uses. A waiting row is highlighted (the `waiting` class,
-  // amber in CSS) and carries a count badge; a click on it transports the human to that thread card via the
-  // channelOpen capability (fly-to-if-present, else open). One waiting + one calm thread in the list.
+  // channelList is the off-log /api/threads projection (content.ts). The reworked waiting-state adds TWO
+  // differentiated per-row signals: (a) UNSEEN MENTION — youWaiting/youWaitingCount + a preview popover
+  // (youWaitingPreview), a quiet indigo `unseen` row + count badge; (b) AGENT AWAITING YOU — ch.state ===
+  // "waiting" (the fused thread-state), the loud amber `your-turn` row. Both are independent and can coexist.
+  // Four rows: only-mention, only-your-turn, both, and calm.
   let opened = null;
+  let jumped = null;
   const channels = [
-    { chanId: "node:thread:aa", title: "Needs you", text: "brief a", messages: 6, mtime: Date.now() - 4000, youWaiting: true, youWaitingCount: 2 },
-    { chanId: "node:thread:bb", title: "All quiet", text: "brief b", messages: 3, mtime: Date.now() - 90_000, youWaiting: false, youWaitingCount: 0 },
+    { chanId: "node:thread:aa", title: "Unseen only", text: "brief a", messages: 6, mtime: Date.now() - 4000, state: "active",
+      youWaiting: true, youWaitingCount: 2, youWaitingMore: 0,
+      youWaitingPreview: [{ seq: 5, from: "s1", fromLabel: "Coordinator", text: "@human decision?" }, { seq: 6, from: "s2", fromLabel: "Builder", text: "@human ok to ship?" }] },
+    { chanId: "node:thread:bb", title: "Your turn only", text: "brief b", messages: 3, mtime: Date.now() - 9000, state: "waiting", youWaiting: false, youWaitingCount: 0 },
+    { chanId: "node:thread:cc", title: "Both", text: "brief c", messages: 9, mtime: Date.now() - 200, state: "waiting",
+      youWaiting: true, youWaitingCount: 1, youWaitingMore: 0, youWaitingPreview: [{ seq: 9, from: "s1", fromLabel: "Coordinator", text: "@human blocked" }] },
+    { chanId: "node:thread:dd", title: "All quiet", text: "brief d", messages: 3, mtime: Date.now() - 90_000, state: "dormant", youWaiting: false, youWaitingCount: 0 },
   ];
   const card = {
     fields: { title: "", text: "", color: "purple" },
-    signals: { channelList: channels, channelRefresh: () => {}, channelOpen: (id) => { opened = id; } },
+    signals: {
+      channelList: channels,
+      channelRefresh: () => {},
+      channelOpen: (id) => { opened = id; },
+      channelJump: (id, _t, _x, seq) => { jumped = { id, seq }; },
+    },
   };
   const out = flatten(mod.render(card));
 
   assert.ok(out.includes("threads"), "header label");
-  assert.ok(out.includes("Needs you") && out.includes("All quiet"), "both threads listed by title");
+  assert.ok(["Unseen only", "Your turn only", "Both", "All quiet"].every((t) => out.includes(t)), "all threads listed");
 
-  // Exactly the waiting row wears the `waiting` class and the count badge — the calm one does not.
-  assert.equal((out.match(/ses-row waiting/g) || []).length, 1, "only the waiting thread gets the waiting highlight");
-  assert.equal((out.match(/ses-row-wait/g) || []).length, 1, "only the waiting thread shows a count badge");
-  assert.ok(out.includes('ses-row-wait" title="messages awaiting you">2<'), "the badge shows the awaiting count");
+  // (a) unseen: exactly the two mention-bearing rows wear `unseen` + the count badge; the calm/your-turn-only do not.
+  assert.equal((out.match(/ses-row-unseen"/g) || []).length, 2, "only mention-bearing rows show the unseen badge");
+  assert.ok(out.includes("2 unseen mentions"), "count badge tooltip (plural)");
+  // (b) your-turn: exactly the two `waiting`-state rows wear the amber your-turn class + chip.
+  assert.equal((out.match(/ses-row-turn"/g) || []).length, 2, "only waiting-state rows show the your-turn chip");
+  assert.ok(out.includes("your turn"), "the your-turn chip label");
+  // The 'Both' row carries BOTH signal classes on the one row.
+  assert.ok(out.includes('class="ses-row your-turn unseen"'), "a row can carry both signals at once");
 
-  // The waiting row's tooltip documents the one-click transport (the calm row keeps the double-click hint).
-  assert.ok(out.includes("2 messages await you — click to go to this thread"), "waiting row documents click-to-transport");
+  // The preview popover lists the pending mentions with their resolved sender label + snippet.
+  assert.ok(out.includes("Coordinator") && out.includes("@human decision?"), "preview lists sender label + snippet");
+
+  // A calm row keeps the double-click/drag hint; a signalling row documents click-to-transport.
   assert.ok(out.includes("double-click or drag onto the canvas to open this thread"), "calm row keeps the double-click/drag hint");
+  assert.ok(out.includes("click to go to this thread"), "a signalling row documents click-to-transport");
 
-  // The transport routes through the channelOpen capability (loader.openChannel flies to the card if it
-  // already exists, else opens it) — the same action the double-click open uses. Drive it directly, as the
-  // sessions test drives sessionRefresh, since the render-string path doesn't fire lit event bindings.
-  card.signals.channelOpen("node:thread:aa", "Needs you", "brief a");
+  // Transport routes through channelOpen; a preview click routes through channelJump (open + scroll-to-seq).
+  // Drive them directly, as the sessions test drives sessionRefresh — the render-string path doesn't fire lit bindings.
+  card.signals.channelOpen("node:thread:aa", "Unseen only", "brief a");
   assert.equal(opened, "node:thread:aa", "channelOpen transports to the clicked thread");
+  card.signals.channelJump("node:thread:aa", "Unseen only", "brief a", 5);
+  assert.deepEqual(jumped, { id: "node:thread:aa", seq: 5 }, "channelJump carries the target mention seq");
 
-  // Singular count wording, and a thread with no waiting fields at all (older server) draws no highlight.
+  // Singular wording, and a thread with no signal fields at all (older server) draws neither highlight.
   const one = flatten(mod.render({
     fields: { title: "", text: "", color: "purple" },
-    signals: { channelList: [{ chanId: "node:thread:cc", title: "One", text: "", messages: 1, mtime: Date.now(), youWaiting: true, youWaitingCount: 1 }], channelOpen: () => {} },
+    signals: { channelList: [{ chanId: "node:thread:ee", title: "One", text: "", messages: 1, mtime: Date.now(), state: "active", youWaiting: true, youWaitingCount: 1, youWaitingPreview: [{ seq: 1, from: "s1", fromLabel: "s1", text: "@human hi" }] }], channelOpen: () => {} },
   }));
-  assert.ok(one.includes("1 message await you — click to go to this thread"), "singular 'message' wording");
+  assert.ok(one.includes("1 unseen mention"), "singular 'mention' wording");
   const legacy = flatten(mod.render({
     fields: { title: "", text: "", color: "purple" },
-    signals: { channelList: [{ chanId: "node:thread:dd", title: "Legacy", text: "", messages: 2, mtime: Date.now() }], channelOpen: () => {} },
+    signals: { channelList: [{ chanId: "node:thread:ff", title: "Legacy", text: "", messages: 2, mtime: Date.now() }], channelOpen: () => {} },
   }));
-  assert.ok(!legacy.includes("ses-row waiting") && !legacy.includes("ses-row-wait"), "a thread without the youWaiting field is not highlighted");
+  assert.ok(!legacy.includes("ses-row-unseen") && !legacy.includes("ses-row-turn"), "a thread without the signal fields shows neither");
 });
 
 test("session template applies the jsonl codec: turns, tool calls with results, thinking", async () => {
