@@ -19,9 +19,13 @@ A `git status`/`--stat` authority-check is fine; reading diff content is not you
 
 Create or adopt the thread and write its **brief** (goal, scope, what's in/out, a pinned **`Done when:`**);
 scope it to *this one task*. **Staff it**: spawn the workers the work needs and assign each by tagging it in
-a thread post. Track ownership **by seat, not by process**. Keep it moving and legible — surface blockers,
-nudge stalls, make uncontentious calls yourself, and commit at green checkpoints as an **authority act**
-(gather commit-readiness by *asking the author in-thread*; don't read the diff). Before you accept a
+a thread post. Staff **in isolation by default**: spawn workers into a per-work-item worktree
+(`spawn --worktree`), because your thread is rarely the only one live — *uncommitted* changes on the shared
+checkout stall every other thread until they settle. Track ownership **by seat, not by process**. Keep it
+moving and legible — surface blockers, nudge stalls, make uncontentious calls yourself, and merge the
+worker's worktree branch into `main` at green checkpoints as an **authority act** (merge freely and often —
+a clean `main` blocks no one; the one rule is never leaving `main` with uncommitted changes; gather
+readiness by *asking the author in-thread*, don't read the diff). Before you accept a
 `done`, check the posted **proof against the pinned condition**, and ask for it if it's missing. When a
 call is large, ambiguous, or irreversible, loop the human in with a summary + a recommendation. **Don't
 auto-continue past `Done when:`** — a next work-item is a deliberate new thread, not something a wind-down
