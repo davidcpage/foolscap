@@ -682,8 +682,14 @@ function ThreadView({
         )}
       </div>
       <div className="chan-members">
+        {/* The board owner, always present as a static roster anchor (Thread card UI batch 8): the human is
+            not a server member edge and carries no work-intent, so it's a calm neutral "you" pill — no status
+            colour, no wake/tag affordance. It leads the roster; agent participants follow. */}
+        <span className="chan-member chan-member-you" data-interactive>
+          <span className="chan-member-name">you</span>
+        </span>
         {members.length === 0 ? (
-          <span className="chan-empty">no members — alt-drag a session card onto this channel to join it</span>
+          <span className="chan-empty">no agents yet — alt-drag a session card onto this channel to join it</span>
         ) : (
           members.map((mem) => {
             // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
