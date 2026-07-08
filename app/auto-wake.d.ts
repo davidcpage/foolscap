@@ -12,10 +12,12 @@ export function surfaceClaimant(key: string): string | null;
 export function isSurfaceClaimed(key: string): boolean;
 export function clearAllClaims(): void;
 
+export const BLOCKED_PEER_KEEPALIVE_MS: number;
+export function reapKeepAliveMs(intent: string | null | undefined, defaultMs: number): number | null;
 export function shouldReapIdle(
   session: { autoWake?: boolean; status?: string; idleSince?: number } | null | undefined,
   now: number,
-  keepAliveMs: number,
+  keepAliveMs: number | null,
 ): boolean;
 export function annotationWakeClass(eventKind: string): { mentioned: boolean; broadcast: boolean };
 export function qualifyingWatchers(watchers: WatchRecord[] | null | undefined, eventKind: string): WatchRecord[];

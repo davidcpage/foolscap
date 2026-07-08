@@ -240,6 +240,31 @@ export function ownBlockedIntentKeys(intents, sid) {
 }
 
 /**
+ * The STRONGEST `blocked:*` work-intent this session itself currently holds across `metas` (the thread
+ * markers from listThreads), or null — the reaper's read of "has this session SAID why it's idle?" (part 2,
+ * intent-aware reaping; auto-wake.reapKeepAliveMs turns the answer into a keep-alive window). "Strongest" is
+ * `blocked:human` > `blocked:peer`: a human block is never idle-reaped, a peer block gets a long backstop,
+ * so a session blocked on a human on ANY thread must win. "Its own" mirrors ownBlockedIntentKeys — a
+ * sid-stamped record (covers a seat-keyed OR bare-sid self-declaration), never another occupant's
+ * seat-inherited block. Pure; short-circuits on the first `blocked:human`.
+ *
+ * @param {Array<{ intents?: Record<string, {intent?: string, sid?: string}> }>|undefined} metas
+ * @param {string} sid
+ * @returns {"blocked:human"|"blocked:peer"|null}
+ */
+export function sessionDeclaredBlock(metas, sid) {
+  let peer = false;
+  for (const meta of metas ?? []) {
+    for (const [key, rec] of Object.entries(meta?.intents ?? {})) {
+      if (key !== sid && rec?.sid !== sid) continue;
+      if (rec?.intent === "blocked:human") return "blocked:human";
+      if (rec?.intent === "blocked:peer") peer = true;
+    }
+  }
+  return peer ? "blocked:peer" : null;
+}
+
+/**
  * The occupant sid of a thread's `role` seat that an UNTAGGED post should NUDGE, or null (untagged→Coordinator,
  * Option B). An untagged post (neither a room `broadcast` nor an @-`mentioned` post) wakes no member by the
  * normal seat-level fan-out — the ambient case principle 3 keeps quiet. But a role like the Coordinator is the

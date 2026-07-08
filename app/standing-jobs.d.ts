@@ -45,6 +45,11 @@ export function removeJob(repoPath: string, threadId: string, id: string): { rem
 export function stampFired(repoPath: string, threadId: string, id: string, ts: number): StandingJob[];
 
 export function jobDue(job: StandingJob | null | undefined, now: number): boolean;
+export function jobDueWithInterval(
+  job: StandingJob | null | undefined,
+  now: number,
+  intervalMs: number | null | undefined,
+): boolean;
 export function dueJobs(jobs: StandingJob[] | null | undefined, now: number): StandingJob[];
 export function jobClaimKey(threadId: string, job: StandingJob): string;
 export function planRoleJobFire(

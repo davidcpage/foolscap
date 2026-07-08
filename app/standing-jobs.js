@@ -134,9 +134,19 @@ export function stampFired(repoPath, threadId, id, ts) {
  * it, so there's no catch-up replay.
  */
 export function jobDue(job, now) {
-  if (!job || !job.intervalMs) return false;
+  return jobDueWithInterval(job, now, job?.intervalMs);
+}
+
+/**
+ * PURE — like jobDue, but against an EXPLICIT `intervalMs` rather than the job's own. The standing-job tick
+ * uses this to apply the intent-keyed heartbeat backoff (coordinator-heartbeat.heartbeatEffectiveInterval):
+ * a Coordinator parked on the human fires on a slower effective interval than its stored `job.intervalMs`,
+ * derived per-tick from live intent so nothing about the job record changes. `intervalMs` falsy ⇒ not due.
+ */
+export function jobDueWithInterval(job, now, intervalMs) {
+  if (!job || !intervalMs) return false;
   const since = job.lastFiredAt ?? job.createdAt ?? 0;
-  return now - since >= job.intervalMs;
+  return now - since >= intervalMs;
 }
 
 /** PURE — the due jobs among `jobs` at `now`. */

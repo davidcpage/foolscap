@@ -3,7 +3,9 @@
 
 export const COORDINATOR_ROLE: "Coordinator";
 export const COORDINATOR_HEARTBEAT_INTERVAL_MS: number;
+export const HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS: number;
 export const COORDINATOR_HEARTBEAT_INSTRUCTION: string;
+export function heartbeatEffectiveInterval(baseIntervalMs: number, intent: string | null | undefined): number;
 
 export interface CoordinatorHeartbeatJobSpec {
   role: "Coordinator";

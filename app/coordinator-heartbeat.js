@@ -13,8 +13,13 @@
 // cadence, and the sweep instruction. The CLI enable verb (`scripts/canvas job coordinator <thread>`) and any
 // programmatic creator both build the job from `coordinatorHeartbeatJobSpec()` so the instruction never drifts.
 //
-// ENABLING a live, auto-firing Coordinator job is the AUTONOMY SWITCH and is HUMAN-GATED — this module only
-// DEFINES the job; creating it on a real thread is a deliberate one-command human act (see the CLI verb).
+// ENABLING a live, auto-firing Coordinator job is the AUTONOMY SWITCH and stays HUMAN-GATED — but the gate is
+// now the act of STAFFING a Coordinator, not a separate remembered command. A Coordinator that can't sweep is
+// useless (peers signal completion via a `done` intent that wakes no one, so only a proactive sweep notices),
+// and the standalone CLI step was routinely forgotten — so vite-fs-plugin.ts auto-enables this job the FIRST
+// time a Coordinator SEAT is staffed on a thread (ensureCoordinatorHeartbeat). The CLI verb
+// (`scripts/canvas job coordinator <thread>`) remains, for a custom `--interval` or to re-enable one a human
+// removed. This module only DEFINES the job; both creators build it from `coordinatorHeartbeatJobSpec()`.
 
 import { normInterval } from "./standing-jobs.js";
 
@@ -25,12 +30,32 @@ export const COORDINATOR_ROLE = "Coordinator";
 
 // The default cadence — a calm few minutes, deliberately NOT the 60s floor (an idle proactive sweep every
 // minute is eager waste; urgent events don't wait for the heartbeat — they wake instantly via the @-mention/
-// ask INTERRUPT path). Set just INSIDE the ~5-min idle keep-alive window (IDLE_KEEPALIVE_MS) so wake-live-else-
+// ask INTERRUPT path). Set well INSIDE the idle keep-alive window (IDLE_KEEPALIVE_MS, 15 min) so wake-live-else-
 // respawn favours the CHEAP branch: a heartbeat at this interval finds the last-woken Coordinator still alive
 // (not yet reaped) and NUDGES it (context intact) rather than paying a fresh respawn's context reassembly each
-// sweep. A longer `--interval` (past keep-alive) flips it to reap-then-respawn, freeing the slot between sweeps
-// — a real tradeoff, hence overridable. Clamped up to the standing-job floor (MIN_INTERVAL_MS) by normInterval.
-export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 240_000; // 4 min — inside the 5-min keep-alive, nudge-favouring
+// sweep. This fast pulse is LOAD-BEARING while working/blocked:peer — it's how the Coordinator detects a peer
+// finishing (a `done` intent wakes no one). It backs off only while the Coordinator is blocked:human (see
+// heartbeatEffectiveInterval). Clamped up to the standing-job floor (MIN_INTERVAL_MS) by normInterval.
+export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 240_000; // 4 min — inside the 15-min keep-alive, nudge-favouring
+
+// Part 4 — intent-keyed backoff. A Coordinator that has EXPLICITLY declared `blocked:human` (it escalated and
+// is parked on a human) needn't keep the fast pulse: the human's reply wakes it reactively, so a frequent
+// sweep just burns turns finding the same block. So while its own declared intent is `blocked:human`, the
+// heartbeat's EFFECTIVE interval slows to this; every other stance (`working`/`blocked:peer`/`done`/none)
+// keeps the base cadence. Derived LIVE from the seat's current intent each tick — no stored backoff counter —
+// so it snaps back the instant the block clears (resumeRunning auto-freshens blocked:* → working on resume).
+export const HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS = 30 * 60_000; // 30 min
+
+/**
+ * The heartbeat's EFFECTIVE fire interval given the seat occupant's currently declared work-intent (part 4):
+ * `blocked:human` → the slow backoff pulse (never shorter than the base — max guards a base already longer);
+ * anything else → the base interval unchanged. PURE. `intent` is the seat's declared intent
+ * (`meta.intents[role].intent`), or null/undefined when none is declared.
+ */
+export function heartbeatEffectiveInterval(baseIntervalMs, intent) {
+  if (intent === "blocked:human") return Math.max(baseIntervalMs, HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS);
+  return baseIntervalMs;
+}
 
 // The sweep instruction — the heartbeat's payload, carried verbatim into the job worker's brief/nudge. It is
 // the same "read your inbox + the board, sweep for stalls, act or sleep" tick the bespoke heartbeat used, made
@@ -41,8 +66,12 @@ export const COORDINATOR_HEARTBEAT_INSTRUCTION =
   "Coordinator heartbeat — your scheduled sweep (not a human message). " +
   "Read your inbox (GET /api/inbox?session=<your session id>) and the board (GET /api/canvas, GET /api/sessions); " +
   "then sweep for stalled or blocked agents, unanswered asks, pending questions, and drifting work. " +
-  "Act on what you find — nudge a stalled thread, answer or route a blocked agent, make an uncontentious call, " +
-  "or escalate to the human — then wind down until the next heartbeat. " +
+  "Act on what you find — nudge a stalled thread, answer or route a blocked agent, make an uncontentious call. " +
+  "ESCALATE to the human (post the issue and declare intent blocked:human) ONLY when work you are watching shows " +
+  "NO PROGRESS and you cannot move it forward — e.g. the peer's session is idle/dead, no new commits, no thread " +
+  "activity. While a peer is ACTIVELY working (running, committing, recent posts), it is NOT stuck: stay silent " +
+  "and let the next heartbeat check again — do NOT escalate merely because this sweep found nothing to do. " +
+  "Then wind down until the next heartbeat. " +
   "If NOTHING needs attention, post nothing and wind down silently (skip days with nothing).";
 
 /**

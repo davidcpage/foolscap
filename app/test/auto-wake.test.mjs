@@ -17,6 +17,8 @@ import {
   annotationWakeClass,
   qualifyingWatchers,
   shouldReapIdle,
+  reapKeepAliveMs,
+  BLOCKED_PEER_KEEPALIVE_MS,
 } from "../auto-wake.js";
 
 // ── surface keys ────────────────────────────────────────────────────────────────────────────────────
@@ -127,9 +129,35 @@ test("shouldReapIdle: NOT reaped while inside the window, or mid-turn, or with n
   assert.equal(shouldReapIdle({ autoWake: true, status: "idle", idleSince: undefined }, NOW, KEEP), false); // never idled
 });
 
-test("shouldReapIdle: a human card / the looping Coordinator (no autoWake) is NEVER reaped", () => {
+test("shouldReapIdle: a human card / a human-spawned looping Coordinator (no autoWake) is NEVER reaped", () => {
   assert.equal(shouldReapIdle({ status: "idle", idleSince: NOW - KEEP * 10 }, NOW, KEEP), false);
   assert.equal(shouldReapIdle({ autoWake: false, status: "idle", idleSince: NOW - KEEP * 10 }, NOW, KEEP), false);
   assert.equal(shouldReapIdle(null, NOW, KEEP), false);
   assert.equal(shouldReapIdle(undefined, NOW, KEEP), false);
+});
+
+test("shouldReapIdle: a null keep-alive means NEVER reap (blocked:human threads through as never)", () => {
+  // reapKeepAliveMs(blocked:human) → null: even a long-idle auto-wake worker is spared.
+  assert.equal(shouldReapIdle({ autoWake: true, status: "idle", idleSince: NOW - KEEP * 100 }, NOW, null), false);
+  assert.equal(shouldReapIdle({ autoWake: true, status: "idle", idleSince: NOW - KEEP * 100 }, NOW, undefined), false);
+});
+
+// ── intent-aware reap window (part 2) ─────────────────────────────────────────────────────────────────
+test("reapKeepAliveMs: a declared block overrides the default idle window", () => {
+  const DEFAULT = 15 * 60_000;
+  assert.equal(reapKeepAliveMs("blocked:human", DEFAULT), null); // never idle-reaped
+  assert.equal(reapKeepAliveMs("blocked:peer", DEFAULT), BLOCKED_PEER_KEEPALIVE_MS); // long backstop
+  assert.equal(reapKeepAliveMs("working", DEFAULT), DEFAULT); // ordinary window
+  assert.equal(reapKeepAliveMs("done", DEFAULT), DEFAULT);
+  assert.equal(reapKeepAliveMs(null, DEFAULT), DEFAULT); // undeclared
+  assert.equal(reapKeepAliveMs(undefined, DEFAULT), DEFAULT);
+  assert.ok(BLOCKED_PEER_KEEPALIVE_MS > DEFAULT); // the peer backstop really is longer than the default
+});
+
+test("reapKeepAliveMs + shouldReapIdle: a blocked:peer session survives the default window but reaps past its backstop", () => {
+  const DEFAULT = 15 * 60_000;
+  const ka = reapKeepAliveMs("blocked:peer", DEFAULT);
+  const s = (idleAgo) => ({ autoWake: true, status: "idle", idleSince: NOW - idleAgo });
+  assert.equal(shouldReapIdle(s(DEFAULT + 1), NOW, ka), false); // past the default window — but blocked:peer, so kept
+  assert.equal(shouldReapIdle(s(BLOCKED_PEER_KEEPALIVE_MS + 1), NOW, ka), true); // past the backstop — reaped
 });

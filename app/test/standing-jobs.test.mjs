@@ -16,6 +16,7 @@ import {
   removeJob,
   stampFired,
   jobDue,
+  jobDueWithInterval,
   dueJobs,
   jobClaimKey,
   sessionHasScheduledWake,
@@ -92,6 +93,18 @@ test("jobDue after a fire counts from lastFiredAt (periodic)", () => {
   const job = { id: "j", intervalMs: 60_000, createdAt: 1000, lastFiredAt: 100_000 };
   assert.equal(jobDue(job, 100_000 + 30_000), false, "not due mid-interval");
   assert.equal(jobDue(job, 100_000 + 60_000), true, "due one interval after the last fire");
+});
+
+test("jobDueWithInterval: applies an EXPLICIT interval (the intent-keyed backoff), and jobDue delegates to it", () => {
+  const job = { id: "j", intervalMs: 60_000, createdAt: 1000, lastFiredAt: 100_000 };
+  // With a backed-off 5x interval, a fire that WOULD be due at the base interval is NOT yet due.
+  assert.equal(jobDueWithInterval(job, 100_000 + 60_000, 300_000), false, "not due — the effective interval is longer");
+  assert.equal(jobDueWithInterval(job, 100_000 + 300_000, 300_000), true, "due once the longer interval elapses");
+  // jobDue is exactly jobDueWithInterval against the job's own interval.
+  assert.equal(jobDueWithInterval(job, 100_000 + 60_000, job.intervalMs), jobDue(job, 100_000 + 60_000));
+  // a falsy interval is never due (guards a role job with an unresolved interval)
+  assert.equal(jobDueWithInterval(job, 1e12, 0), false);
+  assert.equal(jobDueWithInterval(null, 1e12, 60_000), false);
 });
 
 test("fire-next-due, NOT catch-up: a long-overdue job is due exactly once, then stampFired re-bases it", () => {

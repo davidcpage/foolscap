@@ -73,12 +73,36 @@ export function annotationWakeClass(eventKind) {
   return { mentioned: false, broadcast: false };
 }
 
+// A `blocked:peer` session's idleness is EXPLAINED (it's waiting on a peer's work, which routinely outlasts
+// the default idle window), so it gets a long backstop rather than the default reap — long enough not to
+// churn a legitimately-waiting session, but finite so a forgotten block can't leak a process slot forever.
+export const BLOCKED_PEER_KEEPALIVE_MS = 45 * 60_000; // 45 min
+
+/**
+ * The keep-alive window to apply to an idle auto-wake worker given its currently DECLARED work-intent — the
+ * reaper honours a declared block instead of winding down a session that has SAID why it is idle:
+ *   - `blocked:human` → `null` (NEVER reap on the idle timer): a permission gate may be mid-flight and
+ *     reaping would lose it; the human's reply wakes it reactively, so nothing is reclaimed by killing it.
+ *   - `blocked:peer` → the long backstop (BLOCKED_PEER_KEEPALIVE_MS): waiting on a peer is legitimate, but
+ *     bounded so a stale block eventually frees the slot.
+ *   - `working` / `done` / undeclared → the caller's `defaultMs` (the ordinary idle window).
+ * Pure/unit-testable; the reaper tick supplies the session's intent (thread-ledger.sessionDeclaredBlock) and
+ * the default window (IDLE_KEEPALIVE_MS). A `null` return threads through shouldReapIdle as never-reap.
+ */
+export function reapKeepAliveMs(intent, defaultMs) {
+  if (intent === "blocked:human") return null;
+  if (intent === "blocked:peer") return BLOCKED_PEER_KEEPALIVE_MS;
+  return defaultMs;
+}
+
 /**
  * The R1 keep-alive reap decision (docs/claude-tag-lessons.md R1): is this session an auto-wake worker
  * that has been idle past the grace window and should now be wound down? Pure so it's unit-testable without
- * a 5-minute live wait — the reaper tick (vite-fs-plugin.ts) just maps it over the live sessions. Only an
- * auto-wake worker is eligible (a human card / the looping Coordinator has no `autoWake`, so never reaps);
+ * a live wait — the reaper tick (vite-fs-plugin.ts) just maps it over the live sessions. Only an auto-wake
+ * worker is eligible (a human card / a human-spawned looping Coordinator has no `autoWake`, so never reaps);
  * it must be `idle` (a mid-turn worker is left alone) with an `idleSince` stamp at least `keepAliveMs` old.
+ * A `null` / non-finite `keepAliveMs` means NEVER reap on the idle timer (e.g. a `blocked:human` session,
+ * via reapKeepAliveMs) — the session's declared block explains its idleness, so we don't wind it down.
  */
 export function shouldReapIdle(session, now, keepAliveMs) {
   return !!(
@@ -86,6 +110,8 @@ export function shouldReapIdle(session, now, keepAliveMs) {
     session.autoWake &&
     session.status === "idle" &&
     session.idleSince &&
+    keepAliveMs != null &&
+    Number.isFinite(keepAliveMs) &&
     now - session.idleSince >= keepAliveMs
   );
 }
