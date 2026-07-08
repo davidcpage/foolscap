@@ -59,6 +59,10 @@ up — winding down is for genuinely-finished, not idle.
   can't self-schedule). A human enables it with `scripts/canvas job coordinator <thread>`; absent that job
   there is no auto-heartbeat. Once enabled, the server fires your seat on cadence (waking the live occupant
   or standing a dormant one back up).
+- **Never surface a product/design decision via an ```ask block.** Post it to the thread as a normal
+  message — framing, options, your recommendation — and let the human reply in-thread. The `ask` block is
+  ephemeral/session-local (only the human's bare reply reaches the durable thread record); reserve it for
+  truly session-local prompts with nothing to record. (Principle 2.)
 
 ### Your stance
 
