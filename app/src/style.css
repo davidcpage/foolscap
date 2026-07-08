@@ -970,6 +970,33 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   outline-offset: 2px;
   border-radius: 4px;
 }
+/* Cell-delete undo (render.js): a delete writes the file off-log, so the host's Ctrl+Z can't reach it — this
+   strip is the in-card recovery affordance, shown while a delete is stashed (also `z` in command mode). It
+   sits at the top of the scroll body so it's visible the moment a cell vanishes; muted so it doesn't shout. */
+.nb-undo {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 2px 0 6px;
+  padding: 4px 8px;
+  border: 1px solid #e4e4e7;
+  border-radius: 5px;
+  background: #fafafa;
+  font-size: 11px;
+  color: #71717a;
+}
+.nb-undo-msg { flex: 0 1 auto; }
+.nb-undo-btn {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid #d4d4d8;
+  border-radius: 4px;
+  background: #fff;
+  color: #52525b;
+  font-size: 11px;
+  cursor: pointer;
+}
+.nb-undo-btn:hover { background: #f0f0f0; color: #3f3f46; }
 /* The keyboard-shortcut legend (render.js footer()): the discovery surface for the command-mode keys, which
    carry no hover chrome of their own. A SIBLING of .nb-body, so flex:0 0 auto keeps it a fixed bar at the
    card's bottom while the cells scroll behind it — always in view. Muted to near-invisible until looked for. */

@@ -26,6 +26,14 @@ import { deserialize, serialize } from "/vendor/notebook-format.js";
 // it by id (a double-rAF, after lit commits). One-shot: consumed and cleared on read so it never steals
 // focus mid-edit on an unrelated re-render. Module scope (the template loads once) but keyed per card.
 const PENDING_FOCUS = new Map(); // cardKey → cellId to re-focus in command mode after the next render
+
+// Deleting a cell is a direct FILE write (writeFile → POST /api/file), off-log — invisible to the canvas
+// UndoManager (which only tracks the signia store), so the host's Ctrl+Z cannot bring a deleted cell back.
+// To keep a delete from being data loss, we stash the just-deleted cell here (keyed per card, like
+// PENDING_FOCUS) and render an in-card "undo" affordance while a stash exists — Jupyter's undo-cell-delete
+// (`z`). Restoring re-inserts the cell at its original index and clears the stash. This is session-local
+// view state (gone on reload, never committed); the file's shadow-git history is the durable recovery tier.
+const LAST_DELETED = new Map(); // cardKey → { cell, index } — the most recent delete, awaiting undo
 const cssEsc = (s) =>
   typeof globalThis !== "undefined" && globalThis.CSS && globalThis.CSS.escape
     ? globalThis.CSS.escape(String(s))
@@ -236,11 +244,26 @@ export default {
       [cells[i], cells[j]] = [cells[j], cells[i]];
       writeCells(cells);
     };
-    // Delete a cell. Immediate (no modal): cells are small and the file is shadow-git versioned, so a deleted
-    // cell is recoverable from history. Also drop it from the editing set so a stale id never lingers.
+    // Delete a cell. Immediate (no modal), but RECOVERABLE: stash the removed cell + its index first, so the
+    // undo affordance / command-mode `z` can put it back (LAST_DELETED above). Deserialize guarantees unique
+    // ids, so filter-by-id removes EXACTLY this cell — never a colliding neighbour. Also drop it from the
+    // editing set so a stale id never lingers.
     const deleteCell = (cellId) => {
+      const index = nb.cells.findIndex((c) => c.id === cellId);
+      if (index < 0) return;
+      LAST_DELETED.set(cardKey, { cell: nb.cells[index], index });
       setEditing((s) => s.delete(cellId));
       writeCells(nb.cells.filter((c) => c.id !== cellId));
+    };
+    // Undo the most recent delete: re-insert the stashed cell at its original index (clamped to the current
+    // length, in case the list shrank/grew since) and clear the stash. A no-op when nothing is stashed.
+    const undoDelete = () => {
+      const stash = LAST_DELETED.get(cardKey);
+      if (!stash || !card.signals.writeFile) return;
+      LAST_DELETED.delete(cardKey);
+      const at = Math.max(0, Math.min(stash.index, nb.cells.length));
+      keepFocus(stash.cell.id);
+      writeCells([...nb.cells.slice(0, at), stash.cell, ...nb.cells.slice(at)]);
     };
     // Toggle a cell between prose (text/markdown) and code (module) — the Jupyter cell-type switch, so a
     // notebook that starts as one markdown cell becomes code without a delete-and-replace. foldLiveEdits
@@ -337,6 +360,7 @@ export default {
         case "b": cmdInsert(cell, +1); break;
         case "t": cmdToggle(cell); break;
         case "x": case "Delete": case "Backspace": cmdDelete(cell); break;
+        case "z": undoDelete(); break; // Jupyter: undo the last cell delete (restores at its original index)
         case "ArrowUp": case "k": cmdMove(cell, -1); break;
         case "ArrowDown": case "j": cmdMove(cell, 1); break;
         default: handled = false;
@@ -354,6 +378,7 @@ export default {
       insertCell,
       moveCell,
       deleteCell,
+      undoDelete,
       convertType,
       editing,
       canEdit,
@@ -362,6 +387,8 @@ export default {
       exitEdit,
       onCellKeydown,
     };
+    // A deletion is pending undo when this card has a stash — drives the in-card undo strip below.
+    const canUndoDelete = canWrite && LAST_DELETED.has(cardKey);
 
     // Consume any pending command-mode focus (a structural op last render asked to carry the selection across
     // the write→re-parse→re-render). One-shot: delete on read so an unrelated re-render never steals focus
@@ -387,6 +414,14 @@ export default {
         <span class="file-ext">notebook</span>
       </div>
       <div class="nb-body" data-nbkey=${cardKey}>
+        ${canUndoDelete
+          ? html`<div class="nb-undo" data-interactive="1">
+              <span class="nb-undo-msg">Cell deleted.</span>
+              <button class="nb-undo-btn" title="restore the deleted cell (z)" @mousedown=${(e) => e.preventDefault()} @click=${() => ctx.undoDelete()}>
+                ⤶ Undo
+              </button>
+            </div>`
+          : ""}
         ${card.signals.writeFile
           ? html`<input
               class="nb-title"
@@ -419,7 +454,7 @@ function footer() {
   const key = (k) => html`<kbd class="nb-foot-key">${k}</kbd>`;
   return html`<div class="nb-foot">
     ${key("esc")} select · ${key("a")}/${key("b")} add · ${key("↑")}${key("↓")} move · ${key("x")} delete ·
-    ${key("t")} type · ${key("⏎")} edit
+    ${key("z")} undo · ${key("t")} type · ${key("⏎")} edit
   </div>`;
 }
 
