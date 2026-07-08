@@ -13,6 +13,7 @@ import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from
 import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
+import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
@@ -2605,7 +2606,11 @@ function threadLog(boardId: string, threadId: string): ThreadMsg[] {
 function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean): void {
   const repoPath = boards.get(boardId)?.repoPath;
   const pins: PinnedMsg[] = repoPath ? readPins(repoPath, threadId) : [];
-  publishFeed("thread:" + threadId, { messages, truncated, pins });
+  // The board owner's waiting signal (user waiting-state + you-pill): an @you/@human mention newer than the
+  // human's own last post is unaddressed → colour the "you" roster pill amber. Clear-on-reply, derived
+  // read-time from the log (no cursor, no durable state — thread-waiting.js). `count` feeds the pill tooltip.
+  const { waiting: youWaiting, count: youWaitingCount } = humanWaiting(messages);
+  publishFeed("thread:" + threadId, { messages, truncated, pins, youWaiting, youWaitingCount });
 }
 
 function appendThreadMsg(

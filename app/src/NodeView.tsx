@@ -354,8 +354,13 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[] }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number }>("thread:" + id));
   const msgs = feed?.messages ?? [];
+  // The board owner's waiting signal (user waiting-state + you-pill): server-derived on the feed — an
+  // @you/@human mention newer than the human's own last post. Colours the static "you" pill amber; clears
+  // when the human posts (clear-on-reply). thread-waiting.js is the single source of truth.
+  const youWaiting = feed?.youWaiting ?? false;
+  const youWaitingCount = feed?.youWaitingCount ?? 0;
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
   // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
@@ -683,10 +688,20 @@ function ThreadView({
       </div>
       <div className="chan-members">
         {/* The board owner, always present as a static roster anchor (Thread card UI batch 8): the human is
-            not a server member edge and carries no work-intent, so it's a calm neutral "you" pill — no status
-            colour, no wake/tag affordance. It leads the roster; agent participants follow. */}
-        <span className="chan-member chan-member-you" data-interactive>
+            not a server member edge and carries no work-intent, so it's a calm neutral "you" pill — no wake/tag
+            affordance. It leads the roster; agent participants follow. It DOES carry one status: `waiting`
+            (user waiting-state), an amber flag when an @you/@human mention awaits the human, cleared when they
+            reply (clear-on-reply). A hover tooltip explains the amber, shown only while waiting. */}
+        <span className={`chan-member chan-member-you${youWaiting ? " waiting" : ""}`} data-interactive>
           <span className="chan-member-name">you</span>
+          {youWaiting && (
+            <span className="chan-tip chan-tip-up" role="tooltip">
+              <span className="chan-tip-line">
+                <b className="chan-tip-intent i-blocked-human">waiting</b>
+                {` — ${youWaitingCount} message${youWaitingCount === 1 ? "" : "s"} await${youWaitingCount === 1 ? "s" : ""} you; reply to clear`}
+              </span>
+            </span>
+          )}
         </span>
         {members.length === 0 ? (
           <span className="chan-empty">no agents yet — alt-drag a session card onto this channel to join it</span>

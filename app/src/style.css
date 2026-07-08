@@ -2948,6 +2948,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-color: #d4d4d8;
   font-weight: 600;
 }
+/* Waiting (user waiting-state): an @you/@human mention awaits the human. Amber — the same "your turn" hue
+   as an agent's blocked:human pill (2938) — so the owner's own pill reads as "a message awaits you"; clears
+   when they reply (clear-on-reply, derived server-side by thread-waiting.js). Two classes → wins over the
+   neutral rule above. */
+.chan-member-you.waiting {
+  background: #fdf0e0;
+  color: #b45309;
+  border-color: #f3d7b0;
+}
 .chan-post {
   display: flex;
   gap: 5px;
