@@ -11,9 +11,19 @@ export interface ThreadParticipant {
 export declare const THREAD_STATES: readonly ThreadState[];
 export declare function isThreadState(s: unknown): s is ThreadState;
 export declare function deriveThreadState(participants: ThreadParticipant[]): ThreadState;
-// The per-participant display fusion (part 1): running ⇒ 'working' (declared intent ignored — it's stale
-// mid-turn); idle/exited ⇒ the declared intent, or null when none was declared (never fabricate one).
-export declare function memberDisplayIntent(
-  processState: "running" | "idle" | "exited",
-  intent: string | null | undefined,
-): string | null;
+
+// The pill-state vocabulary: the `.chan-member.i-<state>` class suffix a participant pill wears, shared with
+// the session card's own band so the two surfaces can never disagree on which state a session is in.
+export type PillState = "working" | "blocked-human" | "blocked-peer" | "scheduled" | "crashed" | "done";
+export declare const PILL_STATES: readonly PillState[];
+
+/** The pill slot a raw declared work-intent maps to (or null if it names nothing paintable). */
+export declare function intentPillState(intent: string | null | undefined): PillState | null;
+
+// The per-participant, per-thread pill fusion: the whole-session server band (SessionMeta.status) fused with
+// THIS thread's declared intent. Process-observed bands drive the pill exactly as they drive the card;
+// done-on-live (not over a running turn) and an untagged blocked:peer are folded on top. null → neutral pill.
+export declare function memberPillState(
+  band: string | null | undefined,
+  declaredIntent: string | null | undefined,
+): PillState | null;
