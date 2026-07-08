@@ -33,6 +33,18 @@ function tmpRepo() {
 }
 const rm = (dir) => fs.rmSync(dir, { recursive: true, force: true });
 
+// A nested agent worktree under `.canvas/worktrees/<key>` (as `spawn --worktree` creates): its own LINKED
+// git checkout, which the canonical repo sees as a gitlink/submodule boundary. `git worktree add` needs a
+// commit to check out, so we land one in the human repo first. Returns the worktree's absolute path.
+function addNestedWorktree(dir, key) {
+  execFileSync("git", ["add", "src/a.ts"], { cwd: dir });
+  execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: dir });
+  const wt = path.join(dir, ".canvas", "worktrees", key);
+  fs.mkdirSync(path.dirname(wt), { recursive: true });
+  execFileSync("git", ["worktree", "add", "-q", "-b", "agent/" + key, wt], { cwd: dir });
+  return wt;
+}
+
 // Mirrors vite-fs-plugin isInternalPath (Rule B, docs/canvas-home.md §3/§5) after the Gate-1 narrowing: the
 // shadow git-dirs under `.canvas/roots/` are internal (a commit writes objects there → re-fire → loop), but
 // the REST of `.canvas/` is CONTENT the watcher must see. Both the feedback-loop and the steps-1+2
@@ -87,6 +99,33 @@ test("non-interference: a shadow commit leaves the human repo untouched", async 
     const commits = execFileSync("git", ["rev-list", "--all", "--count"], { cwd: dir, encoding: "utf8" }).trim();
     assert.equal(commits, "0", "no commits landed in the human repo");
   } finally {
+    rm(dir);
+  }
+});
+
+test("canonical committer snapshots AROUND a nested agent worktree (no `is in submodule` crash)", async () => {
+  const dir = tmpRepo();
+  const wtKey = "node-abc123-f";
+  try {
+    const wt = addNestedWorktree(dir, wtKey);
+    // A session edits a file INSIDE the agent worktree — the exact shape that used to crash the floor commit
+    // ("fatal: … is in submodule '.canvas/worktrees/…'"), because the force-add tried to stage the gitlink.
+    fs.mkdirSync(path.join(wt, "app"), { recursive: true });
+    fs.writeFileSync(path.join(wt, "app", "edited.ts"), "export const x = 1;\n");
+    // The external floor must NOT throw on the nested checkout…
+    await assert.doesNotReject(commitRoot(dir, { message: "external: edit" }));
+    // …and must NOT stage the nested worktree (neither its files nor the gitlink itself).
+    const tracked = await shadowTrackedPaths(dir);
+    assert.ok(!tracked.some((p) => p.startsWith(".canvas/worktrees/")), `nested worktree not shadow-staged; got ${JSON.stringify(tracked)}`);
+    assert.ok(!tracked.includes(".canvas/worktrees/" + wtKey), "the worktree gitlink itself is not staged");
+    // Sanity: the canonical repo's own content is still versioned around it.
+    assert.ok(tracked.includes("src/a.ts"), "canonical content still tracked");
+  } finally {
+    try {
+      execFileSync("git", ["worktree", "remove", "--force", path.join(dir, ".canvas", "worktrees", wtKey)], { cwd: dir });
+    } catch {
+      /* best-effort; the temp dir is removed regardless */
+    }
     rm(dir);
   }
 });

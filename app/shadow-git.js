@@ -113,8 +113,14 @@ export function commitRoot(workTree, opts = {}) {
       // The `:(exclude)` pathspec prunes roots from the add itself, so the object DB is never staged-then-reset
       // (verified: stages .canvas/images + .canvas/artefacts, nothing under .canvas/roots). One rule — new
       // content subdirs need no change here. (Generalises the old artefacts-only force-add, docs/canvas-home §4.)
+      // Also exclude `.canvas/worktrees/` — agent worktrees there are nested git checkouts (gitlinks); a
+      // force-add would try to stage one as a submodule and fail (`is in submodule`). They reach main via
+      // merge-on-green, not this ledger, so the canonical floor must never stage them.
       if (fs.existsSync(path.join(workTree, ".canvas"))) {
-        const f = await run([...base, "add", "--force", "--", ".canvas", ":(exclude).canvas/roots"], workTree);
+        const f = await run(
+          [...base, "add", "--force", "--", ".canvas", ":(exclude).canvas/roots", ":(exclude).canvas/worktrees"],
+          workTree,
+        );
         if (f.code !== 0) throw new Error(`shadow .canvas add failed: ${f.stderr.trim()}`);
       }
       // Defer: leave claimed paths uncommitted (still dirty in the work-tree) so their attributed

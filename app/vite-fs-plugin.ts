@@ -3780,9 +3780,17 @@ function shadowTargetFor(s: LiveSession, filePath: string): { key: string; rel: 
     if ((abs === r.path || abs.startsWith(r.path + path.sep)) && (!best || r.path.length > best.path.length)) best = r;
   }
   if (!best) return null;
+  const rel = path.relative(best.path, abs);
+  // Agent worktrees (`spawn --worktree`) live under the board's `.canvas/worktrees/` and are their OWN real
+  // git checkouts — they reach main via merge-on-green, never the shadow ledger. listWorktrees excludes them
+  // from boardRoots, so an edit inside one has no committer of its own and falls through to the canonical
+  // repo root, yielding rel = `.canvas/worktrees/<key>/…`. Staging that with `git add` in the canonical
+  // work-tree hits the nested checkout's gitlink boundary ("is in submodule"). Never shadow-attribute it.
+  const wtHome = path.join(".canvas", "worktrees");
+  if (rel === wtHome || rel.startsWith(wtHome + path.sep)) return null;
   const key = boardId + "\0" + best.id;
   const handle = shadowRoots.get(key);
-  return handle ? { key, rel: path.relative(best.path, abs), handle } : null;
+  return handle ? { key, rel, handle } : null;
 }
 
 function foldShadowEdits(s: LiveSession, e: { type?: string; message?: { content?: unknown } }): void {
