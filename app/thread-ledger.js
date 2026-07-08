@@ -214,6 +214,27 @@ export function seatForSid(seats, sid) {
   return null;
 }
 
+/**
+ * The occupant sid of a thread's `role` seat that an UNTAGGED post should NUDGE, or null (untagged→Coordinator,
+ * Option B). An untagged post (neither a room `broadcast` nor an @-`mentioned` post) wakes no member by the
+ * normal seat-level fan-out — the ambient case principle 3 keeps quiet. But a role like the Coordinator is the
+ * thread's STEWARD and is expected to sweep its state, so it should learn of ambient activity on a thread it
+ * owns without waiting for the next heartbeat. This returns the seat occupant to nudge when ALL hold: the post
+ * is untagged, the thread HAS that role's seat, its occupant is not the sender (`exceptSid`), and — per the
+ * caller's `isLive` predicate — the occupant is LIVE. A DORMANT occupant is deliberately NOT returned: no
+ * per-post respawn (the exact cost principle 3 guards against), and it is unnecessary — the occupant is
+ * already a member, so the message is logged to its inbox and it catches it on its next heartbeat sweep. Pure:
+ * `isLive: sid => bool` supplies process liveness (mirrors fillSeat's guard); `meta` is readThreadMeta's marker.
+ */
+export function untaggedSeatNudgeTarget(meta, role, { broadcast, mentioned, exceptSid, isLive } = {}) {
+  if (broadcast) return null; // a room broadcast is not untagged — the normal fan-out already covers it
+  if (mentioned && mentioned.size) return null; // an @-mention is not untagged — handled by the mention path
+  const sid = meta?.seats?.[role]?.sid;
+  if (!sid || sid === exceptSid) return null; // no such seat, or the steward is the poster (don't self-nudge)
+  if (typeof isLive === "function" && !isLive(sid)) return null; // dormant seat: not respawned per untagged post
+  return sid;
+}
+
 // ── durable membership (delete-card-keep-session) ──────────────────────────────────────────────────
 // A thread's DURABLE member set: the sids that JOINED (a `member:open` edge) and have not explicitly LEFT.
 // The member:open EDGE is the canvas VIEW of a membership and dies with the session's card (removeNode
