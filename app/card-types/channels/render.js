@@ -63,15 +63,25 @@ export default {
             // (a single click there would fight selection/drag); the highlight is what earns the one-click jump.
             const waiting = !!ch.youWaiting;
             const count = ch.youWaitingCount || 0;
+            // The actual waiting messages (Phase 3): sender + snippet, bounded server-side with a `+N earlier`
+            // overflow (thread-waiting.js). Hovering the amber row reveals this preview so the human sees WHAT
+            // awaits, not just a count. It's a PURE-REVEAL tooltip (pointer-events:none, no click targets):
+            // the row itself single-click-transports to the thread (Phase 2), so there's nothing to click
+            // inside the preview — which sidesteps the dismiss-on-cursor-move trap the interactive pill hits.
+            const preview = Array.isArray(ch.youWaitingPreview) ? ch.youWaitingPreview : [];
+            const more = ch.youWaitingMore || 0;
+            const fromLabel = (f) => (f === "human" ? "you" : String(f).slice(0, 8));
             return html`
             <div
               class="ses-row ${waiting ? "waiting" : ""}"
               draggable="true"
               data-interactive="1"
               tabindex="0"
-              title=${waiting
+              title=${waiting && preview.length === 0
                 ? `${count} message${count === 1 ? "" : "s"} await you — click to go to this thread`
-                : "double-click or drag onto the canvas to open this thread"}
+                : waiting
+                  ? ""
+                  : "double-click or drag onto the canvas to open this thread"}
               @dragstart=${(e) => dragStart(e, ch)}
               @click=${(e) => { if (!waiting) return; e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
@@ -81,6 +91,18 @@ export default {
               <span class="ses-row-meta">
                 ${ch.messages ? `${ch.messages} msg${ch.messages === 1 ? "" : "s"}` : "no messages"}${ch.mtime ? ` · ${timeAgo(ch.mtime)}` : ""}
               </span>
+              ${waiting && preview.length > 0
+                ? html`<div class="ses-row-preview" role="tooltip">
+                    <div class="ses-row-preview-head">${count} message${count === 1 ? "" : "s"} await you · click the row to open</div>
+                    ${more > 0 ? html`<div class="ses-row-preview-more">+${more} earlier · newest ${preview.length} shown</div>` : ""}
+                    ${preview.map(
+                      (p) => html`<div class="ses-row-preview-item">
+                        <span class="ses-row-preview-from">${fromLabel(p.from)}</span>
+                        <span class="ses-row-preview-text">${p.text}</span>
+                      </div>`,
+                    )}
+                  </div>`
+                : ""}
             </div>
           `;
           },
