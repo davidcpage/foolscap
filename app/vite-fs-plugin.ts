@@ -1414,6 +1414,13 @@ function threadParticipants(boardId: string, threadId: string, marker: ThreadMet
 function handleThreads(res: ServerResponse, boardId: string, repoPath: string): void {
   const threads = listThreads(repoPath).map((m) => {
     const participants = threadParticipants(boardId, m.threadId, m);
+    // The board owner's WAITING signal per thread (user waiting-state + you-pill, Phase 2): an unaddressed
+    // @you/@human mention → the threads-list card highlights this row so the human can find it. Same
+    // server-side derivation as the thread:<id> feed's pill (humanWaiting over the log), so the list and the
+    // open card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
+    // fresh by appendThreadMsg), so this stays a cheap read; the threads:<board> ping re-pulls on any
+    // message or reply, setting/clearing the highlight live.
+    const { waiting: youWaiting, count: youWaitingCount } = humanWaiting(threadLog(boardId, m.threadId));
     return {
       threadId: m.threadId,
       chanId: m.threadId,
@@ -1421,6 +1428,8 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       text: typeof m.text === "string" ? m.text : "",
       messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
       mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
+      youWaiting,
+      youWaitingCount,
       // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
       // declarer holds one, else sid) — the raw material the state projection derives from.
       intents: m.intents ?? {},

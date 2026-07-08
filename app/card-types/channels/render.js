@@ -54,22 +54,36 @@ export default {
         ${!channels ? html`<div class="dir-empty">loading…</div>` : ""}
         ${channels && count === 0 ? html`<div class="dir-empty">no threads yet</div>` : ""}
         ${(channels ?? []).map(
-          (ch) => html`
+          (ch) => {
+            // WAITING highlight (user waiting-state + you-pill, Phase 2): the server flags a thread whose
+            // @you/@human mention sits unaddressed (ch.youWaiting, same signal as the thread card's amber "you"
+            // pill). A waiting row is amber AND SINGLE-CLICK transports the human to that thread card — the fast
+            // path to "the thread that needs me". Transport reuses `open` (loader.openChannel): fly to the card
+            // if it's already on the canvas, else open it. Non-waiting rows keep the double-click-to-open gesture
+            // (a single click there would fight selection/drag); the highlight is what earns the one-click jump.
+            const waiting = !!ch.youWaiting;
+            const count = ch.youWaitingCount || 0;
+            return html`
             <div
-              class="ses-row"
+              class="ses-row ${waiting ? "waiting" : ""}"
               draggable="true"
               data-interactive="1"
               tabindex="0"
-              title="double-click or drag onto the canvas to open this thread"
+              title=${waiting
+                ? `${count} message${count === 1 ? "" : "s"} await you — click to go to this thread`
+                : "double-click or drag onto the canvas to open this thread"}
               @dragstart=${(e) => dragStart(e, ch)}
+              @click=${(e) => { if (!waiting) return; e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
             >
               <span class="ses-row-title ${ch.title ? "" : "ses-row-mono"}">${ch.title || ch.chanId}</span>
+              ${waiting ? html`<span class="ses-row-wait" title="messages awaiting you">${count}</span>` : ""}
               <span class="ses-row-meta">
                 ${ch.messages ? `${ch.messages} msg${ch.messages === 1 ? "" : "s"}` : "no messages"}${ch.mtime ? ` · ${timeAgo(ch.mtime)}` : ""}
               </span>
             </div>
-          `,
+          `;
+          },
         )}
       </div>
     `;
