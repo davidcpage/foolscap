@@ -26,6 +26,8 @@ import {
   readPins,
   pinMessage,
   unpinMessage,
+  readSeenMentions,
+  markSeenMentions,
   addThreadMember,
   removeThreadMember,
   threadMembersFromMeta,
@@ -326,6 +328,34 @@ test("pins ride the marker beside seats/intents without clobbering them", () => 
   assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat survives a pin write");
   assert.equal(meta.intents.Coordinator.intent, "working", "intent survives a pin write");
   assert.equal(meta.pins.length, 1, "pins land alongside");
+});
+
+test("seenMentions (user waiting-state): union add, sorted, idempotent, marker-coexisting", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:seen";
+  assert.deepEqual(readSeenMentions(repo, id), [], "no marker → no seen set, not a throw");
+  // Mark out of order — the durable set stays sorted.
+  assert.deepEqual(markSeenMentions(repo, id, [5, 2]), [2, 5], "union add is sorted");
+  // A second mark unions in the new seq (and drops a duplicate) without churning the rest.
+  assert.deepEqual(markSeenMentions(repo, id, [2, 7]), [2, 5, 7], "existing seq is a no-op; new one unions in");
+  assert.deepEqual(readSeenMentions(repo, id), [2, 5, 7], "the durable marker reflects the union");
+  // Nothing new → returns the prior array unchanged (no churn).
+  const before = readSeenMentions(repo, id);
+  assert.deepEqual(markSeenMentions(repo, id, [2, 5]), before, "re-marking only seen seqs is a no-op");
+  // Non-positive / non-integer seqs are ignored (defensive, mirrors the endpoint's guard).
+  assert.deepEqual(markSeenMentions(repo, id, [0, -1, 3.5, 9]), [2, 5, 7, 9], "only positive integers land");
+});
+
+test("seenMentions rides the marker beside pins/seats/intents without clobbering them", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:seen-coexist";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  pinMessage(repo, id, msg(1, "Done when: tests green"), "sid-a", 200);
+  markSeenMentions(repo, id, [3]);
+  const meta = readThreadMeta(repo, id);
+  assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat survives a seen write");
+  assert.equal(meta.pins.length, 1, "pins survive a seen write");
+  assert.deepEqual(meta.seenMentions, [3], "seen set lands alongside");
 });
 
 // ── durable membership (delete-card-keep-session) ───────────────────────────────────────────────────

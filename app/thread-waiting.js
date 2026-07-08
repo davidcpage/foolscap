@@ -1,17 +1,21 @@
 // The board owner's per-thread WAITING signal (user waiting-state + you-pill, thread node:mrbz24qp-h).
-// Plain ESM, runs under node --test; imported by vite-fs-plugin.ts to compute `youWaiting` on the thread
-// feed, which colours the human's "you" roster pill amber when a message awaits them.
+// Plain ESM, runs under node --test; imported by vite-fs-plugin.ts to compute the human's unseen-mention
+// signal on the thread feed + the threads-list rail.
 //
-// WHAT COUNTS AS WAITING (the human's product call): an @you/@human MENTION that sits UNADDRESSED. There is
-// no human read-cursor and — by design — we don't add one: the human chose CLEAR-ON-REPLY over clear-on-view
-// (the stalled agent is waiting on the human's REPLY, not merely their attention). So "unaddressed" is fully
-// derivable from the existing thread log, read-time, with no durable state:
+// WHAT COUNTS AS WAITING (the human's product call): an @you/@human MENTION the human has not yet VIEWED.
+// This REPLACES the earlier clear-on-reply model (a mention newer than the human's last post). The human
+// asked for per-VIEWED-message clearing: a mention clears only when the human actually scrolls it into the
+// thread-log viewport (while the card is focused), not when they reply, and not merely by focusing the card.
+// So "unaddressed" is no longer a pure function of the log — it needs a small DURABLE per-thread set of the
+// mention seqs the human has SEEN (thread-ledger.js `seenMentions`, cloned from the pin store, bounded to
+// mention-seqs — mentions are few, so the set stays tiny and only grows when a NEW mention is viewed):
 //
-//   youWaiting  =  ∃ message with resolveTags(text).human === true  AND  seq > (latest from:"human" message).seq
+//   unseen(m)  =  resolveTags(m.text).human === true  AND  m.seq ∉ seenMentions
 //
-// A `@human`/`@user` mention newer than the human's own last post is waiting; the moment the human posts
-// anything, their message is newest, nothing is unaddressed, and the pill clears (clear-on-reply). If the
-// human has never posted, any `@human` mention counts (lastHumanSeq = 0), which is correct.
+// A viewed mention's seq lands in `seenMentions` (POST /api/thread/:id/seen, driven by a client viewport
+// observer) and drops out of the count individually; non-viewed mentions stay flagged. Presence (the you-pill
+// green/grey) is DECOUPLED from this: it's live 'is the card focused' state with no durable storage, so
+// focusing the card greens the pill but clears nothing — you clear a mention by scrolling to it.
 //
 // The `human` flag comes from thread-tags.js `resolveTags` — the single source of truth for what a mention
 // IS (HUMAN_TOKENS = @human/@user). It's independent of the member list, so we pass none. Card-only entries
@@ -20,8 +24,7 @@
 //
 // FUTURE (out of scope now): pending ASKS addressed to the human would OR into this — but the `/ask` channel
 // can't target the human today, so there's no such signal yet; the shape (`waiting = mention || ask`) leaves
-// room for it. And WhatsApp-style reply-to-a-specific-message could later scope the clear to the replied-to
-// mention instead of clearing all; for now any human post clears everything.
+// room for it.
 
 import { resolveTags } from "./thread-tags.js";
 
@@ -38,25 +41,28 @@ function snippet(text) {
 }
 
 /**
- * Derive the human's waiting state for one thread from its message log. `log` is the ThreadMsg[] the feed
- * carries (`{ seq, ts, from, text, kind? }`). Returns `{ waiting, count, preview, more }` — `count` is how
- * many @human mentions sit past the human's last post, `waiting` is `count > 0`, `preview` is the most-recent
- * up-to-`PREVIEW_CAP` of those as `{ seq, from, text }` (for the hover preview + jump-to-message), and `more`
- * is how many older waiting mentions the preview omitted (`count - preview.length`). Pure; no I/O.
+ * Derive the human's unseen-mention state for one thread from its message log and the set of mention seqs the
+ * human has already VIEWED. `log` is the ThreadMsg[] the feed carries (`{ seq, ts, from, text, kind? }`);
+ * `seenMentions` is the durable per-thread seen set (an array/Set/iterable of seqs — thread-ledger.js
+ * `readSeenMentions`; omitted ⇒ nothing seen yet). Returns `{ waiting, count, seqs, preview, more }`:
+ * `count` is how many @human mentions are still unseen, `waiting` is `count > 0`, `seqs` is EVERY unseen
+ * mention seq (chronological — the client viewport observer watches exactly these), `preview` is the
+ * most-recent up-to-`PREVIEW_CAP` of them as `{ seq, from, text }` (for the rail popover + cross-card jump),
+ * and `more` is how many older unseen mentions the preview omitted (`count - preview.length`). Pure; no I/O.
  */
-export function humanWaiting(log) {
+export function humanWaiting(log, seenMentions) {
   const msgs = Array.isArray(log) ? log : [];
-  let lastHumanSeq = 0;
-  for (const m of msgs) if (m && m.from === "human" && m.seq > lastHumanSeq) lastHumanSeq = m.seq;
-  const waiting = [];
+  const seen = seenMentions instanceof Set ? seenMentions : new Set(seenMentions ?? []);
+  const unseen = [];
   for (const m of msgs) {
     if (!m || m.kind != null) continue; // card-only (intent/ask) entries don't address the human
-    if (m.seq <= lastHumanSeq) continue; // addressed: the human posted at or after this
-    if (resolveTags(m.text ?? "", []).human) waiting.push(m); // an @human / @user mention
+    if (seen.has(m.seq)) continue; // the human has already viewed this mention (per-viewed clearing)
+    if (resolveTags(m.text ?? "", []).human) unseen.push(m); // an @human / @user mention
   }
-  const count = waiting.length;
+  const count = unseen.length;
+  const seqs = unseen.map((m) => m.seq);
   // Keep the TAIL (most recent) — see PREVIEW_CAP above. In chronological order so it reads like the log.
-  const tail = count > PREVIEW_CAP ? waiting.slice(count - PREVIEW_CAP) : waiting;
+  const tail = count > PREVIEW_CAP ? unseen.slice(count - PREVIEW_CAP) : unseen;
   const preview = tail.map((m) => ({ seq: m.seq, from: m.from, text: snippet(m.text) }));
-  return { waiting: count > 0, count, preview, more: count - preview.length };
+  return { waiting: count > 0, count, seqs, preview, more: count - preview.length };
 }

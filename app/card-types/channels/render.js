@@ -35,6 +35,7 @@ export default {
     const channels = card.signals.channelList;
     const refresh = card.signals.channelRefresh;
     const open = card.signals.channelOpen; // double-click → reopen this channel as a card (drag-out's twin)
+    const jump = card.signals.channelJump; // open + scroll-to-message (the unseen-mention preview → a mention)
     const count = channels ? channels.length : 0;
 
     return html`
@@ -55,32 +56,69 @@ export default {
         ${channels && count === 0 ? html`<div class="dir-empty">no threads yet</div>` : ""}
         ${(channels ?? []).map(
           (ch) => {
-            // WAITING highlight (user waiting-state + you-pill, Phase 2): the server flags a thread whose
-            // @you/@human mention sits unaddressed (ch.youWaiting, same signal as the thread card's amber "you"
-            // pill). A waiting row is amber AND SINGLE-CLICK transports the human to that thread card — the fast
-            // path to "the thread that needs me". Transport reuses `open` (loader.openChannel): fly to the card
-            // if it's already on the canvas, else open it. Non-waiting rows keep the double-click-to-open gesture
-            // (a single click there would fight selection/drag); the highlight is what earns the one-click jump.
-            const waiting = !!ch.youWaiting;
-            const count = ch.youWaitingCount || 0;
-            // The count badge + amber highlight are the whole waiting signal on this list — no per-message
-            // preview: you can't select an individual message from here, so count + jump-to-thread is all
-            // this surface needs (the thread card's interactive "you" pill is where you pick a message).
+            // TWO differentiated per-row signals (user waiting-state + you-pill), distinct hues:
+            //   (a) UNSEEN MENTION — the thread has ≥1 @you/@human mention the human hasn't VIEWED yet
+            //       (ch.youWaiting/youWaitingCount, server-derived against the durable seenMentions set). A
+            //       QUIET indigo count badge whose hover opens an interactive popover of the pending mentions;
+            //       clicking one transports to the thread AND scrolls to that exact message (channelJump).
+            //   (b) AGENT AWAITING YOU — a live participant's effective intent is blocked:human, surfaced via
+            //       the already-fused thread state (ch.state === "waiting", thread-state.js — resume-safe, no
+            //       stale block). The LOUD amber 'your-turn' hue.
+            // They're independent and can coexist; amber (b) wins the row background when both are lit, and both
+            // indicators still show. A row with EITHER signal single-click-transports to that thread (the fast
+            // "the thread that needs me" path); a calm row keeps the double-click-to-open gesture.
+            const unseen = !!ch.youWaiting;
+            const unseenCount = ch.youWaitingCount || 0;
+            const yourTurn = ch.state === "waiting";
+            const signalling = unseen || yourTurn;
+            const preview = ch.youWaitingPreview || [];
+            const more = ch.youWaitingMore || 0;
+            const rowTitle = yourTurn
+              ? "an agent is blocked waiting on you — click to go to this thread"
+              : unseen
+                ? `${unseenCount} unseen mention${unseenCount === 1 ? "" : "s"} — click to go to this thread`
+                : "double-click or drag onto the canvas to open this thread";
             return html`
             <div
-              class="ses-row ${waiting ? "waiting" : ""}"
+              class="ses-row ${yourTurn ? "your-turn" : ""} ${unseen ? "unseen" : ""}"
               draggable="true"
               data-interactive="1"
               tabindex="0"
-              title=${waiting
-                ? `${count} message${count === 1 ? "" : "s"} await you — click to go to this thread`
-                : "double-click or drag onto the canvas to open this thread"}
+              title=${rowTitle}
               @dragstart=${(e) => dragStart(e, ch)}
-              @click=${(e) => { if (!waiting) return; e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
+              @click=${(e) => { if (!signalling) return; e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
             >
-              <span class="ses-row-title ${ch.title ? "" : "ses-row-mono"}">${ch.title || ch.chanId}</span>
-              ${waiting ? html`<span class="ses-row-wait" title="messages awaiting you">${count}</span>` : ""}
+              <span class="ses-row-title ${ch.title ? "" : "ses-row-mono"} ${signalling ? "ses-row-title-pad" : ""}">${ch.title || ch.chanId}</span>
+              ${signalling
+                ? html`<span class="ses-row-signals">
+                    ${yourTurn ? html`<span class="ses-row-turn" title="an agent is waiting on you">◆ your turn</span>` : ""}
+                    ${unseen
+                      ? html`<span class="ses-row-unseen" data-interactive="1" title="${unseenCount} unseen mention${unseenCount === 1 ? "" : "s"} — hover to preview">
+                          ${unseenCount}
+                          <!-- Interactive preview popover (Issue #4 pattern): pointer-events:auto, a DOM descendant
+                               of the badge with NO gap to it, so the cursor can travel in without dropping :hover.
+                               Each entry is a cross-card jump to that specific mention. -->
+                          <span class="ses-row-preview" role="tooltip">
+                            <span class="ses-row-preview-head">${unseenCount} unseen mention${unseenCount === 1 ? "" : "s"}${jump ? " — click one to jump" : ""}</span>
+                            ${more > 0 ? html`<span class="ses-row-preview-more">+${more} earlier · newest ${preview.length} shown</span>` : ""}
+                            ${preview.map(
+                              (p) => html`<button
+                                type="button"
+                                class="ses-row-preview-item"
+                                data-interactive="1"
+                                title="jump to this message"
+                                @click=${(e) => { e.preventDefault(); e.stopPropagation(); jump && jump(ch.chanId, ch.title, ch.text, p.seq); }}
+                              >
+                                <span class="ses-row-preview-from">${p.fromLabel || p.from}</span>
+                                <span class="ses-row-preview-text">${p.text}</span>
+                              </button>`,
+                            )}
+                          </span>
+                        </span>`
+                      : ""}
+                  </span>`
+                : ""}
               <span class="ses-row-meta">
                 ${ch.messages ? `${ch.messages} msg${ch.messages === 1 ? "" : "s"}` : "no messages"}${ch.mtime ? ` · ${timeAgo(ch.mtime)}` : ""}
               </span>

@@ -9,7 +9,7 @@ import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
-import { openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink } from "./loader";
+import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
@@ -368,8 +368,6 @@ function ProvenanceView({
 type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
 // A pinned message (R-PIN): a snapshot flagged as head context, rendered in the collapsible pinned tray.
 type PinnedMsg = { seq: number; from: string; text: string; ts: number; pinnedBy?: string; pinnedAt?: number };
-// One waiting-message preview (Phase 3): the sender + a trimmed one-line snippet + the seq to jump to.
-type WaitingPreview = { seq: number; from: string; text: string };
 // A member's readable display handle: a role-spawned session carries a `.name` ("Coordinator.97acc4bc"); show it as
 // "Coordinator.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
@@ -406,17 +404,17 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingPreview?: WaitingPreview[]; youWaitingMore?: number }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[] }>("thread:" + id));
   const msgs = feed?.messages ?? [];
-  // The board owner's waiting signal (user waiting-state + you-pill): server-derived on the feed — an
-  // @you/@human mention newer than the human's own last post. Colours the static "you" pill amber; clears
-  // when the human posts (clear-on-reply). thread-waiting.js is the single source of truth.
-  const youWaiting = feed?.youWaiting ?? false;
-  const youWaitingCount = feed?.youWaitingCount ?? 0;
-  // The actual waiting messages (Phase 3): sender + snippet + seq, bounded with a `+N more` overflow. Feeds
-  // the pill's hover preview list, each entry jump-to-message (jumpToSeq) within this card's log.
-  const youWaitingPreview = feed?.youWaitingPreview ?? [];
-  const youWaitingMore = feed?.youWaitingMore ?? 0;
+  // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you/@human
+  // mention seqs the human has not yet VIEWED (thread-waiting.js × the durable seenMentions set). This no
+  // longer paints the "you" pill (that is PRESENCE-only now — grey/green by card focus, below). It drives the
+  // viewport observer: `youWaitingSeqs` are exactly the message elements to watch and, once one scrolls into
+  // view with the card focused, mark seen (POST /seen → the seq drops out). The rail (threads-list card) shows
+  // the count + the preview popover + the cross-card jump; the open card's job is only to clear-on-view.
+  const youWaitingSeqs = feed?.youWaitingSeqs;
+  // A stable key so the observer effect re-runs only when the unseen SET actually changes (not per feed frame).
+  const youWaitingKey = (youWaitingSeqs ?? []).join(",");
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
   // Observed process-state per member, for the pill fusion (part 1 — process-state overrides a stale
@@ -462,6 +460,10 @@ function ThreadView({
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  // A pending cross-card jump-to-message (user waiting-state, P3): set when the rail's preview popover
+  // transports here (window event / consumePendingJump on mount), consumed by an effect that scrolls to the
+  // seq once its element renders (jumpToSeq). null when there's nothing to jump to.
+  const [jumpTarget, setJumpTarget] = useState<number | null>(null);
   // Guards the composer against a double-send: while a post is in flight `sending` is true, which disables
   // the Send button and short-circuits a second send() (a transient bus delay let a repeat click through).
   const [sending, setSending] = useState(false);
@@ -650,6 +652,80 @@ function ThreadView({
     el.classList.add("jump-flash");
   };
 
+  // Per-viewed-message clearing (user waiting-state, P2): while the card is FOCUSED, watch the still-unseen
+  // @human-mention elements in the log; when one scrolls into the viewport, mark its seq SEEN (POST /seen),
+  // which drops it from the count individually. Gated on `selected` (focus is what makes "viewed" count) and
+  // scoped to `youWaitingSeqs` (mentions only — the tiny set that keeps write cadence low). Debounced so a
+  // scroll-through batches into one POST; each seq is unobserved once seen so it fires at most once.
+  useEffect(() => {
+    if (!selected) return; // only a focused card clears — focusing greens the pill but clears nothing
+    const root = logRef.current;
+    const unseen = new Set((youWaitingKey ? youWaitingKey.split(",") : []).map(Number).filter((n) => n >= 1));
+    if (!root || unseen.size === 0) return;
+    const pending = new Set<number>();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const flush = () => {
+      timer = null;
+      if (pending.size === 0) return;
+      const seqs = [...pending];
+      pending.clear();
+      void fetch(`/api/thread/${encodeURIComponent(id)}/seen`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ from: "human", seqs }),
+      }).catch(() => {}); // best-effort — a dropped mark just leaves the mention flagged; the next view retries
+    };
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (!e.isIntersecting) continue;
+          const seq = Number((e.target as HTMLElement).dataset.seq);
+          if (!unseen.has(seq)) continue;
+          pending.add(seq);
+          io.unobserve(e.target); // seen once — stop watching so it can't re-fire
+        }
+        if (pending.size && timer == null) timer = setTimeout(flush, 400);
+      },
+      { root, threshold: 0.6 },
+    );
+    for (const seq of unseen) {
+      const el = root.querySelector<HTMLElement>(`.chan-msg[data-seq="${seq}"]`);
+      if (el) io.observe(el); // a mention beyond the rendered tail can't be watched — it clears when scrolled to
+    }
+    return () => {
+      io.disconnect();
+      if (timer != null) clearTimeout(timer);
+    };
+  }, [selected, id, youWaitingKey, msgs.length]);
+
+  // Cross-card jump (user waiting-state, P3): the rail's preview popover transports here and asks the log to
+  // scroll to a specific mention. A freshly-OPENED card reads the pending request on mount (consumePendingJump);
+  // an ALREADY-OPEN card catches it via the window event. Either way it lands in `jumpTarget`; the retry effect
+  // below waits for the message element to render.
+  useEffect(() => {
+    const pending = consumePendingJump(id);
+    if (pending != null) setJumpTarget(pending);
+    const onJump = (e: Event) => {
+      const detail = (e as CustomEvent<{ threadId: string; seq: number }>).detail;
+      if (detail?.threadId === id) setJumpTarget(detail.seq);
+    };
+    window.addEventListener(THREAD_JUMP_EVENT, onJump as EventListener);
+    return () => window.removeEventListener(THREAD_JUMP_EVENT, onJump as EventListener);
+  }, [id]);
+  // Retry the jump as the feed loads: the target element may not exist yet on a fresh open. Re-attempts on any
+  // message-count change; gives up (clears the target) once it lands or after a bounded wait so it can't linger.
+  useEffect(() => {
+    if (jumpTarget == null) return;
+    const el = logRef.current?.querySelector<HTMLElement>(`.chan-msg[data-seq="${jumpTarget}"]`);
+    if (el) {
+      jumpToSeq(jumpTarget);
+      setJumpTarget(null);
+      return;
+    }
+    const giveUp = setTimeout(() => setJumpTarget(null), 4000); // never scrolled into the tail — stop retrying
+    return () => clearTimeout(giveUp);
+  }, [jumpTarget, msgs.length]);
+
   return (
     <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
@@ -770,38 +846,16 @@ function ThreadView({
       <div className="chan-members">
         {/* The board owner, always present as a static roster anchor (Thread card UI batch 8): the human is
             not a server member edge and carries no work-intent, so it's a calm neutral "you" pill — no wake/tag
-            affordance. It leads the roster; agent participants follow. It DOES carry one status: `waiting`
-            (user waiting-state), an amber flag when an @you/@human mention awaits the human, cleared when they
-            reply (clear-on-reply). Hovering the amber pill reveals a PREVIEW of the actual waiting messages —
-            sender + snippet — and clicking one jumps the log to it (Phase 3). The preview is an INTERACTIVE
-            popover (pointer-events:auto, no gap, a DOM descendant of the pill so the cursor can travel into it
-            without dropping :hover — the Issue #4 pattern) precisely because it has click targets. */}
-        <span className={`chan-member chan-member-you${youWaiting ? " waiting" : ""}`} data-interactive>
+            affordance. It leads the roster; agent participants follow. Its one status is PRESENCE (user
+            waiting-state): grey when the card isn't focused, green when it is (`selected` — the same card
+            selection everything else reads). No waiting/amber semantics and no hover preview here anymore —
+            unseen-mention surfacing + the jump-to-message preview live on the threads-list card now, and
+            mentions clear by being VIEWED in the log (the viewport observer above), not by focusing this pill. */}
+        <span
+          className={`chan-member chan-member-you${selected ? " present" : ""}`}
+          title={selected ? "you — viewing this thread" : "you"}
+        >
           <span className="chan-member-name">you</span>
-          {youWaiting && (
-            <span className="chan-tip chan-tip-up chan-tip-preview" role="tooltip" data-interactive>
-              <span className="chan-tip-line">
-                <b className="chan-tip-intent i-blocked-human">waiting</b>
-                {` — ${youWaitingCount} message${youWaitingCount === 1 ? "" : "s"} await${youWaitingCount === 1 ? "s" : ""} you; ${youWaitingPreview.length > 0 ? "click one to jump, or reply to clear" : "reply to clear"}`}
-              </span>
-              {youWaitingMore > 0 && (
-                <span className="chan-tip-preview-more">+{youWaitingMore} earlier · newest {youWaitingPreview.length} shown</span>
-              )}
-              {youWaitingPreview.map((p) => (
-                <button
-                  key={p.seq}
-                  type="button"
-                  className="chan-tip-preview-item"
-                  data-interactive
-                  title="jump to this message"
-                  onClick={() => jumpToSeq(p.seq)}
-                >
-                  <span className="chan-tip-preview-from">{senderLabel(p.from, nameForSid(p.from))}</span>
-                  <span className="chan-tip-preview-text">{p.text}</span>
-                </button>
-              ))}
-            </span>
-          )}
         </span>
         {members.length === 0 ? (
           <span className="chan-empty">no agents yet — alt-drag a session card onto this channel to join it</span>

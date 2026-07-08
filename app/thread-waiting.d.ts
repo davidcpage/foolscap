@@ -7,9 +7,13 @@ export type WaitingMsg = { seq: number; from: string; text?: string; kind?: stri
 // One waiting-message preview: the sender + a trimmed one-line snippet + the seq (for jump-to-message).
 export type WaitingPreview = { seq: number; from: string; text: string };
 
-export function humanWaiting(log: WaitingMsg[]): {
+export function humanWaiting(
+  log: WaitingMsg[],
+  seenMentions?: Iterable<number>,
+): {
   waiting: boolean;
   count: number;
+  seqs: number[];
   preview: WaitingPreview[];
   more: number;
 };

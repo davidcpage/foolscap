@@ -414,3 +414,40 @@ export function unpinMessage(repoPath, threadId, seq) {
   upsertThreadMeta(repoPath, threadId, { pins });
   return pins;
 }
+
+// ── seen mentions (user waiting-state + you-pill, thread node:mrbz24qp-h) ────────────────────────────
+// The board owner's PER-VIEWED-MESSAGE clearing state: the set of @human/@user MENTION seqs the human has
+// actually VIEWED (scrolled into the thread-log viewport while the card is focused). It is the exact PIN-store
+// shape one surface over — a per-seq collection on the marker with a union add — except it stores bare seqs
+// (mentions are few; no snapshot is needed, since a seen mention is derived against the live log, not
+// re-rendered from the marker). thread-waiting.js reads it to decide which mentions are still unseen; a client
+// viewport observer POSTs newly-viewed seqs (POST /api/thread/:id/seen → markSeenMentions). Bounded to
+// mention-seqs, so it stays tiny and only grows when a NEW mention is viewed — the one real cost the scope
+// flagged (an unbounded per-scroll rewrite) is neutralised by tracking mentions only. `seenMentions` lives on
+// the meta marker beside `pins`/`seats`/`intents`.
+
+/**
+ * The seqs the human has VIEWED on this thread (sorted), or [] if none / no marker. Best-effort, never throws.
+ */
+export function readSeenMentions(repoPath, threadId) {
+  const seen = readThreadMeta(repoPath, threadId)?.seenMentions;
+  return Array.isArray(seen) ? seen : [];
+}
+
+/**
+ * Mark mention seqs as VIEWED — union `seqs` (positive integers) into the marker's `seenMentions`, sorted.
+ * Idempotent: re-marking an already-seen seq (or passing nothing new) is a no-op that returns the existing set
+ * unchanged (never a duplicate, never a churned marker write). Returns the updated (or unchanged) array.
+ */
+export function markSeenMentions(repoPath, threadId, seqs) {
+  const prior = readSeenMentions(repoPath, threadId);
+  const set = new Set(prior);
+  let changed = false;
+  for (const s of seqs ?? []) {
+    if (Number.isInteger(s) && s >= 1 && !set.has(s)) { set.add(s); changed = true; }
+  }
+  if (!changed) return prior; // nothing new viewed — don't churn the marker
+  const next = [...set].sort((a, b) => a - b);
+  upsertThreadMeta(repoPath, threadId, { seenMentions: next });
+  return next;
+}

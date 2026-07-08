@@ -14,10 +14,13 @@
 #     card on double-click: the keyboard-free twin of the drag-out (loader.openChannel), placed offset
 #     down-right from this browser card (loader.cascadeFrom) since a double-click carries no drop point.
 #     openChannel flies to the card if it already exists rather than duplicating, so it doubles as the
-#     TRANSPORT for a WAITING row: a thread whose `youWaiting` is set (user waiting-state + you-pill, Phase 2)
-#     is highlighted amber and single-click-transports the human to it via this same action.
+#     TRANSPORT for a signalling row (user waiting-state + you-pill): a thread with an unseen mention (a) or an
+#     agent blocked on the human (b) single-click-transports the human to it via this same action.
+#   • `channelJump` — a per-card ACTION (chanId/title/text/seq): `channelOpen` PLUS a scroll-to-message. The
+#     unseen-mention preview popover (signal (a)) picks a specific mention; this opens the thread card AND
+#     scrolls/flashes that exact message (loader.requestThreadJump → the ThreadView's viewport jump).
 #
 # No `chrome` flag: a browser is a container and wants its frame (like the directory / sessions card).
 name: channels
 contract: 1
-capabilities: [channelList, channelRefresh, channelOpen]
+capabilities: [channelList, channelRefresh, channelOpen, channelJump]
