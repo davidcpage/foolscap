@@ -2624,14 +2624,19 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
    scroll/clip — so the box expands instead of cropping. The textarea autosizes via JS (height:auto+scrollHeight);
    here we just drop the clamp and the manual resize handle so it doesn't fight that. */
 textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
+/* Read-mode brief is its OWN contained element (Thread card UI): a subtle resting outline + faint fill,
+   inset from the card edges by the base margin, so the brief no longer bleeds into the card's side border
+   or the main background — the container reads clearly instead of merging with the card. */
 .chan-description-view {
   cursor: text;
   white-space: pre-wrap;
   word-break: break-word;
   max-height: none;
   overflow: visible;
+  border-color: #ebe6f4;
+  background: #ffffff8c;
 }
-.chan-description-view:hover { border-color: #ece6f7; }
+.chan-description-view:hover { border-color: #d9cef2; background: #ffffffc2; }
 .chan-desc-empty { color: #b8b3c4; font-style: italic; }
 /* A brief clamps to a SINGLE line in read mode — a Slack-topic-style one-liner that can't eat the card's
    vertical space (Thread card UI, human report); the "show more" toggle below drops the clamp for a longer
@@ -2696,6 +2701,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font-weight: 600;
   color: #52525b;
 }
+/* Bottom-right meta cluster (Thread card UI): timestamp + faint pin toggle, WhatsApp-style inline meta at
+   the tail of the bubble rather than a header line. */
+.chan-msg-meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 2px;
+}
 .chan-msg-time {
   font-size: 9px;
   color: #a1a1aa;
@@ -2752,19 +2766,18 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   line-height: 1.5;
 }
-/* The human's own turns are the same purple bubble, distinguished ONLY by right-alignment and a mirrored
-   tail (Thread card UI) — no separate fill. */
+/* WhatsApp-style (Thread card UI): the human's own (outgoing) turns get a DISTINCT fill — a soft green on
+   the right — so "mine vs theirs" reads at a glance, while everyone else's incoming turns stay soft purple
+   on the left. (This deliberately reverses the earlier uniform-purple pass: uniform read too subtle.) */
 .chan-msg.me {
   align-self: flex-end;
   max-width: 85%;
   border-radius: 10px 10px 2px 10px;
+  background: #dbf1e1;
 }
-.chan-msg.me .chan-msg-head { justify-content: flex-end; }
-/* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
-   keeps its place in the log and shows its 📌 lit; the inline left accent below marks it as head context
-   (mirrored server-side into /inbox's `pinned`). */
+/* R-PIN: a per-message pin toggle, faint until the bubble is hovered so the log stays quiet; it lives in the
+   bottom-right meta cluster beside the timestamp. A pinned message shows its 📌 lit + the left accent below. */
 .chan-pin-toggle {
-  margin-left: 6px;
   padding: 0;
   border: none;
   background: none;
@@ -2777,9 +2790,9 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
-/* Pinned now that every bubble is purple, a fill can't mark "pinned" — a thin left accent does, quietly
-   (Thread card UI). The lit 📌 in the header is the other cue. */
-.chan-msg.pinned { box-shadow: inset 3px 0 0 #a78bfa; }
+/* Pinned messages stand out with a thin left accent AND a subtle full outline (Thread card UI) — a fill
+   can't mark them since every bubble is already filled. The lit 📌 in the meta row is the other cue. */
+.chan-msg.pinned { box-shadow: inset 3px 0 0 #a78bfa, 0 0 0 1px #d6c6f2; }
 .chan-members {
   display: flex;
   flex-wrap: wrap;
@@ -2799,18 +2812,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-radius: 10px;
   border: 1px solid transparent;
 }
-/* the member name as a click-to-tag button — drops @<prefix> into the post box. Inherits the pill's mono
-   font/colour and reads as plain text until hovered, so the roster still scans as a list of names. */
-.chan-member-tag {
+/* the member name — plain text. Hover surfaces the member's status (the pill title); the @-tag insert is
+   the rarer, deliberate act, so it's on RIGHT-CLICK of the pill, not a click on the name (Thread card UI). */
+.chan-member-name {
   font: inherit;
   color: inherit;
-  background: transparent;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-}
-.chan-member-tag:hover {
-  text-decoration: underline;
 }
 /* per-member backlog-visibility toggle (full="all" / future="new") — the human's history control. Neutral
    so the roster reads calm (Thread card UI): the pills are informational, not a status to be shouted. */
@@ -2825,8 +2831,10 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-hist:hover { background: #fff; border-color: #a1a1aa; }
 /* An OPEN member reads as a quiet neutral pill; a PENDING (invited) one is dimmer with a dashed border to
-   mark "not yet joined" — the distinction carried by weight/border, not by competing saturated colours. */
+   mark "not yet joined" — the distinction carried by weight/border, not by competing saturated colours.
+   The context-menu cursor hints that right-click inserts the @-tag (Thread card UI). */
 .chan-member.open {
+  cursor: context-menu;
   background: #f4f4f5;
   color: #52525b;
   border-color: #e4e4e7;
