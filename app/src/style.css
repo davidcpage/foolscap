@@ -1243,47 +1243,6 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #d97706;
   border-radius: 8px;
 }
-/* The waiting row's hover PREVIEW (Phase 3): the actual waiting messages — sender + snippet — revealed on
-   hover so the human sees WHAT awaits, not just the count. A PURE-REVEAL tooltip (pointer-events:none): the
-   row itself single-click-transports to the thread (Phase 2), so there are no click targets inside to reach,
-   which is why it needn't be an interactive popover (unlike the thread-card pill, which adds jump-to-message).
-   Opens downward within the card; like the thread card's chan-tip it's bounded by the card's scroll box
-   (.dir-body clips) — kept short (≤4 rows) so it fits below most rows. */
-.ses-row-preview {
-  display: none;
-  position: absolute;
-  z-index: 50;
-  top: calc(100% - 2px);
-  left: 8px;
-  right: 8px;
-  padding: 5px 8px;
-  background: #fff;
-  border: 1px solid #e4e4e7;
-  border-radius: 6px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
-  font: 10px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  color: #3f3f46;
-  text-align: left;
-  white-space: normal;
-  pointer-events: none;
-}
-.ses-row.waiting:hover .ses-row-preview { display: block; }
-.ses-row-preview-head { color: #b45309; font-weight: 600; }
-.ses-row-preview-more { margin-top: 2px; color: #a1a1aa; font-size: 9px; }
-.ses-row-preview-item {
-  margin-top: 4px;
-  padding: 3px 5px;
-  border-radius: 4px;
-  background: #faf7f2;
-}
-.ses-row-preview-from { display: block; font-weight: 700; color: #52525b; }
-.ses-row-preview-text {
-  display: block;
-  color: #71717a;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 /* The title line: an optional role chip then the session title, on one row (the chip never shrinks, the
    title takes the rest and ellipsises). */
 .ses-row-line {

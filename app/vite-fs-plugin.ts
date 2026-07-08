@@ -1420,7 +1420,10 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
     // open card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
     // fresh by appendThreadMsg), so this stays a cheap read; the threads:<board> ping re-pulls on any
     // message or reply, setting/clearing the highlight live.
-    const { waiting: youWaiting, count: youWaitingCount, preview: youWaitingPreview, more: youWaitingMore } =
+    // Only the waiting flag + count here: the threads-list card shows an amber highlight and a count badge,
+    // no per-message preview (you can't select a message from the list — the thread card's "you" pill is
+    // where the preview + jump-to-message lives, off the thread:<id> feed). So we drop preview/more.
+    const { waiting: youWaiting, count: youWaitingCount } =
       humanWaiting(threadLog(boardId, m.threadId));
     return {
       threadId: m.threadId,
@@ -1431,10 +1434,6 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
       youWaiting,
       youWaitingCount,
-      // The actual waiting messages (Phase 3): sender + trimmed snippet + seq, bounded with `+N more` overflow
-      // (thread-waiting.js). Feeds the threads-list row's hover preview, same derivation as the thread feed.
-      youWaitingPreview,
-      youWaitingMore,
       // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
       // declarer holds one, else sid) — the raw material the state projection derives from.
       intents: m.intents ?? {},

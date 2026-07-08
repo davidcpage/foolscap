@@ -404,7 +404,7 @@ export interface ChannelMeta {
   // (handleThreads → humanWaiting), the same signal the thread:<id> feed's "you" pill uses — no client
   // re-derivation. Optional: an older server/board that predates the field simply omits it (no highlight).
   youWaiting?: boolean;
-  youWaitingCount?: number; // how many mentions await (for the badge/tooltip); 0 when not waiting
+  youWaitingCount?: number; // how many mentions await (for the count badge); 0 when not waiting
 }
 
 let channelListValue: ChannelMeta[] | undefined;
