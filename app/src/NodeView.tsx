@@ -8,7 +8,7 @@ import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
-import { MEMBER_OPEN, postToThread, setThreadHistory, setThreadPin } from "./threads";
+import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
 import { openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
@@ -375,18 +375,17 @@ function ThreadView({
   const [editingDesc, setEditingDesc] = useState(false);
   const descRef = useRef<HTMLTextAreaElement>(null);
   // Read-mode brief is always a SINGLE line — a Slack-topic-style one-liner that can't eat the card's
-  // vertical space; the full text shows on hover (title attr). No expand toggle: long briefs are
-  // discouraged, so the UI doesn't accommodate them (Thread card UI). Edit mode still auto-grows (below).
+  // vertical space; a fast custom hover tooltip (below) shows the full text with markdown when it's clamped.
+  // No expand toggle: long briefs are discouraged (Thread card UI). Edit mode still auto-grows (below).
+  // `descOverflows` (does the one-line clamp actually hide anything?) gates that tooltip.
+  const descViewRef = useRef<HTMLDivElement>(null);
+  const [descOverflows, setDescOverflows] = useState(false);
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   // Guards the composer against a double-send: while a post is in flight `sending` is true, which disables
   // the Send button and short-circuits a second send() (a transient bus delay let a repeat click through).
   const [sending, setSending] = useState(false);
-  // The history visibility last chosen for each member (sid → mode), for the per-member toggle's label.
-  // It's the human's last action, not a read-back of the server cursor (which only "means" a mode at the
-  // seeding instant), so it resets to the "full" default on reload — honest as a control, not a mirror.
-  const [histMode, setHistMode] = useState<Record<string, "full" | "future">>({});
   // Tail-follow the conversation: scroll to the newest message when one arrives, UNLESS the user has
   // scrolled up to read history (then leave them put). `stick` tracks "is at the bottom", set on scroll.
   const logRef = useRef<HTMLDivElement>(null);
@@ -403,6 +402,12 @@ function ThreadView({
   // Re-seed the local edit fields when the record changes underneath us (an agent edited the description).
   useEffect(() => setDescription(node.text), [node.text]);
   useEffect(() => setTitle(node.title), [node.title]);
+  // Does the one-line clamp actually hide anything? Only then is the full-text hover tooltip worth showing.
+  useEffect(() => {
+    const el = descViewRef.current;
+    if (!el || editingDesc) return;
+    setDescOverflows(el.scrollHeight - el.clientHeight > 1 || el.scrollWidth - el.clientWidth > 1);
+  }, [description, editingDesc]);
 
   useEffect(() => {
     const host = ref.current;
@@ -487,14 +492,6 @@ function ThreadView({
     el.setSelectionRange(el.value.length, el.value.length);
     autosizeDesc(el);
   }, [editingDesc]);
-  // Flip a member between full backlog and future-only, optimistically (the chip label follows the human's
-  // click; the server is the source of truth for the cursor itself).
-  const toggleHistory = async (sid: string) => {
-    const next = (histMode[sid] ?? "full") === "full" ? "future" : "full";
-    setHistMode((h) => ({ ...h, [sid]: next }));
-    const r = await setThreadHistory(id, sid, next);
-    setStatus(r.ok ? `${sid.slice(0, 8)}: ${next === "full" ? "full history" : "future only"}` : (r.error ?? "failed"));
-  };
   const commitTitle = () => {
     const t = title.trim() || "thread";
     if (t !== node.title) m.editor.commit({ type: "setTitle", actor: "user", payload: { id, title: t } });
@@ -566,10 +563,11 @@ function ThreadView({
           onKeyDown={(e) => { if (e.key === "Escape") { setDescription(node.text); setEditingDesc(false); } }}
         />
       ) : (
-        <>
+        <div className="chan-desc-wrap">
           <div
+            ref={descViewRef}
             className="chan-description chan-description-view clamped"
-            title={description.trim() ? description : "click to edit the brief"}
+            title={description.trim() ? "" : "click to edit the brief"}
             data-interactive
             onClick={() => setEditingDesc(true)}
           >
@@ -579,7 +577,14 @@ function ThreadView({
               <span className="chan-desc-empty">add a brief (markdown — links open canvas cards)</span>
             )}
           </div>
-        </>
+          {/* Fast custom hover tooltip (no native-title ~1s delay): the FULL brief with markdown, shown only
+              when the one-line clamp actually hides something (Thread card UI). */}
+          {description.trim() && descOverflows && (
+            <div className="chan-tip chan-tip-down chan-tip-brief" role="tooltip">
+              <MarkdownInline text={description} m={m} />
+            </div>
+          )}
+        </div>
       )}
       <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
         {feed?.truncated && (
@@ -648,39 +653,34 @@ function ThreadView({
           <span className="chan-empty">no members — alt-drag a session card onto this channel to join it</span>
         ) : (
           members.map((mem) => {
-            const mode = histMode[mem.sid] ?? "full";
             // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
             // blocked:peer, green = working, grey = done); fall back to the open/pending styling when they've
             // declared nothing.
             const ci = mem.open ? currentIntent[mem.sid] : undefined;
             const intentClass = ci ? ` i-${ci.intent.replace(":", "-")}` : "";
             const tag = mem.open ? tagFor(mem, openMembers) : null;
-            // HOVER surfaces the member's current status (the common thing); the @-tag insert is the rarer,
-            // deliberate act, so it's on RIGHT-CLICK (contextmenu), not the hover/click payload (Thread card
-            // UI). Title leads with status, then the right-click hint, then the full sid.
-            const title = [ci?.text, tag ? `right-click to @-tag @${tag}` : null, mem.sid]
-              .filter(Boolean)
-              .join(" · ");
+            // A fast custom hover tooltip (no native-title delay, Thread card UI) surfaces the member's
+            // current STATUS — the common thing — plus a hint that RIGHT-CLICK inserts the @-tag (the rarer,
+            // deliberate act; no cursor change now). Lines are dropped when there's nothing to say.
+            const tipLines = [
+              ci?.text ?? (mem.open ? "no status declared" : "invited — not yet joined"),
+              tag ? "right-click: insert @tag" : null,
+            ].filter(Boolean) as string[];
             return (
               <span
                 key={mem.edgeId}
                 className={`chan-member${mem.open ? " open" : " pending"}${intentClass}`}
-                title={title}
                 data-interactive
                 onContextMenu={tag ? (e) => { e.preventDefault(); e.stopPropagation(); insertTag(tag); } : undefined}
               >
                 <span className="chan-member-name">
                   {displayHandle(mem.name, mem.sid)}{!mem.open && " (invited)"}
                 </span>
-                {mem.open && (
-                  <button
-                    className="chan-hist"
-                    title={`history for this member: ${mode === "full" ? "showing the full backlog" : "future messages only"} — click to ${mode === "full" ? "limit to new messages only" : "replay the full backlog"}`}
-                    onClick={(e) => { e.stopPropagation(); void toggleHistory(mem.sid); }}
-                  >
-                    {mode === "full" ? "all" : "new"}
-                  </button>
-                )}
+                <span className="chan-tip chan-tip-up" role="tooltip">
+                  {tipLines.map((l, i) => (
+                    <span key={i} className="chan-tip-line">{l}</span>
+                  ))}
+                </span>
               </span>
             );
           })
