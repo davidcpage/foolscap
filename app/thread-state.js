@@ -30,6 +30,31 @@ export function isThreadState(s) {
 const effectiveIntent = (p) => p.intent ?? (p.processState === "exited" ? "done" : "working");
 
 /**
+ * The DISPLAY intent for a SINGLE participant surface (the roster member pill, or any view that renders a
+ * raw declared intent) — the same process-state ⇄ declared-intent fusion `deriveThreadState` applies,
+ * surfaced per-member instead of per-thread.
+ *
+ * A declared intent only adds information while the process is IDLE: `idle+working`, `idle+blocked:human`
+ * and `idle+done` are identical to the canvas, so only the declaration tells them apart. When the process
+ * is RUNNING there is no ambiguity — it is demonstrably computing — so `working` is the honest reading and
+ * the declared intent is IGNORED (it can't update mid-turn and goes stale: the "blocked pill on a
+ * green/running card" contradiction this exists to kill).
+ *
+ * Unlike `effectiveIntent`, an idle/exited participant that never declared returns `null` (not a
+ * defaulted `working`): fabricating a status on a surface whose whole job is to show what was *declared*
+ * would be the same dishonesty. deriveThreadState defaults for its own (thread-level) reason; a pill must
+ * not. Callers render `null` as "no status declared".
+ *
+ * @param {"running"|"idle"|"exited"} processState
+ * @param {string|null|undefined} intent  the latest declared work-intent, or null/undefined if none
+ * @returns {string|null} the intent to render, or null when nothing should show
+ */
+export function memberDisplayIntent(processState, intent) {
+  if (processState === "running") return "working";
+  return intent ?? null;
+}
+
+/**
  * Derive a thread's state from its participants (§4 table, in precedence order):
  *
  *   active  — any participant computing (`running`), or live and (declared-or-default) `working`.
