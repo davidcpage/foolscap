@@ -145,12 +145,14 @@ export default {
     //
     // TRUNCATION GUARD (CLAUDE.md size-cap rule): `fileContent` is a MAX_BYTES *preview* — content.ts marks
     // a clipped body with a trailing `\n…` sentinel. Editing that preview and saving would write it back
-    // over the whole file, silently dropping everything past the cap. So a truncated file is NEVER editable
-    // (no Edit affordance) — the user still reads it, they just can't clobber the tail.
+    // over the whole file, silently dropping everything past the cap. So a truncated file can't be edited —
+    // but the affordance is shown DISABLED with a tooltip (not silently absent), so it reads as "too large
+    // to edit here", not a missing feature.
     const write = card.signals.writeFile;
     const editState = card.signals.treeState;
     const truncated = typeof text === "string" && text.endsWith("\n…");
-    const canEdit = Boolean(write && editState) && !truncated;
+    const granted = Boolean(write && editState); // the two edit capabilities are present
+    const canEdit = granted && !truncated; // …and it's safe to edit (not a clipped preview)
     const editing = canEdit && editState.get() === true;
 
     // Read the live textarea from the edit container, persist if changed (a no-op save doesn't churn the
@@ -230,14 +232,21 @@ export default {
         ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
         <span class="file-name">${base}</span>
         <span class="file-ext">${kind}</span>
-        ${canEdit
-          ? html`<button
-              class="file-edit-toggle"
-              type="button"
-              title="edit the raw source"
-              @mousedown=${(e) => e.preventDefault()}
-              @click=${() => editState.set(true)}
-            >edit</button>`
+        ${granted
+          ? canEdit
+            ? html`<button
+                class="file-edit-toggle"
+                type="button"
+                title="edit the raw source"
+                @mousedown=${(e) => e.preventDefault()}
+                @click=${() => editState.set(true)}
+              >edit</button>`
+            : html`<button
+                class="file-edit-toggle file-edit-disabled"
+                type="button"
+                disabled
+                title="This card shows a truncated preview of a large file — editing here would overwrite the rest on save. Open it in a full editor instead."
+              >edit</button>`
           : ""}
       </div>
       ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}

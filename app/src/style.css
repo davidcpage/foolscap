@@ -291,6 +291,18 @@ body {
   background: #eef2ff;
   border-color: #c7d2fe;
 }
+/* Truncated preview: the toggle is shown DISABLED (not silently absent) so a large file reads as "too big
+   to edit here" — the tooltip says why — rather than looking like a missing feature. Editing a clipped
+   preview would clobber the tail on save (the truncation guard in render.js). */
+.file-edit-toggle:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+.file-edit-toggle:disabled:hover {
+  color: #71717a;
+  background: #00000008;
+  border-color: #00000014;
+}
 /* Edit mode: the raw source fills the card body (reusing .file-body's scroll/monospace box) with a Save /
    Cancel bar pinned below it. .file-edit is the container both the textarea and the buttons live in, so a
    Save reads the sibling textarea via closest('.file-edit'). */

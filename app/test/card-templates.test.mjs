@@ -205,13 +205,17 @@ test("file template: in-card raw-source EDIT toggle (writeFile + treeState), tru
   assert.ok(!edit.includes("md-prose"), "the rendered prose view is replaced, not layered");
   assert.ok(edit.includes("file-edit-save") && edit.includes("file-edit-cancel"), "Save + Cancel controls render");
 
-  // TRUNCATION GUARD (CLAUDE.md size-cap rule): a MAX_BYTES-clipped preview (trailing `\n…` sentinel) is
-  // NEVER editable — saving the clipped preview would write it back over the whole file, dropping the tail.
-  mode = undefined;
+  // TRUNCATION GUARD (CLAUDE.md size-cap rule): a MAX_BYTES-clipped preview (trailing `\n…` sentinel) can't
+  // be edited — saving the clipped preview would write it back over the whole file, dropping the tail. The
+  // affordance is shown DISABLED with an explanatory tooltip (not silently absent), so it reads as "too big
+  // to edit here", not a missing feature. Clicking it can't enter edit mode.
+  mode = true; // even if some stale flag says "editing", a truncated file must stay in the rendered view
   const clipped = flatten(
     mod.render({ fields: { title: "big.ts", text: "", color: "blue" }, signals: { fileContent: "const x = 1;\n…", writeFile: () => {}, treeState: ts } }),
   );
-  assert.ok(!clipped.includes("file-edit-toggle"), "no edit on a truncated preview (a save would clobber the tail)");
+  assert.ok(clipped.includes("file-edit-disabled") && clipped.includes("disabled"), "truncated preview shows a DISABLED edit affordance, not a missing one");
+  assert.ok(clipped.includes("truncated preview"), "the tooltip explains WHY it can't be edited");
+  assert.ok(!clipped.includes("textarea"), "a truncated file never enters the raw-source editor");
 });
 
 test("directory template is an in-card tree: dirListing(path) per level, treeState expands, every row drags / folders also expand", async () => {
