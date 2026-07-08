@@ -2630,6 +2630,27 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-description-view:hover { border-color: #ece6f7; }
 .chan-desc-empty { color: #b8b3c4; font-style: italic; }
+/* A long brief clamps to ~3 lines in read mode so it can't eat the card's vertical space (Thread card UI);
+   the "show more" toggle below drops the clamp. -webkit-box + line-clamp is the one widely-supported way to
+   clamp wrapped text by line count. */
+.chan-description-view.clamped {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.chan-desc-more {
+  align-self: flex-start;
+  margin: 0 10px 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  font: 10px ui-monospace, Menlo, monospace;
+  color: #8b5cf6;
+  cursor: pointer;
+}
+.chan-desc-more:hover { text-decoration: underline; }
 /* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
    link (any other href) is a dotted-underline focus affordance — clicking it opens/focuses the target card. */
 .chan-description-view a { color: #2563eb; }
@@ -2706,7 +2727,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 /* a resolved @-tag inside a message (one that names a member / @all / @human) — tinted so the eye finds
    "who this was for" at a glance. Cosmetic; the server decides who a tag actually wakes. */
 .chan-tag {
-  color: #6366f1;
+  color: #7c5cbf;
   font-weight: 600;
 }
 /* inline markdown inside a message (renderInline via renderTaggedText) — mirrors the charter's
@@ -2725,11 +2746,31 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   text-underline-offset: 2px;
   cursor: pointer;
 }
-/* system notices (server-authored joins/leaves/onboarding) — quieted so they recede behind the human/agent
-   conversation, without an italic that would add yet another font style to the card. */
-.chan-msg.sys { opacity: 0.6; }
-.chan-msg.sys .chan-msg-from { color: #a1a1aa; }
-.chan-msg.sys .chan-msg-text { color: #71717a; }
+/* system notices (server-authored joins/leaves) — folded into one dim, centered run so harness chatter
+   recedes behind the human/agent conversation (Thread card UI). No from-label, timestamp, or pin: a join is
+   an ambient room event, not a turn. Consecutive notices stack tight inside one .chan-sysrun block. */
+.chan-sysrun {
+  padding: 3px 2px;
+  text-align: center;
+}
+.chan-sysline {
+  font: 9px ui-monospace, Menlo, monospace;
+  color: #a1a1aa;
+  line-height: 1.5;
+}
+/* The human's own turns render as a right-aligned chat bubble (Thread card UI) — a subtle neutral fill,
+   not full width, so "mine vs theirs" reads at a glance without a loud colour. The turn divider is dropped
+   for a bubble (a full-width hairline over a right-aligned card looks wrong). */
+.chan-msg.me {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 5px 9px;
+  border-radius: 10px 10px 2px 10px;
+  background: #f4f2fa;
+  border-top: none;
+}
+.chan-log > .chan-msg.me + * { border-top: none; }
+.chan-msg.me .chan-msg-head { justify-content: flex-end; }
 /* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
    keeps its place in the log and shows its 📌 lit; the collapsible pinned tray above is the head-context
    surface (re-read on every wake — mirrored server-side into /inbox's `pinned`). */
@@ -2747,31 +2788,50 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
-.chan-msg.pinned { background: #f59e0b11; border-radius: 4px; }
-/* The pinned tray: the thread's head context, folded by default-open. Sits above the log, referencing the
-   pinned messages (which stay in place below). Amber-tinted to read as "kept in view". */
-.chan-pins {
-  margin: 2px 4px 0;
-  padding: 3px 6px;
-  background: #f59e0b14;
-  border: 1px solid #f59e0b33;
-  border-radius: 5px;
-  font-size: 11px;
-}
-.chan-pins-summary {
+.chan-msg.pinned { background: #7c3aed0d; border-radius: 4px; }
+/* The pinned tray as a header chip (Thread card UI): a compact "📌 N" button in the title row that pops a
+   panel OVER the card, so head context is reachable without a full-width block stranding mid-card below a
+   long brief. The wrap is the positioning context for the absolute panel. */
+.chan-pins-chip-wrap { position: relative; flex: 0 0 auto; }
+.chan-pins-chip {
+  font: 9px ui-monospace, Menlo, monospace;
+  padding: 1px 6px;
+  border-radius: 10px;
+  border: 1px solid #e4e4e7;
+  background: #f4f4f5;
+  color: #71717a;
   cursor: pointer;
-  font: 10px ui-monospace, Menlo, monospace;
-  font-weight: 600;
-  color: #b45309;
-  user-select: none;
+}
+.chan-pins-chip:hover, .chan-pins-chip.open {
+  border-color: #d6c7f5;
+  background: #f4f0fc;
+  color: #6b5b95;
+}
+/* The pop-open panel: floats over the log, right-aligned under the chip, scrolls if there are many pins. */
+.chan-pins-panel {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  z-index: 30;
+  margin-top: 4px;
+  width: 260px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px 8px;
+  background: #fff;
+  border: 1px solid #e4e4e7;
+  border-radius: 6px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
+  font-size: 11px;
 }
 .chan-pin {
   display: flex;
   align-items: baseline;
   gap: 6px;
-  margin-top: 3px;
+  margin-top: 4px;
   line-height: 1.35;
 }
+.chan-pin:first-child { margin-top: 0; }
 .chan-pin .chan-msg-text { flex: 1 1 auto; }
 .chan-pin .chan-pin-toggle { opacity: 1; filter: none; margin-left: 0; }
 /* A work-intent typed act (threads-as-cards §6): a slim card-only status line, not a conversation turn.
@@ -2823,42 +2883,52 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-member-tag:hover {
   text-decoration: underline;
 }
-/* per-member backlog-visibility toggle (full="all" / future="new") — the human's history control. */
+/* per-member backlog-visibility toggle (full="all" / future="new") — the human's history control. Neutral
+   so the roster reads calm (Thread card UI): the pills are informational, not a status to be shouted. */
 .chan-hist {
   font: 9px ui-monospace, Menlo, monospace;
   padding: 0 4px;
   border-radius: 6px;
-  border: 1px solid #bbf7d0;
+  border: 1px solid #e4e4e7;
   background: #ffffffcc;
-  color: #15803d;
+  color: #71717a;
   cursor: pointer;
 }
-.chan-hist:hover { background: #fff; border-color: #15803d; }
+.chan-hist:hover { background: #fff; border-color: #a1a1aa; }
+/* An OPEN member reads as a quiet neutral pill; a PENDING (invited) one is dimmer with a dashed border to
+   mark "not yet joined" — the distinction carried by weight/border, not by competing saturated colours. */
 .chan-member.open {
-  background: #ecfdf3;
-  color: #15803d;
-  border-color: #bbf7d0;
+  background: #f4f4f5;
+  color: #52525b;
+  border-color: #e4e4e7;
 }
 .chan-member.pending {
-  background: #fffbeb;
-  color: #b45309;
-  border-color: #fde68a;
+  background: transparent;
+  color: #a1a1aa;
+  border: 1px dashed #d4d4d8;
 }
 .chan-post {
   display: flex;
   gap: 5px;
   padding: 4px 10px 8px;
   margin-top: auto;
+  align-items: flex-end;
 }
+/* Multiline composer (Thread card UI): Enter sends, Shift+Enter adds a line; JS autosizes the height up to
+   a cap, then it scrolls. No manual resize handle (it would fight the JS autosize). */
 .chan-post-input {
   font: inherit;
   font-size: 11px;
   flex: 1 1 auto;
   min-width: 0;
-  padding: 3px 7px;
+  padding: 4px 7px;
   border-radius: 6px;
   border: 1px solid #e4e4e7;
   background: #fff;
+  resize: none;
+  line-height: 1.4;
+  max-height: 120px;
+  overflow-y: auto;
 }
 .chan-post button {
   font: inherit;

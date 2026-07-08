@@ -327,8 +327,10 @@ function displayHandle(name: string | null | undefined, sid: string): string {
   const dot = name.indexOf(".");
   return dot < 0 ? name : `${name.slice(0, dot + 3)}…`;
 }
+// The human's own turns read as "you" (aligned with session cards, which label the human's turns `you`);
+// a server-authored notice stays "system"; an agent shows its readable role handle / short sid.
 const senderLabel = (from: string, name?: string | null) =>
-  from === "human" || from === "system" ? from : displayHandle(name, from);
+  from === "human" ? "you" : from === "system" ? "system" : displayHandle(name, from);
 
 function ThreadView({
   m,
@@ -363,6 +365,15 @@ function ThreadView({
   // textarea, blur (or a record change underneath) commits + returns to read mode (Channel UI improvements).
   const [editingDesc, setEditingDesc] = useState(false);
   const descRef = useRef<HTMLTextAreaElement>(null);
+  // Read-mode brief clamps to a few lines so a long brief can't eat the card's vertical space (Thread card UI);
+  // a "show more/less" toggle expands it. `descOverflows` (measured only while clamped) decides whether the
+  // toggle is needed at all; edit mode still auto-grows (below), unclamped.
+  const [descExpanded, setDescExpanded] = useState(false);
+  const [descOverflows, setDescOverflows] = useState(false);
+  const descViewRef = useRef<HTMLDivElement>(null);
+  // The pinned tray is a compact "📌 N" chip in the header that pops open a panel (Thread card UI) — never a
+  // full-width amber block stranded mid-card below a long brief.
+  const [pinsOpen, setPinsOpen] = useState(false);
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
@@ -373,7 +384,7 @@ function ThreadView({
   // Tail-follow the conversation: scroll to the newest message when one arrives, UNLESS the user has
   // scrolled up to read history (then leave them put). `stick` tracks "is at the bottom", set on scroll.
   const logRef = useRef<HTMLDivElement>(null);
-  const postInputRef = useRef<HTMLInputElement>(null);
+  const postInputRef = useRef<HTMLTextAreaElement>(null);
   const stick = useRef(true);
   const onLogScroll = () => {
     const el = logRef.current;
@@ -386,6 +397,14 @@ function ThreadView({
   // Re-seed the local edit fields when the record changes underneath us (an agent edited the description).
   useEffect(() => setDescription(node.text), [node.text]);
   useEffect(() => setTitle(node.title), [node.title]);
+  // Does the clamped read-mode brief actually overflow (i.e. is there more to "show more")? Measured ONLY
+  // while collapsed — when expanded the box is its full height, so we leave the last measurement standing
+  // (that's what keeps the "show less" affordance visible). Re-runs when the brief text or edit mode changes.
+  useEffect(() => {
+    const el = descViewRef.current;
+    if (!el || editingDesc || descExpanded) return;
+    setDescOverflows(el.scrollHeight - el.clientHeight > 2);
+  }, [description, editingDesc, descExpanded]);
 
   useEffect(() => {
     const host = ref.current;
@@ -444,6 +463,14 @@ function ThreadView({
     el.style.height = "auto";
     el.style.height = `${el.scrollHeight}px`;
   };
+  // Grow the multiline composer to fit its content up to a cap, then scroll internally — so a multi-paragraph
+  // or list message composes without a cramped single line, but never eats the whole card (Thread card UI).
+  const POST_MAX_H = 120;
+  const autosizePost = (el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, POST_MAX_H)}px`;
+  };
   const finishDescEdit = () => { commitDescription(); setEditingDesc(false); };
   useEffect(() => {
     if (!editingDesc) return;
@@ -470,8 +497,11 @@ function ThreadView({
     if (!t) return;
     setStatus("sending…");
     const r = await postToThread(id, "human", t);
-    if (r.ok) { setPost(""); setStatus("posted"); }
-    else setStatus(r.error ?? "failed");
+    if (r.ok) {
+      setPost("");
+      if (postInputRef.current) postInputRef.current.style.height = "auto"; // collapse the grown textarea
+      setStatus("posted");
+    } else setStatus(r.error ?? "failed");
   };
   // Pin/unpin a message as head context (R-PIN). The feed republishes the pins on success, so the tray and
   // the message's pin glyph update from the live feed — no local pin state to keep in sync.
@@ -491,6 +521,36 @@ function ThreadView({
           onBlur={commitTitle}
           onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
         />
+        {pins.length > 0 && (
+          // The pinned tray as a compact header chip: it reads "📌 N" and pops the pins panel over the card
+          // (absolute, so it never strands as a full-width block mid-card below a long brief — Thread card UI).
+          <div className="chan-pins-chip-wrap" data-interactive>
+            <button
+              className={`chan-pins-chip${pinsOpen ? " open" : ""}`}
+              title="pinned head context — the thread's kept-in-view messages"
+              onClick={() => setPinsOpen((o) => !o)}
+            >
+              📌 {pins.length}
+            </button>
+            {pinsOpen && (
+              <div className="chan-pins-panel">
+                {pins.map((p) => (
+                  <div key={p.seq} className="chan-pin">
+                    <span className="chan-msg-from" title={p.from}>{senderLabel(p.from, nameForSid(p.from))}</span>
+                    <div className="chan-msg-text">{renderTaggedText(p.text, openEntries, m)}</div>
+                    <button
+                      className="chan-pin-toggle on"
+                      title="unpin — remove from head context"
+                      onClick={(e) => { e.stopPropagation(); void togglePin(p.seq); }}
+                    >
+                      📌
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
         <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
@@ -504,39 +564,30 @@ function ThreadView({
           onKeyDown={(e) => { if (e.key === "Escape") { setDescription(node.text); setEditingDesc(false); } }}
         />
       ) : (
-        <div
-          className="chan-description chan-description-view"
-          title="click to edit the brief"
-          data-interactive
-          onClick={() => setEditingDesc(true)}
-        >
-          {description.trim() ? (
-            <MarkdownInline text={description} m={m} />
-          ) : (
-            <span className="chan-desc-empty">add a brief (markdown — links open canvas cards)</span>
+        <>
+          <div
+            ref={descViewRef}
+            className={`chan-description chan-description-view${descExpanded ? "" : " clamped"}`}
+            title="click to edit the brief"
+            data-interactive
+            onClick={() => setEditingDesc(true)}
+          >
+            {description.trim() ? (
+              <MarkdownInline text={description} m={m} />
+            ) : (
+              <span className="chan-desc-empty">add a brief (markdown — links open canvas cards)</span>
+            )}
+          </div>
+          {(descOverflows || descExpanded) && description.trim() && (
+            <button
+              className="chan-desc-more"
+              data-interactive
+              onClick={(e) => { e.stopPropagation(); setDescExpanded((v) => !v); }}
+            >
+              {descExpanded ? "show less" : "show more"}
+            </button>
           )}
-        </div>
-      )}
-      {pins.length > 0 && (
-        // The pinned tray (R-PIN): the thread's head context — the task statement, the Done-when condition,
-        // any framing kept in view. Collapsible (<details>), chronological (the server keeps pins seq-sorted).
-        // It REFERENCES the messages (they keep their place in the log below); clicking a row's 📌 unpins.
-        <details className="chan-pins" data-interactive>
-          <summary className="chan-pins-summary">📌 pinned · {pins.length}</summary>
-          {pins.map((p) => (
-            <div key={p.seq} className="chan-pin">
-              <span className="chan-msg-from" title={p.from}>{senderLabel(p.from, nameForSid(p.from))}</span>
-              <div className="chan-msg-text">{renderTaggedText(p.text, openEntries, m)}</div>
-              <button
-                className="chan-pin-toggle on"
-                title="unpin — remove from head context"
-                onClick={(e) => { e.stopPropagation(); void togglePin(p.seq); }}
-              >
-                📌
-              </button>
-            </div>
-          ))}
-        </details>
+        </>
       )}
       <div className="chan-log" ref={logRef} onScroll={onLogScroll}>
         {feed?.truncated && (
@@ -545,34 +596,60 @@ function ThreadView({
         {msgs.length === 0 ? (
           <span className="chan-empty">no messages yet</span>
         ) : (
-          msgs.map((mm) =>
-            mm.kind === "intent" ? (
-              // A work-intent typed act (threads-as-cards §6): a small card-only status line — who declared
-              // what stance toward this work — not a conversation turn. The glyph/tint carry the intent.
-              <div key={mm.seq} className={`chan-intent i-${(mm.intent ?? "").replace(":", "-")}`}>
-                <span className="chan-intent-glyph">{intentGlyph(mm.intent)}</span>
-                <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-                <span className="chan-intent-text">{mm.text}</span>
-                <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-              </div>
-            ) : (
-              <div key={mm.seq} className={`chan-msg${mm.from === "system" ? " sys" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}>
-                <div className="chan-msg-head">
-                  <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
-                  <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-                  <button
-                    className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
-                    data-interactive
-                    title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
-                    onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
-                  >
-                    📌
-                  </button>
-                </div>
-                <div className="chan-msg-text">{renderMessageBody(mm.text, openEntries, m)}</div>
-              </div>
-            ),
-          )
+          // Walk the log, folding each RUN of consecutive system notices (joins/leaves) into one dim, centered
+          // block so harness chatter recedes behind the human/agent conversation (Thread card UI). Conversation
+          // turns and work-intent lines render individually; the human's own turns get the right-aligned `me`
+          // bubble.
+          (() => {
+            const out: React.ReactNode[] = [];
+            for (let i = 0; i < msgs.length; i++) {
+              const mm = msgs[i];
+              if (mm.kind !== "intent" && mm.from === "system") {
+                const run = [];
+                while (i < msgs.length && msgs[i].kind !== "intent" && msgs[i].from === "system") { run.push(msgs[i]); i++; }
+                i--; // the for-loop will re-increment
+                out.push(
+                  <div key={`sys-${run[0].seq}`} className="chan-sysrun">
+                    {run.map((s) => (
+                      <div key={s.seq} className="chan-sysline">· {s.text} ·</div>
+                    ))}
+                  </div>,
+                );
+                continue;
+              }
+              if (mm.kind === "intent") {
+                // A work-intent typed act (threads-as-cards §6): a small card-only status line — who declared
+                // what stance toward this work — not a conversation turn. The glyph/tint carry the intent.
+                out.push(
+                  <div key={mm.seq} className={`chan-intent i-${(mm.intent ?? "").replace(":", "-")}`}>
+                    <span className="chan-intent-glyph">{intentGlyph(mm.intent)}</span>
+                    <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                    <span className="chan-intent-text">{mm.text}</span>
+                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                  </div>,
+                );
+                continue;
+              }
+              out.push(
+                <div key={mm.seq} className={`chan-msg${mm.from === "human" ? " me" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}>
+                  <div className="chan-msg-head">
+                    <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
+                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
+                    <button
+                      className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
+                      data-interactive
+                      title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
+                      onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
+                    >
+                      📌
+                    </button>
+                  </div>
+                  <div className="chan-msg-text">{renderMessageBody(mm.text, openEntries, m)}</div>
+                </div>,
+              );
+            }
+            return out;
+          })()
         )}
       </div>
       <div className="chan-members">
@@ -609,13 +686,18 @@ function ThreadView({
         )}
       </div>
       <div className="chan-post">
-        <input
+        <textarea
           ref={postInputRef}
           className="chan-post-input"
-          placeholder="post… @tag a member to notify, @all for everyone"
+          rows={1}
+          placeholder="post… Enter to send, Shift+Enter for a new line — @tag a member, @all for everyone"
           value={post}
-          onChange={(e) => setPost(e.target.value)}
-          onKeyDown={(e) => { if (e.key === "Enter") void send(); }}
+          onChange={(e) => { setPost(e.target.value); autosizePost(e.target); }}
+          onKeyDown={(e) => {
+            // Enter sends; Shift+Enter inserts a newline (so lists/paragraphs compose) — the actual bug the
+            // human hit. preventDefault on the send path so the newline isn't also inserted.
+            if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void send(); }
+          }}
         />
         <button onClick={() => void send()}>Send</button>
       </div>
