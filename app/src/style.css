@@ -3152,6 +3152,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   margin: 1px 0 2px 8px;
   padding-left: 6px;
   border-left: 1px solid #00000010;
+  /* Cap the sub-list (roles / boards can be long) and scroll its own overflow, mirroring .menu-list, so an
+     expanded sub-list can't inflate the popover past the viewport clamp. */
+  max-height: min(40vh, 320px);
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 /* A role option: a colour swatch then the role name, left-aligned (overriding the menu's space-between). */
 .menu-list .menu-roleopt {

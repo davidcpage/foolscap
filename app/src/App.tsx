@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   Editor,
   InteractionManager,
@@ -638,10 +638,9 @@ function Board({ m, undo, persistence }: Engine) {
       e.preventDefault();
       const r = el.getBoundingClientRect();
       const at = m.camera.screenToPage(vec(e.clientX - r.left, e.clientY - r.top));
-      const screen = {
-        x: Math.min(e.clientX, window.innerWidth - 232),
-        y: Math.min(e.clientY, window.innerHeight - 372),
-      };
+      // Anchor at the raw cursor; CanvasMenu measures its own rendered size and clamps into the viewport
+      // (re-clamping when the Board sub-list expands), so no hardcoded height guess is needed here.
+      const screen = { x: e.clientX, y: e.clientY };
       setMenu({ screen, at: { x: Math.round(at.x), y: Math.round(at.y) } });
     },
     [m],
@@ -867,6 +866,31 @@ function CanvasMenu({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // The rendered position, clamped so the whole popover stays inside the viewport. Starts at the cursor,
+  // then a layout-effect measures the real menu box and pulls it in if it would spill off the right/bottom
+  // (or top/left) edge. A ResizeObserver re-clamps whenever the menu's size changes — e.g. expanding the
+  // Board sub-list — so the bottom rows stay reachable near the bottom edge. useLayoutEffect corrects the
+  // position before paint, so there is no visible jump.
+  const [pos, setPos] = useState<Pos>(screen);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const clamp = () => {
+      const r = el.getBoundingClientRect();
+      const margin = 8;
+      const x = Math.max(margin, Math.min(screen.x, window.innerWidth - r.width - margin));
+      const y = Math.max(margin, Math.min(screen.y, window.innerHeight - r.height - margin));
+      setPos((prev) => (prev.x === x && prev.y === y ? prev : { x, y }));
+    };
+    clamp();
+    const ro = new ResizeObserver(clamp);
+    ro.observe(el);
+    window.addEventListener("resize", clamp);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", clamp);
+    };
+  }, [screen.x, screen.y]);
   useEffect(() => {
     const onDoc = (e: MouseEvent) => {
       if (ref.current && !ref.current.contains(e.target as Node)) onClose();
@@ -887,7 +911,7 @@ function CanvasMenu({
     onClose();
   };
   return (
-    <div className="canvas-menu" ref={ref} style={{ left: screen.x, top: screen.y }}>
+    <div className="canvas-menu" ref={ref} style={{ left: pos.x, top: pos.y }}>
       <div className="menu-list">
         <div className="menu-section">Session</div>
         <NewSessionItem m={m} at={at} run={run} />
