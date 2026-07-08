@@ -3357,8 +3357,12 @@ function standingJobsTick(): void {
         if (job.role) {
           const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
           const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
-          const plan = planRoleJobFire(live?.status ?? null);
-          if (plan === "skip") continue; // mid-turn occupant — don't interrupt; retry next tick (no stamp)
+          const plan = planRoleJobFire(live?.status ?? null, seatIntent);
+          // "skip" (mid-turn occupant) and "stand-down" (seat declared done — the endless-Coordinator guard)
+          // both suppress this fire WITHOUT stamping, so it re-evaluates next tick: a mid-turn seat fires the
+          // moment it's idle; a stood-down seat stays suppressed until a reactive wake freshens its intent off
+          // `done`. Neither respawns a fresh worker.
+          if (plan === "skip" || plan === "stand-down") continue;
           if (plan === "nudge") {
             sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
             stampFired(board.repoPath, t.threadId, job.id, now);

@@ -84,6 +84,21 @@ test("planRoleJobFire — idle nudges, running skips, dormant/absent respawns", 
   assert.equal(planRoleJobFire("exited"), "respawn", "an exited occupant is reconstituted fresh");
   assert.equal(planRoleJobFire(null), "respawn", "no live occupant → respawn");
   assert.equal(planRoleJobFire(undefined), "respawn", "absent status → respawn");
+  // a seat with a non-terminal intent still fires normally across every liveness state
+  for (const intent of ["working", "blocked:peer", "blocked:human", null, undefined]) {
+    assert.equal(planRoleJobFire("exited", intent), "respawn", `intent=${intent}: an exited seat still respawns`);
+    assert.equal(planRoleJobFire("idle", intent), "nudge", `intent=${intent}: a live+idle seat still nudges`);
+  }
+});
+
+// The endless-Coordinator guard: a seat that STOOD DOWN (intent="done") must not be auto-fired by the timer —
+// in ANY liveness state — so a dormant done-seat is never blindly respawned (the runaway) and a live done-seat
+// is never nudged back into a sweep it declared finished. The stand-down wins over liveness (checked first).
+test("planRoleJobFire — a stood-down seat (intent=done) is suppressed, never respawned or nudged", () => {
+  assert.equal(planRoleJobFire("exited", "done"), "stand-down", "dormant done-seat: no blind respawn (the runaway)");
+  assert.equal(planRoleJobFire(null, "done"), "stand-down", "absent done-seat: still suppressed");
+  assert.equal(planRoleJobFire("idle", "done"), "stand-down", "live+idle done-seat: not nudged back into a sweep");
+  assert.equal(planRoleJobFire("running", "done"), "stand-down", "mid-turn done-seat: suppressed too");
 });
 
 // ── the mocked tick ─────────────────────────────────────────────────────────────────────────────

@@ -188,15 +188,32 @@ export function sessionHasScheduledWake(markers, sid) {
 
 /**
  * PURE — the WAKE-LIVE-ELSE-RESPAWN decision for a role-seat job's fire, given the current liveness of the
- * seat's occupant. This is the efficiency norm (W6 seq 104) factored out of standingJobsTick so it can be
- * unit-tested (a "mocked tick") and shared: a job whose seat is occupied by a LIVE, IDLE session is served by
- * NUDGING it (cheap — assembled context intact); a MID-TURN occupant is skipped WITHOUT stamping (retry next
- * tick the moment it's idle, never talk over a working session); a DORMANT/absent occupant pays a fresh
- * respawn seeded from the durable record. `occupantStatus` is the LiveSession status of the seat's current
- * sid — `"idle"` / `"running"` (mid-turn) / `"exited"`, or `null` when the seat has no live occupant at all.
- * Returns `"nudge"` | `"skip"` (mid-turn, no stamp) | `"respawn"`.
+ * seat's occupant AND the seat's declared work-intent. This is the efficiency norm (W6 seq 104) factored out
+ * of standingJobsTick so it can be unit-tested (a "mocked tick") and shared: a job whose seat is occupied by a
+ * LIVE, IDLE session is served by NUDGING it (cheap — assembled context intact); a MID-TURN occupant is
+ * skipped WITHOUT stamping (retry next tick the moment it's idle, never talk over a working session); a
+ * DORMANT/absent occupant pays a fresh respawn seeded from the durable record.
+ *
+ * STAND-DOWN GUARD (the endless-Coordinator fix): a seat whose Coordinator has EXPLICITLY declared
+ * `intent:"done"` has stood down — its work on this thread is finished. Such a seat must NOT be auto-fired by
+ * the timer, in EITHER direction: a dormant done-seat that we blindly respawned every interval was the
+ * runaway that spawned a fresh Coordinator every few minutes forever on a stood-down thread (it swept an empty
+ * thread, found nothing, exited, and got respawned on the next tick); and even a live+idle done-seat should be
+ * left alone rather than nudged back into a sweep it declared finished. This gates ONLY the timer: the seat
+ * still re-engages the instant it's genuinely needed — a reactive @-mention / ask wakes or respawns it through
+ * a SEPARATE path (auto-wake / seat-nudge), untouched by this guard — and the heartbeat TIMER resumes once the
+ * seat's declared intent moves off `done` (the re-engaged occupant declaring its stance per "declare your
+ * stance"; note the resume self-freshen clears only `blocked:*`, not `done`). So the guard SUPPRESSES the fire
+ * (no spawn, no nudge, no stamp) until the seat declares a non-done stance; it does not remove the job. It runs
+ * BEFORE the liveness branches so a stood-down-but-not-yet-exited occupant is also left alone.
+ *
+ * `occupantStatus` is the LiveSession status of the seat's current sid — `"idle"` / `"running"` (mid-turn) /
+ * `"exited"`, or `null` when the seat has no live occupant. `seatIntent` is the seat's declared work-intent
+ * (`meta.intents[role].intent`), or null/undefined when none is declared. Returns
+ * `"nudge"` | `"skip"` (mid-turn, no stamp) | `"stand-down"` (suppressed, no stamp) | `"respawn"`.
  */
-export function planRoleJobFire(occupantStatus) {
+export function planRoleJobFire(occupantStatus, seatIntent) {
+  if (seatIntent === "done") return "stand-down"; // seat explicitly stood down → don't auto-fire the timer
   if (occupantStatus === "idle") return "nudge";
   if (occupantStatus === "running") return "skip";
   return "respawn"; // "exited" or null (no live occupant) → reconstitute fresh
