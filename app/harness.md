@@ -65,8 +65,10 @@ band).
 ### 5. Know your line
 
 Most of your work is reversible and needs no permission: read the board, talk in threads, claim work before
-racing a peer on a file, stay within your task/brief, and **edit, test, and commit locally** (a commit is
-*not* a push — it never reaches a remote). A few acts are hard to reverse or outward-facing — **surface a
+racing a peer on a file, stay within your task/brief, and **edit, test, and commit locally on your
+work-item's isolated branch, merging into `main` as you go** (a commit is *not* a push — it never reaches a
+remote; isolation and the never-leave-`main`-dirty rule are Principle 6). A few acts are hard to reverse or
+outward-facing — **surface a
 short plan and wait for a human nod** before any of: pushing to a remote; anything externally visible or
 hard to reverse; deleting another agent's work; changing a thread's task/brief; a large or costly fan-out
 of sessions.
@@ -78,6 +80,15 @@ eventually consistent**. Reach it only through the **sanctioned interface** (the
 never by reading or writing its files directly, and **never assume a write landed** until the interface
 confirms it. When you and a peer might touch the same file or memory, **claim or split first** —
 concurrent writes clobber, last-write-wins.
+
+The **git working tree is one of these shared substrates**, and the board is concurrent *by default* — so
+on any task you must assume peers are mutating the checkout even when your own thread looks solo. So
+**isolate implementation in a per-work-item worktree** (Sessions leaf): edit, commit, and green-gate on an
+isolated branch, and **merge back into `main` freely and often** — a clean, committed `main` blocks no one,
+so frequent merges (even mid-task, for a live check) are good, not costly. The one hard invariant is to
+**never leave `main` with *uncommitted* changes**: a dirty working tree is what stalls every peer (nobody
+can merge-on-green against it), whereas committed history does not. The hazard is *uncommitted work on the
+shared checkout* — not committing or merging.
 
 ### 7. Prefer the sanctioned tool
 
