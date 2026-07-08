@@ -2916,6 +2916,8 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-tip-intent.i-blocked-human { color: #b45309; }
 .chan-tip-intent.i-blocked-peer { color: #3d5bb0; }
 .chan-tip-intent.i-done { color: #8a8a90; }
+.chan-tip-intent.i-scheduled { color: #0f766e; }
+.chan-tip-intent.i-crashed { color: #b91c1c; }
 .chan-tip-brief a { color: #2563eb; }
 .chan-tip-brief code { font: 10px ui-monospace, Menlo, monospace; background: #00000010; padding: 0 3px; border-radius: 3px; }
 /* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
@@ -3143,6 +3145,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-member.i-blocked-human { background: #fdf0e0; color: #b45309; border-color: #f3d7b0; }
 .chan-member.i-blocked-peer { background: #e9eefb; color: #3d5bb0; border-color: #cdd9f4; }
 .chan-member.i-done { background: #f2f2f3; color: #8a8a90; border-color: #e0e0e2; }
+/* scheduled (teal) + crashed (red): the pill tints for the two bands that used to collapse to idle on the
+   roster. Same hue family as the card band (.ses-frame-scheduled #0d9488 / .ses-frame-crashed #ef4444) so a
+   session's card and its pill read the same state — a looping seat asleep on a timer vs a process that died. */
+.chan-member.i-scheduled { background: #e2f2f0; color: #0f766e; border-color: #c3e6e1; }
+.chan-member.i-crashed { background: #fdeaea; color: #b91c1c; border-color: #f6cccc; }
 /* The board owner ("you") — a static roster anchor, not an agent (Thread card UI batch 8). Deliberately NOT
    one of the work-intent hues above (the human has no status): a calm filled neutral, a touch more present
    than the agent open pill (deeper fill + medium weight), so it reads as the owner without borrowing a

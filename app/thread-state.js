@@ -29,29 +29,77 @@ export function isThreadState(s) {
 // re-activates non-destructively on the next event).
 const effectiveIntent = (p) => p.intent ?? (p.processState === "exited" ? "done" : "working");
 
+// The participant-pill STATE vocabulary — the `.chan-member.i-<state>` class suffix, and the semantic slot
+// the SESSION CARD's own band shares. Six slots, one hue each: green `working`, orange `blocked-human`
+// (idle "your turn" / a held permission), blue `blocked-peer` (waiting on an agent), teal `scheduled`, red
+// `crashed`, grey `done`. This list is the contract a drift test locks against style.css.
+export const PILL_STATES = ["working", "blocked-human", "blocked-peer", "scheduled", "crashed", "done"];
+
+// The SINGLE band→pill-state map: the whole-session server band (SessionMeta.status, session-status.ts) →
+// its pill slot. The card's visibility surfaces render those same bands through STATUS_COLOR, so this map
+// is what keeps the card band and the thread pill from ever disagreeing on WHICH state a session is in —
+// the whole point of the unification. Every band here is PROCESS-OBSERVED and GLOBAL to the session: it
+// paints the card and the pill identically. `waiting` fuses idle-"your turn" and a held permission (both
+// orange = blocked-human); `done`/`ended` share grey. Keep the keys a total cover of SessionStatus (a test
+// asserts it) so a new band can't silently fall through to a neutral pill.
+const BAND_TO_PILL = {
+  working: "working",
+  waiting: "blocked-human",
+  "waiting-agent": "blocked-peer",
+  scheduled: "scheduled",
+  done: "done",
+  crashed: "crashed",
+  ended: "done",
+};
+
+// A declared work-intent → the pill slot it names. This is the PER-THREAD interaction axis: what a session
+// declares about ITS work in THIS thread, which the server cannot observe per-thread. Only these four are
+// declarable (work-intent.js). Used both as the fallback when there's no live session row and as the fold
+// applied over the server band below.
+const INTENT_TO_PILL = {
+  working: "working",
+  "blocked:human": "blocked-human",
+  "blocked:peer": "blocked-peer",
+  done: "done",
+};
+
+/** The pill slot a raw declared work-intent maps to (or null if it names nothing paintable). */
+export function intentPillState(intent) {
+  return (intent && INTENT_TO_PILL[intent]) ?? null;
+}
+
 /**
- * The DISPLAY intent for a SINGLE participant surface (the roster member pill, or any view that renders a
- * raw declared intent) — the same process-state ⇄ declared-intent fusion `deriveThreadState` applies,
- * surfaced per-member instead of per-thread.
+ * The pill state for ONE participant in ONE thread — the fusion the roster pill renders, superseding the
+ * old working-only `memberDisplayIntent`. It fuses the whole-session server band (what the canvas OBSERVES
+ * of the process) with THIS thread's latest declared work-intent (what the session SAYS about its work
+ * here).
  *
- * A declared intent only adds information while the process is IDLE: `idle+working`, `idle+blocked:human`
- * and `idle+done` are identical to the canvas, so only the declaration tells them apart. When the process
- * is RUNNING there is no ambiguity — it is demonstrably computing — so `working` is the honest reading and
- * the declared intent is IGNORED (it can't update mid-turn and goes stale: the "blocked pill on a
- * green/running card" contradiction this exists to kill).
+ * Process-observed bands are GLOBAL: they drive the pill exactly as they drive the card (both surfaces show
+ * the same slot, so they can never disagree). Two things only the per-thread declaration carries are folded
+ * on top — the states the server can't see per-thread:
+ *   • done-on-a-still-live session: the agent wound up ITS part here though the process runs on (idle, or
+ *     busy in another thread) → grey, even while the card (whole-session) still reads waiting/etc. NOT
+ *     applied over a RUNNING turn (`working`): a live turn is demonstrably not done, and a grey pill on a
+ *     green/running card is the exact "stale declaration contradicts the live process" bug this fusion was
+ *     built to kill. NOT applied over `crashed` either — a real exit is not "done".
+ *   • blocked:peer with no @-tag: the server only infers `waiting-agent` (blue) from an @-tagged peer, so a
+ *     peer named in prose leaves the band at `waiting` (orange). A declared blocked:peer promotes it to blue.
+ *     (A running turn stays green — see above; the promotion only lifts the idle orange band.)
  *
- * Unlike `effectiveIntent`, an idle/exited participant that never declared returns `null` (not a
- * defaulted `working`): fabricating a status on a surface whose whole job is to show what was *declared*
- * would be the same dishonesty. deriveThreadState defaults for its own (thread-level) reason; a pill must
- * not. Callers render `null` as "no status declared".
+ * With no live session row (band null/undefined) the seat may still carry a durable declaration — an exited
+ * seat holding `blocked:human`, or a `done` — so fall back to the declared intent alone; null → a neutral
+ * "no status declared" pill (never fabricate one, same honesty rule the old fn kept).
  *
- * @param {"running"|"idle"|"exited"} processState
- * @param {string|null|undefined} intent  the latest declared work-intent, or null/undefined if none
- * @returns {string|null} the intent to render, or null when nothing should show
+ * @param {string|null|undefined} band  the session's SessionMeta.status, or null when there's no live row
+ * @param {string|null|undefined} declaredIntent  this thread's latest declared work-intent, or null
+ * @returns {string|null} a PILL_STATES member, or null for a neutral pill
  */
-export function memberDisplayIntent(processState, intent) {
-  if (processState === "running") return "working";
-  return intent ?? null;
+export function memberPillState(band, declaredIntent) {
+  const base = band ? (BAND_TO_PILL[band] ?? null) : null;
+  if (!base) return intentPillState(declaredIntent);
+  if (declaredIntent === "done" && base !== "working" && base !== "crashed") return "done";
+  if (declaredIntent === "blocked:peer" && base === "blocked-human") return "blocked-peer";
+  return base;
 }
 
 /**

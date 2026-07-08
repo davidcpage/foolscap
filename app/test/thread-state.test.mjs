@@ -5,7 +5,16 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deriveThreadState, isThreadState, memberDisplayIntent, THREAD_STATES } from "../thread-state.js";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import {
+  deriveThreadState,
+  isThreadState,
+  intentPillState,
+  memberPillState,
+  PILL_STATES,
+  THREAD_STATES,
+} from "../thread-state.js";
 
 const p = (processState, intent = null) => ({ processState, intent });
 
@@ -72,26 +81,79 @@ test("isThreadState / THREAD_STATES", () => {
   assert.ok(!isThreadState(null));
 });
 
-// memberDisplayIntent — the per-pill fusion (part 1). A running process is unambiguously 'working' and its
-// declared intent is ignored (it can't refresh mid-turn and goes stale); idle/exited shows the declaration.
-test("memberDisplayIntent: running collapses to 'working', ignoring ANY stale declaration", () => {
-  assert.equal(memberDisplayIntent("running", "blocked:human"), "working");
-  assert.equal(memberDisplayIntent("running", "blocked:peer"), "working");
-  assert.equal(memberDisplayIntent("running", "done"), "working");
-  assert.equal(memberDisplayIntent("running", null), "working");
-  assert.equal(memberDisplayIntent("running", undefined), "working");
+// memberPillState — the unified per-pill fusion that superseded memberDisplayIntent. The pill wears the SAME
+// slot as the session card's band; the full server band (not a working-only bit) drives it, with this
+// thread's declared intent folded on top for the two states the server can't observe per-thread.
+
+// Every server band, with nothing declared, maps to the card's slot for that band — the "card and pill never
+// disagree" contract. (These are the Done-when divergence cases.)
+test("memberPillState: each process-observed band drives the pill exactly as it drives the card", () => {
+  assert.equal(memberPillState("working", null), "working");
+  assert.equal(memberPillState("waiting", null), "blocked-human"); // idle "your turn" / permission-held → orange
+  assert.equal(memberPillState("waiting-agent", null), "blocked-peer"); // server-inferred blue, free
+  assert.equal(memberPillState("scheduled", null), "scheduled"); // teal
+  assert.equal(memberPillState("crashed", null), "crashed"); // red
+  assert.equal(memberPillState("done", null), "done"); // grey
+  assert.equal(memberPillState("ended", null), "done"); // grey (shares the done slot)
 });
 
-test("memberDisplayIntent: idle/exited shows the raw declared intent (that's when it adds information)", () => {
-  assert.equal(memberDisplayIntent("idle", "blocked:human"), "blocked:human");
-  assert.equal(memberDisplayIntent("idle", "blocked:peer"), "blocked:peer");
-  assert.equal(memberDisplayIntent("idle", "done"), "done");
-  assert.equal(memberDisplayIntent("idle", "working"), "working");
-  assert.equal(memberDisplayIntent("exited", "blocked:human"), "blocked:human");
+test("memberPillState: a RUNNING turn stays green regardless of a stale declaration (the contradiction it kills)", () => {
+  assert.equal(memberPillState("working", "blocked:human"), "working");
+  assert.equal(memberPillState("working", "blocked:peer"), "working");
+  assert.equal(memberPillState("working", "done"), "working");
 });
 
-test("memberDisplayIntent: idle/exited + no declaration → null (never fabricate a status on a pill)", () => {
-  assert.equal(memberDisplayIntent("idle", null), null);
-  assert.equal(memberDisplayIntent("idle", undefined), null);
-  assert.equal(memberDisplayIntent("exited", null), null);
+test("memberPillState: done-on-a-still-live idle session → grey (the one thing only the declaration carries)", () => {
+  assert.equal(memberPillState("waiting", "done"), "done"); // idle-live, wound up its part here
+  assert.equal(memberPillState("waiting-agent", "done"), "done");
+  assert.equal(memberPillState("scheduled", "done"), "done");
+  // ...but never over a real exit band — a crash is not "done".
+  assert.equal(memberPillState("crashed", "done"), "crashed");
+});
+
+test("memberPillState: an untagged blocked:peer promotes the idle orange band to blue (the server can't see it)", () => {
+  assert.equal(memberPillState("waiting", "blocked:peer"), "blocked-peer");
+  // server already blue (an @-tagged peer) — declaration just agrees.
+  assert.equal(memberPillState("waiting-agent", "blocked:peer"), "blocked-peer");
+});
+
+test("memberPillState: no live row → fall back to the durable declared intent (a seat outlives its occupant)", () => {
+  assert.equal(memberPillState(null, "blocked:human"), "blocked-human"); // exited seat still holds the question
+  assert.equal(memberPillState(null, "done"), "done");
+  assert.equal(memberPillState(undefined, "blocked:peer"), "blocked-peer");
+});
+
+test("memberPillState: no row and nothing declared → null (never fabricate a status on a pill)", () => {
+  assert.equal(memberPillState(null, null), null);
+  assert.equal(memberPillState(undefined, undefined), null);
+  assert.equal(memberPillState(null, "working"), "working"); // a declared working still shows
+});
+
+test("intentPillState: the four declarable intents map, anything else → null", () => {
+  assert.equal(intentPillState("working"), "working");
+  assert.equal(intentPillState("blocked:human"), "blocked-human");
+  assert.equal(intentPillState("blocked:peer"), "blocked-peer");
+  assert.equal(intentPillState("done"), "done");
+  assert.equal(intentPillState(null), null);
+  assert.equal(intentPillState("nonsense"), null);
+});
+
+// Drift lock: the whole point of the shared map is that the card band and the pill can never drift out of
+// step. Two guards — (1) every server band a session can carry maps to a pill slot (no band silently falls
+// through to a neutral pill); (2) every pill slot has a `.chan-member.i-<slot>` rule in style.css (the two
+// added here — scheduled/crashed — plus the four that predate this).
+test("drift lock: every SessionStatus band maps to a pill slot", () => {
+  // The SessionStatus union (session-status.ts) — kept here as the contract since node --test can't import
+  // the .ts. If a band is added there, add it to BAND_TO_PILL and to this list together.
+  const BANDS = ["working", "waiting", "waiting-agent", "scheduled", "done", "crashed", "ended"];
+  for (const b of BANDS) {
+    assert.ok(PILL_STATES.includes(memberPillState(b, null)), `band ${b} has no pill slot`);
+  }
+});
+
+test("drift lock: every pill slot has a .chan-member.i-<slot> rule in style.css", () => {
+  const css = readFileSync(fileURLToPath(new URL("../src/style.css", import.meta.url)), "utf8");
+  for (const slot of PILL_STATES) {
+    assert.match(css, new RegExp(`\\.chan-member\\.i-${slot}\\b`), `no pill CSS for i-${slot}`);
+  }
 });

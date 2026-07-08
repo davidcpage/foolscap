@@ -24,7 +24,20 @@ import {
   type AnnotationInfo,
 } from "./annotations";
 import { fileContentSignal, sessionListSignal } from "./content";
-import { memberDisplayIntent } from "../thread-state.js";
+import { memberPillState, intentPillState, type PillState } from "../thread-state.js";
+
+// Human label per participant-pill state (thread-state.js PILL_STATES). The tooltip's bold status word: the
+// declared-intent vocabulary where a state can be declared (blocked:human/blocked:peer), the plain band word
+// otherwise (scheduled/crashed) — so a server-inferred blue reads "blocked:peer" without an agent having to
+// declare it, and a card-only band still gets a word on the pill.
+const PILL_LABEL: Record<PillState, string> = {
+  working: "working",
+  "blocked-human": "blocked:human",
+  "blocked-peer": "blocked:peer",
+  scheduled: "scheduled",
+  crashed: "crashed",
+  done: "done",
+};
 
 // The spike's own node renderer — the ONLY thing that differs from app/'s NodeView. Every card
 // subscribes to the SAME two per-entity channel-1 handles (layout for position/size, node for
@@ -419,17 +432,16 @@ function ThreadView({
   const youWaitingMore = feed?.youWaitingMore ?? 0;
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
-  // Observed process-state per member, for the pill fusion (part 1 — process-state overrides a stale
-  // declaration). The server's session band (SessionMeta.status) rides /api/sessions keyed by sid = the
-  // session node's `title` (the same node↔session join Minimap/App use). `working` ⟺ the process is
-  // RUNNING; every other band (waiting / waiting-agent / scheduled / done / crashed / ended) or an absent
-  // row ⟺ NOT running. memberDisplayIntent collapses running → 'working', so a declared intent that has
-  // gone stale can't paint a 'blocked' pill on a green/running card.
+  // The server's whole-session status band per member, for the pill fusion. `SessionMeta.status` rides
+  // /api/sessions keyed by sid = the session node's `title` (the same node↔session join Minimap/App use).
+  // The pill consumes the FULL band (working / waiting / waiting-agent / scheduled / done / crashed / ended)
+  // — not a working-only boolean — so all seven card bands reach the pill instead of collapsing to idle;
+  // memberPillState then maps the band to a pill slot and folds this thread's declared intent on top.
   const sessions = useSignal(sessionListSignal);
-  const runningBySid = useMemo(() => {
-    const set = new Set<string>();
-    for (const s of sessions ?? []) if (s.status === "working") set.add(s.id);
-    return set;
+  const bandBySid = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const s of sessions ?? []) if (s.status) map[s.id] = s.status;
+    return map;
   }, [sessions]);
   // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
   // (Thread card UI). Instead each member's *latest* declared intent colours their participant pill. The
@@ -807,29 +819,31 @@ function ThreadView({
           <span className="chan-empty">no agents yet — alt-drag a session card onto this channel to join it</span>
         ) : (
           members.map((mem) => {
-            // Colour the pill by this member's current work-intent (orange = blocked:human, blue =
-            // blocked:peer, green = working, grey = done); fall back to the open/pending styling when they've
-            // declared nothing. But FUSE the declared intent with the observed process-state first
-            // (memberDisplayIntent): a RUNNING process reads 'working' regardless of what it last declared —
-            // the declaration goes stale mid-turn, and a 'blocked' pill on a green/running card is the exact
-            // contradiction this kills. Only an idle/exited member shows its raw declared intent.
+            // Colour the pill by this member's UNIFIED status slot — the SAME band the session card wears, so
+            // the two surfaces can never disagree (green = working, orange = blocked:human, blue =
+            // blocked:peer, teal = scheduled, red = crashed, grey = done). memberPillState fuses the full
+            // server band (process-observed, whole-session — permission-hold, crash, scheduled all reach the
+            // pill now, not just running) with THIS thread's declared intent (done-on-live → grey; an untagged
+            // blocked:peer promotes idle orange → blue). A running turn stays green regardless of a stale
+            // declaration — the "blocked pill on a green/running card" contradiction this fusion kills. A
+            // member with nothing observed and nothing declared falls back to the open/pending styling.
             const ci = mem.open ? currentIntent[mem.sid] : undefined;
-            const running = mem.open && runningBySid.has(mem.sid);
-            const displayIntent: string | null = mem.open
-              ? memberDisplayIntent(running ? "running" : "idle", ci?.intent ?? null)
+            const pillState: PillState | null = mem.open
+              ? memberPillState(bandBySid[mem.sid] ?? null, ci?.intent ?? null)
               : null;
-            // Keep the declared note ONLY while it still describes the shown intent; when process-state
-            // overrode a declaration to 'working', its note ("blocked on X") is now misleading — drop it.
-            const displayNote = displayIntent && displayIntent === ci?.intent ? ci?.note : "";
-            const intentClass = displayIntent ? ` i-${displayIntent.replace(":", "-")}` : "";
+            // Keep the declared note ONLY when the shown slot actually came FROM the declaration; when the
+            // server band drove the slot (e.g. running → working, or waiting-agent → blue with nothing
+            // declared) a stale note ("blocked on X") would be misleading — drop it.
+            const displayNote = pillState && pillState === intentPillState(ci?.intent) ? ci?.note : "";
+            const intentClass = pillState ? ` i-${pillState}` : "";
             const tag = mem.open ? tagFor(mem, openMembers) : null;
             // A fast custom hover tooltip (no native-title delay, Thread card UI) surfaces the member's
             // current STATUS — the common thing — plus a hint that RIGHT-CLICK inserts the @-tag (the rarer,
-            // deliberate act; no cursor change now). The intent word is bold + status-coloured to set it
+            // deliberate act; no cursor change now). The status word is bold + status-coloured to set it
             // apart from its note. Lines are dropped when there's nothing to say.
-            const statusNode: React.ReactNode = displayIntent ? (
+            const statusNode: React.ReactNode = pillState ? (
               <>
-                <b className={`chan-tip-intent i-${displayIntent.replace(":", "-")}`}>{displayIntent}</b>
+                <b className={`chan-tip-intent i-${pillState}`}>{PILL_LABEL[pillState]}</b>
                 {displayNote && ` — ${displayNote}`}
               </>
             ) : mem.open ? "no status declared" : "invited — not yet joined";
