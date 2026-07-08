@@ -546,17 +546,23 @@ function ThreadView({
     if (!r.ok) setStatus(r.error ?? "pin failed");
   };
   // Minimal pinned-nav (Thread card UI): the "📌 N" header count's ‹/› step through the pinned messages,
-  // scrolling each into view in turn (cycling). Queries the live pinned message elements in the log rather
-  // than tracking refs per message; the index rides a ref so stepping doesn't re-render.
+  // scrolling each to the TOP of the log in turn (cycling). Queries the live pinned message elements in the
+  // log rather than tracking refs per message; the index rides a ref so stepping doesn't re-render.
   const pinNavRef = useRef(-1);
   const jumpPinned = (dir: number) => {
-    const els = logRef.current?.querySelectorAll<HTMLElement>(".chan-msg.pinned");
-    if (!els || els.length === 0) return;
+    const log = logRef.current;
+    const els = log?.querySelectorAll<HTMLElement>(".chan-msg.pinned");
+    if (!log || !els || els.length === 0) return;
+    // Always step ±1 (wrapping) so EVERY click lands on a distinct pinned message — never a dead click on the
+    // one already showing (batch 7). Start at -1 so the first "next" targets the first pinned message.
     let i = pinNavRef.current + dir;
     if (i < 0) i = els.length - 1;
     if (i >= els.length) i = 0;
     pinNavRef.current = i;
-    els[i].scrollIntoView({ block: "nearest", behavior: "smooth" });
+    // Scroll the LOG directly (not scrollIntoView, which would also scroll the transformed canvas ancestors
+    // and shift the card) by the delta between the target's top and the log's top — landing it flush at the
+    // top of the viewport, instantly, regardless of the message's offsetParent. block:'start', behavior:'auto'.
+    log.scrollTop += els[i].getBoundingClientRect().top - log.getBoundingClientRect().top;
   };
 
   return (
