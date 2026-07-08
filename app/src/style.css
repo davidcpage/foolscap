@@ -2732,19 +2732,27 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font-weight: 600;
   color: #52525b;
 }
-/* Bottom-right meta cluster (Thread card UI): timestamp + faint pin toggle, WhatsApp-style inline meta at
-   the tail of the bubble rather than a header line. */
-.chan-msg-meta {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-  margin-top: 2px;
-}
 .chan-msg-time {
   font-size: 9px;
   color: #a1a1aa;
 }
+/* WhatsApp-style inline timestamp (Thread card UI): floated into the bottom-right of the bubble, sitting in
+   the gap the invisible spacer reserves at the end of the last paragraph. If the last line has room the meta
+   shares it; if the text fills the width the spacer wraps and the meta lands on that fresh line — no wasted
+   vertical row. `.chan-msg` is the positioning context (position:relative). */
+.chan-time-float {
+  position: absolute;
+  right: 9px;
+  bottom: 4px;
+}
+.chan-msg-timespace {
+  display: inline-block;
+  width: 46px; /* ~ the "HH:MM:SS" timestamp width + a little gap, so the last line's text clears the float */
+  height: 1px;
+}
+/* Fallback when the body ends in a LIST (a spacer inside a list is awkward): the timestamp gets its own
+   right-aligned row below instead of floating. */
+.chan-msg-metaline { text-align: right; margin-top: 2px; }
 .chan-msg-text {
   color: #27272a;
   white-space: pre-wrap;
@@ -2806,8 +2814,9 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-radius: 10px 10px 2px 10px;
   background: #e7f6ec;
 }
-/* R-PIN: a per-message pin toggle, faint until the bubble is hovered so the log stays quiet; it lives in the
-   bottom-right meta cluster beside the timestamp. A pinned message shows its 📌 lit + the left accent below. */
+/* R-PIN: a per-message pin toggle, faint until the bubble is hovered so the log stays quiet; a top-right
+   hover affordance (out of the text flow, so it doesn't compete with the floated timestamp). A pinned
+   message shows its 📌 lit + the left gutter bar below. */
 .chan-pin-toggle {
   padding: 0;
   border: none;
@@ -2819,6 +2828,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   filter: grayscale(1);
   transition: opacity 0.1s;
 }
+.chan-pin-abs { position: absolute; top: 3px; right: 5px; z-index: 1; }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
 /* Pinned messages stand out by CONTRAST (Thread card UI): a bold solid left GUTTER BAR + a deeper fill than

@@ -627,20 +627,19 @@ function ThreadView({
                       <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
                     </div>
                   )}
-                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m)}</div>
-                  {/* Bottom-right meta cluster: the timestamp (WhatsApp-style inline meta, not a header line)
-                      and the faint pin toggle. */}
-                  <div className="chan-msg-meta">
-                    <button
-                      className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
-                      data-interactive
-                      title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
-                      onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
-                    >
-                      📌
-                    </button>
-                    <span className="chan-msg-time">{formatEventTime(mm.ts)}</span>
-                  </div>
+                  {/* Pin toggle: a faint top-right hover affordance, out of the text flow (WhatsApp-style, so
+                      it doesn't compete with the floated timestamp meta below). */}
+                  <button
+                    className={`chan-pin-toggle chan-pin-abs${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
+                    data-interactive
+                    title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
+                    onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
+                  >
+                    📌
+                  </button>
+                  {/* The timestamp is placed by renderMessageBody: floated into the last paragraph's tail
+                      (WhatsApp inline meta), or a below-line row when the body ends in a list. */}
+                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m, formatEventTime(mm.ts))}</div>
                 </div>,
               );
             }
@@ -763,30 +762,20 @@ function highlightTags(text: string, entries: TagEntry[]): React.ReactNode {
 // by design. Kept deliberately small (paragraphs + lists) — headings and tables are rare in a thread post;
 // the shared lit-html codec (vendor/markdown.js) is the wrong renderer here (raw target=_blank links, no
 // canvas-link/tag handling).
-function renderMessageBody(text: string, entries: TagEntry[], m: InteractionManager): React.ReactNode {
+// `time`, when given, is the message's timestamp, placed WhatsApp-style: floated into the bottom-right of
+// the LAST paragraph's tail via an invisible inline spacer that reserves room on the last line (the meta
+// sits in that gap when the line has room, and drops to a fresh line when the text fills the width). When
+// the last block is a LIST (a spacer inside a list is awkward), it falls back to a below-line meta row.
+function renderMessageBody(text: string, entries: TagEntry[], m: InteractionManager, time?: string): React.ReactNode {
   const render = (run: string) => renderInline(run, m, (r) => highlightTags(r, entries));
   const lines = text.replace(/\r\n/g, "\n").split("\n");
-  const blocks: React.ReactNode[] = [];
+  // Parse into block descriptors first, so the LAST block can be special-cased (spacer) at render time.
+  type Block = { kind: "p"; text: string } | { kind: "list"; ordered: boolean; items: string[] };
+  const parsed: Block[] = [];
   let para: string[] = [];
   let list: { ordered: boolean; items: string[] } | null = null;
-  let key = 0;
-  const flushPara = () => {
-    if (para.length) {
-      blocks.push(<div className="chan-p" key={key++}>{render(para.join("\n"))}</div>);
-      para = [];
-    }
-  };
-  const flushList = () => {
-    if (list) {
-      const items = list.items.map((it, i) => <li key={i}>{render(it)}</li>);
-      blocks.push(
-        list.ordered
-          ? <ol className="chan-md-list" key={key++}>{items}</ol>
-          : <ul className="chan-md-list" key={key++}>{items}</ul>,
-      );
-      list = null;
-    }
-  };
+  const flushPara = () => { if (para.length) { parsed.push({ kind: "p", text: para.join("\n") }); para = []; } };
+  const flushList = () => { if (list) { parsed.push({ kind: "list", ...list }); list = null; } };
   for (const line of lines) {
     const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
     const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
@@ -805,6 +794,30 @@ function renderMessageBody(text: string, entries: TagEntry[], m: InteractionMana
   }
   flushPara();
   flushList();
+  const lastIdx = parsed.length - 1;
+  const lastIsPara = lastIdx >= 0 && parsed[lastIdx].kind === "p";
+  const blocks: React.ReactNode[] = parsed.map((b, i) => {
+    if (b.kind === "p") {
+      return (
+        <div className="chan-p" key={i}>
+          {render(b.text)}
+          {time && i === lastIdx && <span className="chan-msg-timespace" aria-hidden="true" />}
+        </div>
+      );
+    }
+    const items = b.items.map((it, j) => <li key={j}>{render(it)}</li>);
+    return b.ordered
+      ? <ol className="chan-md-list" key={i}>{items}</ol>
+      : <ul className="chan-md-list" key={i}>{items}</ul>;
+  });
+  if (time) {
+    // Float into the last paragraph's reserved gap; fall back to a below-line row for a list-final body.
+    blocks.push(
+      lastIsPara
+        ? <span className="chan-msg-time chan-time-float" key="t">{time}</span>
+        : <div className="chan-msg-metaline" key="t"><span className="chan-msg-time">{time}</span></div>,
+    );
+  }
   return blocks;
 }
 
