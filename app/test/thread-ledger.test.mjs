@@ -24,6 +24,9 @@ import {
   readPins,
   pinMessage,
   unpinMessage,
+  addThreadMember,
+  removeThreadMember,
+  threadMembersFromMeta,
 } from "../thread-ledger.js";
 
 function tmpRepo() {
@@ -252,6 +255,43 @@ test("pins ride the marker beside seats/intents without clobbering them", () => 
   assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat survives a pin write");
   assert.equal(meta.intents.Coordinator.intent, "working", "intent survives a pin write");
   assert.equal(meta.pins.length, 1, "pins land alongside");
+});
+
+// ── durable membership (delete-card-keep-session) ───────────────────────────────────────────────────
+
+test("members: addThreadMember records durably, is idempotent, and removeThreadMember drops one", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:members";
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, id)), [], "no marker → no members, not a throw");
+  addThreadMember(repo, id, "sid-a", 100);
+  addThreadMember(repo, id, "sid-b", 110);
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, id)).sort(), ["sid-a", "sid-b"]);
+  assert.equal(readThreadMeta(repo, id).members["sid-a"].joinedAt, 100, "joinedAt is stamped");
+  // Idempotent: re-adding the same member must NOT churn the marker (keep the original joinedAt).
+  addThreadMember(repo, id, "sid-a", 999);
+  assert.equal(readThreadMeta(repo, id).members["sid-a"].joinedAt, 100, "re-add is a no-op — joinedAt unchanged");
+  // Remove one member; the other survives.
+  removeThreadMember(repo, id, "sid-a");
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, id)), ["sid-b"], "only the removed sid is dropped");
+  // Removing a non-member is a harmless no-op.
+  removeThreadMember(repo, id, "sid-nobody");
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, id)), ["sid-b"]);
+});
+
+test("members: the durable set survives activity/seat/pin upserts (marker coexistence)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:members-coexist";
+  addThreadMember(repo, id, "sid-a", 100);
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  pinMessage(repo, id, msg(1, "Done when: green"), "sid-a", 150);
+  // An ordinary post's activity upsert must shallow-merge AROUND members (the property that makes the
+  // marker a safe home for durable membership — the same guarantee seats/intents/pins rely on).
+  upsertThreadMeta(repo, id, { title: "build", lastSeq: 3, lastTs: 300 });
+  const meta = readThreadMeta(repo, id);
+  assert.deepEqual(threadMembersFromMeta(meta), ["sid-a"], "membership survives an activity upsert");
+  assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat coexists");
+  assert.equal(meta.pins.length, 1, "pins coexist");
+  assert.equal(meta.title, "build");
 });
 
 // ── notification levels (P1, wakeable-substrate-plan W4) ─────────────────────────────────────────────

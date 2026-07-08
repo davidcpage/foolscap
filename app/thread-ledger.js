@@ -214,6 +214,47 @@ export function seatForSid(seats, sid) {
   return null;
 }
 
+// ── durable membership (delete-card-keep-session) ──────────────────────────────────────────────────
+// A thread's DURABLE member set: the sids that JOINED (a `member:open` edge) and have not explicitly LEFT.
+// The member:open EDGE is the canvas VIEW of a membership and dies with the session's card (removeNode
+// cascades its wires; the engine is deliberately blind to member semantics, records.ts). This set is the
+// membership ITSELF, kept on the marker beside `seats` — so deleting a session card removes the VIEW, not
+// the membership: the session stays logged, still wakeable by @-tag, still in the roster, just cardless.
+// A SEAT is a role's durable identity on the thread; this is the plain-sid analogue that also covers an
+// UNSEATED member (a seated member is recorded here too, harmlessly). Stored as `members: { [sid]: { joinedAt } }`.
+
+/**
+ * Record `sid` as a durable member of a thread (idempotent — an already-recorded member is a no-op that
+ * returns the unchanged map). Called wherever a `member:open` is observed (join/spawn/accept). Best-effort.
+ */
+export function addThreadMember(repoPath, threadId, sid, ts) {
+  const members = readThreadMeta(repoPath, threadId)?.members ?? {};
+  if (members[sid]) return members; // already a member — don't churn the marker
+  const next = { ...members, [sid]: { joinedAt: ts } };
+  upsertThreadMeta(repoPath, threadId, { members: next });
+  return next;
+}
+
+/**
+ * Drop `sid` from a thread's durable member set — the companion to addThreadMember, called on a REAL leave
+ * (an explicit /leave, or a human disconnecting the edge while the card stays). NOT called on a card delete:
+ * that removes the view, not the membership. A no-op (returns the prior map) when `sid` held no membership.
+ */
+export function removeThreadMember(repoPath, threadId, sid) {
+  const members = readThreadMeta(repoPath, threadId)?.members ?? {};
+  if (!members[sid]) return members; // not a member — nothing to remove
+  const { [sid]: _gone, ...rest } = members;
+  upsertThreadMeta(repoPath, threadId, { members: rest });
+  return rest;
+}
+
+/**
+ * The durable member sids on a thread's marker, or [] if none. Pure — callers pass `meta` (readThreadMeta).
+ */
+export function threadMembersFromMeta(meta) {
+  return meta && meta.members && typeof meta.members === "object" ? Object.keys(meta.members) : [];
+}
+
 // ── notification levels (P1, wakeable-substrate-plan W4; claude-tag R2 recast) ──────────────────────
 // A thread member's SEAT carries a notification LEVEL — the same wake preference a doc watcher carries
 // (notification-levels.js), one surface up. Default `all` (any room broadcast wakes it, the R2 default);
