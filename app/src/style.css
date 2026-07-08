@@ -2594,6 +2594,28 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   outline: none;
   background: #faf6ff;
 }
+/* Minimal pinned-nav (Thread card UI): a muted "📌 N" count with ‹/› steppers that scroll each pinned
+   message into view — the functional successor to the header chip removed in batch 1. Low-noise: small,
+   muted, no panel; hidden entirely when there are no pins. */
+.chan-pinnav {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+  font: 9px ui-monospace, Menlo, monospace;
+  color: #a1a1aa;
+}
+.chan-pinnav-count { white-space: nowrap; }
+.chan-pinnav-step {
+  border: none;
+  background: none;
+  color: #a1a1aa;
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+  line-height: 1;
+}
+.chan-pinnav-step:hover { color: #6b5b95; }
 /* the description — optional, Slack-topic style: quiet by default so the conversation is the focus. Empty
    shows just the muted placeholder; it grows on focus / when it has content. */
 .chan-description {
@@ -2676,10 +2698,19 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-tip-up { bottom: calc(100% + 4px); left: 0; }   /* pills sit low → open upward, over the log */
 .chan-tip-down { top: calc(100% + 2px); left: 8px; }  /* brief sits high → open downward */
+/* The brief tooltip is prose — give it a wider floor so it's never narrower than the (content-sized) pill
+   tooltips, which the human flagged (Thread card UI). Same 260px ceiling. */
+.chan-tip-brief { min-width: 240px; }
 .chan-member:hover .chan-tip-up { display: block; }
 .chan-desc-wrap:hover .chan-tip-brief { display: block; }
 .chan-tip-line { display: block; }
 .chan-tip-line + .chan-tip-line { margin-top: 3px; color: #8b8b93; } /* the right-click hint, dimmer */
+/* The intent word in a pill tooltip: bold + status-coloured to set it apart from its note (Thread card UI). */
+.chan-tip-intent { font-weight: 700; }
+.chan-tip-intent.i-working { color: #3f7a4c; }
+.chan-tip-intent.i-blocked-human { color: #b45309; }
+.chan-tip-intent.i-blocked-peer { color: #3d5bb0; }
+.chan-tip-intent.i-done { color: #8a8a90; }
 .chan-tip-brief a { color: #2563eb; }
 .chan-tip-brief code { font: 10px ui-monospace, Menlo, monospace; background: #00000010; padding: 0 3px; border-radius: 3px; }
 /* a rendered markdown link in the charter. An EXTERNAL link (http(s)) is an ordinary blue anchor; a CANVAS
@@ -2851,7 +2882,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   bottom: 5px;
   width: 3px;
   border-radius: 2px;
-  background: #7c3aed;
+  background: #e5484d; /* the pin's red — reads as "pinned" consistently on both green and purple bubbles */
 }
 .chan-members {
   display: flex;

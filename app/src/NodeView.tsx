@@ -363,8 +363,14 @@ function ThreadView({
   // feed is ordered, so the last intent act per sid wins. `visible` is the log with intent acts filtered
   // out — the conversation the walk below renders.
   const currentIntent = useMemo(() => {
-    const map: Record<string, { intent: string; text: string }> = {};
-    for (const mm of msgs) if (mm.kind === "intent" && mm.intent) map[mm.from] = { intent: mm.intent, text: mm.text };
+    const map: Record<string, { intent: string; note: string }> = {};
+    for (const mm of msgs) {
+      if (mm.kind !== "intent" || !mm.intent) continue;
+      // `text` is intentLine = `${intent} — ${note}` (or just `${intent}`); split off the note so the tooltip
+      // can style the intent distinctly from its note (Thread card UI).
+      const note = mm.text.startsWith(mm.intent) ? mm.text.slice(mm.intent.length).replace(/^\s*—\s*/, "").trim() : mm.text;
+      map[mm.from] = { intent: mm.intent, note };
+    }
     return map;
   }, [msgs]);
   const visible = useMemo(() => msgs.filter((mm) => mm.kind !== "intent"), [msgs]);
@@ -539,6 +545,19 @@ function ThreadView({
     const r = await setThreadPin(id, "human", seq, pinned);
     if (!r.ok) setStatus(r.error ?? "pin failed");
   };
+  // Minimal pinned-nav (Thread card UI): the "📌 N" header count's ‹/› step through the pinned messages,
+  // scrolling each into view in turn (cycling). Queries the live pinned message elements in the log rather
+  // than tracking refs per message; the index rides a ref so stepping doesn't re-render.
+  const pinNavRef = useRef(-1);
+  const jumpPinned = (dir: number) => {
+    const els = logRef.current?.querySelectorAll<HTMLElement>(".chan-msg.pinned");
+    if (!els || els.length === 0) return;
+    let i = pinNavRef.current + dir;
+    if (i < 0) i = els.length - 1;
+    if (i >= els.length) i = 0;
+    pinNavRef.current = i;
+    els[i].scrollIntoView({ block: "nearest", behavior: "smooth" });
+  };
 
   return (
     <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
@@ -550,6 +569,15 @@ function ThreadView({
           onBlur={commitTitle}
           onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
         />
+        {pins.length > 0 && (
+          // Minimal pinned-nav: a muted "📌 N" count with ‹/› to step through the pinned messages in the log
+          // (scroll-into-view, cycling). The functional successor to the header chip removed in batch 1.
+          <div className="chan-pinnav" data-interactive>
+            <button className="chan-pinnav-step" title="previous pinned message" onClick={() => jumpPinned(-1)}>‹</button>
+            <span className="chan-pinnav-count" title={`${pins.length} pinned message${pins.length > 1 ? "s" : ""} — ‹ › to jump`}>📌 {pins.length}</span>
+            <button className="chan-pinnav-step" title="next pinned message" onClick={() => jumpPinned(1)}>›</button>
+          </div>
+        )}
         <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
@@ -660,11 +688,16 @@ function ThreadView({
             const tag = mem.open ? tagFor(mem, openMembers) : null;
             // A fast custom hover tooltip (no native-title delay, Thread card UI) surfaces the member's
             // current STATUS — the common thing — plus a hint that RIGHT-CLICK inserts the @-tag (the rarer,
-            // deliberate act; no cursor change now). Lines are dropped when there's nothing to say.
-            const tipLines = [
-              ci?.text ?? (mem.open ? "no status declared" : "invited — not yet joined"),
-              tag ? "right-click: insert @tag" : null,
-            ].filter(Boolean) as string[];
+            // deliberate act; no cursor change now). The intent word is bold + status-coloured to set it
+            // apart from its note. Lines are dropped when there's nothing to say.
+            const statusNode: React.ReactNode = ci ? (
+              <>
+                <b className={`chan-tip-intent i-${ci.intent.replace(":", "-")}`}>{ci.intent}</b>
+                {ci.note && ` — ${ci.note}`}
+              </>
+            ) : mem.open ? "no status declared" : "invited — not yet joined";
+            const tipNodes: React.ReactNode[] = [statusNode];
+            if (tag) tipNodes.push("right-click: insert @tag");
             return (
               <span
                 key={mem.edgeId}
@@ -676,8 +709,8 @@ function ThreadView({
                   {displayHandle(mem.name, mem.sid)}{!mem.open && " (invited)"}
                 </span>
                 <span className="chan-tip chan-tip-up" role="tooltip">
-                  {tipLines.map((l, i) => (
-                    <span key={i} className="chan-tip-line">{l}</span>
+                  {tipNodes.map((n, i) => (
+                    <span key={i} className="chan-tip-line">{n}</span>
                   ))}
                 </span>
               </span>
