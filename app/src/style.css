@@ -2602,7 +2602,10 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   min-height: 20px;
   max-height: 60px;
   flex: 0 0 auto;
-  resize: vertical;
+  /* No manual resize: the read-mode brief clamps to one line (expand toggle below), edit mode JS-autosizes.
+     A `resize: vertical` handle here also created a drag that landed as a click → dropped the card into raw
+     edit (Thread card UI, human report). */
+  resize: none;
   font: 11px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   color: #71717a;
   border: 1px solid transparent;
@@ -2630,14 +2633,14 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-description-view:hover { border-color: #ece6f7; }
 .chan-desc-empty { color: #b8b3c4; font-style: italic; }
-/* A long brief clamps to ~3 lines in read mode so it can't eat the card's vertical space (Thread card UI);
-   the "show more" toggle below drops the clamp. -webkit-box + line-clamp is the one widely-supported way to
-   clamp wrapped text by line count. */
+/* A brief clamps to a SINGLE line in read mode — a Slack-topic-style one-liner that can't eat the card's
+   vertical space (Thread card UI, human report); the "show more" toggle below drops the clamp for a longer
+   brief. -webkit-box + line-clamp is the one widely-supported way to clamp wrapped text by line count. */
 .chan-description-view.clamped {
   display: -webkit-box;
   -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
+  -webkit-line-clamp: 1;
+  line-clamp: 1;
   overflow: hidden;
 }
 .chan-desc-more {
@@ -2674,22 +2677,24 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   overflow-y: auto;
   overscroll-behavior: contain;
   margin: 2px 4px;
-  padding: 0 6px;
+  padding: 2px 6px;
   display: flex;
   flex-direction: column;
+  gap: 6px; /* a small chat-app gap between messages (Thread card UI) — replaces the old hairline dividers */
 }
 .chan-log::-webkit-scrollbar { width: 8px; }
 .chan-log::-webkit-scrollbar-thumb { background: #00000022; border-radius: 4px; }
-/* Each entry is a self-contained block: a quiet header row (who / when / pin) over the body, with a hairline
-   divider between successive entries so a long conversation reads as discrete turns rather than one run-on
-   column. The divider is barely-there on purpose — separation without the noise of a boxed-message look. */
+/* Every message is a soft purple bubble (Thread card UI): the tinted fill is the standard message background
+   broadly, not just the human's turns, so the log reads as a calm chat rather than a run-on column of
+   divider-separated blocks. Agents' turns sit left; the human's own turn (.me) is right-aligned below. */
 .chan-msg {
   font-size: 11px;
   line-height: 1.5;
-  padding: 6px 2px;
-}
-.chan-log > * + * {
-  border-top: 1px solid #0000000d;
+  align-self: flex-start;
+  max-width: 92%;
+  padding: 5px 9px;
+  border-radius: 10px 10px 10px 2px;
+  background: #f6f3fc;
 }
 .chan-msg-head {
   display: flex;
@@ -2758,22 +2763,18 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   line-height: 1.5;
 }
-/* The human's own turns render as a right-aligned chat bubble (Thread card UI) — a subtle neutral fill,
-   not full width, so "mine vs theirs" reads at a glance without a loud colour. The turn divider is dropped
-   for a bubble (a full-width hairline over a right-aligned card looks wrong). */
+/* The human's own turns are the same purple bubble, but right-aligned with a mirrored tail and a slightly
+   deeper fill so "mine vs theirs" still reads at a glance (Thread card UI). */
 .chan-msg.me {
   align-self: flex-end;
   max-width: 85%;
-  padding: 5px 9px;
   border-radius: 10px 10px 2px 10px;
-  background: #f4f2fa;
-  border-top: none;
+  background: #ece5f9;
 }
-.chan-log > .chan-msg.me + * { border-top: none; }
 .chan-msg.me .chan-msg-head { justify-content: flex-end; }
 /* R-PIN: a per-message pin toggle, faint until the row is hovered so the log stays quiet. A pinned message
-   keeps its place in the log and shows its 📌 lit; the collapsible pinned tray above is the head-context
-   surface (re-read on every wake — mirrored server-side into /inbox's `pinned`). */
+   keeps its place in the log and shows its 📌 lit; the inline left accent below marks it as head context
+   (mirrored server-side into /inbox's `pinned`). */
 .chan-pin-toggle {
   margin-left: 6px;
   padding: 0;
@@ -2788,69 +2789,29 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
-.chan-msg.pinned { background: #7c3aed0d; border-radius: 4px; }
-/* The pinned tray as a header chip (Thread card UI): a compact "📌 N" button in the title row that pops a
-   panel OVER the card, so head context is reachable without a full-width block stranding mid-card below a
-   long brief. The wrap is the positioning context for the absolute panel. */
-.chan-pins-chip-wrap { position: relative; flex: 0 0 auto; }
-.chan-pins-chip {
-  font: 9px ui-monospace, Menlo, monospace;
-  padding: 1px 6px;
-  border-radius: 10px;
-  border: 1px solid #e4e4e7;
-  background: #f4f4f5;
-  color: #71717a;
-  cursor: pointer;
-}
-.chan-pins-chip:hover, .chan-pins-chip.open {
-  border-color: #d6c7f5;
-  background: #f4f0fc;
-  color: #6b5b95;
-}
-/* The pop-open panel: floats over the log, right-aligned under the chip, scrolls if there are many pins. */
-.chan-pins-panel {
-  position: absolute;
-  top: 100%;
-  right: 0;
-  z-index: 30;
-  margin-top: 4px;
-  width: 260px;
-  max-height: 220px;
-  overflow-y: auto;
-  padding: 4px 8px;
-  background: #fff;
-  border: 1px solid #e4e4e7;
-  border-radius: 6px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
-  font-size: 11px;
-}
-.chan-pin {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  margin-top: 4px;
-  line-height: 1.35;
-}
-.chan-pin:first-child { margin-top: 0; }
-.chan-pin .chan-msg-text { flex: 1 1 auto; }
-.chan-pin .chan-pin-toggle { opacity: 1; filter: none; margin-left: 0; }
-/* A work-intent typed act (threads-as-cards §6): a slim card-only status line, not a conversation turn.
-   Tints follow the session-status vocabulary — amber = your turn, blue = in flight elsewhere, green = done. */
+/* Pinned now that every bubble is purple, a fill can't mark "pinned" — a thin left accent does, quietly
+   (Thread card UI). The lit 📌 in the header is the other cue. */
+.chan-msg.pinned { box-shadow: inset 3px 0 0 #a78bfa; }
+/* A work-intent typed act (threads-as-cards §6): a slim, DIM card-only status line, not a conversation turn
+   — softened small/quiet so the harness status recedes behind the human/agent turns (Thread card UI). The
+   semantic tints still carry the stance (amber = your turn, blue = in flight elsewhere, green = done) but
+   muted so they don't shout. */
 .chan-intent {
-  font-size: 10px;
-  line-height: 1.35;
-  color: #71717a;
-  padding: 4px 2px;
+  font-size: 9px;
+  line-height: 1.3;
+  color: #b0aeb8;
+  padding: 1px 2px;
 }
-.chan-intent .chan-msg-from { color: #71717a; }
-.chan-intent-glyph { margin-right: 4px; }
+.chan-intent .chan-msg-from { color: #b0aeb8; font-weight: 500; }
+.chan-intent-glyph { margin-right: 4px; opacity: 0.7; }
 .chan-intent-text { margin-left: 6px; }
-.chan-intent.i-blocked-human { color: #b45309; }
-.chan-intent.i-blocked-human .chan-msg-from { color: #b45309; }
-.chan-intent.i-blocked-peer { color: #2563eb; }
-.chan-intent.i-blocked-peer .chan-msg-from { color: #2563eb; }
-.chan-intent.i-done { color: #16a34a; }
-.chan-intent.i-done .chan-msg-from { color: #16a34a; }
+.chan-intent .chan-msg-time { font-size: 8px; }
+.chan-intent.i-blocked-human { color: #c68a4a; }
+.chan-intent.i-blocked-human .chan-msg-from { color: #c68a4a; }
+.chan-intent.i-blocked-peer { color: #7f95c9; }
+.chan-intent.i-blocked-peer .chan-msg-from { color: #7f95c9; }
+.chan-intent.i-done { color: #6bb082; }
+.chan-intent.i-done .chan-msg-from { color: #6bb082; }
 .chan-members {
   display: flex;
   flex-wrap: wrap;
@@ -2939,6 +2900,12 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   background: #f3ecff;
   color: #6b21a8;
   cursor: pointer;
+}
+/* Disabled while a post is in flight (send guard, Thread card UI) — dimmed and non-interactive so a repeat
+   click can't fire a second post before the first returns. */
+.chan-post button:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 .chan-status {
   padding: 0 10px 6px;
