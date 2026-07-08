@@ -120,7 +120,37 @@ USAGE
 
 # JSON-encode a single string safely (handles quotes/newlines/unicode).
 jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
-post() { curl -sS -X POST "$1" -H 'Content-Type: application/json' -d "$2"; }
+# POST helper — the single sanctioned mutation path for every verb. GUARDRAIL (T3a, retires the manual
+# "check delivered>0" caution that used to live in the harness): a mutation that did NOT land must FAIL,
+# never silently "succeed". So this hard-errors (prints the body, then a clear message to stderr, then
+# returns non-zero → set -e exits the script) on:
+#   • an unreachable server (curl transport error);
+#   • an HTTP 4xx/5xx (e.g. /api/command's 503 {delivered:0} when no live tab applied it, a 409 unread-
+#     mention guard, a 403 non-member) — the request did not do what was asked;
+#   • a body carrying "delivered":0/false (defense-in-depth for a 200 that still reached no tab).
+# NOT an error: a message endpoint's notified:0 — an untagged post legitimately wakes nobody (it's a
+# different field and a deliberate design), so we key ONLY on `delivered`, never `notified`.
+post() {
+  local url="$1" data="$2" out status body rc=""
+  out=$(curl -sS -w $'\n%{http_code}' -X POST "$url" -H 'Content-Type: application/json' -d "$data") || rc=$?
+  if [ -n "$rc" ]; then
+    echo "canvas: could not reach ${url%%/api/*} (curl exit $rc) — is the dev server up on 5173?" >&2
+    return 1
+  fi
+  status="${out##*$'\n'}" # the %{http_code} we appended on its own trailing line
+  body="${out%$'\n'*}"    # everything before it (may itself contain newlines)
+  [ -n "$body" ] && printf '%s\n' "$body"
+  if [ "$status" -ge 400 ] 2>/dev/null; then
+    echo "canvas: POST $url failed (HTTP $status) — the write did NOT land." >&2
+    return 1
+  fi
+  case "$body" in
+    *'"delivered":0'*|*'"delivered": 0'*|*'"delivered":false'*)
+      echo "canvas: bus returned delivered:0 — no live tab of this board applied it; the write went nowhere." >&2
+      return 1 ;;
+  esac
+  return 0
+}
 # percent-encode a thread id for the URL PATH (thread ids contain colons: node:thread:<hex>).
 enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' "$1"; }
 
