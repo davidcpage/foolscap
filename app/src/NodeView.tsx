@@ -422,11 +422,11 @@ function ThreadView({
   // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you/@human
   // mention seqs the human has not yet VIEWED (thread-waiting.js × the durable seenMentions set). This no
   // longer paints the "you" pill (that is PRESENCE-only now — grey/green by card focus, below). It drives the
-  // viewport observer: `youWaitingSeqs` are exactly the message elements to watch and, once one scrolls into
-  // view with the card focused, mark seen (POST /seen → the seq drops out). The rail (threads-list card) shows
-  // the count + the preview popover + the cross-card jump; the open card's job is only to clear-on-view.
+  // focus-clears-all effect: whenever the card is focused, ALL these seqs are marked seen at once (POST /seen
+  // → they drop out). The rail (threads-list card) shows the count + the preview popover + the cross-card
+  // jump; the open card's job is only to clear-on-focus.
   const youWaitingSeqs = feed?.youWaitingSeqs;
-  // A stable key so the observer effect re-runs only when the unseen SET actually changes (not per feed frame).
+  // A stable key so the focus-clear effect re-runs only when the unseen SET actually changes (not per feed frame).
   const youWaitingKey = (youWaitingSeqs ?? []).join(",");
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
@@ -664,51 +664,23 @@ function ThreadView({
     el.classList.add("jump-flash");
   };
 
-  // Per-viewed-message clearing (user waiting-state, P2): while the card is FOCUSED, watch the still-unseen
-  // @human-mention elements in the log; when one scrolls into the viewport, mark its seq SEEN (POST /seen),
-  // which drops it from the count individually. Gated on `selected` (focus is what makes "viewed" count) and
-  // scoped to `youWaitingSeqs` (mentions only — the tiny set that keeps write cadence low). Debounced so a
-  // scroll-through batches into one POST; each seq is unobserved once seen so it fires at most once.
+  // Focus-clears-all clearing (user waiting-state, P2, revised per Done-when seq 106): when the card is
+  // FOCUSED, mark ALL its currently-unseen @you/@human mentions SEEN at once (POST /seen) — not per-scroll,
+  // not per-reply. The effect re-runs whenever the unseen SET changes WHILE focused, so a mention arriving on
+  // an already-focused card clears immediately; mentions arriving while the card is unfocused accumulate and
+  // clear on the next focus. Scoped to `youWaitingSeqs` (mentions only). Best-effort POST — a dropped mark
+  // just leaves the mention flagged and the next focus retries. (This replaced the per-message
+  // IntersectionObserver, which also moots its ≥60%-visibility threshold bug.)
   useEffect(() => {
     if (!selected) return; // only a focused card clears — focusing greens the pill but clears nothing
-    const root = logRef.current;
-    const unseen = new Set((youWaitingKey ? youWaitingKey.split(",") : []).map(Number).filter((n) => n >= 1));
-    if (!root || unseen.size === 0) return;
-    const pending = new Set<number>();
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const flush = () => {
-      timer = null;
-      if (pending.size === 0) return;
-      const seqs = [...pending];
-      pending.clear();
-      void fetch(`/api/thread/${encodeURIComponent(id)}/seen`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ from: "human", seqs }),
-      }).catch(() => {}); // best-effort — a dropped mark just leaves the mention flagged; the next view retries
-    };
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (!e.isIntersecting) continue;
-          const seq = Number((e.target as HTMLElement).dataset.seq);
-          if (!unseen.has(seq)) continue;
-          pending.add(seq);
-          io.unobserve(e.target); // seen once — stop watching so it can't re-fire
-        }
-        if (pending.size && timer == null) timer = setTimeout(flush, 400);
-      },
-      { root, threshold: 0.6 },
-    );
-    for (const seq of unseen) {
-      const el = root.querySelector<HTMLElement>(`.chan-msg[data-seq="${seq}"]`);
-      if (el) io.observe(el); // a mention beyond the rendered tail can't be watched — it clears when scrolled to
-    }
-    return () => {
-      io.disconnect();
-      if (timer != null) clearTimeout(timer);
-    };
-  }, [selected, id, youWaitingKey, msgs.length]);
+    const seqs = (youWaitingKey ? youWaitingKey.split(",") : []).map(Number).filter((n) => n >= 1);
+    if (seqs.length === 0) return;
+    void fetch(`/api/thread/${encodeURIComponent(id)}/seen`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ from: "human", seqs }),
+    }).catch(() => {}); // best-effort — a dropped mark just leaves the mention flagged; the next focus retries
+  }, [selected, id, youWaitingKey]);
 
   // Cross-card jump (user waiting-state, P3): the rail's preview popover transports here and asks the log to
   // scroll to a specific mention. A freshly-OPENED card reads the pending request on mount (consumePendingJump);

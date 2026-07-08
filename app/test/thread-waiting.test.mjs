@@ -1,6 +1,9 @@
-// The board owner's per-thread unseen-mention signal: an @you/@human mention the human has not yet VIEWED
-// is "waiting". Per-viewed-message clearing (NOT clear-on-reply, NOT clear-on-focus): a mention clears only
-// when its seq lands in the durable `seenMentions` set. Pure derivation over (log, seenMentions).
+// The board owner's per-thread unseen-mention signal: an @you/@human mention the human has not yet SEEN is
+// "waiting". A mention clears only when its seq lands in the durable `seenMentions` set — the client marks
+// ALL currently-unseen mentions seen at once when the human focuses the thread card (focus-clears-all, NOT
+// clear-on-reply). This derivation is a pure function of (log, seenMentions): it is agnostic to WHEN or HOW
+// a seq entered the seen set, so its per-seq granularity below is a capability the focus-clears-all client
+// drives by POSTing the whole unseen set — not a claim that the human clears mentions one at a time.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -40,13 +43,13 @@ test("@all is NOT a human mention (only @human/@user)", () => {
   assert.equal(humanWaiting(log({ from: "a9", text: "heads up @all" })).waiting, false);
 });
 
-test("per-viewed clearing: a SEEN mention seq no longer waits", () => {
+test("a SEEN mention seq no longer waits", () => {
   const l = log({ from: "a9", text: "@human decision needed" });
   assert.equal(humanWaiting(l, []).waiting, true); // not yet viewed
   assert.deepEqual(humanWaiting(l, [1]), { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
-test("clearing is PER-MESSAGE: seeing one mention leaves the others flagged individually", () => {
+test("derivation granularity: a PARTIAL seen set leaves the un-marked mentions flagged individually", () => {
   const l = log(
     { from: "a9", text: "@human one" },
     { from: "a9", text: "@human two" },
@@ -58,7 +61,7 @@ test("clearing is PER-MESSAGE: seeing one mention leaves the others flagged indi
   assert.deepEqual(r.preview.map((p) => p.seq), [1, 3]);
 });
 
-test("a human REPLY does NOT clear (clear-on-reply is gone — only viewing clears)", () => {
+test("a human REPLY does NOT clear (clear-on-reply is gone — only focusing the card clears)", () => {
   const r = humanWaiting(log(
     { from: "a9", text: "@human decision needed" },
     { from: "human", text: "go with option 2" },
@@ -97,7 +100,7 @@ test("a backtick-escaped @human is a mention-in-prose, not a wake → does not w
 
 test("preview keeps the TAIL and reports the overflow as `more`; seqs holds them ALL", () => {
   // Six unseen @human mentions, cap is 4 → preview is the LAST four (seq 3..6), more = 2 (older ones), but
-  // `seqs` carries all six (the client observer must watch every unseen mention, not just the previewed tail).
+  // `seqs` carries all six (on focus the client POSTs every unseen mention seq, not just the previewed tail).
   const r = humanWaiting(log(
     { from: "a9", text: "@human one" },
     { from: "a9", text: "@human two" },
