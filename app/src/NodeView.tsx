@@ -318,6 +318,8 @@ function ProvenanceView({
 type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
 // A pinned message (R-PIN): a snapshot flagged as head context, rendered in the collapsible pinned tray.
 type PinnedMsg = { seq: number; from: string; text: string; ts: number; pinnedBy?: string; pinnedAt?: number };
+// One waiting-message preview (Phase 3): the sender + a trimmed one-line snippet + the seq to jump to.
+type WaitingPreview = { seq: number; from: string; text: string };
 // A member's readable display handle: a role-spawned session carries a `.name` ("Coordinator.97acc4bc"); show it as
 // "Coordinator.97…" (role + the first 2 of its sid hex) so a member reads as who they are, not a raw hash. No name
 // (a plain non-role session) → the original 8-char sid prefix. The full sid stays on the pill's title attr.
@@ -354,13 +356,17 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingPreview?: WaitingPreview[]; youWaitingMore?: number }>("thread:" + id));
   const msgs = feed?.messages ?? [];
   // The board owner's waiting signal (user waiting-state + you-pill): server-derived on the feed — an
   // @you/@human mention newer than the human's own last post. Colours the static "you" pill amber; clears
   // when the human posts (clear-on-reply). thread-waiting.js is the single source of truth.
   const youWaiting = feed?.youWaiting ?? false;
   const youWaitingCount = feed?.youWaitingCount ?? 0;
+  // The actual waiting messages (Phase 3): sender + snippet + seq, bounded with a `+N more` overflow. Feeds
+  // the pill's hover preview list, each entry jump-to-message (jumpToSeq) within this card's log.
+  const youWaitingPreview = feed?.youWaitingPreview ?? [];
+  const youWaitingMore = feed?.youWaitingMore ?? 0;
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
   // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
@@ -569,6 +575,18 @@ function ThreadView({
     // top of the viewport, instantly, regardless of the message's offsetParent. block:'start', behavior:'auto'.
     log.scrollTop += els[i].getBoundingClientRect().top - log.getBoundingClientRect().top;
   };
+  // Jump the log to a specific message by seq (Phase 3 waiting-preview → click a waiting message to see it).
+  // Same log-relative scroll as jumpPinned (never scrollIntoView — that would drag the transformed canvas
+  // ancestors and shift the card). A brief highlight pulse marks the landed message so the eye finds it.
+  const jumpToSeq = (seq: number) => {
+    const log = logRef.current;
+    const el = log?.querySelector<HTMLElement>(`.chan-msg[data-seq="${seq}"]`);
+    if (!log || !el) return;
+    log.scrollTop += el.getBoundingClientRect().top - log.getBoundingClientRect().top;
+    el.classList.remove("jump-flash");
+    void el.offsetWidth; // reflow so re-adding the class restarts the animation even on a repeat click
+    el.classList.add("jump-flash");
+  };
 
   return (
     <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
@@ -657,6 +675,7 @@ function ThreadView({
               out.push(
                 <div
                   key={mm.seq}
+                  data-seq={mm.seq}
                   className={`chan-msg${isMe ? " me" : ""}${pinnedSeqs.has(mm.seq) ? " pinned" : ""}`}
                 >
                   {/* WhatsApp-style (Thread card UI): the sender label is dropped on the human's OWN turns —
@@ -691,15 +710,34 @@ function ThreadView({
             not a server member edge and carries no work-intent, so it's a calm neutral "you" pill — no wake/tag
             affordance. It leads the roster; agent participants follow. It DOES carry one status: `waiting`
             (user waiting-state), an amber flag when an @you/@human mention awaits the human, cleared when they
-            reply (clear-on-reply). A hover tooltip explains the amber, shown only while waiting. */}
+            reply (clear-on-reply). Hovering the amber pill reveals a PREVIEW of the actual waiting messages —
+            sender + snippet — and clicking one jumps the log to it (Phase 3). The preview is an INTERACTIVE
+            popover (pointer-events:auto, no gap, a DOM descendant of the pill so the cursor can travel into it
+            without dropping :hover — the Issue #4 pattern) precisely because it has click targets. */}
         <span className={`chan-member chan-member-you${youWaiting ? " waiting" : ""}`} data-interactive>
           <span className="chan-member-name">you</span>
           {youWaiting && (
-            <span className="chan-tip chan-tip-up" role="tooltip">
+            <span className="chan-tip chan-tip-up chan-tip-preview" role="tooltip" data-interactive>
               <span className="chan-tip-line">
                 <b className="chan-tip-intent i-blocked-human">waiting</b>
-                {` — ${youWaitingCount} message${youWaitingCount === 1 ? "" : "s"} await${youWaitingCount === 1 ? "s" : ""} you; reply to clear`}
+                {` — ${youWaitingCount} message${youWaitingCount === 1 ? "" : "s"} await${youWaitingCount === 1 ? "s" : ""} you; ${youWaitingPreview.length > 0 ? "click one to jump, or reply to clear" : "reply to clear"}`}
               </span>
+              {youWaitingMore > 0 && (
+                <span className="chan-tip-preview-more">+{youWaitingMore} earlier · newest {youWaitingPreview.length} shown</span>
+              )}
+              {youWaitingPreview.map((p) => (
+                <button
+                  key={p.seq}
+                  type="button"
+                  className="chan-tip-preview-item"
+                  data-interactive
+                  title="jump to this message"
+                  onClick={() => jumpToSeq(p.seq)}
+                >
+                  <span className="chan-tip-preview-from">{senderLabel(p.from, nameForSid(p.from))}</span>
+                  <span className="chan-tip-preview-text">{p.text}</span>
+                </button>
+              ))}
             </span>
           )}
         </span>

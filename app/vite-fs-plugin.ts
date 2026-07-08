@@ -1420,7 +1420,8 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
     // open card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
     // fresh by appendThreadMsg), so this stays a cheap read; the threads:<board> ping re-pulls on any
     // message or reply, setting/clearing the highlight live.
-    const { waiting: youWaiting, count: youWaitingCount } = humanWaiting(threadLog(boardId, m.threadId));
+    const { waiting: youWaiting, count: youWaitingCount, preview: youWaitingPreview, more: youWaitingMore } =
+      humanWaiting(threadLog(boardId, m.threadId));
     return {
       threadId: m.threadId,
       chanId: m.threadId,
@@ -1430,6 +1431,10 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
       youWaiting,
       youWaitingCount,
+      // The actual waiting messages (Phase 3): sender + trimmed snippet + seq, bounded with `+N more` overflow
+      // (thread-waiting.js). Feeds the threads-list row's hover preview, same derivation as the thread feed.
+      youWaitingPreview,
+      youWaitingMore,
       // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
       // declarer holds one, else sid) — the raw material the state projection derives from.
       intents: m.intents ?? {},
@@ -2618,8 +2623,18 @@ function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMs
   // The board owner's waiting signal (user waiting-state + you-pill): an @you/@human mention newer than the
   // human's own last post is unaddressed → colour the "you" roster pill amber. Clear-on-reply, derived
   // read-time from the log (no cursor, no durable state — thread-waiting.js). `count` feeds the pill tooltip.
-  const { waiting: youWaiting, count: youWaitingCount } = humanWaiting(messages);
-  publishFeed("thread:" + threadId, { messages, truncated, pins, youWaiting, youWaitingCount });
+  // `count` feeds the pill badge; `preview`/`more` feed the pill's hover preview + jump-to-message (Phase 3).
+  const { waiting: youWaiting, count: youWaitingCount, preview: youWaitingPreview, more: youWaitingMore } =
+    humanWaiting(messages);
+  publishFeed("thread:" + threadId, {
+    messages,
+    truncated,
+    pins,
+    youWaiting,
+    youWaitingCount,
+    youWaitingPreview,
+    youWaitingMore,
+  });
 }
 
 function appendThreadMsg(

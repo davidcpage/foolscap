@@ -4,4 +4,12 @@
 // The subset of a thread message the derivation reads (the feed's ThreadMsg is a superset).
 export type WaitingMsg = { seq: number; from: string; text?: string; kind?: string | null };
 
-export function humanWaiting(log: WaitingMsg[]): { waiting: boolean; count: number };
+// One waiting-message preview: the sender + a trimmed one-line snippet + the seq (for jump-to-message).
+export type WaitingPreview = { seq: number; from: string; text: string };
+
+export function humanWaiting(log: WaitingMsg[]): {
+  waiting: boolean;
+  count: number;
+  preview: WaitingPreview[];
+  more: number;
+};

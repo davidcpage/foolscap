@@ -25,20 +25,38 @@
 
 import { resolveTags } from "./thread-tags.js";
 
+// Hover-preview bounds (Phase 3): the pill/row hover reveals the ACTUAL waiting messages, not just a count.
+// Bounded in the derivation (one place) so no consumer re-drops: keep the TAIL — the most recent mentions are
+// the ones the human is catching up to — and surface the older overflow as `more` ("+N earlier"), never a
+// silent truncation. The snippet is a single collapsed line, generous but bounded (CLAUDE.md size caps).
+const PREVIEW_CAP = 4;
+const SNIPPET_MAX = 100;
+
+function snippet(text) {
+  const s = String(text ?? "").replace(/\s+/g, " ").trim();
+  return s.length > SNIPPET_MAX ? s.slice(0, SNIPPET_MAX - 1).trimEnd() + "…" : s;
+}
+
 /**
  * Derive the human's waiting state for one thread from its message log. `log` is the ThreadMsg[] the feed
- * carries (`{ seq, ts, from, text, kind? }`). Returns `{ waiting, count }` — `count` is how many @human
- * mentions sit past the human's last post (for a tooltip/badge), `waiting` is `count > 0`. Pure; no I/O.
+ * carries (`{ seq, ts, from, text, kind? }`). Returns `{ waiting, count, preview, more }` — `count` is how
+ * many @human mentions sit past the human's last post, `waiting` is `count > 0`, `preview` is the most-recent
+ * up-to-`PREVIEW_CAP` of those as `{ seq, from, text }` (for the hover preview + jump-to-message), and `more`
+ * is how many older waiting mentions the preview omitted (`count - preview.length`). Pure; no I/O.
  */
 export function humanWaiting(log) {
   const msgs = Array.isArray(log) ? log : [];
   let lastHumanSeq = 0;
   for (const m of msgs) if (m && m.from === "human" && m.seq > lastHumanSeq) lastHumanSeq = m.seq;
-  let count = 0;
+  const waiting = [];
   for (const m of msgs) {
     if (!m || m.kind != null) continue; // card-only (intent/ask) entries don't address the human
     if (m.seq <= lastHumanSeq) continue; // addressed: the human posted at or after this
-    if (resolveTags(m.text ?? "", []).human) count++; // an @human / @user mention
+    if (resolveTags(m.text ?? "", []).human) waiting.push(m); // an @human / @user mention
   }
-  return { waiting: count > 0, count };
+  const count = waiting.length;
+  // Keep the TAIL (most recent) — see PREVIEW_CAP above. In chronological order so it reads like the log.
+  const tail = count > PREVIEW_CAP ? waiting.slice(count - PREVIEW_CAP) : waiting;
+  const preview = tail.map((m) => ({ seq: m.seq, from: m.from, text: snippet(m.text) }));
+  return { waiting: count > 0, count, preview, more: count - preview.length };
 }
