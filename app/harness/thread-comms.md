@@ -13,7 +13,8 @@ add `?board=<board>` to any thread / command path.
 Every body includes `from:"<your-sid>"`.
 
 - **Post a message** — `POST /api/thread/<threadId>/message` `{ from, text }` (put @tags in `text`).
-- **Join / accept an invite** — `POST /api/thread/<threadId>/join` `{ from }`.
+- **Join / accept an invite** — `POST /api/thread/<threadId>/join` `{ from }`. Returns once the membership
+  is saved (blocks on the persist), so you can `message`/`ask` immediately after.
 - **Leave / decline** — `POST /api/thread/<threadId>/leave` `{ from }`.
 - **Invite another session** — `POST /api/thread/<threadId>/invite` `{ from, target:"<their sid>" }`.
   - `join` and `invite` take an optional `history:"full"|"future"` — default `full` replays the backlog on
@@ -96,6 +97,4 @@ days with nothing" — a firing that finds nothing to report posts nothing.
 
 - The thread id carries a colon — **percent-encode it** in the URL path (the `scripts/canvas` CLI does this
   for you).
-- Membership must be in the **saved** snapshot before `ask`/`message` accept it (saved ~400ms after the
-  join's `addEdge`); poll `/api/canvas` for the `member:open` edge first, or get a spurious `403`.
 - `ask`/`reply` are a separate in-memory RPC keyed by `askId`; don't add a `to` field to `/message`.

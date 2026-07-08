@@ -27,8 +27,9 @@ logged / attributed / persisted path a gesture uses. E.g. remove a card:
 
 - **Confirm it landed:** a command with no live tab for that board returns **503 `{delivered:0}`** — it
   went nowhere. Check `delivered>0`. (An unknown `?board=` → 400.)
-- **Removing cards:** delete edges before nodes (no dangling wires). File-card ids are deterministic
-  `node:repo:<path>`, so a removal set can be derived without reading the board.
+- **Removing cards:** just `removeNode` — the server cascades its edges (no dangling wires, no delete-edges-
+  first dance). File-card ids are deterministic `node:repo:<path>`, so a removal set can be derived without
+  reading the board.
 - **Attribution / undo:** commits land under their `actor`; a user's ⌘Z pops only their own `actor:"user"`
   acts — bus (`actor:"<sid>"`) and `actor:"system"` acts are not undoable.
 

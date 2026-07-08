@@ -14,6 +14,7 @@ import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, seatForSid, setThreadLevel, threadLevelForSid, unpinMessage, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
+import { connectedEdgeIds } from "./node-cascade.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
 import { isNotificationLevel, NOTIFICATION_LEVELS, wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
@@ -3949,6 +3950,24 @@ function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+// T3c helper: tear down every edge touching `nodeId` before its removeNode lands. Emits a removeEdge over
+// the bus for each connected edge (connectedEdgeIds off the durable snapshot) so the cascade is server-
+// authoritative, and — for a session card — also drops its member edges from the emitted-membership bridge,
+// including any join still inside the ~400ms save window (the snapshot wouldn't list those yet). Idempotent:
+// re-removing an edge the store already dropped is a no-op.
+function cascadeNodeEdges(boardId: string, nodeId: string, actor: string, origin: string): void {
+  const records = boardSnapshotRecords(boardId) ?? [];
+  const ids = new Set(connectedEdgeIds(records, nodeId));
+  const sid = nodeSessionId(records, nodeId);
+  if (sid)
+    for (const [edgeId, m] of emittedMembers)
+      if (m.sid === sid) {
+        ids.add(edgeId);
+        emittedMembers.delete(edgeId); // clear the bridge even with no live tab to apply the removeEdge
+      }
+  for (const id of ids) dispatchBusCommand(boardId, { type: "removeEdge", actor, payload: { id } }, origin);
+}
+
 async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId: string, origin: string): Promise<void> {
   let cmd: { type?: unknown; payload?: unknown; actor?: unknown };
   try {
@@ -3957,6 +3976,15 @@ async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId:
     return sendJson(res, 400, { error: "body must be JSON" });
   }
   if (typeof cmd.type !== "string") return sendJson(res, 400, { error: "missing command type" });
+  // T3c: a removeNode CASCADES its edges server-side, so "delete edges before nodes" is no longer a rule the
+  // operator carries. The browser store already tears a node's wires down (core removeNode), but re-deriving
+  // the edge set here and emitting a removeEdge for each FIRST makes the cascade client-independent and — the
+  // part only the server owns — lets us clear the in-memory emitted-membership bridge, so a deleted session
+  // card stops counting as a thread member at once rather than after the 60s TTL.
+  if (cmd.type === "removeNode") {
+    const nodeId = typeof (cmd.payload as { id?: unknown } | undefined)?.id === "string" ? String((cmd.payload as { id: string }).id) : null;
+    if (nodeId) cascadeNodeEdges(boardId, nodeId, typeof cmd.actor === "string" ? cmd.actor : "system", origin);
+  }
   // Broadcast to the board's tabs (+ fire the membership announce if it's a member:* edge). delivered=0
   // tells the agent no tab for THIS board is listening — the command went nowhere.
   const delivered = dispatchBusCommand(boardId, cmd as { type: string; payload?: Record<string, unknown>; actor?: string }, origin);
@@ -4097,6 +4125,25 @@ function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> |
   if (!b) return null;
   const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
   return snap?.records ?? null;
+}
+
+// T3b: block a join until its member:open edge lands in the DURABLE snapshot — poll the saved records for
+// the edge id until it appears or the deadline passes. The tab applies the addEdge then persists on a
+// ~400ms debounce, so a caller that messages/asks the instant /join returns would otherwise race that save
+// and 403 ("not a member") off a snapshot that doesn't list the edge yet. Bounded and returns false (rather
+// than hanging the request) on timeout — the in-memory emitted-membership bridge still covers the window,
+// so a timeout degrades to the old best-effort behaviour, never a broken join. Kept well under the agent's
+// Bash/curl timeout.
+const JOIN_PERSIST_TIMEOUT_MS = 5000;
+const JOIN_PERSIST_POLL_MS = 75;
+async function waitForEdgePersisted(boardId: string, edgeId: string, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const recs = boardSnapshotRecords(boardId);
+    if (recs && recs.some((r) => r.typeName === "edge" && r.id === edgeId)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, JOIN_PERSIST_POLL_MS));
+  }
 }
 
 // A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /
@@ -4506,7 +4553,11 @@ async function handleThreadMembership(
   }
   const delivered = dispatchBusCommand(boardId, cmd, origin);
   if (delivered === 0) return sendJson(res, 503, { error: "no tab of this board is live to apply it", delivered: 0 });
-  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid });
+  // T3b: a join doesn't return until its member:open edge is in the saved snapshot (waitForEdgePersisted),
+  // so the caller can message/ask straight away without racing the ~400ms persist. `persisted:false` means
+  // the block timed out (the emitted-membership bridge still covers membership); leave/invite don't wait.
+  const persisted = action === "join" ? await waitForEdgePersisted(boardId, String(cmd.payload.id), JOIN_PERSIST_TIMEOUT_MS) : undefined;
+  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid, ...(persisted === undefined ? {} : { persisted }) });
 }
 
 // POST /api/thread/<id>/history { target, mode:"full"|"future" } — set how much of the backlog a member
