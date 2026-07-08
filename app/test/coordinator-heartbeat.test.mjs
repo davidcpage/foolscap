@@ -14,7 +14,9 @@ import {
   COORDINATOR_ROLE,
   COORDINATOR_HEARTBEAT_INTERVAL_MS,
   COORDINATOR_HEARTBEAT_INSTRUCTION,
+  HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS,
   coordinatorHeartbeatJobSpec,
+  heartbeatEffectiveInterval,
 } from "../coordinator-heartbeat.js";
 import {
   MIN_INTERVAL_MS,
@@ -57,6 +59,22 @@ test("coordinatorHeartbeatJobSpec — interval override, floor-clamped", () => {
 
 test("the default interval is at/above the standing-job floor", () => {
   assert.ok(COORDINATOR_HEARTBEAT_INTERVAL_MS >= MIN_INTERVAL_MS);
+});
+
+// ── intent-keyed backoff (part 4) ─────────────────────────────────────────────────────────────────
+test("heartbeatEffectiveInterval: backs off ONLY while the seat is blocked:human; base cadence otherwise", () => {
+  const base = COORDINATOR_HEARTBEAT_INTERVAL_MS; // 4 min
+  // blocked:human → the slow pulse (parked on a human; the reply wakes it reactively)
+  assert.equal(heartbeatEffectiveInterval(base, "blocked:human"), HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS);
+  assert.ok(HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS > base, "the backoff pulse really is slower than the base");
+  // every other stance keeps the base cadence — blocked:peer/working MUST stay fast to detect a peer finishing
+  for (const intent of ["working", "blocked:peer", "done", null, undefined])
+    assert.equal(heartbeatEffectiveInterval(base, intent), base, `intent=${intent} keeps the base cadence`);
+});
+
+test("heartbeatEffectiveInterval: never SHORTENS a base already longer than the backoff floor", () => {
+  const longBase = HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS + 60_000; // a human-set --interval past the floor
+  assert.equal(heartbeatEffectiveInterval(longBase, "blocked:human"), longBase);
 });
 
 // ── the wake-live-else-respawn decision ─────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredBlock, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -22,9 +22,9 @@ import { deriveThreadState } from "./thread-state.js";
 import { resolveAnchor, type QuoteAnchor } from "./anchors.js";
 import { appendAnnotationEvent, foldAnnotations, listAnnotatedPaths, questionState, suggestionState, readAnnotationLog, type AnnotationEvent, type AnnotationOption } from "./annotations.js";
 import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherState, type WatchRecord } from "./doc-watch.js";
-import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
-import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
+import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, reapKeepAliveMs, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
+import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
+import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
@@ -3083,7 +3083,10 @@ async function handleSessionSpawn(
 // NOT used (R1): reconstitution is a FRESH spawn seeded from the durable substrate, never a transcript
 // replay. W6 (standing jobs) rides this same function. Returns the new sid, or null if it couldn't spawn
 // (cap reached / spawn error — logged, never thrown: a wake is best-effort, it degrades to pull).
-const IDLE_KEEPALIVE_MS = 5 * 60_000; // R1: an auto-wake worker idles this long, then the reaper winds it down
+const IDLE_KEEPALIVE_MS = 15 * 60_000; // R1: an undeclared-idle auto-wake worker idles this long, then the reaper
+// winds it down. Extended from 5 min — 5 was aggressive and churned Coordinators mid-task. A DECLARED block
+// overrides this per session (reapKeepAliveMs): blocked:human is never idle-reaped, blocked:peer gets a longer
+// backstop. The Coordinator heartbeat (4 min) stays well inside this so a live Coordinator is nudged, not reaped.
 
 function serverSpawnWorker(opts: {
   boardId: string;
@@ -3233,16 +3236,33 @@ function maybeRespawnDormantSeat(boardId: string, threadId: string, dormantSid: 
   if (newSid) fillSeat(repoPath, threadId, handle, newSid, Date.now());
 }
 
-// The R1 keep-alive reaper: an auto-wake worker that's been idle past the grace window is wound down (its
+// The R1 keep-alive reaper: an auto-wake worker that's been idle past its grace window is wound down (its
 // seat/doc goes dormant; the next qualifying activity respawns fresh). Only auto-wake workers are eligible —
-// never a human card, never the looping Coordinator. Runs on the loop heartbeat's cadence (loopTick).
+// never a human card. INTENT-AWARE (part 2): the grace window depends on the session's declared work-intent
+// (reapKeepAliveMs) — a session that has SAID why it's idle isn't churned as if it forgot. blocked:human is
+// never idle-reaped; blocked:peer gets the long backstop; everything else uses IDLE_KEEPALIVE_MS. Thread
+// markers are read once per repo per tick (only for repos that have an eligible session). Runs on loopTick.
 function autoWakeReapTick(): void {
   const now = Date.now();
+  const threadsByRepo = new Map<string, ThreadMetaMarker[]>();
   for (const s of liveSessions.values()) {
-    if (!shouldReapIdle(s, now, IDLE_KEEPALIVE_MS)) continue;
+    // Cheap pre-filter before the marker read: only an idle auto-wake worker with an idle stamp can reap.
+    if (!s.autoWake || s.status !== "idle" || !s.idleSince) continue;
+    let metas = threadsByRepo.get(s.repoPath);
+    if (!metas) {
+      try {
+        metas = listThreads(s.repoPath);
+      } catch {
+        metas = [];
+      }
+      threadsByRepo.set(s.repoPath, metas);
+    }
+    const intent = sessionDeclaredBlock(metas, s.id);
+    const keepAlive = reapKeepAliveMs(intent, IDLE_KEEPALIVE_MS);
+    if (!shouldReapIdle(s, now, keepAlive)) continue;
     console.warn(
       `[auto-wake] reaping idle worker ${s.id} (idle ${Math.round((now - s.idleSince!) / 1000)}s ≥ ` +
-        `${IDLE_KEEPALIVE_MS / 1000}s keep-alive) — winding down; next activity respawns fresh`,
+        `${keepAlive! / 1000}s keep-alive${intent ? `, intent=${intent}` : ""}) — winding down; next activity respawns fresh`,
     );
     endSession(s.id, "done");
   }
@@ -3281,12 +3301,27 @@ function standingJobNudge(job: { instruction: string }, origin: string): string 
   );
 }
 
+// Part 1 — heartbeat DEFAULT-ON. Auto-enable the Coordinator heartbeat standing job the first time a
+// Coordinator seat is staffed (coordinator-heartbeat.js): a Coordinator that doesn't proactively sweep can't
+// do its core job (peers signal completion via a `done` intent that wakes no one, so only a sweep notices),
+// and the standalone CLI enable step was routinely forgotten — so staffing a Coordinator IS the (human)
+// autonomy decision that turns it on. Idempotent: skipped when a Coordinator-role job already exists, so a
+// human who deliberately `job rm`'d it isn't overridden. Best-effort; the CLI verb remains the override path.
+function ensureCoordinatorHeartbeat(repoPath: string, threadId: string): void {
+  try {
+    if (readJobs(repoPath, threadId).some((j) => j.role === COORDINATOR_ROLE)) return;
+    upsertJob(repoPath, threadId, coordinatorHeartbeatJobSpec());
+  } catch {
+    /* best-effort — the CLI verb (`scripts/canvas job coordinator`) remains the manual fallback */
+  }
+}
+
 // Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
 // heartbeat, fire the standing jobs that have come due across every board's threads. WAKE-LIVE-ELSE-RESPAWN
 // (the efficiency norm — human's W6 concern, seq 104): a role-seat job whose seat is still occupied by a LIVE
 // session NUDGES that session (cheap — context intact), and only a DORMANT target pays a fresh respawn via the
 // serverSpawnWorker primitive (the same path doc-wake and dormant-seat respawn ride). This makes the
-// "<5min ⇒ wake existing / >5min ⇒ full respawn" split FALL OUT of the 5-min keep-alive window automatically:
+// "<5min ⇒ wake existing / >5min ⇒ full respawn" split FALL OUT of the keep-alive window automatically:
 // a short interval finds the occupant still alive (nudge); an interval past keep-alive finds it reaped
 // (respawn). SINGLE-FLIGHT: a job whose prior fire is still running (its surface claimed, or the live occupant
 // mid-turn) is SKIPPED this tick and retried next — no double-fire, never talk over a working session.
@@ -3303,7 +3338,15 @@ function standingJobsTick(): void {
       continue;
     }
     for (const t of threads) {
-      for (const job of dueJobs(readJobs(board.repoPath, t.threadId), now)) {
+      // Read the marker once for both the due-check's intent (part 4 backoff) and the seat resolution below.
+      const tMeta = readThreadMeta(board.repoPath, t.threadId);
+      for (const job of readJobs(board.repoPath, t.threadId)) {
+        // Part 4 — intent-keyed backoff: a role-seat job's EFFECTIVE interval slows while its seat's occupant
+        // is parked on the human (blocked:human), keeps the base cadence otherwise. Derived live from the
+        // seat's declared intent — no stored backoff state (heartbeatEffectiveInterval is a no-op unless
+        // blocked:human, so a bare/undeclared job fires exactly as before).
+        const seatIntent = job.role ? tMeta?.intents?.[job.role]?.intent ?? null : null;
+        if (!jobDueWithInterval(job, now, heartbeatEffectiveInterval(job.intervalMs, seatIntent))) continue;
         const key = jobClaimKey(t.threadId, job);
         if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
 
@@ -4462,6 +4505,9 @@ function maybeAnnounceMembership(
             `[canvas] The ${role} seat on thread ${thread.id} is held by a live session (${r.heldBy}); ` +
               `you joined SEATLESS (a sid-identified member). @${role} mentions still route to the seated ${role}.`,
           );
+        else if (role === COORDINATOR_ROLE && r.seat?.fills === 1)
+          // Part 1 — heartbeat DEFAULT-ON: the FIRST staffing of a Coordinator seat auto-enables its sweep.
+          ensureCoordinatorHeartbeat(repoPath, thread.id);
       }
     }
   }

@@ -87,6 +87,10 @@ export function ownBlockedIntentKeys(
   intents: Record<string, DeclaredIntent> | undefined,
   sid: string,
 ): string[];
+export function sessionDeclaredBlock(
+  metas: ThreadMetaMarker[] | undefined,
+  sid: string,
+): "blocked:human" | "blocked:peer" | null;
 export function untaggedSeatNudgeTarget(
   meta: ThreadMetaMarker | null | undefined,
   role: string,
