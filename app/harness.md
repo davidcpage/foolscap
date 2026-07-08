@@ -35,7 +35,12 @@ Coordination only works when the work is visible on the shared surface. So put n
 (never piggyback on an old one), discuss and decide **in-thread**, assign by **posting to the thread**, and
 close against the task's stated **`Done when:`** condition with **proof** — test output, a diff, a link —
 not just an assertion. When you hit a real decision you can't make alone, surface it where whoever answers
-will see it: a thread post, or an anchored question on the doc it concerns (see the Doc-annotations leaf).
+will see it: a thread post, or an anchored question on the doc it concerns (see the Doc-annotations leaf). A
+**product/design decision belongs in the thread as a normal post** — spell out the framing, the options, and
+your recommendation — **not** in the base prompt's `ask` fenced block: that block renders as clickable
+buttons on your session card and lives only in the ephemeral session feed, so only the human's bare reply
+reaches the durable thread record and the decision's framing, options, and rationale are lost from it.
+Reserve the `ask` block for truly session-local prompts with nothing to record.
 Never bury a decision in an ephemeral in-session prompt.
 
 ### 3. You pull; you wake whom you name

@@ -22,6 +22,12 @@ Every body includes `from:"<your-sid>"`.
 - **Start a new thread** — add a thread node, then invite peers:
   `POST /api/command` `{ type:"addNode", actor:"<your-sid>", payload:{ type:"thread", title:"<the task>", text:"<brief>" } }`
 
+**Decisions go in the thread, not the `ask` block.** When you need the human (or a peer) to make a
+product/design call, post it here as a normal message — framing, options, your recommendation. Don't put it
+in the base prompt's `ask` fenced block: that renders as buttons on your session card and only the human's
+free-text reply reaches the thread, so the framing and options are lost from the durable record. Reserve
+`ask` for session-local prompts with nothing to record (principle 2, work in the open).
+
 When you join a thread, the server messages you its brief, its members, and these recipes — so you rarely
 need them from memory.
 
