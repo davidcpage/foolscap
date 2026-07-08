@@ -2656,7 +2656,11 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   position: absolute;
   z-index: 50;
   display: none;
-  max-width: 240px;
+  /* Its OWN readable width, independent of the (narrow) trigger element — otherwise an absolute box with
+     only `left` set shrink-to-fits to the pill's width and reads tall/narrow (Thread card UI). */
+  width: max-content;
+  min-width: 160px;
+  max-width: 260px;
   max-height: 180px;
   overflow: hidden;
   padding: 5px 8px;
@@ -2670,8 +2674,8 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   word-break: break-word;
   pointer-events: none;
 }
-.chan-tip-up { bottom: calc(100% + 4px); left: 0; }         /* pills sit low → open upward, over the log */
-.chan-tip-down { top: calc(100% + 2px); left: 8px; right: 8px; } /* brief sits high → open downward */
+.chan-tip-up { bottom: calc(100% + 4px); left: 0; }   /* pills sit low → open upward, over the log */
+.chan-tip-down { top: calc(100% + 2px); left: 8px; }  /* brief sits high → open downward */
 .chan-member:hover .chan-tip-up { display: block; }
 .chan-desc-wrap:hover .chan-tip-brief { display: block; }
 .chan-tip-line { display: block; }
@@ -2831,11 +2835,24 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-pin-abs { position: absolute; top: 3px; right: 5px; z-index: 1; }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
-/* Pinned messages stand out by CONTRAST (Thread card UI): a bold solid left GUTTER BAR + a deeper fill than
-   the lightened non-pinned bubbles — obvious at a glance without a heavy full border. The lit 📌 is the
-   other cue. `.me.pinned` keeps the green family so a pinned own-message doesn't turn purple. */
-.chan-msg.pinned { background: #e2d9f4; box-shadow: inset 4px 0 0 #8b5cf6; }
+/* Pinned messages stand out by CONTRAST (Thread card UI): a bold left GUTTER BAR + a deeper fill than the
+   lightened non-pinned bubbles. The bar is a ::before element (an inset box-shadow was invisible — the
+   bubble's rounded corners clipped it away); inset a few px + top/bottom so the radius never eats it, and
+   painted over the fill in a high-contrast accent. `.me.pinned` keeps the green family. This left-edge
+   treatment is EXCLUSIVE to pinned — non-pinned messages carry no accent (fill + alignment distinguish
+   them). The lit 📌 is the other pinned cue. */
+.chan-msg.pinned { background: #e2d9f4; }
 .chan-msg.me.pinned { background: #d1ecda; }
+.chan-msg.pinned::before {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 5px;
+  bottom: 5px;
+  width: 3px;
+  border-radius: 2px;
+  background: #7c3aed;
+}
 .chan-members {
   display: flex;
   flex-wrap: wrap;
