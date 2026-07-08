@@ -5,7 +5,12 @@ import assert from "node:assert/strict";
 // the vendored acorn and reports its free variables (`reads`), the name(s) it defines via the `name = …`
 // convention (`defines`), and the expression the worker should run (`valueSource`). It imports acorn through
 // a relative ./acorn.js, which node resolves on disk — no data:-URL rewrite needed (unlike the templates).
-const { analyzeCell, analyzeMarkdown, compileMarkdown } = await import(new URL("../vendor/notebook-infer.js", import.meta.url));
+const { analyzeCell, analyzeMarkdown, compileMarkdown, resolveSpecifierUrl, DEFAULT_CDN_BASE } = await import(
+  new URL("../vendor/notebook-infer.js", import.meta.url)
+);
+// The worker's core — reused to prove a rewritten import-block actually RUNS (import → compute), exactly as the
+// scheduler would post it. No network: a `data:text/javascript,…` URL is the stubbed CDN, loaded by real import().
+const { runJob } = await import(new URL("../public/notebook-worker.js", import.meta.url));
 
 const sorted = (a) => [...a].sort();
 
@@ -126,11 +131,14 @@ test("a namespace / default import is a whole-notebook object import (export nul
   assert.deepEqual(def.imports, [{ name: "nb1", path: "./nb1", export: null }], "default → object import");
 });
 
-test("a bare/npm specifier is not an edge but is still stripped so the body runs", () => {
+test("a bare/npm specifier is not a cross-card edge but is REWRITTEN into a dynamic import (A2 lib loading)", () => {
   const a = analyzeCell('import _ from "lodash"\n_.range(n)');
   assert.deepEqual(a.imports, [], "a non-relative specifier is not a cross-card edge");
-  assert.equal(a.block, true, "the import still forces block mode (so it gets stripped)");
-  assert.ok(!/import/.test(a.valueSource), "the unsupported import is blanked, not left to syntax-error");
+  assert.equal(a.block, true, "the import still forces block mode");
+  assert.ok(
+    /const \{ default: _ \} = await import\("https:\/\/esm\.sh\/lodash"\);/.test(a.valueSource),
+    "the bare import is re-emitted as a dynamic import() prologue, not blanked away",
+  );
   assert.deepEqual(a.reads, ["n"], "_ is import-bound; n is the free read");
 });
 
@@ -327,4 +335,151 @@ test("a block whose final statement has NO trailing `;` does not suppress", () =
 test("a markdown cell never suppresses (its compiled template is not a `;`-terminated statement)", () => {
   const a = analyzeMarkdown("Total: ${total};");
   assert.equal(a.suppress, false, "a literal ; in prose is not a statement terminator");
+});
+
+// ── A2 external-library loading (Phase 1): a non-relative `import` → a dynamic import() in the block body ──
+// A bare specifier (`d3`) or a full ESM URL is neither a cross-card edge nor runnable as a static `import` in
+// the DOM-less worker. So analyzeCell REWRITES it into a top-of-cell `const … = await import(<url>)` prologue
+// (the worker runs the block via `new Function` in a module realm, where import() works), mapping bare specs
+// onto a configurable ESM CDN (resolveSpecifierUrl, default esm.sh) and passing URL specs through. Relative
+// imports are untouched — they stay cross-card edges injected as inputs. import() self-caches per realm.
+
+test("resolveSpecifierUrl: bare → CDN base, full URL passes through, base is configurable", () => {
+  assert.equal(resolveSpecifierUrl("d3"), "https://esm.sh/d3", "a bare specifier maps onto the default CDN");
+  assert.equal(resolveSpecifierUrl("d3-array"), "https://esm.sh/d3-array");
+  assert.equal(resolveSpecifierUrl("@scope/pkg"), "https://esm.sh/@scope/pkg", "a scoped package is still bare");
+  assert.equal(DEFAULT_CDN_BASE, "https://esm.sh/", "the default base is esm.sh");
+  assert.equal(
+    resolveSpecifierUrl("https://esm.sh/d3-array@3"),
+    "https://esm.sh/d3-array@3",
+    "a full URL passes through unchanged",
+  );
+  assert.equal(resolveSpecifierUrl("d3", "https://cdn.example/"), "https://cdn.example/d3", "the base is a knob");
+});
+
+test("a namespace import of a bare specifier becomes `const ns = await import(cdnUrl)`", () => {
+  const a = analyzeCell('import * as d3 from "d3"\nd3.max([1, 9, 3])');
+  assert.deepEqual(a.imports, [], "a bare specifier is not a cross-card edge");
+  assert.equal(a.block, true);
+  assert.deepEqual(a.reads, [], "d3 is import-bound, not a free read");
+  assert.ok(
+    /const d3 = await import\("https:\/\/esm\.sh\/d3"\);/.test(a.valueSource),
+    "the namespace binding loads the whole module object",
+  );
+  assert.ok(/return \(d3\.max\(\[1, 9, 3\]\)\)/.test(a.valueSource), "the last expression is still returned");
+});
+
+test("a named import becomes an object destructure; `as` aliases the local", () => {
+  const named = analyzeCell('import { mean } from "d3-array"\nmean([2, 4])');
+  assert.ok(/const \{ mean \} = await import\("https:\/\/esm\.sh\/d3-array"\);/.test(named.valueSource));
+  const aliased = analyzeCell('import { mean as m } from "d3-array"\nm([2, 4])');
+  assert.ok(
+    /const \{ mean: m \} = await import\("https:\/\/esm\.sh\/d3-array"\);/.test(aliased.valueSource),
+    "the CDN export name maps to the local alias",
+  );
+});
+
+test("a default import destructures `.default`; default + named fold into one destructure", () => {
+  const def = analyzeCell('import d3 from "d3"\nd3.scaleLinear');
+  assert.ok(/const \{ default: d3 \} = await import\("https:\/\/esm\.sh\/d3"\);/.test(def.valueSource));
+  const both = analyzeCell('import d3, { mean } from "d3"\nmean');
+  assert.ok(
+    /const \{ default: d3, mean \} = await import\("https:\/\/esm\.sh\/d3"\);/.test(both.valueSource),
+    "a default + named import is one destructure over the namespace",
+  );
+});
+
+test("a default + namespace import binds the namespace, then the default off it", () => {
+  const a = analyzeCell('import d3, * as ns from "d3"\nns');
+  assert.ok(
+    /const ns = await import\("https:\/\/esm\.sh\/d3"\), d3 = ns\.default;/.test(a.valueSource),
+    "namespace first (a later declarator may reference an earlier one)",
+  );
+});
+
+test("a full ESM URL specifier passes through import() unchanged (no CDN rewrite)", () => {
+  const a = analyzeCell('import { mean } from "https://esm.sh/d3-array@3"\nmean([1, 2])');
+  assert.ok(
+    /const \{ mean \} = await import\("https:\/\/esm\.sh\/d3-array@3"\);/.test(a.valueSource),
+    "a URL is loaded verbatim",
+  );
+});
+
+test("a side-effect-only import loads the module for its effects with no bindings", () => {
+  const a = analyzeCell('import "some-lib"\n42');
+  assert.ok(/await import\("https:\/\/esm\.sh\/some-lib"\);/.test(a.valueSource), "no `const`, just the import");
+  assert.ok(!/const .*await import/.test(a.valueSource), "no binding is introduced");
+});
+
+test("bare and RELATIVE imports coexist: the lib is rewritten, the sibling stays a cross-card edge", () => {
+  const a = analyzeCell('import * as d3 from "d3"\nimport { df } from "./prices"\nd3.max(df) + n');
+  assert.deepEqual(a.imports, [{ name: "df", path: "./prices", export: "df" }], "only the relative import is an edge");
+  assert.ok(/const d3 = await import\("https:\/\/esm\.sh\/d3"\);/.test(a.valueSource), "d3 is rewritten to a dynamic import");
+  assert.ok(!/import \{ df \}/.test(a.valueSource), "the relative import is blanked (df arrives as an injected input)");
+  assert.deepEqual(a.reads, ["n"], "d3 and df are import-bound; only n is free");
+});
+
+test("the CDN base is configurable per call via opts.cdnBase (the A3 import-map seam)", () => {
+  const a = analyzeCell('import * as d3 from "d3"\nd3', { cdnBase: "https://cdn.example/esm/" });
+  assert.ok(
+    /const d3 = await import\("https:\/\/cdn\.example\/esm\/d3"\);/.test(a.valueSource),
+    "a bare specifier resolves against the supplied base",
+  );
+});
+
+test("the dynamic-import prologue adds NO newline, so user line numbers are preserved", () => {
+  // The import spans stay blanked in place; the prologue is prepended without a newline. So the number of
+  // newlines BEFORE the returned expression matches the source — an important property for error line mapping.
+  const src = 'import * as d3 from "d3"\nconst xs = [1, 2, 3]\nd3.max(xs)';
+  const a = analyzeCell(src);
+  const upToReturn = a.valueSource.slice(0, a.valueSource.indexOf("return ("));
+  const srcUpToLast = src.slice(0, src.lastIndexOf("d3.max(xs)"));
+  assert.equal(
+    (upToReturn.match(/\n/g) || []).length,
+    (srcUpToLast.match(/\n/g) || []).length,
+    "same newline count before the final expression → line numbers unshifted",
+  );
+});
+
+// ── A2 end-to-end: the rewritten block RUNS and computes (real import(), stubbed via a data: URL) ─────────
+// Prove the whole chain: analyzeCell rewrites the import → the worker's runJob executes the block via
+// new Function → the dynamic import() resolves. A `data:text/javascript,…` URL is the stubbed CDN (real
+// import(), no network), reached either as a URL passthrough or by pointing cdnBase at a data: URL prefix.
+const runBlock = async (source, opts) => {
+  const a = analyzeCell(source, opts);
+  assert.equal(a.block, true, "an import forces block mode");
+  const r = await runJob({ source: a.valueSource, inputs: {}, block: a.block });
+  assert.equal(r.ok, true, `the rewritten block should run: ${r.error ?? ""}`);
+  return r.value;
+};
+
+test("E2E: a NAMED import (URL passthrough) loads and computes", async () => {
+  const url = "data:text/javascript,export const max = (arr) => Math.max(...arr)";
+  const out = await runBlock(`import { max } from "${url}"\nmax([3, 9, 4])`);
+  assert.equal(out, 9, "d3.max-style compute over an imported function");
+});
+
+test("E2E: a NAMESPACE import (URL passthrough) exposes the whole module object", async () => {
+  const url = "data:text/javascript,export const a = 2; export const b = 40";
+  const out = await runBlock(`import * as lib from "${url}"\nlib.a + lib.b`);
+  assert.equal(out, 42);
+});
+
+test("E2E: a BARE specifier resolves through the CDN base and computes", async () => {
+  // Point cdnBase at a data: URL whose trailing `//` comments out the appended bare name — so a bare specifier
+  // resolves to a real, loadable module. This exercises the bare → resolveSpecifierUrl → import() → compute path.
+  const cdnBase = "data:text/javascript,export const scale = (x) => x * 10;//";
+  const out = await runBlock('import { scale } from "d3-magic"\nscale(4)', { cdnBase });
+  assert.equal(out, 40, "the bare specifier loaded and computed");
+});
+
+test("E2E: an import + a named-cell define exports the computed value and displays the last expression", async () => {
+  const url = "data:text/javascript,export const mean = (arr) => arr.reduce((s, x) => s + x, 0) / arr.length";
+  const src = `import { mean } from "${url}"\navg = mean([2, 4, 6])`;
+  const a = analyzeCell(src);
+  assert.deepEqual(a.defines, ["avg"], "the assignment is the export");
+  assert.equal(a.keyedExports, true);
+  const r = await runJob({ source: a.valueSource, inputs: {}, block: a.block });
+  assert.equal(r.ok, true, `should run: ${r.error ?? ""}`);
+  assert.deepEqual(r.value, { value: 4, exports: { avg: 4 } }, "avg is exported (=4) and displayed");
 });

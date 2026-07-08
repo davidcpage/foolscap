@@ -19,7 +19,9 @@
 // so the named-cell form needs NO global assignment in the shared worker. When the cell is a STATEMENT
 // BLOCK — it has an `import` (step-4b) or more than one top-level statement — `block` is true and
 // `valueSource` is the whole body rewritten so the worker runs it as a function body: every `import`
-// declaration blanked out (stripped — the worker is not a module, §13) and the LAST top-level expression
+// declaration span blanked out in place, a NON-relative import (bare `"d3"` / a full ESM URL) additionally
+// re-emitted as a dynamic-import prologue (`const d3 = await import(<url>)`, A2 lib loading — the worker IS a
+// module realm, so import() runs there), and the LAST top-level expression
 // turned into a `return` (a trailing `name = expr` becomes `return (expr)`, so a block define still maps to
 // its export without leaking a global). This is step-4b's "richer worker" (docs/notebook-card.md §11.4b).
 //
@@ -45,8 +47,11 @@ const isNode = (x) => x && typeof x === "object" && typeof x.type === "string";
 // Keys on an acorn node that are positions/metadata, never child AST — skipped by the generic recursion.
 const META = new Set(["type", "start", "end", "loc", "range", "sourceType", "directive", "raw", "regex", "bigint", "value", "name", "operator", "kind", "computed", "static", "prefix", "delegate", "optional", "generator", "async", "method", "shorthand", "tail", "flags", "pattern"]);
 
-export function analyzeCell(source) {
+export function analyzeCell(source, opts) {
   const src = String(source ?? "");
+  // A2 lib loading: the ESM CDN base a BARE import specifier resolves to (a full URL passes through). One knob,
+  // resolved once here so a future import-map (A3) slots in at resolveSpecifierUrl. Default esm.sh.
+  const cdnBase = (opts && typeof opts.cdnBase === "string" && opts.cdnBase) || DEFAULT_CDN_BASE;
   let ast;
   try {
     ast = parse(src, PARSE_OPTS);
@@ -86,7 +91,7 @@ export function analyzeCell(source) {
   const suppress = endsWithStatementSemicolon(src, ast);
   let defines, valueSource, keyedExports;
   if (block) {
-    const b = buildBlockSource(src, importDecls, rest);
+    const b = buildBlockSource(src, importDecls, rest, cdnBase);
     defines = b.defines;
     valueSource = b.body;
     keyedExports = b.keyedExports;
@@ -304,8 +309,9 @@ function stripTrailingSemicolon(src, stmt) {
 //   import { df as d } from "./nb"  → { name:"d",  path:"./nb", export:"df" }   (aliased)
 //   import * as nb from "./nb"      → { name:"nb", path:"./nb", export:null }   (the whole notebook object)
 //   import nb from "./nb"           → { name:"nb", path:"./nb", export:null }   (default → notebook object)
-// A bare/npm specifier (`from "d3"`) yields no edge (unsupported on the bare worker) but its statement is
-// still blanked from the value source (buildBlockSource) so it can't syntax-error the run.
+// A bare/npm or URL specifier (`from "d3"`) yields no cross-card EDGE here (it is not another notebook/file),
+// but its statement is NOT dropped: buildBlockSource re-emits it as a dynamic-import prologue (A2 lib loading),
+// so `import * as d3 from "d3"` becomes a runnable `const d3 = await import(<cdn>/d3)` in the same cell.
 function importsFromDecls(decls, src) {
   const out = [];
   for (const d of decls) {
@@ -320,6 +326,19 @@ function importsFromDecls(decls, src) {
 }
 function isRelativeSpecifier(p) {
   return p.startsWith("./") || p.startsWith("../") || p.startsWith("/");
+}
+
+// ── A2 external-library loading: a non-relative specifier → the URL a dynamic import() loads ────────────
+// The SINGLE place a bare/URL import specifier becomes a URL — so a future import-map (A3) slots in right
+// here. A full URL (any scheme, or a protocol-relative `//cdn`) passes through UNCHANGED; a bare specifier
+// (`d3`, `d3-array`, `@scope/pkg`) maps onto a configurable ESM CDN base (default esm.sh, e.g.
+// `https://esm.sh/d3`). Relative specifiers never reach this — isRelativeSpecifier routes them to the
+// cross-card edge/input path instead.
+export const DEFAULT_CDN_BASE = "https://esm.sh/";
+export function resolveSpecifierUrl(spec, base = DEFAULT_CDN_BASE) {
+  const s = String(spec ?? "");
+  if (/^[a-z][a-z0-9+.-]*:/i.test(s) || s.startsWith("//")) return s; // has a URI scheme, or protocol-relative
+  return base + s; // a bare specifier → the CDN base
 }
 // The exported name of a named import: an Identifier (`{df}`) or a string literal (`{"odd name" as x}`).
 function importedName(node) {
@@ -343,8 +362,15 @@ function importedName(node) {
 //     last statement isn't an expression (a loop, a bare declaration) yields undefined, as a REPL block would.
 //
 // Returns the rewritten body, the define names, and keyedExports (true for the { value, exports } define form).
-function buildBlockSource(src, importDecls, rest) {
-  const body0 = maskSpans(src, importDecls); // imports blanked; every other offset preserved (same length)
+function buildBlockSource(src, importDecls, rest, cdnBase) {
+  const body0 = maskSpans(src, importDecls); // ALL import spans blanked; every other offset preserved (same length)
+  // A2 LIB LOADING: a NON-relative import (bare `"d3"` / a full ESM URL) is neither a cross-card edge nor
+  // runnable as a static `import` in the worker — but the worker runs the body via `new Function` in a module
+  // realm, where dynamic import() works. Re-emit each as a single-line `const … = await import(<url>);` and
+  // PREPEND it as a prologue. The import spans stay blanked in body0 above, so every downstream AST offset is
+  // intact; the prologue carries NO newline, so the user's line 1 is still line 1 (as the define prologue relies
+  // on). Empty string when the block has no non-relative import — the common case adds nothing.
+  const libPrologue = buildLibPrologue(importDecls, cdnBase);
   // Collect the names of every TOP-LEVEL `name = expr` assignment, in source order (no duplicates).
   const defines = [];
   for (const s of rest) {
@@ -368,14 +394,62 @@ function buildBlockSource(src, importDecls, rest) {
     }
     const prologue = "let __nbValue, " + defines.join(", ") + "; ";
     const epilogue = ";\nreturn ({ value: __nbValue, exports: { " + defines.join(", ") + " } });";
-    return { body: prologue + captured + epilogue, defines, keyedExports: true };
+    return { body: libPrologue + prologue + captured + epilogue, defines, keyedExports: true };
   }
   if (last && last.type === "ExpressionStatement") {
     const ex = last.expression; // `EXPR [;]` → `return (EXPR)` (drops a trailing semicolon)
     const body = body0.slice(0, last.start) + "return (" + body0.slice(last.start, ex.end) + ")" + body0.slice(last.end);
-    return { body, defines: [], keyedExports: false };
+    return { body: libPrologue + body, defines: [], keyedExports: false };
   }
-  return { body: body0, defines: [], keyedExports: false };
+  return { body: libPrologue + body0, defines: [], keyedExports: false };
+}
+
+// The dynamic-import PROLOGUE for a block's non-relative imports (A2). Each becomes one runnable
+// `const … = await import(<url>);` statement, joined on a SINGLE line (no newlines → line numbers preserved)
+// with a trailing space so it sits cleanly before the (blanked) body. Relative imports are skipped — they are
+// cross-card edges (injected as inputs, blanked from the body). Returns "" when there are none.
+function buildLibPrologue(importDecls, cdnBase) {
+  const stmts = [];
+  for (const d of importDecls) {
+    const spec = d.source && typeof d.source.value === "string" ? d.source.value : "";
+    if (!spec || isRelativeSpecifier(spec)) continue;
+    stmts.push(dynamicImportStatement(d, resolveSpecifierUrl(spec, cdnBase)));
+  }
+  return stmts.length ? stmts.join(" ") + " " : "";
+}
+
+// Build the runnable `const … = await import(url)` for ONE non-relative import declaration, mapping its
+// specifiers to the module-namespace object a dynamic import() resolves to:
+//   import * as ns from "x"      → const ns = await import(url)
+//   import def from "x"          → const { default: def } = await import(url)
+//   import { a, b as c } from x  → const { a, b: c } = await import(url)
+//   import def, { a } from "x"   → const { default: def, a } = await import(url)
+//   import def, * as ns from x   → const ns = await import(url), def = ns.default   (default + namespace)
+//   import "x"                   → await import(url)                                (side-effect only)
+// A string-named specifier (`{ "odd name" as x }`) becomes a quoted destructuring key. `url` is already
+// resolved (bare→CDN / URL passthrough) and JSON-encoded so it is a safe string literal.
+function dynamicImportStatement(decl, url) {
+  const lit = JSON.stringify(url);
+  const specs = decl.specifiers || [];
+  if (!specs.length) return "await import(" + lit + ");"; // side-effect-only import — no bindings
+  const ns = specs.find((s) => s.type === "ImportNamespaceSpecifier");
+  const def = specs.find((s) => s.type === "ImportDefaultSpecifier");
+  const named = specs.filter((s) => s.type === "ImportSpecifier");
+  if (ns) {
+    // `* as ns` (optionally with a default): bind the namespace, then the default off it — a single `const
+    // a = …, b = a.default` works because a later declarator may reference an earlier one. (JS syntax forbids
+    // a namespace specifier ALONGSIDE named ones, so there is nothing else to fold in here.)
+    let out = "const " + ns.local.name + " = await import(" + lit + ")";
+    if (def) out += ", " + def.local.name + " = " + ns.local.name + ".default";
+    return out + ";";
+  }
+  const parts = [];
+  if (def) parts.push("default: " + def.local.name);
+  for (const s of named) {
+    const imported = s.imported.type === "Identifier" ? s.imported.name : JSON.stringify(s.imported.value);
+    parts.push(imported === s.local.name ? imported : imported + ": " + s.local.name);
+  }
+  return "const { " + parts.join(", ") + " } = await import(" + lit + ");";
 }
 // Replace each node's [start,end) span of src with spaces, preserving newlines (so blanking imports keeps
 // every other character at its original offset, and line numbers in a runtime error stay accurate).

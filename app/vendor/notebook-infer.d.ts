@@ -27,7 +27,21 @@ export interface CellAnalysis {
   suppress: boolean;
 }
 
-export function analyzeCell(source: string): CellAnalysis;
+/** Options for {@link analyzeCell}. `cdnBase` overrides the ESM CDN base a BARE import specifier resolves to
+ *  (A2 lib loading); default {@link DEFAULT_CDN_BASE}. */
+export interface AnalyzeOptions {
+  cdnBase?: string;
+}
+
+export function analyzeCell(source: string, opts?: AnalyzeOptions): CellAnalysis;
+
+/** The default ESM CDN base a bare import specifier maps onto (A2 lib loading), e.g. `https://esm.sh/`. */
+export const DEFAULT_CDN_BASE: string;
+
+/** Map a NON-relative import specifier to the URL a dynamic `import()` loads (A2 lib loading): a full URL (any
+ *  scheme, or a protocol-relative `//cdn`) passes through unchanged; a bare specifier (`d3`) maps onto `base`
+ *  (default {@link DEFAULT_CDN_BASE}). The single seam a future import-map (A3) replaces. */
+export function resolveSpecifierUrl(spec: string, base?: string): string;
 
 /** A markdown cell's analysis: a CellAnalysis (defines/imports always empty) plus whether it carries a live
  *  `${ }` interpolation. False ⇒ pure prose, not scheduled; the card renders the source directly. */
