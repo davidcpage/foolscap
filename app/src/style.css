@@ -3593,6 +3593,24 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-radius: 8px;
   box-shadow: 0 6px 20px #0000001f;
 }
+/* A FRAMELESS HUD card (the top-centre clock) paints on transparent ground — no box, border, blur or
+   shadow. Higher specificity than `.hud-frame > .node` above so it wins despite being the earlier concept;
+   it also clears the clock's per-colour left rail (.node.clock border) so only the bare face remains. */
+.hud-frame.frameless > .node {
+  background: transparent;
+  border-color: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+/* The Threads indicator (node:channels) sits under the minimap at matching width; its frame is height-
+   capped (maxHeight in HudFrame), and .dir-body is already a scroll container, so a long thread list
+   scrolls inside the viewport rather than overflowing the bottom. A slightly smaller row type than a world
+   card keeps the compact HUD panel legible without crowding. */
+.hud-frame > .node.channels .file-name { font-size: 11px; }
+.hud-frame > .node.channels .ses-row-title { font-size: 11px; }
+.hud-frame > .node.channels .ses-row-meta { font-size: 9.5px; }
 
 /* The minimap HUD — navigation chrome pinned top-right, OUTSIDE the canvas subtree. It fades in on
    camera activity / held-Alt (the .show class) and out otherwise; pointer-transparent while hidden so

@@ -400,9 +400,9 @@ export function addFolderCard(m: InteractionManager, path: string, at?: Pos): vo
 // Drop the clock as a corner-pinned HUD element (hud.ts). It's an ordinary node (logged spatial state)
 // whose CONTENT is not stored — NodeView reads the time from the off-log `nowSignal` instead of node.text.
 // So this addNode is the ONLY thing the clock ever puts on the log; the per-second ticks never commit.
-// anchor:"screen" routes it to the ScreenLayer, where being a HUD card (hud.ts) corner-locks it below the
-// minimap and toggles it with the HUD group — so the stored x/y are a headless fallback only, overridden
-// by the derived corner position at render. Stable id → idempotent across reloads/StrictMode.
+// anchor:"screen" routes it to the ScreenLayer, where being a HUD card (hud.ts) corner-locks it at the
+// top-CENTRE, frameless, and toggles it with the HUD group — so the stored x/y (and w/h) are a headless
+// fallback only, overridden by the derived placement at render. Stable id → idempotent across reloads.
 export function addClock(m: InteractionManager, at?: Pos): void {
   m.editor.commit({
     type: "addNode",
@@ -538,7 +538,7 @@ export function addStickyNote(m: InteractionManager, at?: Pos): void {
 // (hud.ts). Its body reads the off-log `usage` feed (account plan windows, polled server-side) plus, if
 // titled with a live session id, that session's token gauge. Like the clock/feed cards, this addNode is
 // the only thing it ever logs; the polled values never commit. anchor:"screen" routes it to the
-// ScreenLayer, where being a HUD card corner-locks it below the minimap and toggles it with the HUD group
+// ScreenLayer, where being a HUD card corner-locks it at the top-LEFT and toggles it with the HUD group
 // (the stored x/y are a headless fallback, overridden by the derived corner position). A stable singleton
 // id → idempotent. Left untitled so it shows the plan bars alone.
 export function addUsageCard(m: InteractionManager, at?: Pos): void {
@@ -582,10 +582,15 @@ export function addSessionsCard(m: InteractionManager, at?: Pos): void {
 // this board's threads with unread counts + waiting highlights, and click/double-click/drag-out to open a
 // thread (openChannel). So this addNode is the only thing it ever logs — the list churns off-log like the
 // clock/usage/sessions cards. anchor:"screen" routes it to the ScreenLayer, where HUD membership corner-locks
-// it in the top-left stack and toggles it with the minimap (Alt tap) — the stored x/y are a headless fallback
-// overridden by the derived corner position. Seeded hidden (seedHud), not menu-spawnable. Stable singleton id
+// it at the top-RIGHT directly under the minimap, at matching width and a viewport-capped scrolling height,
+// and toggles it with the minimap (Alt tap) — the stored x/y/w are a headless fallback overridden by the
+// derived placement. Seeded hidden (seedHud), not menu-spawnable. Stable singleton id
 // (node:channels) → idempotent across reloads/StrictMode. Compact height: the interior list scrolls.
-export const CHANNELS_HUD_W = 280;
+// Matches the minimap width (.minimap-hud / hud.ts MINIMAP_WIDTH) so the Threads card sits flush beneath it.
+// The render overrides the frame width from the placement regardless, so this only keeps the stored/migrated
+// layout record in step. The height is a compact default the interior list scrolls within (HudFrame also
+// viewport-caps it so a long list never overflows the bottom).
+export const CHANNELS_HUD_W = 240;
 export const CHANNELS_HUD_H = 300;
 export function addChannelsCard(m: InteractionManager, at?: Pos): void {
   m.editor.commit({
