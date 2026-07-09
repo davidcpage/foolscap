@@ -105,7 +105,7 @@ all documented as known/intended:
 | Aspect | Worker cell (default) | View cell (main-thread) |
 |---|---|---|
 | Statelessness | Enforced | **Same** — re-established identically, not relaxed |
-| Blocks the UI thread | No (off-thread) | **Yes** — a heavy/long view cell freezes the UI; no timeout/abort |
+| Blocks the UI thread | No (off-thread) | **Yes** — a view cell runs on the UI thread; a synchronous runaway still freezes it (unpreemptable). Guarded by the consent gate + async time budget in §5 (Fix A), not eliminated. |
 | Real DOM + layout | No | **Yes** — the whole point (Plot/d3 charts) |
 | Export to downstream cells | Structured-clone-safe value | If the value is a **DOM Node**, the export **degrades to the markup string** (a node can't clone into a downstream worker cell). Non-Node values behave identically. |
 | Live node serialization | n/a | Live `node` is browser-only, **never serialized**; only `markup` rides the relay |
@@ -113,8 +113,10 @@ all documented as known/intended:
 
 So, concretely, the three things a view cell gives up versus a worker cell:
 
-1. **It runs on the UI thread** — a slow chart cell can jank the app. Mitigated by routing *only* view
-   candidates to the main thread; pure compute stays in the worker.
+1. **It runs on the UI thread** — a slow chart cell can jank the app, and a *synchronous* runaway (`while
+   (true){}`) freezes it outright with no in-realm interrupt. Mitigated (not eliminated) by §5's trust
+   boundary: a view cell no longer auto-runs on open — it needs one-time notebook consent — and an *async*
+   overrun hits a time budget. The sync-loop freeze is the residual limit consent is designed around.
 2. **A node export degrades to a string** — if a view cell is also consumed by a downstream cell, the
    downstream cell receives the chart's markup string, not a live node. (Matches the pre-existing
    "non-clone-safe value → string" rule.)
@@ -127,7 +129,66 @@ all intact. The worker was not modified.
 
 ---
 
-## 5. Feasibility of the two improvements you raised
+## 5. The main-thread trust boundary and its guard (Fix A, 2026-07-09)
+
+> Shipped in thread `node:mrdj7o3s-9`, closing the two HIGH-severity gaps a pre-push review found in the
+> main-thread realm. This section is the durable statement of the boundary; §4 above is the trade-off it
+> guards.
+
+**The boundary.** A `domCandidate` cell runs on the **main thread with full page authority** — the real
+`document`, `window`, IndexedDB, `localStorage`, cookies, and credentialed same-origin `fetch`. That is a
+genuine privilege escalation over the worker realm (which has none of these), and it is decided
+**statically** by `analyzeCell`: a cell earns it merely by importing an external lib (`Plot`/`d3`) or
+free-reading `document`/`window` (`notebook-infer.js`, `domCandidate`). Two things made that escalation
+dangerous as originally shipped:
+
+1. **It could hang the whole app.** Main-thread code is synchronous UI-thread code; a `while(true){}` or a
+   heavy sync compute freezes the tab with no recovery. **There is no in-realm fix for this** — JavaScript
+   has no preemption, so a synchronous loop cannot be interrupted from the thread it runs on. A watchdog
+   timer, an `AbortController`, even tearing down a same-origin iframe all require the event loop to turn,
+   which the loop is monopolising. The only substrate where arbitrary user compute is truly interruptible is
+   a *separate thread* (the Worker, via `terminate()`), and the whole reason this realm exists is that the
+   worker lacks the real layout engine Plot needs. So the honest guard is **not auto-running untrusted
+   compute here**, not a fictional watchdog.
+2. **It escalated silently, on open.** Routing was automatic and cells auto-ran under the default `auto`
+   policy — so opening a board with a notebook that imported `d3` handed that notebook full page authority
+   with no gate, the instant the card rendered.
+
+**The guard (a single consent gate + an async budget + this doc).**
+
+- **Consent gate.** A `domCandidate` cell does **not run** — not on open, not on a manual Run (the gate is a
+  security boundary, not a policy the Run button overrides) — unless the notebook carries explicit consent:
+  the attribute **`data-main-realm="allow"`** on its `<notebook>` element. Until then the scheduler parks the
+  cell unrun and the card shows a one-time **"Allow page access"** affordance (`render.js`), which writes the
+  attribute to the file. One grant covers the whole notebook. Parsed/serialized by `notebook-format.js`,
+  threaded through `syncCells` as `mainRealmAllowed`, enforced at the single chokepoint in
+  `notebook-runtime.ts` `startRun`. This closes **both** gaps at once: no auto-run-on-open hang, and no
+  silent privilege grant.
+- **Durable + doc-declarable, not an ephemeral click.** Consent lives in the *file*, so it survives reload
+  and is legible in the source — and a **headless/agent author pre-grants** by writing the attribute
+  directly, no human click required (important: an agent-opened notebook can be trusted in the record
+  without a person present). Toggling it re-syncs (it is in the runtime's spec signature) and re-dirties the
+  gated cells, so a grant runs them and a revoke re-parks them.
+- **Async time budget.** For runs that *do* yield, a wall-clock budget (`MAIN_THREAD_BUDGET_MS`, 10 s) races
+  the run and abandons a never-settling `await` / cooperative-yield loop, surfacing a **"time budget
+  exceeded"** error instead of a cell wedged `running` forever (`notebook-main-exec.js`). **Honest limit,
+  stated in the error text and here:** this catches *async* overruns only — a purely synchronous infinite
+  loop never returns control to the event loop for the timer to fire, which is exactly why the consent gate,
+  not the budget, is the primary guard against a hang.
+
+**Deliberately deferred (a good follow-up, not this fix):**
+
+- **A sandboxed null-origin iframe** for the DOM realm would be a *real* privilege drop (no parent cookies /
+  IndexedDB / credentialed fetch), not just consent. But a same-origin-null iframe shares the parent event
+  loop, so it does **not** solve the hang, and handing a live node back across the frame boundary loses the
+  direct-mount fidelity. Worth a dedicated thread as defense-in-depth on top of consent.
+- **A terminable worker timeout.** Worker cells also lack a timeout today, but a worker *is* terminable, so a
+  `timeout → terminate → respawn` there would be a true interrupt (unlike the main thread). Out of scope for
+  the main-thread realm; noted as a candidate.
+
+---
+
+## 6. Feasibility of the two improvements you raised
 
 > **Update after review (2026-07-09):** both of the ideas below collapse into a single, cleaner mechanism —
 > **parse-time reference resolution against a notebook-level import map (with defaults)** — suggested in
@@ -178,7 +239,7 @@ The parse-time approach is strictly better because it never tries to transport a
 
 ---
 
-## 6. Recommendation summary
+## 7. Recommendation summary
 
 The two ideas are one feature. Suggested ordering:
 

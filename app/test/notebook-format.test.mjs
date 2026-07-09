@@ -158,3 +158,32 @@ test("deserialize tolerates empty/garbage input without throwing", () => {
   assert.deepEqual(deserialize(undefined).cells, []);
   assert.equal(deserialize("<notebook></notebook>").title, "");
 });
+
+// ── main-realm consent (Fix A trust boundary, thread node:mrdj7o3s-9) ────────────────────────────────
+// `data-main-realm="allow"` on the <notebook> element is the durable, doc-declarable consent that lets this
+// notebook's DOM-producing cells run on the main thread (notebook-runtime's gate reads it via syncCells). The
+// format parser must round-trip it so a grant survives every cell/title edit (render.js threads it through
+// every serialize), and treat its ABSENCE as no consent (the gate holds).
+test("deserialize: reads data-main-realm off the <notebook> element", () => {
+  assert.equal(deserialize('<notebook data-main-realm="allow"><title>T</title></notebook>').mainRealm, "allow");
+  assert.equal(deserialize("<notebook><title>T</title></notebook>").mainRealm, "", "absent → empty (no consent)");
+  assert.equal(deserialize("").mainRealm, "", "garbage input → empty, never throws");
+});
+
+test("serialize: emits data-main-realm only when granted, and round-trips", () => {
+  const granted = serialize({ title: "T", cells: [], mainRealm: "allow" });
+  assert.match(granted, /<notebook data-main-realm="allow">/, "a grant is written onto the <notebook> tag");
+  assert.equal(deserialize(granted).mainRealm, "allow", "grant survives a round-trip");
+
+  const ungranted = serialize({ title: "T", cells: [] });
+  assert.doesNotMatch(ungranted, /data-main-realm/, "no consent → the attribute is absent (no file noise)");
+  assert.match(ungranted, /<notebook>/, "the bare <notebook> tag is still well-formed");
+});
+
+test("serialize: a cell edit that carries mainRealm through preserves consent (the render.js contract)", () => {
+  // render.js includes `mainRealm: nb.mainRealm` in EVERY serialize; simulate an edit that keeps it.
+  const src = serialize({ title: "T", cells: [{ id: "c1", type: "module", source: "1" }], mainRealm: "allow" });
+  const nb = deserialize(src);
+  const edited = serialize({ title: nb.title, cells: nb.cells.map((c) => ({ ...c, source: "2" })), mainRealm: nb.mainRealm });
+  assert.equal(deserialize(edited).mainRealm, "allow", "editing a cell does not silently revoke consent");
+});

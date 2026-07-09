@@ -1021,6 +1021,32 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   overflow-x: auto;
   padding: 6px 7px;
 }
+/* The MAIN-REALM CONSENT affordance (Fix A trust boundary — render.js renderConsent): shown in place of a gated
+   DOM cell's output. A muted amber "held" notice + an Allow button, so a cell that wants full page access reads
+   as deliberately withheld (not an error, not empty). Amber matches the running/stale "waiting" family above. */
+.nb-output.nb-consent {
+  white-space: normal;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+  background: #fffbeb;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+.nb-consent-msg { line-height: 1.5; }
+.nb-consent-msg strong { color: #78350f; }
+.nb-consent-btn {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border: 1px solid #f59e0b40;
+  border-radius: 5px;
+  background: #fef3c7;
+  color: #78350f;
+  cursor: pointer;
+}
+.nb-consent-btn:hover { background: #fde68a; }
 /* The per-cell hover toolbar (type-switch / reorder / delete) was removed — those actions are the keyboard
    layer's now (t / ↑↓ / x in command mode), and on a small card the floating bar flickered as the pointer
    crossed cells. See render.js. The between-cell insert strips below stay (the mouse path for adding cells). */
