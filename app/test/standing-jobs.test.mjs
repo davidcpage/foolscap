@@ -22,6 +22,7 @@ import {
   sessionHasScheduledWake,
 } from "../standing-jobs.js";
 import { readThreadMeta, fillSeat, listThreads } from "../thread-ledger.js";
+import { shouldRepublishBand } from "../session-band-republish.js";
 
 function tmpRepo() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "standing-jobs-"));
@@ -194,4 +195,39 @@ test("jobs coexist with seats/intents/pins on the same marker (no clobber)", () 
   assert.ok(meta.seats?.Coordinator, "seat survived the job write");
   assert.equal(meta.jobs.length, 1, "job landed alongside the seat");
   assert.equal(meta.jobs[0].role, "Coordinator");
+});
+
+// mrcmofwf-10: the out-of-band staleness trigger the loopTick safety net reconciles. A standing job
+// created/removed on an occupied seat flips that occupant's live band (scheduled ⇄ not) with NO process
+// event of its own — so nothing pushes a fresh band to the card, and it goes stale against the live pill.
+// Here we drive that exact transition and show `shouldRepublishBand` fires on it: the safety net republishes.
+test("job on/off an occupied seat flips the live band out-of-band ⇒ safety net republishes", () => {
+  const repo = tmpRepo();
+  const SID = "sid-coord-2";
+  fillSeat(repo, TID, "Coordinator", SID, 1000);
+
+  // Model the two inputs sessionStatus folds for an idle looping session: scheduled-wake ⇒ "scheduled",
+  // else "waiting". (waitingOn/intents held constant here — the point is the job-driven flip.)
+  const liveBand = () => (sessionHasScheduledWake(listThreads(repo), SID) ? "scheduled" : "waiting");
+
+  // The card last pushed "waiting" (no job when the session went idle).
+  let pushedBand = liveBand();
+  assert.equal(pushedBand, "waiting", "no job ⇒ live band is 'waiting'");
+
+  // A human adds a heartbeat job to the seat. No stdout/stdin/exit fires — the session is idle throughout —
+  // so the card's pushed band stays "waiting" while the live band (what the pill reads) is now "scheduled".
+  const { job } = upsertJob(repo, TID, { instruction: "sweep", role: "Coordinator", intervalMs: 60_000 });
+  const afterAdd = liveBand();
+  assert.equal(afterAdd, "scheduled", "job on the seat ⇒ live band flipped to 'scheduled'");
+  assert.equal(shouldRepublishBand(pushedBand, afterAdd), true, "drift detected ⇒ the safety net republishes");
+  pushedBand = afterAdd; // the republish pushes the fresh band
+
+  // No further drift on the next tick — republish-on-change means no per-tick spam.
+  assert.equal(shouldRepublishBand(pushedBand, liveBand()), false, "no change ⇒ no spurious republish");
+
+  // Removing the job flips it back the same silent way; the safety net catches that too.
+  removeJob(repo, TID, job.id);
+  const afterRemove = liveBand();
+  assert.equal(afterRemove, "waiting", "job removed ⇒ live band back to 'waiting'");
+  assert.equal(shouldRepublishBand(pushedBand, afterRemove), true, "reverse drift also republishes");
 });

@@ -1382,6 +1382,36 @@ test("session template surfaces held permission prompts: allow/deny rows + the w
   assert.ok(cleared.includes("● Working…"), "…and the pill returns to the live verb");
 });
 
+// Drift lock (card side, thread mrcmofwf-10): the card's CLIENT idle fallback — used only for a bandless
+// slice-1/historical feed with no server `band` — must rank the idle states in the SAME order as the server
+// (vite-fs-plugin.ts sessionStatus: scheduled > waitingOn > waiting). The old fallback ranked waitingOn
+// ABOVE scheduled — the exact precedence split this thread exists to kill. With a live standing wake AND a
+// server @-tag peer-wait both set on a bandless idle feed, the fallback frame + pill must both read
+// "scheduled" (teal), never "waiting-agent" (blue), matching what the server band would have said.
+test("session card idle FALLBACK matches server precedence: scheduled outranks waiting-agent (no server band)", async () => {
+  const mod = await loadTemplate("session");
+  const turn = JSON.stringify({ type: "user", message: { role: "user", content: "go" } });
+  // No `band` key on the feed → the client fallback derivation runs (the primary server-band path is skipped).
+  const card = {
+    fields: { title: "abcd1234", text: "", color: "blue" },
+    signals: { session: { content: turn, truncated: false, status: "idle", scheduled: true, waitingOn: ["peersid1"] } },
+  };
+  const out = flatten(mod.render(card));
+  assert.ok(!("band" in card.signals.session), "fixture carries no server band (exercises the fallback)");
+  assert.ok(out.includes("ses-frame-scheduled"), "fallback frame is teal scheduled, not blue waiting-agent");
+  assert.ok(!out.includes("ses-frame-waiting-agent"), "waiting-agent frame does NOT win over scheduled");
+  assert.ok(out.includes("◷ scheduled"), "fallback pill matches the frame — scheduled, not waiting on agent");
+  assert.ok(!out.includes("waiting on agent"), "pill does NOT show waiting-on-agent when scheduled is set");
+
+  // Sanity: with scheduled cleared, the same bandless idle feed falls through to the waiting-agent state —
+  // the reorder didn't drop waiting-agent, it just ranked it below scheduled.
+  const noSched = flatten(
+    mod.render({ ...card, signals: { session: { content: turn, truncated: false, status: "idle", waitingOn: ["peersid1"] } } }),
+  );
+  assert.ok(noSched.includes("ses-frame-waiting-agent"), "waiting-agent still wins when nothing is scheduled");
+  assert.ok(noSched.includes("waiting on agent"), "…and its pill too");
+});
+
 // worktree-activity slices A/C: the session card's touched-files activity strip — derived from the same
 // tool_use blocks as the turns — dedupes by path (newest touch wins), marks edited files as written
 // (sticky even after a later read), and colours each dot by the WORKTREE the absolute path falls under.

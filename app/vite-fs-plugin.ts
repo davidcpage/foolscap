@@ -25,6 +25,7 @@ import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherSt
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, reapKeepAliveMs, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
+import { shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
@@ -2118,6 +2119,12 @@ interface LiveSession {
   autoWake?: boolean;
   autoWakeKey?: string;
   idleSince?: number;
+  // Band-staleness reconciliation (thread mrcmofwf-10): the last whole-session status band publishSession
+  // pushed onto this session's feed. The loopTick safety net compares a freshly recomputed sessionStatus to
+  // this and republishes on drift, catching out-of-band transitions (a standing job / intent / waitingOn that
+  // moves the live band without firing one of the session's own process events). `undefined` = never
+  // published (nothing to reconcile yet); `null` is a real published value (a bandless never-run session).
+  lastBand?: SessionBand | null;
 }
 
 // liveSessions lives on fsState (aliased at the top) so spawned children survive a server reload and
@@ -2165,6 +2172,10 @@ function publishSession(s: LiveSession): void {
     content = content.slice(content.length - MAX_SESSION_FEED_BYTES);
     truncated = true;
   }
+  // Compute the band ONCE and remember it: this pushed value is what the card renders, and the loopTick
+  // safety net compares against `lastBand` to catch it going stale on an out-of-band transition.
+  const band = sessionStatus(s.repoPath, s.id);
+  s.lastBand = band;
   publishFeed("session:" + s.id, {
     content,
     truncated,
@@ -2173,7 +2184,7 @@ function publishSession(s: LiveSession): void {
     // the thread participant pill reads off /api/sessions, so the two surfaces can't drift. Sent on every
     // publish (including `null` = bandless/never-run) so the card stops recomputing the band client-side;
     // it falls back to its own derivation only when this key is absent (a slice-1 file-tail feed).
-    band: sessionStatus(s.repoPath, s.id),
+    band,
     skills: s.skills ?? undefined,
     verb: s.verb ?? undefined, // live progress label for the status pill (channel-1 chrome)
     usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
@@ -2189,6 +2200,21 @@ function publishSession(s: LiveSession): void {
     // the process is mid-turn ("running") but blocked on a HUMAN, and only the server knows that.
     permissions: (() => { const p = permissionsOf(s.id); return p.length ? p : undefined; })(),
   });
+}
+
+// Republish every LIVE seat occupant of a thread (mrcmofwf-10 instant path). A standing job created/removed
+// on a seat flips that occupant's `scheduled` band (sessionHasScheduledWake goes true/false) with no process
+// event of its own, so push the affected occupants' feeds now rather than waiting for the loopTick safety
+// net. Cheap: a thread holds a handful of seats, publishSession recomputes the band fresh, and dead/absent
+// occupants are skipped. Best-effort — a read failure leaves the safety net to reconcile.
+function republishThreadSeatOccupants(repoPath: string, threadId: string): void {
+  try {
+    const seats = readThreadMeta(repoPath, threadId)?.seats ?? {};
+    for (const seat of Object.values(seats) as Array<{ sid?: string }>) {
+      const s = seat?.sid ? liveSessions.get(seat.sid) : undefined;
+      if (s && s.status !== "exited") publishSession(s);
+    }
+  } catch { /* best-effort; loopTick reconciles */ }
 }
 
 // The full prompt size a usage object represents: fresh input plus both cache tiers. This is the
@@ -2908,6 +2934,20 @@ function loopTick(): void {
   autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
   standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
   //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
+  reconcileSessionBands(); // mrcmofwf-10: republish any session whose live band has drifted from its last
+  //                          push — the catch-all for out-of-band transitions the instant paths don't cover.
+}
+
+// Band-staleness safety net (thread mrcmofwf-10). Runs AFTER the ticks above so it sees the state they left
+// (a job that fired, a seat reaped). For every live session, recompute the live band and republish only when
+// it has drifted from what was last pushed — so the card's pushed band can never stay stale for longer than
+// one tick regardless of WHAT changed it (standing job, seat flip, intent, waitingOn). Republish-on-change
+// only, so this is not per-tick spam; sessionStatus short-circuits to "working" for running sessions (no
+// disk read), so the listThreads read is hit only for the handful of idle sessions.
+function reconcileSessionBands(): void {
+  for (const s of liveSessions.values()) {
+    if (shouldRepublishBand(s.lastBand, sessionStatus(s.repoPath, s.id))) publishSession(s);
+  }
 }
 
 // Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
@@ -4564,6 +4604,10 @@ async function handleThreadMessage(
     const peers = tagged.filter((sid) => sid !== from);
     ss.waitingOn = !wakeAll && !human && peers.length ? peers : null;
     persistSessionState(ss);
+    // Instant path (mrcmofwf-10): the sender's own band just moved (idle+waitingOn ⇒ blue "waiting-agent",
+    // or cleared ⇒ back to orange). It's the sender's own post, not a process event, so nothing else would
+    // republish its card until the loopTick safety net — push now so the card matches the pill immediately.
+    publishSession(ss);
   }
   // The awaited peer just spoke: anyone waiting on `from` has had their wait answered — drop `from` from
   // their waitingOn (→ null when empty) and republish so their card/surfaces fall out of blue. This is the
@@ -4914,6 +4958,11 @@ function recordThreadIntent(
     upsertThreadMeta(repoPath, threadId, {
       intents: { ...prior, [seat ?? from]: { intent, ts: msg.ts, sid: from, ...(note ? { note } : {}) } },
     });
+    // Instant path (mrcmofwf-10): a declared blocked:human/blocked:peer refines the declarer's idle band
+    // (orange/blue), but a declaration is card-only bookkeeping — it fires no process event, so the card's
+    // pushed band would otherwise wait for the loopTick safety net. Republish the declarer now if it's live.
+    const declarer = liveSessions.get(from);
+    if (declarer) publishSession(declarer);
   }
   return { msg, seat };
 }
@@ -5176,6 +5225,7 @@ async function handleThreadJob(
     if (typeof body.jobId !== "string" || !body.jobId) return sendJson(res, 400, { error: "remove needs a jobId" });
     const { removed, jobs } = removeJob(repoPath, threadId, body.jobId);
     publishFeed("threads:" + boardId, { ts: Date.now() }); // nudge the rail to re-pull like an intent does
+    if (removed) republishThreadSeatOccupants(repoPath, threadId); // mrcmofwf-10: the seat's `scheduled` band may have dropped
     return sendJson(res, removed ? 200 : 404, { ok: removed, thread: threadId, removed, jobs });
   }
   // Create or update.
@@ -5193,6 +5243,7 @@ async function handleThreadJob(
     by: body.from,
   });
   publishFeed("threads:" + boardId, { ts: Date.now() });
+  republishThreadSeatOccupants(repoPath, threadId); // mrcmofwf-10: the seat's occupant may now read `scheduled`
   sendJson(res, 200, { ok: true, thread: threadId, job, jobs });
 }
 
