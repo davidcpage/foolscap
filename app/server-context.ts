@@ -54,6 +54,17 @@ export interface ServerContext {
     after: Array<Record<string, unknown>> | null,
     origin: string,
   ) => void; // onboarding from a snapshot's membership-edge diff
+  // Auto-wake on annotation activity (P2/W5, doc-annotations): a qualifying comment/answer on a watched doc
+  // nudges an already-servicing worker or server-spawns a fresh doc worker. A cross-cutting EFFECT (it reads
+  // liveSessions and drives the spawn/auto-wake-surface subsystem), so — exactly like publishSession — its
+  // definition stays in vite-fs-plugin.ts and the annotations route (routes/annotations.ts) reaches it here.
+  maybeWakeDocWorker: (
+    boardId: string,
+    repoPath: string,
+    origin: string,
+    rel: string,
+    eventKind: "note" | "answer" | "suggestion",
+  ) => void;
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter

@@ -1,0 +1,109 @@
+import fs from "node:fs";
+import path from "node:path";
+import chokidar from "chokidar";
+import { contentVersion } from "./cas-guard.js";
+
+// ── the filesystem-serving / confinement helpers ────────────────────────────────────────────────
+// The third stateless seam of the god-file split (after server-http.ts's HTTP plumbing and
+// server-context.ts's stateful accessors). Where server-http.ts holds the transport-level helpers, this
+// module holds the PURE filesystem primitives the file/asset/watch/annotation route handlers share: path
+// confinement (safeResolve), the browse/serve visibility rules (EXCLUDE_DIRS + isInternalPath), the text /
+// image extension gates, the content-version stamp, and the root watcher. Everything here touches only its
+// arguments and the filesystem — no cross-request state — so it lives outside ServerContext, exactly like
+// server-http.ts. It is a SIBLING of server-http.ts, not part of it: these are fs-serving rules (and pull
+// chokidar), not HTTP plumbing, so keeping them apart preserves each module's single identity. The god-file
+// still imports isInternalPath (its shadow-git ignore predicate) and openRootWatcher (the WS file-watch)
+// from here — the same one-definition-shared-both-ways discipline the split exists to establish.
+
+// The directory basenames the browse listing and the watchers skip. `.canvas` is DELIBERATELY NOT here: the
+// canvas's own filesystem (docs/canvas-home.md — memory, roles, threads, annotations, images) is BROWSABLE
+// so a human can navigate to a file (e.g. `.canvas/memory/`) and drag it onto the board as an
+// editable/annotatable card. The browse listing (handleLs / Rule A) is kept in lock-step with servability
+// by ALSO filtering on isInternalPath (Rule B) — so it shows exactly what the content endpoint will serve,
+// hiding only the two off-limits `.canvas` subtrees (`board`, the churny record store; `roots`, the shadow
+// git-dirs / feedback-loop hazard). No dead rows that 404 on open.
+export const EXCLUDE_DIRS = new Set([
+  "node_modules", ".git", "dist", "build", ".vite", ".cache", "coverage",
+]);
+
+// Rule B (docs/canvas-home.md §3/§5): is this path INTERNAL to the watchers + content endpoints? Excluded if
+// any segment is a generated/internal dir — EXCEPT `.canvas`, whose CONTENT must be reachable; under `.canvas`
+// only the shadow git-dirs (`.canvas/roots/<id>/git`) are internal (a commit writes objects there, so a
+// watcher seeing them would re-commit forever — the feedback loop). Path-aware: the `.canvas/roots` boundary
+// is two adjacent segments, which a bare basename Set can't express. Accepts absolute or root-relative paths.
+export function isInternalPath(p: string): boolean {
+  const segs = p.split(/[\\/]/);
+  for (let i = 0; i < segs.length; i++) {
+    const s = segs[i];
+    if (s === ".canvas") {
+      if (segs[i + 1] === "roots") return true; // the shadow object store — never watched/served
+      // The board record store (board-persist.js): an event append per GESTURE + a snapshot rewrite
+      // per edit burst. No card reads these via the file endpoints (they have their own
+      // /api/board/persist API), so watching them would only spam every tab with watch events and
+      // TRIGGER a shadow commit per gesture. They still ride ALONG in shadow commits fired by real
+      // content edits (commitRoot force-adds `.canvas` minus only `roots`) — versioned, not churning.
+      if (segs[i + 1] === "board") return true;
+      continue; // every other `.canvas/<content>` is reachable
+    }
+    if (EXCLUDE_DIRS.has(s)) return true;
+  }
+  return false;
+}
+
+// Text files only — the cards render content inline, so binaries are skipped at the listing.
+export const TEXT_EXT = new Set([
+  ".md", ".markdown", ".txt", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+  ".json", ".css", ".html", ".py", ".yaml", ".yml", ".toml", ".sh",
+]);
+
+// IMAGE assets (the image card, image-cards-on-canvas). Binaries can't ride the text file endpoints
+// (TEXT_EXT-gated, utf8) so they get their OWN /api/asset read/write, with a parallel extension gate and
+// a mime map for the read's Content-Type. Drag-and-drop lands a screenshot/photo as a repo file here, then
+// the image card views it by (root, path) — same addressing as a file card, different transport.
+export const IMAGE_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"]);
+export const IMAGE_MIME: Record<string, string> = {
+  ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+  ".webp": "image/webp", ".svg": "image/svg+xml", ".avif": "image/avif", ".bmp": "image/bmp",
+  ".ico": "image/x-icon",
+};
+export const MAX_ASSET_BYTES = 12 * 1024 * 1024; // images are heavier than source — a generous cap (a high-res
+// screenshot or photo fits comfortably); the byte read is the one bound, per CLAUDE.md's size-cap rule.
+
+// Resolve a caller-supplied relative path against a root and refuse anything that escapes it.
+export function safeResolve(root: string, rel: string): string | null {
+  const abs = path.resolve(root, rel);
+  return abs === root || abs.startsWith(root + path.sep) ? abs : null;
+}
+
+// W12 — the doc's optimistic-concurrency version: a content hash of its FULL on-disk bytes (not the
+// MAX_BYTES preview), so the CAS detects a change anywhere in the file, and `null` for a file that doesn't
+// exist yet. A read stamps this alongside the content; a write echoes it as `baseVersion` (handleFileWrite).
+export function fileVersion(abs: string): string | null {
+  try {
+    return contentVersion(fs.readFileSync(abs));
+  } catch {
+    return null; // no such file — the version of "absent" (a create passes baseVersion:null)
+  }
+}
+
+// The chokidar watcher one watch subscription rides — shared by the SSE endpoint (handleWatch, the /api/watch
+// compat path) and the WS file-watch (one per open root). Forward file add/change/unlink plus DIR add/remove
+// (mapped to the generic add/unlink), so a directory card whose folder is deleted on disk gets tombstoned
+// rather than hanging on "loading…" (worktree-activity slice D). The client gates every event to a card that
+// actually exists, so forwarding dir events is harmless noise otherwise. Returns the close handle.
+export function openRootWatcher(root: string, send: (ev: { type: string; path: string }) => void): () => void {
+  const emit = (type: string) => (abs: string) => send({ type, path: path.relative(root, abs) });
+  const watcher = chokidar.watch(root, {
+    ignoreInitial: true,
+    // Rule B (docs/canvas-home.md §5): watch `.canvas/` CONTENT (so a dropped image / file-backed body
+    // refreshes its card) but never the shadow git-dirs under `.canvas/roots/` (the feedback loop).
+    ignored: (p: string) => isInternalPath(p),
+  });
+  watcher
+    .on("add", emit("add"))
+    .on("addDir", emit("add"))
+    .on("change", emit("change"))
+    .on("unlink", emit("unlink"))
+    .on("unlinkDir", emit("unlink"));
+  return () => void watcher.close();
+}
