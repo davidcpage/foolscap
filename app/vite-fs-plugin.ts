@@ -25,7 +25,7 @@ import { listWatchedPaths, readWatchers, removeWatcher, setWatcher, setWatcherSt
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, reapKeepAliveMs, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
-import { shouldRepublishBand } from "./session-band-republish.js";
+import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
@@ -1321,19 +1321,16 @@ function sessionStatus(repoPath: string, id: string): SessionBand | null {
       // Never-run: idle with no output yet has handed you nothing back, so the loud amber "your turn" is
       // wrong — stay bandless until the first turn produces output and idles again (which IS your turn).
       if (live.lines.length === 0) return null;
-      // Idle band precedence (v2, whole-session): scheduled (a looping role asleep on its heartbeat — teal,
-      // no human demand; gated on an ACTUAL live wake, not the static `loops` flag) > declared blocked:human
-      // (loud orange) > declared blocked:peer (blue) > a server-inferred @-tag peer-wait (blue `waitingOn`,
-      // free) > the default orange "your turn". Declared intent is aggregated across ALL the session's
-      // threads; `done`/`working` don't paint the idle band (done never colours a live session — it shows
-      // only once the process exits, via endReason grey). One listThreads read shared by both consults.
+      // Idle band precedence (v3, whole-session — see idleBand): a DECLARED intent outranks a wake timer —
+      // declared blocked:human (loud orange) > declared blocked:peer (blue) > scheduled (a looping role asleep
+      // on its heartbeat — teal, no human demand; gated on an ACTUAL live wake, not the static `loops` flag) >
+      // a server-inferred @-tag peer-wait (blue `waitingOn`, free) > the default orange "your turn". Declared
+      // intent is aggregated across ALL the session's threads; `done`/`working` don't paint the idle band
+      // (done never colours a live session — it shows only once the process exits, via endReason grey). One
+      // listThreads read shared by both consults.
       const metas = listThreads(repoPath);
-      if (live.loops && sessionHasScheduledWake(metas, id)) return "scheduled";
-      const idleIntent = sessionIdleIntent(metas, id);
-      if (idleIntent === "blocked:human") return "waiting";
-      if (idleIntent === "blocked:peer") return "waiting-agent";
-      if (live.waitingOn?.length) return "waiting-agent";
-      return "waiting";
+      const scheduled = !!live.loops && sessionHasScheduledWake(metas, id);
+      return idleBand(sessionIdleIntent(metas, id), scheduled, !!live.waitingOn?.length);
     }
     if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
   }
