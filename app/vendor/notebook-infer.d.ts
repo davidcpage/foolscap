@@ -30,10 +30,19 @@ export interface CellAnalysis {
   domCandidate: boolean;
 }
 
-/** Options for {@link analyzeCell}. `cdnBase` overrides the ESM CDN base a BARE import specifier resolves to
- *  (A2 lib loading); default {@link DEFAULT_CDN_BASE}. */
+/** Options for {@link analyzeCell}.
+ *  - `cdnBase` overrides the ESM CDN base a BARE import specifier resolves to (A2 lib loading); default
+ *    {@link DEFAULT_CDN_BASE}.
+ *  - `importMap` (A3) pins the URL a bare specifier resolves to (`{ name → url }`, keyed by the reference
+ *    name) — applied to explicit imports via {@link resolveSpecifierUrl} and to ambient auto-imports below.
+ *  - `ambient` (A3, Phase 2) is the caller-approved set of free-read names to AUTO-IMPORT (each must be a key
+ *    in `importMap`): analyzeCell synthesizes a `const name = await import(url)` prologue for them, forcing
+ *    block mode and marking the cell a DOM candidate. The caller (computeEffective) supplies only names that
+ *    are neither a local binding nor a sibling export (precedence: local > sibling > ambient). */
 export interface AnalyzeOptions {
   cdnBase?: string;
+  importMap?: Record<string, string> | null;
+  ambient?: string[];
 }
 
 export function analyzeCell(source: string, opts?: AnalyzeOptions): CellAnalysis;
@@ -41,10 +50,15 @@ export function analyzeCell(source: string, opts?: AnalyzeOptions): CellAnalysis
 /** The default ESM CDN base a bare import specifier maps onto (A2 lib loading), e.g. `https://esm.sh/`. */
 export const DEFAULT_CDN_BASE: string;
 
-/** Map a NON-relative import specifier to the URL a dynamic `import()` loads (A2 lib loading): a full URL (any
- *  scheme, or a protocol-relative `//cdn`) passes through unchanged; a bare specifier (`d3`) maps onto `base`
- *  (default {@link DEFAULT_CDN_BASE}). The single seam a future import-map (A3) replaces. */
-export function resolveSpecifierUrl(spec: string, base?: string): string;
+/** The small, deliberate default import map (A3): the libs a notebook can reference with NO import line,
+ *  version-pinned. Keyed by the REFERENCE NAME a cell writes (`d3`, `Plot`) → the ESM URL. A notebook extends
+ *  or overrides it via a `type="importmap"` cell. */
+export const DEFAULT_IMPORT_MAP: Readonly<Record<string, string>>;
+
+/** Map a NON-relative import specifier to the URL a dynamic `import()` loads. Resolution order: the A3 import
+ *  `map` (a `{ specifier → url }` override) first; then a full URL (any scheme, or a protocol-relative `//cdn`)
+ *  passes through unchanged; then a bare specifier (`d3`) maps onto `base` (default {@link DEFAULT_CDN_BASE}). */
+export function resolveSpecifierUrl(spec: string, base?: string, map?: Record<string, string> | null): string;
 
 /** A markdown cell's analysis: a CellAnalysis (defines/imports always empty) plus whether it carries a live
  *  `${ }` interpolation. False ⇒ pure prose, not scheduled; the card renders the source directly. */
