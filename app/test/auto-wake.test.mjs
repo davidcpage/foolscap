@@ -142,24 +142,22 @@ test("shouldReapIdle: a null keep-alive means NEVER reap (blocked:human threads 
 });
 
 // ── reap ONLY when done (thread mrcauz0v-f) ─────────────────────────────────────────────────────────────
-test("reapKeepAliveMs: reaps ONLY a done session; every other stance parks (never idle-reaped)", () => {
+test("reapKeepAliveMs: reaps ONLY a done session; not-done parks (never idle-reaped)", () => {
   const DEFAULT = 15 * 60_000;
-  assert.equal(reapKeepAliveMs("done", DEFAULT), DEFAULT); // finished — reclaim the slot after the grace window
-  // everything else parks: null threads through shouldReapIdle as NEVER reap
-  for (const intent of ["working", "blocked:human", "blocked:peer", "escalated", null, undefined])
-    assert.equal(reapKeepAliveMs(intent, DEFAULT), null, `intent=${intent} → parked, never idle-reaped`);
+  assert.equal(reapKeepAliveMs(true, DEFAULT), DEFAULT); // done — reclaim the slot after the grace window
+  // not-done parks: null threads through shouldReapIdle as NEVER reap
+  for (const done of [false, null, undefined])
+    assert.equal(reapKeepAliveMs(done, DEFAULT), null, `done=${done} → parked, never idle-reaped`);
 });
 
-test("reapKeepAliveMs + shouldReapIdle: a working/blocked/undeclared session is PARKED however long it idles; only done reaps", () => {
+test("reapKeepAliveMs + shouldReapIdle: a not-done session is PARKED however long it idles; only done reaps", () => {
   const DEFAULT = 15 * 60_000;
   const s = (idleAgo) => ({ autoWake: true, status: "idle", idleSince: NOW - idleAgo });
-  // parked stances: never reaped, even after 100× the default window
-  for (const intent of ["working", "blocked:peer", "blocked:human", null]) {
-    const ka = reapKeepAliveMs(intent, DEFAULT);
-    assert.equal(shouldReapIdle(s(DEFAULT * 100), NOW, ka), false, `intent=${intent}: parked, not reaped`);
-  }
+  // not done: never reaped, even after 100× the default window
+  const kaParked = reapKeepAliveMs(false, DEFAULT);
+  assert.equal(shouldReapIdle(s(DEFAULT * 100), NOW, kaParked), false, "not done: parked, not reaped");
   // done: kept inside the grace window, reaped once past it
-  const kaDone = reapKeepAliveMs("done", DEFAULT);
+  const kaDone = reapKeepAliveMs(true, DEFAULT);
   assert.equal(shouldReapIdle(s(DEFAULT - 1), NOW, kaDone), false, "done but still inside the grace window — kept");
   assert.equal(shouldReapIdle(s(DEFAULT + 1), NOW, kaDone), true, "done and past the grace window — reaped");
 });

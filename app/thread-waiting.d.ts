@@ -7,6 +7,11 @@ export type WaitingMsg = { seq: number; from: string; text?: string; kind?: stri
 // One waiting-message preview: the sender + a trimmed one-line snippet + the seq (for jump-to-message).
 export type WaitingPreview = { seq: number; from: string; text: string };
 
+// A card-only entry (work-intent / ask echo, `kind != null`) — bookkeeping that never wakes a member or
+// addresses the human. Shared by vite-fs-plugin.ts's unread/nudge filters and the derivation below. A
+// falsy entry counts as card-only. Accepts any message-shaped object (the feed's ThreadMsg is a superset).
+export function cardOnly(m: { kind?: string | null } | null | undefined): boolean;
+
 export function humanWaiting(
   log: WaitingMsg[],
   seenMentions?: Iterable<number>,

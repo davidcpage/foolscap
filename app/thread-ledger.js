@@ -245,8 +245,8 @@ export function ownBlockedIntentKeys(intents, sid) {
  * across `metas` (the thread markers from listThreads) AND owns NO `working`/`blocked:*` intent (so a session
  * done on one thread but still active on another is NOT reaped). Every non-done stance parks (never idle-
  * reaped), so the reaper only needs this one bit — a blocked/working/undeclared session is kept alive
- * regardless. "Its own" mirrors ownBlockedIntentKeys / the old sessionDeclaredBlock — a sid-stamped record
- * (covers a seat-keyed OR bare-sid self-declaration), never another occupant's seat-inherited intent. Pure;
+ * regardless. "Its own" mirrors ownBlockedIntentKeys — a sid-stamped record (covers a seat-keyed OR bare-sid
+ * self-declaration), never another occupant's seat-inherited intent. Pure;
  * short-circuits to false on the first active intent.
  *
  * @param {Array<{ intents?: Record<string, {intent?: string, sid?: string}> }>|undefined} metas

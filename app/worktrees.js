@@ -73,6 +73,36 @@ function gitOk(cwd, args) {
   }
 }
 
+// Parse `git worktree list --porcelain` into one entry per worktree. The porcelain format is a blank-line-
+// separated block per worktree, each block a `worktree <path>` line followed by `HEAD <sha>`, `branch
+// refs/heads/<name>`, or a bare `detached`. Shared by worktreeExists here and listWorktrees in
+// vite-fs-plugin.ts so the two never drift on the format. `head` is the short 7-char sha; a detached HEAD
+// reports branch `(detached)`; branch is "" when git prints neither line.
+export function parseWorktreePorcelain(out) {
+  const entries = [];
+  let cur = null;
+  const flush = () => {
+    if (cur && cur.path) entries.push(cur);
+    cur = null;
+  };
+  for (const line of out.split("\n")) {
+    if (line.startsWith("worktree ")) {
+      flush();
+      cur = { path: line.slice(9), branch: "", head: "" };
+    } else if (!cur) {
+      continue;
+    } else if (line.startsWith("HEAD ")) {
+      cur.head = line.slice(5, 12);
+    } else if (line.startsWith("branch ")) {
+      cur.branch = line.slice(7).replace("refs/heads/", "");
+    } else if (line === "detached") {
+      cur.branch = "(detached)";
+    }
+  }
+  flush();
+  return entries;
+}
+
 // Is `p` a live git worktree of the canonical repo right now? `git worktree list` is authoritative (the
 // meta record can go stale if someone `git worktree remove`d by hand).
 function worktreeExists(repoPath, wtPath) {
@@ -83,7 +113,7 @@ function worktreeExists(repoPath, wtPath) {
     return false;
   }
   const want = realpath(wtPath);
-  return out.split("\n").some((l) => l.startsWith("worktree ") && realpath(l.slice(9)) === want);
+  return parseWorktreePorcelain(out).some((w) => realpath(w.path) === want);
 }
 function realpath(p) {
   try {
