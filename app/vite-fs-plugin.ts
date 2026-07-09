@@ -7,7 +7,7 @@ import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
-import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
+import { canvasSessionsDir, isCanvasSession, listSessions, markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
@@ -160,10 +160,23 @@ for (const e of readBoardRegistry()) {
     }
 }
 
-// A board's Claude Code transcripts dir: ~/.claude/projects/<repoPath with / → ->. Per board now (was a
-// single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev repo's.
+// A board's Claude Code transcripts dir: ~/.claude/projects/<abs path with every non-alnum → ->. Per board
+// (was a single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev
+// repo's. The slug rule lives once in projectsDirForCwd (session-ledger) — a board root has no dots so it's
+// unchanged, but a worktree cwd contains `.canvas` and MUST slug the dot too (`.canvas` → `-canvas`), or its
+// transcript dir won't be found. Passing a worktree cwd here resolves that session's own dir.
 function sessionsDir(repoPath: string): string {
-  return path.join(os.homedir(), ".claude", "projects", repoPath.replace(/\//g, "-"));
+  return projectsDirForCwd(repoPath);
+}
+
+// The transcripts dir for ONE session: its marker records the process `cwd` (worktree sessions spawn under
+// <board>/.canvas/worktrees/<key>), so a worktree session's .jsonl lives in a different projects dir than
+// the board root's. Falls back to the board-root dir for board-root/adopted sessions (marker without cwd, or
+// no marker yet). The single resolver the list (listSessions), the open (handleSession) and the resume all
+// go through, so a worktree session's transcript is found everywhere — not just the live-tail seed.
+function sessionTranscriptDir(repoPath: string, id: string): string {
+  const cwd = readCanvasSession(repoPath, id)?.cwd as string | undefined;
+  return cwd ? sessionsDir(cwd) : sessionsDir(repoPath);
 }
 
 // Map a session's process cwd back to its CANONICAL board root. A worktree session runs in
@@ -1191,14 +1204,18 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
   if (!/^[\w-]+$/.test(chosen)) return sendJson(res, 400, { error: "bad session id" });
-  const r = readSessionFile(dir, chosen);
+  // Resolve the transcript dir PER SESSION: a worktree session's .jsonl isn't under the board-root `dir`
+  // this handler was passed, but under its own cwd's projects dir (recorded on the marker). Without this a
+  // listed worktree session 404s the moment its card is opened.
+  const tdir = sessionTranscriptDir(repoPath, chosen);
+  const r = readSessionFile(tdir, chosen);
   if (!r) return sendJson(res, 404, { error: "not found" });
   // Backfill the ledger: a card asked for this transcript, so it's ON the board — that makes it canvas-
   // owned by adoption (whether we spawned it or it predates the ledger). Marking on first serve is what
   // migrates existing cards in (so they list again) without a client change, and keeps the list filtered
   // to externals nobody has placed. Write-once: a real spawn already wrote a richer marker; don't clobber it.
   if (!isCanvasSession(repoPath, chosen)) markCanvasSession(repoPath, chosen, { adoptedAt: Date.now() });
-  ensureSessionFeed(dir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
+  ensureSessionFeed(tdir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
   sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated });
 }
 
@@ -1325,14 +1342,21 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
 // Debounced — Claude Code writes a live transcript repeatedly, so a burst of appends (and the
 // `*.usage.jsonl` sidecar landing alongside) coalesces to one ping. `change` is watched too, so an
 // open list also keeps a running session's turn/message counts and title live, not just its arrival.
+// Also watches the board's MARKER dir (`.canvas/sessions/`): the list is now marker-driven, and a WORKTREE
+// session's transcript lands in a projects dir this watcher can't see, so its arrival would otherwise miss
+// the feed and only show on a manual refresh. A spawn writes the marker under the board root, so watching
+// that dir pings the list the moment any owned session (worktree or not) appears or changes end-state.
 // (Like the git/HN/cardtypes feeds, the watcher isn't pinned on fsState — the boardFeedsStarted guard
 // stops a server reload from stacking a second one per board, and a surviving watcher keeps publishing.)
-function startSessionsFeed(boardId: string, dir: string): void {
+function startSessionsFeed(boardId: string, dir: string, markersDir: string): void {
   let t: ReturnType<typeof setTimeout> | null = null;
-  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
+  const ping = () => {
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("sessions:" + boardId, { ts: Date.now() }), 200);
-  });
+  };
+  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", ping);
+  // ignorePermissionErrors + a lazy create: the marker dir may not exist until the first spawn/adoption.
+  chokidar.watch(markersDir, { ignoreInitial: true, depth: 0, ignorePermissionErrors: true }).on("all", ping);
 }
 
 // The PARTICIPANTS a thread's state derives from (§8 step 3): the union of the current member:open
@@ -3425,7 +3449,7 @@ async function handleSessionInput(req: IncomingMessage, res: ServerResponse, id:
 // historical to live duplex — no new card, no new id. This is the unify-on-resume handoff (slice 3).
 function handleSessionResume(req: IncomingMessage, res: ServerResponse, repoPath: string, id: string): void {
   if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!readSessionFile(sessionsDir(repoPath), id))
+  if (!readSessionFile(sessionTranscriptDir(repoPath, id), id))
     return sendJson(res, 404, { error: "no transcript for that session" });
   try {
     ensureLiveSession(id, repoPath, true, originOf(req));
@@ -3928,7 +3952,13 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   if (boardFeedsStarted.has(boardId)) return;
   boardFeedsStarted.add(boardId);
   startGitHeadFeed(boardId, repoPath);
-  startSessionsFeed(boardId, sessionsDir(repoPath));
+  const markersDir = canvasSessionsDir(repoPath);
+  try {
+    fs.mkdirSync(markersDir, { recursive: true }); // so chokidar has a dir to watch before the first spawn
+  } catch {
+    /* best-effort — the watcher tolerates a missing dir, this just makes the watch immediate */
+  }
+  startSessionsFeed(boardId, sessionsDir(repoPath), markersDir);
   startWorktreesFeed(boardId, repoPath);
   migrateChannelLedger(repoPath); // one-time §8 step 2 rename: `.canvas/channels/` → `.canvas/threads/`
   seedThreadLogs(repoPath); // restore thread conversations from `.canvas/threads/` (cold-restart fix)
