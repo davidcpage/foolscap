@@ -79,6 +79,11 @@ export function mergeWorktree(
 ): MergeResult;
 export function linkNodeModules(canonicalPath: string, wtPath: string): string[];
 
+// The isolation-onboarding block appended to a --worktree worker's system prompt: tells it its cwd is an
+// isolated checkout and that ALL edits must stay there (the main checkout must stay clean). Pure — branch
+// is passed in (best-effort), so it renders without git.
+export function worktreeOnboarding(opts: { cwd: string; repoPath: string; branch?: string }): string;
+
 // One parsed entry from `git worktree list --porcelain`. `branch` is "" when git prints neither a `branch`
 // nor a `detached` line; `head` is the short 7-char sha (or "" if absent).
 export interface WorktreePorcelainEntry {

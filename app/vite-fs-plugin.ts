@@ -29,7 +29,7 @@ import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
-import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey, parseWorktreePorcelain } from "./worktrees.js";
+import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey, parseWorktreePorcelain, worktreeOnboarding } from "./worktrees.js";
 import { sessionSummaryFromText } from "./session-summary.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
@@ -2358,8 +2358,24 @@ function ensureLiveSession(
   // injected here — it IS Claude Code's built-in file memory, pointed at `.canvas/memory` via
   // `autoMemoryDirectory` (below), so the built-in system handles both recall (MEMORY.md index) and the
   // save-a-durable-fact instructions; a second custom injection only duplicated and fought that prompt.
+  // A --worktree worker's cwd is its isolated checkout while repoPath stays the canonical board root; when
+  // the two differ, append the isolation onboarding (worktrees.js) so the worker confines edits to its
+  // worktree and keeps main clean. Every path pointer in the rest of the prompt names the main checkout, so
+  // without this a worker anchors on those and edits main — the bug this closes. Branch is best-effort; the
+  // cwd path is the load-bearing fact, so a git miss just drops the branch label.
+  let worktreeBlock = "";
+  if (cwd !== repoPath) {
+    let branch = "";
+    try {
+      branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd, encoding: "utf8" }).trim();
+    } catch {
+      // best-effort; the onboarding stands without the branch name
+    }
+    worktreeBlock = "\n\n" + worktreeOnboarding({ cwd, repoPath, branch });
+  }
   const appendPrompt =
     ASK_CONVENTION + "\n\n" + collabBrief(boardIdentity(repoPath).boardId, id, origin) +
+    worktreeBlock +
     (role?.charter ? "\n\n## Your role: " + role.name + "\n\n" + role.charter : "") +
     (threadId ? "\n\n" + workerBrief(threadId) : "");
   // The permission relay (see PERMISSION_HOLD_MS): a per-session stdio MCP server whose one tool the
