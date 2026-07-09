@@ -12,7 +12,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldRepublishBand } from "../session-band-republish.js";
+import { idleBand, shouldRepublishBand } from "../session-band-republish.js";
 
 test("never-published (undefined lastBand) never republishes — no stale band to correct", () => {
   // The card falls back to its own file-tail derivation until the first real publish; the safety net must
@@ -50,4 +50,52 @@ test("every ordered pair of distinct bands (incl. null) republishes; identical p
       assert.equal(shouldRepublishBand(a, b), a !== b, `${String(a)} → ${String(b)}`);
     }
   }
+});
+
+// idle-band precedence (thread mrcmofwf-10 Done-when v3): the reorder this thread exists for. The v2 code
+// checked `scheduled` FIRST, so a session with a live standing wake (a Coordinator ALWAYS has a heartbeat
+// job) could never show a declared blocked:human/blocked:peer — the loud states were masked by teal. v3
+// makes a DECLARED intent outrank the wake timer, while a mere server-INFERRED @-tag peer-wait still ranks
+// BELOW the scheduled fact. Process facts (crashed/exited/running) are resolved before idleBand runs.
+
+test("v3 fix: declared blocked:human outranks a scheduled wake → orange 'waiting', NOT 'scheduled'", () => {
+  // The masking bug's headline case: a heartbeat Coordinator that declared blocked:human. scheduled=true,
+  // but the explicit "I'm blocked on a human" must win — this is the whole point of the reorder.
+  assert.equal(idleBand("blocked:human", true, false), "waiting");
+  assert.equal(idleBand("blocked:human", true, true), "waiting", "…even with a waitingOn also set");
+});
+
+test("v3 fix: declared blocked:peer outranks a scheduled wake → blue 'waiting-agent', NOT 'scheduled'", () => {
+  assert.equal(idleBand("blocked:peer", true, false), "waiting-agent");
+  assert.equal(idleBand("blocked:peer", true, true), "waiting-agent");
+});
+
+test("no declared intent + scheduled wake → teal 'scheduled' (unchanged)", () => {
+  assert.equal(idleBand(null, true, false), "scheduled");
+});
+
+test("scheduled still outranks the @-tag waitingOn inference (a free guess loses to the wake fact)", () => {
+  // scheduled AND a waitingOn both set, nothing declared: scheduled wins — the reorder moved declared
+  // intents above scheduled, it did NOT lift the @-tag inference above it.
+  assert.equal(idleBand(null, true, true), "scheduled");
+});
+
+test("@-tag waitingOn inference wins only once nothing higher is set → blue 'waiting-agent'", () => {
+  assert.equal(idleBand(null, false, true), "waiting-agent");
+});
+
+test("nothing set → the default orange 'waiting' (your turn)", () => {
+  assert.equal(idleBand(null, false, false), "waiting");
+  assert.equal(idleBand(undefined, false, false), "waiting", "undefined idleIntent behaves like null");
+});
+
+test("full idle-band precedence order is pinned (highest wins, top to bottom)", () => {
+  // Enumerate the ladder so any future reorder of idleBand breaks this test loudly. Each row: the highest
+  // input present, and the band it must produce.
+  //   declared blocked:human > declared blocked:peer > scheduled > waitingOn inference > default
+  assert.equal(idleBand("blocked:human", true, true), "waiting", "blocked:human is top");
+  assert.equal(idleBand("blocked:peer", true, true), "waiting-agent", "blocked:peer beats scheduled+waitingOn");
+  assert.equal(idleBand(null, true, true), "scheduled", "scheduled beats the waitingOn inference");
+  assert.equal(idleBand(null, false, true), "waiting-agent", "waitingOn inference beats the default");
+  assert.equal(idleBand(null, false, false), "waiting", "default is the floor");
 });
