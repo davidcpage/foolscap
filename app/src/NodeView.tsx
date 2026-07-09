@@ -141,7 +141,11 @@ export const NodeView = memo(function NodeView({
 // corner + the HUD stack, passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS
 // top/left on the full-viewport .screen-layer means a window resize re-lays it out with no JS. Like the
 // minimap, a mousedown preventDefaults so a press on the card doesn't blur the canvas (keeping the
-// number-key / Alt-tap shortcuts live). The card fills the frame exactly as a floating card does.
+// number-key / Alt-tap shortcuts live) — but ONLY off an interactive interior: the Threads indicator's rows
+// are focusable (tabindex) and drag-out-able (draggable="true"), and preventDefault on mousedown would
+// suppress focus and native drag start. So skip it when the press lands on an interactive descendant (the
+// same data-interactive seam FloatingFrame/TemplateCard use), leaving click/dblclick/drag-out intact. The
+// card fills the frame exactly as a floating card does.
 function HudFrame({
   id,
   layout,
@@ -158,7 +162,10 @@ function HudFrame({
       data-node-id={id}
       className="hud-frame"
       style={{ top: placement.top, left: placement.left, width: layout.w, height: layout.h, zIndex: layout.z }}
-      onMouseDown={(e) => e.preventDefault()}
+      onMouseDown={(e) => {
+        if (e.target instanceof Element && e.target.closest("input, textarea, button, [data-interactive]")) return;
+        e.preventDefault();
+      }}
     >
       {children}
     </div>
