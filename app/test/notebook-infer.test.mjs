@@ -5,9 +5,8 @@ import assert from "node:assert/strict";
 // the vendored acorn and reports its free variables (`reads`), the name(s) it defines via the `name = …`
 // convention (`defines`), and the expression the worker should run (`valueSource`). It imports acorn through
 // a relative ./acorn.js, which node resolves on disk — no data:-URL rewrite needed (unlike the templates).
-const { analyzeCell, analyzeMarkdown, compileMarkdown, resolveSpecifierUrl, DEFAULT_CDN_BASE } = await import(
-  new URL("../vendor/notebook-infer.js", import.meta.url)
-);
+const { analyzeCell, analyzeMarkdown, compileMarkdown, resolveSpecifierUrl, DEFAULT_CDN_BASE, DEFAULT_IMPORT_MAP } =
+  await import(new URL("../vendor/notebook-infer.js", import.meta.url));
 // The worker's core — reused to prove a rewritten import-block actually RUNS (import → compute), exactly as the
 // scheduler would post it. No network: a `data:text/javascript,…` URL is the stubbed CDN, loaded by real import().
 const { runJob } = await import(new URL("../public/notebook-worker.js", import.meta.url));
@@ -523,4 +522,107 @@ test("domCandidate: an invalid/half-typed cell is false (never routes on a parse
 
 test("domCandidate: a markdown interpolation is never a view candidate (it yields a prose string)", () => {
   assert.equal(analyzeMarkdown("width is ${window.innerWidth}px").domCandidate, false, "prose always produces a string, never a DOM node");
+});
+
+// ── A3 import map + parse-time reference resolution (ergonomics): d3/Plot with NO import line ──────────────
+// Two features share one `{ name → url }` map (keyed by the identifier a cell writes). Phase 1: an EXPLICIT
+// bare import resolves through the map (via resolveSpecifierUrl), so a lib's URL/version is pinned per notebook.
+// Phase 2: analyzeCell(source, { importMap, ambient }) AUTO-IMPORTS the caller-approved free-read names — it
+// synthesizes the same `const name = await import(url)` prologue an explicit import would, forcing block mode
+// and marking the cell a DOM candidate. NO value crosses postMessage: the realm imports the lib itself.
+
+test("DEFAULT_IMPORT_MAP: the small, deliberate, version-pinned default set (d3 + Plot only)", () => {
+  assert.deepEqual(Object.keys(DEFAULT_IMPORT_MAP).sort(), ["Plot", "d3"], "exactly the two default libs — a tiny blast radius");
+  assert.equal(DEFAULT_IMPORT_MAP.d3, "https://esm.sh/d3@7", "d3 is pinned to v7");
+  assert.equal(DEFAULT_IMPORT_MAP.Plot, "https://esm.sh/@observablehq/plot@0.6", "Plot's identifier is `Plot`, spec @observablehq/plot, pinned to 0.6");
+});
+
+test("resolveSpecifierUrl: the import map pins a bare specifier's URL, overriding the CDN base", () => {
+  const map = { d3: "https://esm.sh/d3@7" };
+  assert.equal(resolveSpecifierUrl("d3", DEFAULT_CDN_BASE, map), "https://esm.sh/d3@7", "the map pins d3");
+  assert.equal(resolveSpecifierUrl("d3-array", DEFAULT_CDN_BASE, map), "https://esm.sh/d3-array", "an unmapped specifier still hits the CDN base");
+  assert.equal(resolveSpecifierUrl("d3@6", DEFAULT_CDN_BASE, map), "https://esm.sh/d3@6", "a user's OWN version (d3@6) is a different specifier — never overridden by the map");
+  assert.equal(resolveSpecifierUrl("https://cdn/x", DEFAULT_CDN_BASE, map), "https://cdn/x", "a full URL still passes through");
+});
+
+test("Phase 1: an explicit `import * as d3 from \"d3\"` pins to the map URL (consistent versions)", () => {
+  const a = analyzeCell('import * as d3 from "d3"\nd3.max(xs)', { importMap: DEFAULT_IMPORT_MAP });
+  assert.ok(
+    /const d3 = await import\("https:\/\/esm\.sh\/d3@7"\);/.test(a.valueSource),
+    "the explicit bare import resolves through the notebook map, not bare esm.sh",
+  );
+});
+
+test("Phase 2: a bare d3 reference with NO import line is auto-imported (the headline feature)", () => {
+  // Simulate what computeEffective decides: d3 is a free read, not a sibling export, and IS in the map → ambient.
+  const a = analyzeCell("d3.max(xs)", { importMap: DEFAULT_IMPORT_MAP, ambient: ["d3"] });
+  assert.equal(a.block, true, "an ambient import injects statements → block mode");
+  assert.equal(a.domCandidate, true, "loading an external lib routes to the main-thread realm");
+  assert.ok(
+    /const d3 = await import\("https:\/\/esm\.sh\/d3@7"\);/.test(a.valueSource),
+    "the synthesized prologue is a namespace import of the pinned URL",
+  );
+  assert.ok(/return \(d3\.max\(xs\)\)/.test(a.valueSource), "the original expression is still the returned value");
+  assert.deepEqual(a.reads, ["d3", "xs"], "reads are unchanged — d3 stays free (resolved via the prologue, not an input)");
+});
+
+test("Phase 2: a bare Plot reference resolves even though its identifier (Plot) != its npm spec", () => {
+  const a = analyzeCell("Plot.plot({ marks: [] })", { importMap: DEFAULT_IMPORT_MAP, ambient: ["Plot"] });
+  assert.ok(
+    /const Plot = await import\("https:\/\/esm\.sh\/@observablehq\/plot@0\.6"\);/.test(a.valueSource),
+    "the map is keyed by the IDENTIFIER `Plot`, so a bare `Plot` read auto-imports @observablehq/plot",
+  );
+  assert.equal(a.domCandidate, true);
+});
+
+test("Phase 2: an ambient define (`y = d3.max(xs)`) keeps its export via the block form", () => {
+  const a = analyzeCell("y = d3.max(xs)", { importMap: DEFAULT_IMPORT_MAP, ambient: ["d3"] });
+  assert.deepEqual(a.defines, ["y"], "the define is preserved through the forced block conversion");
+  assert.equal(a.keyedExports, true, "a define in block mode returns { value, exports }");
+  assert.ok(/const d3 = await import\("https:\/\/esm\.sh\/d3@7"\);/.test(a.valueSource), "the ambient prologue is prepended");
+  assert.ok(/exports: \{ y \}/.test(a.valueSource), "y is still exported");
+});
+
+test("Phase 2: multiple ambient libs each get a prologue entry", () => {
+  const a = analyzeCell("Plot.plot({ marks: [d3.line()] })", { importMap: DEFAULT_IMPORT_MAP, ambient: ["Plot", "d3"] });
+  assert.ok(/const Plot = await import\("https:\/\/esm\.sh\/@observablehq\/plot@0\.6"\);/.test(a.valueSource));
+  assert.ok(/const d3 = await import\("https:\/\/esm\.sh\/d3@7"\);/.test(a.valueSource));
+});
+
+test("Phase 2 precedence: a LOCALLY-bound name is never auto-imported (local > ambient)", () => {
+  // Even if the caller mistakenly lists d3 as ambient, a `const d3 = …` in the cell wins — injecting an import
+  // would be a redeclaration SyntaxError, so analyzeCell filters ambient against the cell's own bindings.
+  const a = analyzeCell("const d3 = { max: () => 7 };\nd3.max()", { importMap: DEFAULT_IMPORT_MAP, ambient: ["d3"] });
+  assert.ok(!/await import/.test(a.valueSource), "no synthesized import — the local binding shadows the ambient lib");
+  assert.equal(a.domCandidate, false, "no external lib loaded → stays in the worker");
+});
+
+test("Phase 2: ambient is opt-in — no importMap/ambient means today's behaviour (a bare read stays free)", () => {
+  const a = analyzeCell("d3.max(xs)");
+  assert.equal(a.block, false, "no ambient → the single-expression path is unchanged");
+  assert.ok(!/await import/.test(a.valueSource), "nothing is auto-imported");
+  assert.equal(a.domCandidate, false);
+});
+
+test("Phase 2: the ambient prologue adds NO newline, so user line numbers are preserved", () => {
+  const src = "const xs = [1, 2, 3]\nd3.max(xs)";
+  const a = analyzeCell(src, { importMap: DEFAULT_IMPORT_MAP, ambient: ["d3"] });
+  const upToReturn = a.valueSource.slice(0, a.valueSource.indexOf("return ("));
+  const srcUpToLast = src.slice(0, src.lastIndexOf("d3.max(xs)"));
+  assert.equal(
+    (upToReturn.match(/\n/g) || []).length,
+    (srcUpToLast.match(/\n/g) || []).length,
+    "same newline count before the final expression → line numbers unshifted",
+  );
+});
+
+test("E2E: a bare (unimported) reference auto-imports through the map and computes", async () => {
+  // A data: URL map entry stands in for the CDN (real import(), no network). The cell references `lib` with NO
+  // import line; the ambient prologue loads it and the expression computes — the full Phase-2 chain end to end.
+  const url = "data:text/javascript,export const twice = (x) => x * 2";
+  const importMap = { lib: url };
+  const a = analyzeCell("lib.twice(21)", { importMap, ambient: ["lib"] });
+  const r = await runJob({ source: a.valueSource, inputs: {}, block: a.block });
+  assert.equal(r.ok, true, `the auto-imported block should run: ${r.error ?? ""}`);
+  assert.equal(r.value, 42, "the bare reference resolved to the imported module and computed");
 });

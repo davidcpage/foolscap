@@ -5071,13 +5071,21 @@ async function handleThreadSeen(
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   if (!Array.isArray(body.seqs) || !body.seqs.every((s) => Number.isInteger(s) && (s as number) >= 1))
     return sendJson(res, 400, { error: "seqs must be an array of positive integers" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
   const repoPath = boards.get(boardId)?.repoPath;
   if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  // Existence gate is the LEDGER marker, NOT a canvas node. A thread persists in `.canvas/threads/` with no
+  // card on the board — the rail lists EVERY thread, and opening one adds its card CLIENT-side, which may not
+  // have reached the server snapshot yet (a thread deleted from the canvas still lists too). Requiring the
+  // node 404'd every seen-POST for an off-canvas thread, so a rail-badged thread never cleared on open — only
+  // a later deselect/reselect worked, once the client's addNode had persisted. Marking mentions seen is a
+  // durable ledger op that doesn't need the node.
+  if (!readThreadMeta(repoPath, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  // Consent mirrors handleThreadPin: a SESSION sender must be a member (checked against the live snapshot when
+  // one exists); the human at the card is not a session node and always may. An absent/node-less snapshot
+  // therefore never blocks the human — the only caller the rail badge depends on.
+  const records = boardSnapshotRecords(boardId);
+  if (records && sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
   const seen = markSeenMentions(repoPath, threadId, body.seqs as number[]);
   // Republish the card feed (shrinks youWaitingSeqs) + nudge the rail (clears/decrements signal (a)) so both
   // surfaces reflect the newly-viewed mentions live, exactly like a pin does.

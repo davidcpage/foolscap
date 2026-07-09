@@ -129,68 +129,69 @@ all intact. The worker was not modified.
 
 ## 5. Feasibility of the two improvements you raised
 
-### (i) Default / ambient imports for common libs (d3, Plot, …)
+> **Update after review (2026-07-09):** both of the ideas below collapse into a single, cleaner mechanism —
+> **parse-time reference resolution against a notebook-level import map (with defaults)** — suggested in
+> review. This section is rewritten around that approach; the earlier "inject a preloaded value" framing is
+> kept only as the *rejected* alternative, since it's what runs into the worker-transport wall.
 
-Idea: preload common libs so a user never writes an import line — they're just always-available cell
-inputs (this is design option "A1").
+### The unifying approach: resolve references at parse time, synthesize the import
 
-What it would touch:
-- **Input assembly** in `notebook-runtime.ts` `startRun` — seed `inputs` with the ambient libs before the
-  execution call, for cells that don't already bind those names. Both realm entry points already inject
-  inputs as named params, so the execution wrappers themselves don't change.
-- **BUT the preloaded value must be transportable to the worker.** A module namespace full of functions
-  won't cleanly survive the worker's clone/rehydrate boundary. Realistically each realm would need to
-  `await import()` the ambient lib itself (an ambient list consulted at both worker and main-exec entry) —
-  i.e. an eager prologue rather than a passed-in value.
-- **Inference must exclude ambient names** from the `domCandidate` trigger and from free-variable/producer
-  matching — otherwise every cell touching `d3` would route to the main thread, and `d3` might be mistaken
-  for a sibling cell's export.
+Instead of injecting a preloaded lib *value* into each cell, resolve a bare reference (`d3`, `Plot`) at
+parse/analyze time and **synthesize the import statement** into the cell body — reusing the exact mechanism
+A2 already ships:
 
-Costs: **worker/realm bloat** (every realm eagerly loads d3+Plot even for cells that never use them);
-**version pinning** (an ambient `d3` fixes one version globally, versus per-cell `import "d3@7"`); and it
-reintroduces a hidden namespace, which the design has deliberately resisted. Recorded as deferred in the
-design doc, gated behind general card-naming.
+- `analyzeCell` already computes each cell's **free reads** (undeclared variables); today a free read is
+  either matched to a sibling cell's export (becomes a cross-card edge) or left unresolved.
+- Add a third resolution: a free read that is *not* a sibling export and *is* in the notebook's import
+  map / default set → synthesize a prologue entry `const d3 = await import("https://esm.sh/d3")`, reusing
+  the existing `resolveSpecifierUrl` + `buildLibPrologue`. **No value crosses `postMessage`** — the
+  `import()` runs inside the cell realm exactly like a hand-typed import and self-caches per realm, so the
+  network cost is still paid once.
 
-**Assessment:** feasible and high-value ergonomically, but not free — the transport constraint pushes toward
-an eager per-realm import rather than a simple injected value, and the inference exclusions are a required
-part of the work, not an afterthought. A pragmatic middle ground worth considering: a small, opt-in ambient
-set (just `d3` + `Plot`) loaded lazily on first reference rather than eagerly for every cell.
+This single mechanism satisfies **both** of the original asks at once: a notebook-level import map (seeded
+with a default d3/Plot/… set) supplies the name→URL table, and parse-time resolution means the user never
+types an import line in *any* cell — so "default imports for common libs" and "import once per notebook"
+are the same feature.
 
-### (ii) Import-once-per-notebook (shared binding across cells)
+**Where it lives.** The synthesis belongs in `computeEffective` (`notebook-runtime.ts`, the read→producer
+step), not in the pure per-cell `analyzeCell`, because only that layer knows both the sibling exports and
+the notebook import map. `analyzeCell` hands it the free-reads set; `computeEffective` applies precedence:
+**local binding > sibling export > ambient/import-map**. The `opts.cdnBase` hook on `analyzeCell` is the
+already-plumbed seam for the map (nothing passes `opts` today, so wiring it is the first step).
 
-Idea: write the import once, share the binding everywhere in the notebook.
+**Caveats to decide up front (all small):**
+- **Precedence** — a sibling cell that exports `d3` must win over the ambient `d3`, or you'd shadow the
+  user's own data (order above).
+- **Magic vs explicit** — auto-importing from a bare reference means a typo that happens to match a map
+  entry silently imports instead of erroring. Argues for a deliberate, *smallish* default map, not
+  "resolve any unknown name."
+- **Routing unchanged** — an ambient `d3` read still marks the cell a view-candidate (routes main-thread);
+  a pure `d3.max` cell over-routes harmlessly, same as today.
 
-Two distinct things are bundled in "import once":
-- **Import once (network/version):** already largely solved. `import()` self-caches per realm, so the
-  *download* happens once regardless. The remaining piece is version consistency, which is exactly what the
-  **A3 import-map seam** (`resolveSpecifierUrl` + the already-plumbed `analyzeCell` `opts.cdnBase`) is for:
-  a notebook-level map pins which URL each bare specifier resolves to across all cells. Wiring this is
-  relatively contained — thread `opts` from `computeEffective` into `analyzeCell` and surface a
-  notebook-level map. **This is the cheaper, lower-risk win.**
-- **Import once (syntax/binding):** the genuinely hard part — sharing the *binding* so cell 2 sees cell 1's
-  `d3` without its own import line. This needs either (a) the ambient-input machinery from (i), or (b)
-  treating a lib import as a cross-cell *export* (a producer other cells read). Option (b) touches the graph
-  builder and runs into the same transport problem — a live module namespace can't cleanly cross the
-  worker `postMessage` boundary, so a downstream worker cell would likely have to re-`import()` anyway.
+### The rejected alternative (why not "inject a value")
 
-**Assessment:** I'd recommend splitting this. The **import-map (version pinning across cells)** is a clean,
-self-contained improvement using an existing seam. The **shared-binding ergonomic** is better delivered via
-the ambient-imports work in (i) than via cross-cell export plumbing, because the transport constraint makes
-the export route fragile.
+The naive form of "default imports" (design option A1) is to seed `inputs` in `startRun` with a preloaded
+lib *value*. This hits a wall: a module namespace full of functions won't cleanly survive the worker's
+clone/rehydrate boundary — a live value can't cross `postMessage`. You'd end up making each realm
+`await import()` the lib anyway, i.e. reinventing the parse-time synthesis above but with extra machinery.
+The parse-time approach is strictly better because it never tries to transport a value.
 
 ---
 
 ## 6. Recommendation summary
 
-If we pursue the rough-edge smoothing, a sensible ordering (lowest risk / highest value first):
+The two ideas are one feature. Suggested ordering:
 
-1. **Notebook-level import map (A3).** Uses the existing `resolveSpecifierUrl` / `opts.cdnBase` seam;
-   pins lib versions once per notebook; contained change. Solves "import once" in the network/version sense.
-2. **Opt-in ambient imports for d3 + Plot.** The biggest ergonomic win (no import line for the common case).
-   Non-trivial: needs a per-realm eager/lazy import path and inference exclusions. Best done as a small,
-   fixed, opt-in set rather than an open ambient namespace.
-3. **(Deferred) cross-cell live-binding sharing** — lower priority; the transport constraint makes it
-   fragile and (2) covers most of the ergonomic need.
+1. **Notebook-level import map, wired through `opts.cdnBase`.** The foundation — a per-notebook name→URL
+   table (with sensible d3/Plot/… defaults), threaded from `computeEffective` into `analyzeCell`. Contained
+   change; also pins lib versions consistently across cells.
+2. **Parse-time reference resolution on top of it.** Resolve free reads against the map and synthesize the
+   import prologue (precedence: local > sibling export > map). This is what removes the per-cell import
+   line entirely — the whole ergonomic win — and it reuses the shipped A2 rewrite path rather than adding a
+   value-transport mechanism.
+
+Deferred / not needed: cross-cell *live-binding* sharing via the export DAG — the parse-time approach
+covers the ergonomic need without the transport fragility.
 
 None of the above is committed work — this doc is for your review to decide what (if anything) to staff as
 a follow-up thread.
