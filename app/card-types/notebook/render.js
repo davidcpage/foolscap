@@ -99,6 +99,32 @@ function policyLabel(raw) {
   return k === "manual" ? "manual" : k === "debounced" ? "debounced" : "auto";
 }
 
+// The MAIN-REALM CONSENT affordance (Fix A trust boundary — thread node:mrdj7o3s-9). Shown IN PLACE of a gated
+// cell's output. The cell wants to run on the MAIN THREAD — it imports an external lib (Plot/d3) or touches
+// document/window — which grants it full page authority AND lets a runaway freeze the app, so the scheduler
+// parked it unrun (out.needsConsent). "Allow page access" writes `data-main-realm="allow"` to the file: ONE
+// durable grant for the whole notebook (an agent author can pre-write the same attribute). Without write access
+// (read-only / the headless mock) it degrades to the explanatory notice alone — nothing to click, still legible.
+function renderConsent(ctx) {
+  return html`<div class="nb-output nb-consent" data-interactive="1">
+    <div class="nb-consent-msg">
+      <strong>Needs page access.</strong> This cell renders on the main thread (it imports a library or uses the
+      page), which gives it full access to this page and can freeze the app if it runs away — so it hasn't run.
+    </div>
+    ${ctx.canWrite
+      ? html`<button
+          class="nb-consent-btn"
+          data-interactive="1"
+          title="run this notebook's chart cells on the main thread (writes data-main-realm=allow)"
+          @mousedown=${(e) => e.preventDefault()}
+          @click=${() => ctx.allowMainRealm()}
+        >
+          Allow page access
+        </button>`
+      : ""}
+  </div>`;
+}
+
 export default {
   contract: 1,
   render(card) {
@@ -122,6 +148,10 @@ export default {
           outNames: c.outNames || [],
           policy: c.policy || "",
         })),
+        // The MAIN-REALM consent (Fix A): the scheduler gates domCandidate cells to the main thread UNRUN unless
+        // this notebook opted in via `data-main-realm="allow"`. Threading it here (not a per-cell field) keeps
+        // the gate a notebook-level trust decision. A toggle re-syncs (it's in the runtime's spec signature).
+        { mainRealmAllowed: nb.mainRealm === "allow" },
       );
     }
 
@@ -139,7 +169,7 @@ export default {
       const current = nb.cells.find((c) => c.id === cellId);
       if (current && current.source === value) return; // nothing changed → never write
       const cells = nb.cells.map((c) => (c.id === cellId ? { ...c, source: value } : c));
-      card.signals.writeFile(serialize({ title: nb.title, cells }));
+      card.signals.writeFile(serialize({ title: nb.title, cells, mainRealm: nb.mainRealm }));
     };
 
     // Patch ONE cell's fields (the wiring editor: imports/outNames/policy) and write the whole notebook
@@ -149,13 +179,25 @@ export default {
     const updateCell = (cellId, patch) => {
       if (!card.signals.writeFile) return;
       const cells = nb.cells.map((c) => (c.id === cellId ? { ...c, ...patch } : c));
-      card.signals.writeFile(serialize({ title: nb.title, cells }));
+      card.signals.writeFile(serialize({ title: nb.title, cells, mainRealm: nb.mainRealm }));
     };
     // The notebook's own <title> — a cosmetic heading (NOT the filename / import path, which is the file's
     // path). Editable inline, written back through serialize like any cell edit. Guarded no-op on no change.
     const onTitleEdit = (value) => {
       if (!card.signals.writeFile || value === nb.title) return;
-      card.signals.writeFile(serialize({ title: value, cells: nb.cells }));
+      card.signals.writeFile(serialize({ title: value, cells: nb.cells, mainRealm: nb.mainRealm }));
+    };
+
+    // Grant this notebook the MAIN-THREAD REALM (Fix A trust boundary — thread node:mrdj7o3s-9). DOM-producing
+    // cells (they import an external lib like Plot/d3, or touch document/window) run on the UI thread with FULL
+    // PAGE AUTHORITY and can hang the app; until granted they are parked unrun (needsConsent). Granting writes
+    // `data-main-realm="allow"` to the FILE — durable across reload and legible in the source (an agent author
+    // pre-grants the same way) — which re-parses, re-syncs with consent, and lets the gated cells run. One-way
+    // in the UI (no revoke button): deleting the attribute in the source is the revoke, keeping the gesture that
+    // grants full page access deliberate and visible in the record, not a toggle buried in card chrome.
+    const allowMainRealm = () => {
+      if (!card.signals.writeFile || nb.mainRealm === "allow") return;
+      card.signals.writeFile(serialize({ title: nb.title, cells: nb.cells, mainRealm: "allow" }));
     };
 
     // Markdown edit-mode toggling rides `treeState` (off-log, per-card): a Set of cell ids shown as raw
@@ -212,7 +254,7 @@ export default {
     };
     const writeCells = (cells) => {
       if (!card.signals.writeFile) return;
-      card.signals.writeFile(serialize({ title: nb.title, cells: foldLiveEdits(cells) }));
+      card.signals.writeFile(serialize({ title: nb.title, cells: foldLiveEdits(cells), mainRealm: nb.mainRealm }));
     };
     const setEditing = (mut) => {
       if (!treeState) return;
@@ -388,6 +430,7 @@ export default {
       enterEdit,
       exitEdit,
       onCellKeydown,
+      allowMainRealm,
     };
     // A deletion is pending undo when this card has a stash — drives the in-card undo strip below.
     const canUndoDelete = canWrite && LAST_DELETED.has(cardKey);
@@ -646,7 +689,11 @@ function renderCell(cell, out, ctx) {
                   : ""}
           </div>`
         : ""}
-      ${out && out.view && out.view.node
+      ${out && out.needsConsent
+        ? // MAIN-REALM CONSENT GATE (Fix A): this domCandidate cell is parked unrun because the notebook has not
+          // opted into main-thread execution — show the consent affordance instead of an (empty) output pane.
+          renderConsent(ctx)
+        : out && out.view && out.view.node
         ? // DOM/SVG OUTPUT (Phase-2 B2): the cell ran on the main-thread realm and returned a LIVE node (an
           // Observable Plot chart, a d3 selection). lit-html renders a raw DOM Node passed as a child binding,
           // so we mount the live node directly — no import needed (template contract intact). data-interactive

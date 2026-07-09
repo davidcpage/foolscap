@@ -22,7 +22,7 @@
 // mounted + serialized (serializeView); any other value takes the existing clone-safe text/JSON path. Mirrors
 // the worker's runJob exactly (same wrap, same input binding, same never-throw contract) so the two realms
 // behave identically for non-DOM code.
-export async function runMainThreadCell({ source, inputs, block }) {
+export async function runMainThreadCell({ source, inputs, block, budgetMs }) {
   try {
     const names = inputs ? Object.keys(inputs) : [];
     const args = names.map((n) => rehydrate(inputs[n]));
@@ -30,11 +30,34 @@ export async function runMainThreadCell({ source, inputs, block }) {
       ? "return (async () => {\n" + source + "\n})()" // block: the body already carries its own `return`
       : "return (async () => { return (\n" + source + "\n); })()"; // expression: wrap as the returned value
     const fn = new Function(...names, body);
-    const value = await Promise.resolve(fn(...args));
+    // The cell body is wrapped in an async IIFE, so `fn(...args)` returns a promise — UNLESS the synchronous
+    // prologue (before the first await) loops forever, in which case this call BLOCKS the thread here and no
+    // watchdog can fire (JS has no preemption; a sync loop on the main thread is unstoppable in-realm). That is
+    // the honest limit the consent gate, not this budget, guards. For everything that DOES yield, the budget
+    // below abandons a run that never settles so the cell surfaces an error instead of hanging "running" forever.
+    const value = await withBudget(Promise.resolve(fn(...args)), budgetMs);
     return { ok: true, value };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
+}
+
+// Race a main-thread run against a wall-clock budget. If the run settles first, its value passes through and the
+// timer is cleared. If the budget expires first, we REJECT with a "time budget exceeded" error — the run itself
+// keeps going in the background (we cannot cancel an in-flight promise), but the cell is unstuck and reports the
+// overrun. HONEST by construction: this only ever fires for ASYNC overruns (a never-resolving await, a loop that
+// yields), because a synchronous infinite loop never returns control to the event loop for the timer to fire.
+// A non-positive/absent budget disables the race (tests + any caller that wants the raw run).
+function withBudget(promise, budgetMs) {
+  if (!(budgetMs > 0)) return promise;
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`time budget exceeded (${budgetMs} ms) — a still-awaiting cell was abandoned (a purely synchronous loop cannot be interrupted)`)),
+      budgetMs,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // Is this value a live DOM node (an Element / SVG element / Text / DocumentFragment)? nodeType is the portable

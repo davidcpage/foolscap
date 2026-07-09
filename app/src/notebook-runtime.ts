@@ -94,6 +94,8 @@ export interface CellOutput {
   error?: string; // the error string, for an "error" run
   running?: boolean; // a run is queued or in flight
   stale?: boolean; // inputs changed since the last run; awaiting a trigger (manual click / debounce timer)
+  needsConsent?: boolean; // a main-thread (domCandidate) cell parked UNRUN because the notebook lacks main-realm
+  // consent (Fix A trust boundary) — the card shows a one-time "allow page access" affordance; granting re-runs it
   suppressed?: boolean; // the cell ran fine but its final statement ended in `;` → the pane shows no value
   // Inferred wiring (step-4a/4b) for the card to DISPLAY as a muted hint where no explicit declaration was
   // written — so a cell that auto-wired by its code shows what it reads/defines, not an empty box.
@@ -118,6 +120,8 @@ interface NB {
   state: Map<string, RunState>;
   job: Map<string, number>; // cell id → its current jobId, so a superseded run's reply is ignored
   timer: Map<string, ReturnType<typeof setTimeout>>; // debounce timers, by cell id
+  mainRealmAllowed: boolean; // the notebook carries `data-main-realm="allow"` — its domCandidate cells may run
+  // on the MAIN THREAD (full page authority; can hang the UI). False → those cells are gated unrun (Fix A).
 }
 
 const nbs = new Map<string, NB>();
@@ -336,6 +340,13 @@ function ensureWorker(): Worker {
 
 // ── policy + value helpers ────────────────────────────────────────────────────────────────────────
 const DEFAULT_DEBOUNCE = 400;
+// The MAIN-THREAD realm's async time budget (Fix A, thread node:mrdj7o3s-9). A domCandidate cell runs on the UI
+// thread; a never-settling await or a cooperative-yield loop would otherwise leave the cell stuck "running"
+// forever. After this budget the run is ABANDONED and the cell surfaces a "time budget exceeded" error. HONEST
+// LIMIT: this catches only ASYNC overruns — a purely SYNCHRONOUS infinite loop cannot be preempted from the
+// thread it runs on, which is exactly why the CONSENT GATE (not this budget) is the primary guard against a hang.
+// Generous on purpose (the repo's err-large caps ethos): it exists to unstick a wedged cell, not to police speed.
+const MAIN_THREAD_BUDGET_MS = 10_000;
 function parsePolicy(raw: string): Policy {
   const [kind, ms] = (raw || "auto").trim().split(":");
   if (kind === "manual") return { kind: "manual", ms: 0 };
@@ -514,7 +525,12 @@ function extractImportMap(rawCells: CellSpec[]): Record<string, string> {
 }
 
 // ── sync: the template feeds the parsed cells in; we diff and (re)schedule ────────────────────────
-export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
+export function syncCells(cardKey: string, rawCells: CellSpec[], opts?: { mainRealmAllowed?: boolean }): void {
+  // MAIN-REALM CONSENT (Fix A): whether this notebook carries `data-main-realm="allow"`. It's in the signature
+  // below so TOGGLING consent re-syncs and re-dirties the gated domCandidate cells (granting makes them run,
+  // revoking parks them again) — otherwise a consent change alone (source unchanged) would be gated out as a
+  // no-op re-render.
+  const mainRealmAllowed = !!(opts && opts.mainRealmAllowed);
   const importMap = extractImportMap(rawCells); // A3: defaults + any type="importmap" cell (before scheduling)
   const rawScheduled = rawCells.filter(isScheduled); // module cells + interpolated markdown cells
   // The signature is over the RAW cells the template parsed — what the user actually wrote (type + source +
@@ -523,7 +539,7 @@ export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
   // function of these, so an unchanged signature means an unchanged EFFECTIVE graph: gate on it FIRST, so a
   // mere re-render (an output change) never re-parses every cell with acorn — only a real source/wiring/map
   // edit pays for computeEffective. `type` is in the signature so a markdown↔module conversion still re-syncs.
-  const sig = JSON.stringify([importMap, rawScheduled.map((c) => [c.id, c.type, c.source, importsOf(c), c.outNames, c.policy])]);
+  const sig = JSON.stringify([importMap, mainRealmAllowed, rawScheduled.map((c) => [c.id, c.type, c.source, importsOf(c), c.outNames, c.policy])]);
   let nb = nbs.get(cardKey);
   if (nb && nb.sig === sig) return; // a pure re-render (outputs changed) — same graph, nothing to do
 
@@ -550,6 +566,7 @@ export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
     state: prev?.state ?? new Map(),
     job: prev?.job ?? new Map(),
     timer: prev?.timer ?? new Map(),
+    mainRealmAllowed,
   };
   nbs.set(cardKey, nb);
   // Publish this notebook's address so other cards' imports resolve to it. New address (first sync / a
@@ -615,6 +632,14 @@ export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
       old.inNames.join(",") !== c.inNames.join(",") ||
       old.outNames.join(",") !== c.outNames.join(",");
     if (specChanged || depsChanged) markDirty(cardKey, c.id);
+  }
+
+  // CONSENT TOGGLED (Fix A): flipping `data-main-realm` changes no cell's SOURCE, so the spec-diff above
+  // re-dirties nothing — but the gate outcome for every domCandidate cell just changed. Re-dirty them so a
+  // GRANT runs the previously-parked cells (per their own policy) and a REVOKE re-parks any that had run.
+  // Only on an actual flip (prev exists and differs); the first sync already dirties them as new cells.
+  if (prev && prev.mainRealmAllowed !== mainRealmAllowed) {
+    for (const c of nb.specs.values()) if (c.domCandidate && !nb.cyclic.has(c.id)) markDirty(cardKey, c.id);
   }
 
   // Reconcile this card's CROSS-CARD subscriptions (notebook-object/export imports + data-file imports)
@@ -831,10 +856,26 @@ function startRun(cardKey: string, cellId: string): void {
     afterRun(cardKey, cellId);
     return;
   }
+  // MAIN-THREAD REALM CONSENT GATE (Fix A, the trust boundary — thread node:mrdj7o3s-9). A domCandidate cell runs
+  // on the MAIN THREAD with FULL PAGE AUTHORITY (DOM, IndexedDB, localStorage, credentialed same-origin fetch)
+  // and, being synchronous UI-thread code, CAN hang the whole app with no in-realm interrupt. So it must NOT run
+  // — not on card open, not on a manual Run (this gate is a security boundary, not a policy the Run button
+  // overrides) — until the notebook carries explicit consent (`data-main-realm="allow"` → nb.mainRealmAllowed).
+  // Until then the cell is parked idle with `needsConsent` (the card renders a one-time "allow page access"
+  // affordance) and publishes undefined for its exports, so downstream cells settle exactly as for an empty cell
+  // (never a deadlock). This closes BOTH review HIGHs at one chokepoint: no auto-run-on-open hang, no silent
+  // privilege escalation on lib import.
+  if (spec.domCandidate && !nb.mainRealmAllowed) {
+    setState(cardKey, cellId, "idle");
+    patchOutput(cardKey, cellId, { running: false, stale: false, status: undefined, value: undefined, view: undefined, error: undefined, needsConsent: true });
+    applyExports(cardKey, cellId, undefined);
+    afterRun(cardKey, cellId);
+    return;
+  }
   const inputs: Record<string, unknown> = {};
   for (const imp of importsOf(spec)) inputs[imp.name] = resolveInput(nb, imp);
   setState(cardKey, cellId, "running");
-  patchOutput(cardKey, cellId, { running: true, stale: false });
+  patchOutput(cardKey, cellId, { running: true, stale: false, needsConsent: undefined });
   const jobId = ++nextJob;
   nb.job.set(cellId, jobId);
   const src = spec.runSource ?? spec.source;
@@ -845,7 +886,7 @@ function startRun(cardKey: string, cellId: string): void {
   // inputs injected as named params only (notebook-main-exec.js / notebook-worker.js) — no shared namespace.
   if (spec.domCandidate) {
     // runMainThreadCell never rejects (it catches internally); the onRejected arm is belt-and-braces.
-    runMainThreadCell({ source: src, inputs, block: spec.block }).then(
+    runMainThreadCell({ source: src, inputs, block: spec.block, budgetMs: MAIN_THREAD_BUDGET_MS }).then(
       (r) => onMainReply(cardKey, cellId, jobId, r),
       (err) => onMainReply(cardKey, cellId, jobId, { ok: false, error: String(err) }),
     );

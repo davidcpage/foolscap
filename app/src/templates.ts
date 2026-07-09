@@ -340,7 +340,7 @@ export function buildCard(
     // re-running cells on an unrelated re-render. Keyed by this card's node id. Not read-tracked.
     if (name === "syncCells") {
       const cardKey = host?.id ?? nodeSub.get()?.title ?? "";
-      signals.syncCells = (cells: CellSpec[]): void => syncCells(cardKey, cells);
+      signals.syncCells = (cells: CellSpec[], opts?: { mainRealmAllowed?: boolean }): void => syncCells(cardKey, cells, opts);
       continue;
     }
     // `gone` (slice D): true once this card's (root, path) backing is deleted on disk (the watch's unlink

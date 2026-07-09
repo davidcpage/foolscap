@@ -73,6 +73,14 @@ export function deserialize(html) {
   const src = String(html ?? "");
   const tm = /<title\b[^>]*>([\s\S]*?)<\/title>/i.exec(src);
   const title = tm ? tm[1].trim() : "";
+  // The notebook-level MAIN-REALM CONSENT (the trust boundary — docs/notebook-external-libs-and-dom-output.md
+  // §5). `data-main-realm="allow"` on the <notebook> element grants THIS notebook's DOM-producing cells the
+  // right to run on the MAIN THREAD (full page authority; a runaway can hang the UI). Absent → those cells are
+  // GATED: they don't run, and the card shows a one-time "allow" affordance. It lives on the <notebook> tag so
+  // it is DURABLE and DOC-DECLARABLE — a headless/agent author pre-grants by writing the attribute, no click
+  // needed. Any value other than the literal "allow" (mistyped/tampered) reads as no consent (the gate holds).
+  const nm = /<notebook\b([^>]*)>/i.exec(src);
+  const mainRealm = nm ? attr(nm[1] || "", "data-main-realm") || "" : "";
   const cells = [];
   // Cell ids MUST be unique: they're the per-cell handle every structural op in the card keys on
   // (delete/move/edit/convert-type in render.js) and the DOM `data-cellid`. A source file can carry
@@ -107,7 +115,7 @@ export function deserialize(html) {
       policy: attr(attrs, "data-policy") || "", // "" | auto | manual | debounced[:ms]
     });
   }
-  return { title, cells };
+  return { title, cells, mainRealm };
 }
 
 function indent(src) {
@@ -119,6 +127,9 @@ function indent(src) {
 
 export function serialize(nb) {
   const title = nb && nb.title != null ? String(nb.title) : "";
+  // Round-trip the notebook-level main-realm consent (see deserialize). Only a truthy string is emitted, so an
+  // ungranted notebook stays attribute-free (no noise in the file); granting it writes `data-main-realm="allow"`.
+  const mainRealm = nb && typeof nb.mainRealm === "string" ? nb.mainRealm : "";
   const cells = (nb && nb.cells) || [];
   const blocks = cells.map((c) => {
     // Prefer the structured `imports` (carries path/export); fall back to the bare `inNames` for a cell
@@ -131,5 +142,6 @@ export function serialize(nb) {
     const body = indent(String(c.source ?? "").replace(/<\/script>/g, "<\\/script>"));
     return `  <script id="${c.id}"${flags}>\n${body}\n  </script>`;
   });
-  return `<!doctype html>\n<notebook>\n  <title>${title}</title>\n${blocks.join("\n")}\n</notebook>\n`;
+  const nbAttr = mainRealm ? ` data-main-realm="${mainRealm}"` : "";
+  return `<!doctype html>\n<notebook${nbAttr}>\n  <title>${title}</title>\n${blocks.join("\n")}\n</notebook>\n`;
 }
