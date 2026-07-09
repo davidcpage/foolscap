@@ -367,9 +367,11 @@ test("channels template renders the two differentiated waiting signals (user wai
   // (a) unseen: exactly the two mention-bearing rows wear `unseen` + the count badge; the calm/your-turn-only do not.
   assert.equal((out.match(/ses-row-unseen"/g) || []).length, 2, "only mention-bearing rows show the unseen badge");
   assert.ok(out.includes("2 unseen mentions"), "count badge tooltip (plural)");
-  // (b) your-turn: exactly the two `waiting`-state rows wear the amber your-turn class + chip.
-  assert.equal((out.match(/ses-row-turn"/g) || []).length, 2, "only waiting-state rows show the your-turn chip");
-  assert.ok(out.includes("your turn"), "the your-turn chip label");
+  // (b) your-turn: the amber signal is now the ROW itself (class + background) — the text chip was dropped,
+  // the colour alone carries it. Exactly the two `waiting`-state rows wear the your-turn row class.
+  assert.equal((out.match(/ses-row your-turn/g) || []).length, 2, "only waiting-state rows wear the amber your-turn row");
+  assert.ok(!out.includes("ses-row-turn"), "the your-turn text chip is gone — colour alone signals it");
+  assert.ok(!out.includes("your turn"), "no 'your turn' text label remains");
   // The 'Both' row carries BOTH signal classes on the one row.
   assert.ok(out.includes('class="ses-row your-turn unseen"'), "a row can carry both signals at once");
 
@@ -397,7 +399,7 @@ test("channels template renders the two differentiated waiting signals (user wai
     fields: { title: "", text: "", color: "purple" },
     signals: { channelList: [{ chanId: "node:thread:ff", title: "Legacy", text: "", messages: 2, mtime: Date.now() }], channelOpen: () => {} },
   }));
-  assert.ok(!legacy.includes("ses-row-unseen") && !legacy.includes("ses-row-turn"), "a thread without the signal fields shows neither");
+  assert.ok(!legacy.includes("ses-row-unseen") && !legacy.includes("your-turn"), "a thread without the signal fields shows neither");
 });
 
 test("session template applies the jsonl codec: turns, tool calls with results, thinking", async () => {

@@ -89,10 +89,9 @@ export default {
               @click=${(e) => { if (!signalling) return; e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
               @dblclick=${(e) => { e.preventDefault(); e.stopPropagation(); open && open(ch.chanId, ch.title, ch.text); }}
             >
-              <span class="ses-row-title ${ch.title ? "" : "ses-row-mono"} ${signalling ? "ses-row-title-pad" : ""}">${ch.title || ch.chanId}</span>
-              ${signalling
+              <span class="ses-row-title ${ch.title ? "" : "ses-row-mono"} ${unseen ? "ses-row-title-pad" : ""}">${ch.title || ch.chanId}</span>
+              ${unseen
                 ? html`<span class="ses-row-signals">
-                    ${yourTurn ? html`<span class="ses-row-turn" title="an agent is waiting on you">◆ your turn</span>` : ""}
                     ${unseen
                       ? html`<span class="ses-row-unseen" data-interactive="1" title="${unseenCount} unseen mention${unseenCount === 1 ? "" : "s"} — hover to preview">
                           ${unseenCount}
