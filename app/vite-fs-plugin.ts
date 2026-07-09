@@ -34,6 +34,8 @@ import { sessionSummaryFromText } from "./session-summary.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
+import { sendJson, readBody, readBodyBuffer, openSse, windowParam, type SseClient } from "./server-http.js";
+import { setServerContext } from "./server-context.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -85,7 +87,7 @@ const DEFAULT_BOARD = boardIdentity(ROOTS.repo!);
 // /api/boards SURVIVE a dev-server re-eval (a plugin edit re-runs this module in the same process) — an
 // open non-default tab would otherwise 400 on its boardId until the browser re-mounted. The default board
 // (the dev repo) is always present.
-interface BoardInfo {
+export interface BoardInfo {
   root: string;
   name: string;
   repoPath: string;
@@ -221,7 +223,7 @@ function handleBoards(res: ServerResponse): void {
 // sees whatever an agent or a human created via the CLI, so a new tree appears on its own (and the
 // watcher below re-discovers on `.git/worktrees/` churn). Node ids are already `node:<root>:<path>`, so
 // the extra roots' file cards never collide; the rootId is the slug of the worktree's dir basename.
-interface RootInfo {
+export interface RootInfo {
   id: string; // "repo" for the canonical checkout; slug(basename) for a worktree
   name: string;
   path: string; // absolute, realpath'd — the confined dir every read of this root is re-checked against
@@ -538,12 +540,6 @@ function fileVersion(abs: string): string | null {
   } catch {
     return null; // no such file — the version of "absent" (a create passes baseVersion:null)
   }
-}
-
-function sendJson(res: ServerResponse, status: number, body: unknown): void {
-  res.statusCode = status;
-  res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
 }
 
 // The IMMEDIATE children of one directory (root-relative paths, no content) — the lazy primitive the
@@ -1069,7 +1065,7 @@ async function handleAssetWrite(req: IncomingMessage, res: ServerResponse, root:
   if (!assetGate(root, rel)) return sendJson(res, 404, { error: "not found" });
   let buf: Buffer;
   try {
-    buf = await readBodyBuffer(req);
+    buf = await readBodyBuffer(req, MAX_ASSET_BYTES);
   } catch {
     return sendJson(res, 400, { error: "bad body" });
   }
@@ -1563,10 +1559,6 @@ function handleWatch(req: IncomingMessage, res: ServerResponse, root: string): v
 // canvas — nothing a feed emits ever touches the log/persistence/git. New connections get every
 // feed's last value immediately, so cards render without waiting for the next tick.
 
-interface SseClient {
-  res: ServerResponse;
-}
-
 // Vite restarts the dev server on a plugin-file edit by RE-EVALUATING this module in the SAME node
 // process (a server.restart, not a process exit). Module-level state would therefore reset while the
 // spawned session children keep running — orphaning them: the new registry has no handle, so a
@@ -1634,7 +1626,7 @@ interface WsClient {
   watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
   send(msg: unknown): void;
 }
-interface CanvasFsState {
+export interface CanvasFsState {
   feedClients: Set<SseClient>;
   feedValues: Map<string, unknown>;
   feedsStarted: boolean;
@@ -1717,25 +1709,6 @@ function publishFeed(feed: string, value: unknown): void {
   const frame = `data: ${JSON.stringify({ feed, value })}\n\n`;
   for (const c of feedClients) c.res.write(frame);
   for (const c of wsClients) c.send({ ch: "feed", feed, value });
-}
-
-// Open an SSE stream and add it to a client set, with the keep-alive ping + close bookkeeping all
-// the streams here share. Returns the client handle.
-function openSse(req: IncomingMessage, res: ServerResponse, clients: Set<SseClient>): SseClient {
-  res.writeHead(200, {
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
-  res.write(`retry: 2000\n\n`);
-  const client: SseClient = { res };
-  clients.add(client);
-  const ping = setInterval(() => res.write(`: ping\n\n`), 25000);
-  req.on("close", () => {
-    clearInterval(ping);
-    clients.delete(client);
-  });
-  return client;
 }
 
 function handleFeeds(req: IncomingMessage, res: ServerResponse): void {
@@ -2042,7 +2015,7 @@ interface ContentBlock {
   input?: unknown;
 }
 
-interface LiveSession {
+export interface LiveSession {
   id: string;
   repoPath: string; // the board's CANONICAL repo — where its `.canvas/` home (markers, threads, memory) lives
   // The process's working directory. Equals repoPath for an ordinary session; for a WORKTREE session
@@ -4089,36 +4062,6 @@ function tabCountFor(boardId: string): number {
   return (busClients.get(boardId)?.size ?? 0) + [...wsClients].filter((c) => c.boardId === boardId).length;
 }
 
-function readBody(req: IncomingMessage): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c: Buffer) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    req.on("error", reject);
-  });
-}
-
-// The binary twin of readBody, for the image-asset write (raw bytes, not utf8). Capped at the same
-// MAX_ASSET_BYTES the handler enforces, but bounded here too so an oversized upload can't balloon memory
-// before the length check — rejects mid-stream the moment it overruns.
-function readBodyBuffer(req: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let len = 0;
-    req.on("data", (c: Buffer) => {
-      len += c.length;
-      if (len > MAX_ASSET_BYTES) {
-        reject(new Error("too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(c);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
-}
-
 // T3c helper: tear down every edge touching `nodeId` before its removeNode lands. Emits a removeEdge over
 // the bus for each connected edge (connectedEdgeIds off the durable snapshot) so the cascade is server-
 // authoritative, and — for a session card — also drops its member edges from the emitted-membership bridge,
@@ -5364,14 +5307,282 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
   sendJson(res, 200, { channels, count });
 }
 
-// Parse an opt-in positive-integer window param (?limit= / ?bytes=); null when absent/invalid (⇒ uncapped,
-// the default — no silent truncation for a caller that didn't ask for it).
-function windowParam(url: URL, key: string): number | null {
-  const raw = url.searchParams.get(key);
-  if (raw == null) return null;
-  const n = Number(raw);
-  return Number.isInteger(n) && n > 0 ? n : null;
+// Wire the ServerContext seam ONCE at module load (before configureServer runs). The references handed in
+// are the same globalThis-pinned singletons the rest of this file holds, so a route handler lifted into a
+// `routes/*.ts` module in a later phase reaches identical state via getServerContext() — no fork across a
+// Vite hot re-eval (this call re-runs on a re-eval and re-points the pinned holder at the still-pinned
+// singletons). No consumer in Phase 0; the seam is proved by typecheck matching this shape to the real state.
+setServerContext({
+  boards,
+  liveSessions,
+  fsState,
+  defaultBoardId: DEFAULT_BOARD.boardId,
+  reqBoard,
+  rootDir,
+  boardRoots,
+  originOf,
+});
+
+// ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────
+// The middleware below is a THREE-STAGE dispatcher, reproducing the exact staged-resolution gate the
+// if/else ladder encoded: GLOBAL routes are tried first (each self-resolves its board via reqBoard where
+// it needs one); if none match, the shared board gate resolves ?board= once (400 on unknown) and BOARD
+// routes are tried; if none match, the shared root gate resolves ?root= once (400 on unknown) and ROOT
+// routes are tried; a miss falls through to Vite via next(). Within each stage, entries are evaluated in
+// array order — so exact-before-prefix/param ordering is just declaration order, preserved arm-for-arm.
+// A route with a `method` only matches that verb and otherwise FALLS THROUGH to later entries, exactly as
+// the ladder's `&& req.method === "POST"` arms did; a route without one matches any verb and branches on
+// the method inside its handler (the ladder's `if (req.method === "POST") … else …` arms).
+type RouteMatch = (pathname: string) => string[] | null; // capture groups (or [] for a plain match); null = no match
+const exact = (p: string): RouteMatch => (path) => (path === p ? [] : null);
+const oneOf = (...ps: string[]): RouteMatch => (path) => (ps.includes(path) ? [] : null);
+const prefix = (p: string): RouteMatch => (path) => (path.startsWith(p) ? [] : null);
+const re = (r: RegExp): RouteMatch => (path) => {
+  const m = r.exec(path);
+  return m ? m.slice(1) : null;
+};
+interface GlobalRoute {
+  method?: string;
+  match: RouteMatch;
+  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[]) => void;
 }
+interface BoardRoute {
+  method?: string;
+  match: RouteMatch;
+  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo) => void;
+}
+interface RootRoute {
+  method?: string;
+  match: RouteMatch;
+  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo, root: string) => void;
+}
+
+// STAGE 1 — GLOBAL routes (tried before the shared board gate; board-scoped ones call reqBoard themselves).
+const GLOBAL_ROUTES: GlobalRoute[] = [
+  // The feeds stream is global (one connection per tab; feed names are themselves board-suffixed).
+  { match: exact("/api/feeds"), run: (req, res) => handleFeeds(req, res) },
+  // Session reads/spawns ARE board-scoped (?board=, default board if omitted) — the transcripts dir and the
+  // spawn cwd are this board's repo. input/interrupt/resume address a live process by its globally-unique
+  // id; only spawn + resume need the repo (cwd / transcript seed).
+  {
+    method: "POST",
+    match: exact("/api/session/spawn"),
+    run: (req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return void handleSessionSpawn(req, res, b.repoPath, b.boardId, originOf(req));
+    },
+  },
+  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/input$/), run: (req, res, _url, g) => void handleSessionInput(req, res, g[0]!) },
+  {
+    method: "POST",
+    match: re(/^\/api\/session\/([\w-]+)\/resume$/),
+    run: (req, res, url, g) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return handleSessionResume(req, res, b.repoPath, g[0]!);
+    },
+  },
+  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/interrupt$/), run: (_req, res, _url, g) => handleSessionInterrupt(res, g[0]!) },
+  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/terminate$/), run: (_req, res, _url, g) => handleSessionTerminate(res, g[0]!) },
+  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/done$/), run: (_req, res, _url, g) => handleSessionDone(res, g[0]!) },
+  // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision buttons, and
+  // the headless list. Ids are global UUIDs — no ?board= anywhere here.
+  { method: "POST", match: exact("/api/permission/request"), run: (req, res) => void handlePermissionRequest(req, res) },
+  { method: "POST", match: re(/^\/api\/permission\/([\w-]+)\/decision$/), run: (req, res, _url, g) => void handlePermissionDecision(req, res, g[0]!) },
+  { method: "GET", match: exact("/api/permissions"), run: (_req, res, url) => handlePermissionsRead(res, url.searchParams.get("session")) },
+  // The channel-message read tool (session id is a global UUID, so no ?board= needed).
+  { method: "GET", match: exact("/api/inbox"), run: (_req, res, url) => handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes")) },
+  // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
+  { method: "GET", match: exact("/api/asks"), run: (_req, res, url) => handleAsksRead(res, url.searchParams.get("session")) },
+  // Threads (§8 step 2 — /api/thread/… is canonical; /api/channel/… stays a working alias). The thread id
+  // is a node id carrying a colon, so the client percent-encodes it — match any non-slash segment and decode.
+  {
+    method: "POST",
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|seen|job|worktree)$/),
+    run: (req, res, url, g) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const threadId = decodeURIComponent(g[0]!);
+      const action = g[1]!;
+      if (action === "message") return void handleThreadMessage(req, res, b.boardId, threadId);
+      if (action === "history") return void handleThreadHistory(req, res, b.boardId, threadId);
+      if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
+      if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
+      if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
+      if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
+      if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
+      if (action === "seen") return void handleThreadSeen(req, res, b.boardId, threadId);
+      if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
+      if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);
+      return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
+    },
+  },
+  // GET /api/thread/<id>/jobs — read this thread's standing jobs (R6/W6, for the CLI + smoke test).
+  {
+    method: "GET",
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/jobs$/),
+    run: (_req, res, url, g) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const threadId = decodeURIComponent(g[0]!);
+      return sendJson(res, 200, { thread: threadId, jobs: readJobs(b.repoPath, threadId) });
+    },
+  },
+  // GET /api/thread/<id>/worktrees — read this thread's recorded work-item worktrees (Stage 1, for the CLI).
+  {
+    method: "GET",
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/worktrees$/),
+    run: (_req, res, url, g) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const threadId = decodeURIComponent(g[0]!);
+      return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(b.repoPath, threadId) });
+    },
+  },
+  {
+    match: exact("/api/session"),
+    run: (_req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return handleSession(res, sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath);
+    },
+  },
+  {
+    match: exact("/api/sessions"),
+    run: (_req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return handleSessions(res, sessionsDir(b.repoPath), b.repoPath);
+    },
+  },
+  {
+    match: oneOf("/api/threads", "/api/channels"),
+    run: (_req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return handleThreads(res, b.boardId, b.repoPath);
+    },
+  },
+  {
+    match: exact("/api/roles"),
+    run: (req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      if (req.method === "POST") return void handleRolesCreate(req, res, b.repoPath);
+      return handleRoles(res, b.repoPath);
+    },
+  },
+  { match: exact("/api/card-types"), run: (_req, res) => handleCardTypesList(res) },
+  { method: "POST", match: exact("/api/boards"), run: (req, res) => void handleBoardMount(req, res) },
+  { match: exact("/api/boards"), run: (_req, res) => handleBoards(res) },
+  // The durable board store (step 4): the browser's persistence backends live here now.
+  {
+    match: prefix("/api/board/persist"),
+    run: (req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      if (url.pathname === "/api/board/persist" && req.method === "GET") {
+        // Compact on the boot read (once per page load): drop events the snapshot absorbed, beyond a
+        // generous tail — see board-persist.js. Never silent when it bites.
+        const { dropped } = compactBoardEvents(b.repoPath);
+        if (dropped > 0) console.log(`[boards] compacted ${b.boardId}: dropped ${dropped} events below the snapshot watermark tail`);
+        return sendJson(res, 200, readBoardPersist(b.repoPath));
+      }
+      if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
+        clearBoardPersist(b.repoPath);
+        return sendJson(res, 200, { ok: true });
+      }
+      if (req.method === "POST") {
+        const kind = url.pathname.slice("/api/board/persist/".length);
+        if (kind === "event" || kind === "snapshot" || kind === "import")
+          return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind);
+      }
+      return sendJson(res, 404, { error: "unknown board-persist endpoint" });
+    },
+  },
+  // The agent bus IS board-scoped now (Phase 3): ?board=<id> picks which board's tabs a command reaches and
+  // which board's snapshot is read back (default board if omitted).
+  {
+    match: exact("/api/bus"),
+    run: (req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return void openSse(req, res, busClientsFor(b.boardId));
+    },
+  },
+  {
+    method: "POST",
+    match: exact("/api/command"),
+    run: (req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return void handleCommand(req, res, b.boardId, originOf(req));
+    },
+  },
+  {
+    match: exact("/api/canvas"),
+    run: (_req, res, url) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      return handleCanvasGet(res, b.boardId);
+    },
+  },
+  // Notebook outputs (§7 agent-legibility). The id is a node id carrying colons + a slashed path, so the
+  // client percent-encodes it — match a non-slash segment and decode, exactly like channels.
+  {
+    match: re(/^\/api\/notebook\/([^/]+)\/outputs$/),
+    run: (req, res, url, g) => {
+      const b = reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const id = decodeURIComponent(g[0]!);
+      if (req.method === "POST") return void handleNotebookOutputsPush(req, res, b.boardId, id);
+      return handleNotebookOutputsGet(res, b.boardId, id);
+    },
+  },
+  { match: exact("/api/weather"), run: (_req, res, url) => void handleWeather(res, url.searchParams.get("q") ?? "") },
+];
+
+// STAGE 2 — BOARD routes (reached only after the shared board gate resolved `board`/`boardId`).
+const BOARD_ROUTES: BoardRoute[] = [
+  // The board's ROOTS: its canonical checkout + any git worktrees (worktree-activity slice B). The
+  // file/ls/watch endpoints take `?root=<id>` to pick which; `/api/roots` lists them.
+  { match: exact("/api/roots"), run: (_req, res, _url, _g, boardId) => sendJson(res, 200, { roots: boardRoots(boardId) }) },
+  // Doc annotations (docs/doc-annotations.md): quote-anchored standoff comments on this board's files.
+  // Deliberately CANONICAL-root only (no ?root=): the ledger is keyed by repo-relative path, and a
+  // worktree's copy of a doc is the same doc — annotations shouldn't fork per tree.
+  {
+    match: exact("/api/annotations"),
+    run: (req, res, url, _g, boardId, board) => {
+      const canonical = rootDir(boardId, null);
+      if (!canonical) return sendJson(res, 400, { error: "unknown root" });
+      if (req.method === "POST") return void handleAnnotationsWrite(req, res, canonical, board.repoPath, boardId, originOf(req));
+      return handleAnnotationsRead(res, canonical, board.repoPath, url.searchParams.get("path"));
+    },
+  },
+];
+
+// STAGE 3 — ROOT routes (reached only after the shared root gate resolved the confined `root` dir).
+const ROOT_ROUTES: RootRoute[] = [
+  { match: exact("/api/ls"), run: (_req, res, url, _g, _boardId, _board, root) => handleLs(res, root, url.searchParams.get("path") ?? "") },
+  { method: "POST", match: exact("/api/file/rename"), run: (req, res, _url, _g, _boardId, _board, root) => void handleFileRename(req, res, root) },
+  { method: "POST", match: exact("/api/file/delete"), run: (_req, res, url, _g, _boardId, _board, root) => handleFileDelete(res, root, url.searchParams.get("path") ?? "") },
+  {
+    match: exact("/api/file"),
+    run: (req, res, url, _g, _boardId, board, root) => {
+      if (req.method === "POST") return void handleFileWrite(req, res, root, url.searchParams.get("path") ?? "", board.repoPath);
+      return handleFile(res, root, url.searchParams.get("path") ?? "");
+    },
+  },
+  {
+    match: exact("/api/asset"),
+    run: (req, res, url, _g, _boardId, _board, root) => {
+      if (req.method === "POST") return void handleAssetWrite(req, res, root, url.searchParams.get("path") ?? "");
+      return handleAssetRead(res, root, url.searchParams.get("path") ?? "");
+    },
+  },
+  { match: exact("/api/watch"), run: (req, res, _url, _g, _boardId, _board, root) => handleWatch(req, res, root) },
+];
 
 export function fsApi(): Plugin {
   return {
@@ -5412,202 +5623,39 @@ export function fsApi(): Plugin {
         const url = new URL(req.url, "http://localhost");
         if (url.pathname.startsWith("/card-types/")) return handleCardTypeAsset(res, url.pathname);
 
-        // The feeds stream is global (one connection per tab; feed names are themselves board-suffixed).
-        if (url.pathname === "/api/feeds") return handleFeeds(req, res);
-        // Session reads/spawns ARE board-scoped (?board=, default board if omitted) — the transcripts dir
-        // and the spawn cwd are this board's repo. input/interrupt/resume address a live process by its
-        // globally-unique id; only spawn + resume need the repo (cwd / transcript seed).
-        if (url.pathname === "/api/session/spawn" && req.method === "POST") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return void handleSessionSpawn(req, res, b.repoPath, b.boardId, originOf(req));
+        // STAGE 1 — global routes (each self-resolves its board where it needs one).
+        for (const r of GLOBAL_ROUTES) {
+          if (r.method && req.method !== r.method) continue;
+          const g = r.match(url.pathname);
+          if (g) return r.run(req, res, url, g);
         }
-        const inputMatch = /^\/api\/session\/([\w-]+)\/input$/.exec(url.pathname);
-        if (inputMatch && req.method === "POST") return void handleSessionInput(req, res, inputMatch[1]!);
-        const resumeMatch = /^\/api\/session\/([\w-]+)\/resume$/.exec(url.pathname);
-        if (resumeMatch && req.method === "POST") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleSessionResume(req, res, b.repoPath, resumeMatch[1]!);
-        }
-        const interruptMatch = /^\/api\/session\/([\w-]+)\/interrupt$/.exec(url.pathname);
-        if (interruptMatch && req.method === "POST") return handleSessionInterrupt(res, interruptMatch[1]!);
-        const terminateMatch = /^\/api\/session\/([\w-]+)\/terminate$/.exec(url.pathname);
-        if (terminateMatch && req.method === "POST") return handleSessionTerminate(res, terminateMatch[1]!);
-        const doneMatch = /^\/api\/session\/([\w-]+)\/done$/.exec(url.pathname);
-        if (doneMatch && req.method === "POST") return handleSessionDone(res, doneMatch[1]!);
-        // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision
-        // buttons, and the headless list. Ids are global UUIDs — no ?board= anywhere here.
-        if (url.pathname === "/api/permission/request" && req.method === "POST")
-          return void handlePermissionRequest(req, res);
-        const permMatch = /^\/api\/permission\/([\w-]+)\/decision$/.exec(url.pathname);
-        if (permMatch && req.method === "POST") return void handlePermissionDecision(req, res, permMatch[1]!);
-        if (url.pathname === "/api/permissions" && req.method === "GET")
-          return handlePermissionsRead(res, url.searchParams.get("session"));
-        // The channel-message read tool (session id is a global UUID, so no ?board= needed).
-        if (url.pathname === "/api/inbox" && req.method === "GET")
-          return handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes"));
-        // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
-        if (url.pathname === "/api/asks" && req.method === "GET")
-          return handleAsksRead(res, url.searchParams.get("session"));
-        // Threads (§8 step 2 — /api/thread/… is canonical; /api/channel/… stays a working alias so live
-        // agents and old recipes don't break mid-transition). The thread id is a node id carrying a colon
-        // (node:thread:<short> / legacy node:chan:<short>), so the client percent-encodes it — match any
-        // non-slash segment and decode before the snapshot lookup.
-        const threadMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|seen|job|worktree)$/.exec(url.pathname);
-        if (threadMatch && req.method === "POST") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          const threadId = decodeURIComponent(threadMatch[1]!);
-          const action = threadMatch[2]!;
-          if (action === "message") return void handleThreadMessage(req, res, b.boardId, threadId);
-          if (action === "history") return void handleThreadHistory(req, res, b.boardId, threadId);
-          if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
-          if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
-          if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
-          if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
-          if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
-          if (action === "seen") return void handleThreadSeen(req, res, b.boardId, threadId);
-          if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
-          if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);
-          return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
-        }
-        // GET /api/thread/<id>/jobs — read this thread's standing jobs (R6/W6, for the CLI + smoke test).
-        const threadJobsMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/jobs$/.exec(url.pathname);
-        if (threadJobsMatch && req.method === "GET") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          const threadId = decodeURIComponent(threadJobsMatch[1]!);
-          return sendJson(res, 200, { thread: threadId, jobs: readJobs(b.repoPath, threadId) });
-        }
-        // GET /api/thread/<id>/worktrees — read this thread's recorded work-item worktrees (Stage 1, for the CLI).
-        const threadWorktreesMatch = /^\/api\/(?:thread|channel)\/([^/]+)\/worktrees$/.exec(url.pathname);
-        if (threadWorktreesMatch && req.method === "GET") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          const threadId = decodeURIComponent(threadWorktreesMatch[1]!);
-          return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(b.repoPath, threadId) });
-        }
-        if (url.pathname === "/api/session") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleSession(res, sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath);
-        }
-        if (url.pathname === "/api/sessions") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleSessions(res, sessionsDir(b.repoPath), b.repoPath);
-        }
-        if (url.pathname === "/api/threads" || url.pathname === "/api/channels") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleThreads(res, b.boardId, b.repoPath);
-        }
-        if (url.pathname === "/api/roles") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          if (req.method === "POST") return void handleRolesCreate(req, res, b.repoPath);
-          return handleRoles(res, b.repoPath);
-        }
-        if (url.pathname === "/api/card-types") return handleCardTypesList(res);
-        if (url.pathname === "/api/boards" && req.method === "POST")
-          return void handleBoardMount(req, res);
-        if (url.pathname === "/api/boards") return handleBoards(res);
-        // The durable board store (step 4): the browser's persistence backends live here now.
-        if (url.pathname.startsWith("/api/board/persist")) {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          if (url.pathname === "/api/board/persist" && req.method === "GET") {
-            // Compact on the boot read (once per page load): drop events the snapshot absorbed,
-            // beyond a generous tail — see board-persist.js. Never silent when it bites.
-            const { dropped } = compactBoardEvents(b.repoPath);
-            if (dropped > 0) console.log(`[boards] compacted ${b.boardId}: dropped ${dropped} events below the snapshot watermark tail`);
-            return sendJson(res, 200, readBoardPersist(b.repoPath));
-          }
-          if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
-            clearBoardPersist(b.repoPath);
-            return sendJson(res, 200, { ok: true });
-          }
-          if (req.method === "POST") {
-            const kind = url.pathname.slice("/api/board/persist/".length);
-            if (kind === "event" || kind === "snapshot" || kind === "import")
-              return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind);
-          }
-          return sendJson(res, 404, { error: "unknown board-persist endpoint" });
-        }
-        // The agent bus IS board-scoped now (Phase 3): ?board=<id> picks which board's tabs a command
-        // reaches and which board's snapshot is read back (default board if omitted).
-        if (url.pathname === "/api/bus") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return void openSse(req, res, busClientsFor(b.boardId));
-        }
-        if (url.pathname === "/api/command" && req.method === "POST") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return void handleCommand(req, res, b.boardId, originOf(req));
-        }
-        if (url.pathname === "/api/canvas") {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          return handleCanvasGet(res, b.boardId);
-        }
-        // Notebook outputs (§7 agent-legibility). The id is a node id carrying colons + a slashed path, so
-        // the client percent-encodes it — match a non-slash segment and decode, exactly like channels.
-        const nbOutMatch = /^\/api\/notebook\/([^/]+)\/outputs$/.exec(url.pathname);
-        if (nbOutMatch) {
-          const b = reqBoard(url);
-          if (!b) return sendJson(res, 400, { error: "unknown board" });
-          const id = decodeURIComponent(nbOutMatch[1]!);
-          if (req.method === "POST") return void handleNotebookOutputsPush(req, res, b.boardId, id);
-          return handleNotebookOutputsGet(res, b.boardId, id);
-        }
-        if (url.pathname === "/api/weather") return void handleWeather(res, url.searchParams.get("q") ?? "");
 
-        // The remaining endpoints are board-scoped: ?board=<boardId> picks which mounted repo to serve
-        // (defaulting to the dev repo). The board's `root` is then the confined directory every read is
-        // re-checked against, exactly as the single static root was before.
+        // The shared BOARD gate: the remaining endpoints are board-scoped: ?board=<boardId> picks which
+        // mounted repo to serve (defaulting to the dev repo). Resolved ONCE here, then shared by the board-
+        // and root-stage routes below — exactly as the ladder resolved it after the last global arm.
         const boardId = url.searchParams.get("board") ?? DEFAULT_BOARD.boardId;
         const board = boards.get(boardId);
         if (!board) return sendJson(res, 400, { error: "unknown board" });
 
-        // The board's ROOTS: its canonical checkout + any git worktrees (worktree-activity slice B). The
-        // file/ls/watch endpoints take `?root=<id>` to pick which (defaulting to canonical); `/api/roots`
-        // lists them (the file tree drops one tree card per root, coloured by id).
-        if (url.pathname === "/api/roots") return sendJson(res, 200, { roots: boardRoots(boardId) });
-
-        // Doc annotations (docs/doc-annotations.md): quote-anchored standoff comments on this board's
-        // files. Deliberately CANONICAL-root only (no ?root=): the ledger is keyed by repo-relative
-        // path, and a worktree's copy of a doc is the same doc — annotations shouldn't fork per tree.
-        if (url.pathname === "/api/annotations") {
-          const canonical = rootDir(boardId, null);
-          if (!canonical) return sendJson(res, 400, { error: "unknown root" });
-          if (req.method === "POST") return void handleAnnotationsWrite(req, res, canonical, board.repoPath, boardId, originOf(req));
-          return handleAnnotationsRead(res, canonical, board.repoPath, url.searchParams.get("path"));
+        // STAGE 2 — board-scoped routes (before the root gate; `/api/annotations` resolves its own canonical root).
+        for (const r of BOARD_ROUTES) {
+          if (r.method && req.method !== r.method) continue;
+          const g = r.match(url.pathname);
+          if (g) return r.run(req, res, url, g, boardId, board);
         }
 
-        // `root` is resolved to a confined dir from the board's KNOWN roots (never a caller path), exactly
-        // as the single `board.root` was — an unknown rootId is rejected rather than served.
+        // The shared ROOT gate: `root` is resolved to a confined dir from the board's KNOWN roots (never a
+        // caller path), exactly as the single `board.root` was — an unknown rootId is rejected rather than
+        // served. Resolved once, shared by every root-stage route below.
         const root = rootDir(boardId, url.searchParams.get("root"));
         if (!root) return sendJson(res, 400, { error: "unknown root" });
 
-        if (url.pathname === "/api/ls")
-          return handleLs(res, root, url.searchParams.get("path") ?? "");
-        if (url.pathname === "/api/file/rename" && req.method === "POST")
-          return void handleFileRename(req, res, root);
-        if (url.pathname === "/api/file/delete" && req.method === "POST")
-          return handleFileDelete(res, root, url.searchParams.get("path") ?? "");
-        if (url.pathname === "/api/file") {
-          if (req.method === "POST")
-            return void handleFileWrite(req, res, root, url.searchParams.get("path") ?? "", board.repoPath);
-          return handleFile(res, root, url.searchParams.get("path") ?? "");
+        // STAGE 3 — root-scoped file/asset/watch routes.
+        for (const r of ROOT_ROUTES) {
+          if (r.method && req.method !== r.method) continue;
+          const g = r.match(url.pathname);
+          if (g) return r.run(req, res, url, g, boardId, board, root);
         }
-        if (url.pathname === "/api/asset") {
-          if (req.method === "POST")
-            return void handleAssetWrite(req, res, root, url.searchParams.get("path") ?? "");
-          return handleAssetRead(res, root, url.searchParams.get("path") ?? "");
-        }
-        if (url.pathname === "/api/watch") return handleWatch(req, res, root);
         return next();
       });
     },
