@@ -7,7 +7,7 @@ import { execFile, execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { commitRoot, watchRoot } from "./shadow-git.js";
-import { canvasSessionsDir, isCanvasSession, listSessions, markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
+import { canvasSessionsDir, markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
@@ -25,7 +25,6 @@ import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { canvasRolesDir, listRoles, readRole } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, parseWorktreePorcelain, worktreeOnboarding } from "./worktrees.js";
-import { sessionSummaryFromText } from "./session-summary.js";
 import { boardPersistMtime, describeBoardEvents, readBoardPersist, readBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -45,6 +44,7 @@ import { rootsBoardRoutes } from "./routes/roots.js";
 import { inboxRoutes } from "./routes/inbox.js";
 import { askRoutes } from "./routes/asks.js";
 import { threadRoutes } from "./routes/threads.js";
+import { sessionLifecycleRoutes, sessionReadRoutes } from "./routes/sessions.js";
 import { isInternalPath, openRootWatcher } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -181,15 +181,9 @@ function sessionsDir(repoPath: string): string {
   return projectsDirForCwd(repoPath);
 }
 
-// The transcripts dir for ONE session: its marker records the process `cwd` (worktree sessions spawn under
-// <board>/.canvas/worktrees/<key>), so a worktree session's .jsonl lives in a different projects dir than
-// the board root's. Falls back to the board-root dir for board-root/adopted sessions (marker without cwd, or
-// no marker yet). The single resolver the list (listSessions), the open (handleSession) and the resume all
-// go through, so a worktree session's transcript is found everywhere — not just the live-tail seed.
-function sessionTranscriptDir(repoPath: string, id: string): string {
-  const cwd = readCanvasSession(repoPath, id)?.cwd as string | undefined;
-  return cwd ? sessionsDir(cwd) : sessionsDir(repoPath);
-}
+// sessionTranscriptDir (the per-session transcripts-dir resolver) moved to routes/sessions.ts (god-file
+// split, Phase 4) — only the session read/resume routes called it. It reaches sessionsDir through the
+// ServerContext (sessionsDir stays here: the sessions-feed startup + the live-tail seed still call it).
 
 // Map a session's process cwd back to its CANONICAL board root. A worktree session runs in
 // `<canonical>/.canvas/worktrees/<key>` (a deterministic location we own), so its board home — where the
@@ -372,57 +366,10 @@ function readSessionFile(dir: string, id: string): { content: string; truncated:
   }
 }
 
-function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string): void {
-  let chosen = id;
-  if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
-  if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
-  if (!/^[\w-]+$/.test(chosen)) return sendJson(res, 400, { error: "bad session id" });
-  // Resolve the transcript dir PER SESSION: a worktree session's .jsonl isn't under the board-root `dir`
-  // this handler was passed, but under its own cwd's projects dir (recorded on the marker). Without this a
-  // listed worktree session 404s the moment its card is opened.
-  const tdir = sessionTranscriptDir(repoPath, chosen);
-  const r = readSessionFile(tdir, chosen);
-  if (!r) return sendJson(res, 404, { error: "not found" });
-  // Backfill the ledger: a card asked for this transcript, so it's ON the board — that makes it canvas-
-  // owned by adoption (whether we spawned it or it predates the ledger). Marking on first serve is what
-  // migrates existing cards in (so they list again) without a client change, and keeps the list filtered
-  // to externals nobody has placed. Write-once: a real spawn already wrote a richer marker; don't clobber it.
-  if (!isCanvasSession(repoPath, chosen)) markCanvasSession(repoPath, chosen, { adoptedAt: Date.now() });
-  ensureSessionFeed(tdir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
-  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated });
-}
-
-// A human-legible label + counts for the dropdown, parsed from a transcript. The label prefers the
-// agent-written `ai-title` record (a clean summary the session already produces, refined as it grows
-// — so we keep the LAST one); failing that, the first human prompt, truncated. Two counts, both shown:
-// `turns` is user messages carrying actual text (things you typed, not the tool-result envelopes that
-// also ride the `user` channel); `messages` is the raw user+assistant record count (every tool
-// iteration included). Cached by mtime so the dropdown parses each transcript at most once.
-const summaryCache = new Map<
-  string,
-  { mtime: number; title: string | null; turns: number; messages: number }
->();
-
-function sessionSummary(
-  abs: string,
-  mtime: number,
-): { title: string | null; turns: number; messages: number } {
-  const hit = summaryCache.get(abs);
-  if (hit && hit.mtime === mtime)
-    return { title: hit.title, turns: hit.turns, messages: hit.messages };
-  let summary: { title: string | null; turns: number; messages: number };
-  try {
-    // Scan the WHOLE transcript (session-summary.js explains why a head/tail slice corrupts the counts and
-    // title). Memory is bounded here by parsing at most once per mtime; the byte cap lives at the file reads
-    // that serve content to the browser (readSessionFile / the live feed), not on this metadata pass.
-    summary = sessionSummaryFromText(fs.readFileSync(abs, "utf8"));
-  } catch {
-    // unreadable transcript → no summary; the client falls back to the bare id
-    summary = { title: null, turns: 0, messages: 0 };
-  }
-  summaryCache.set(abs, { mtime, ...summary });
-  return summary;
-}
+// handleSession + sessionSummary/summaryCache moved to routes/sessions.ts (god-file split, Phase 4) — only
+// the session read/list routes call them. handleSession reaches readSessionFile + ensureSessionFeed, and
+// handleSessions reaches sessionStatus, through the ServerContext; those three stay here (readSessionFile
+// and sessionStatus are shared with the feed/shadow-git/band paths, ensureSessionFeed is the feed engine).
 
 // The lifecycle BAND a session reads, in the SAME categories the session card paints
 // (card-types/session/render.js `frameState`): a live process is `working` (running) or `waiting` (idle,
@@ -430,7 +377,7 @@ function sessionSummary(
 // (blue, "waiting on an agent, not you"); an ended one reads its recorded reason — `done` / `crashed` / a
 // neutral `ended` (terminate or unknown). One server-side source so every view (the sessions list bar, the
 // minimap dot, the heads-up) agrees with the card instead of re-deriving it.
-type SessionBand =
+export type SessionBand =
   | "working" | "waiting" | "waiting-agent" | "scheduled" | "done" | "crashed" | "ended";
 function endReasonBand(reason: string | undefined): SessionBand {
   return reason === "done" ? "done" : reason === "crashed" ? "crashed" : "ended";
@@ -483,26 +430,8 @@ function sessionStatus(repoPath: string, id: string): SessionBand | null {
   return endReasonBand(readCanvasSession(repoPath, id)?.endReason as string | undefined);
 }
 
-// GET /api/sessions → every historical transcript (newest-first), for the Open-session dropdown. The
-// list IS the disk: a session card deleted from the canvas still appears here, so "reopen it later"
-// needs no canvas persistence — the .jsonl is the source of truth. listSessions() stays a cheap
-// readdir+stat (handleSession leans on it too); the per-transcript title/turn parse is added only here.
-function handleSessions(res: ServerResponse, dir: string, repoPath: string): void {
-  const sessions = listSessions(dir, repoPath).map((s) => {
-    const marker = readCanvasSession(repoPath, s.id);
-    return {
-      ...s,
-      ...sessionSummary(path.join(dir, s.id + ".jsonl"), s.mtime),
-      status: sessionStatus(repoPath, s.id),
-      // The role this session instantiates, if any — lets the list/minimap render `<RoleName>.<short-sid>`,
-      // with roleColour so a historical row's role chip tints the same as the live picker swatch.
-      roleId: (marker?.roleId as string | undefined) ?? null,
-      roleName: (marker?.roleName as string | undefined) ?? null,
-      roleColour: (marker?.roleColour as string | undefined) ?? null,
-    };
-  });
-  sendJson(res, 200, { sessions });
-}
+// handleSessions (GET /api/sessions) moved to routes/sessions.ts (god-file split, Phase 4). It reaches
+// sessionStatus through the ServerContext (sessionStatus stays here — the band-republish loop calls it too).
 
 // ── sessions-list feed (the sessions browser card's live push) ──────────────────────────────────
 // The session list is built by readdir+parse ON DEMAND (handleSessions); unlike the file tree it had
@@ -2117,103 +2046,10 @@ function resolveSpawnCwd(
   return { cwd: wt.path, worktree: wt, key };
 }
 
-async function handleSessionSpawn(
-  req: IncomingMessage,
-  res: ServerResponse,
-  repoPath: string,
-  boardId: string,
-  origin: string,
-): Promise<void> {
-  let body: {
-    prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
-    worktree?: unknown; base?: unknown; worktreeKey?: unknown;
-  } = {};
-  try {
-    const raw = await readBody(req);
-    if (raw) body = JSON.parse(raw);
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (liveSessionCount() >= MAX_LIVE_SESSIONS)
-    return sendJson(res, 429, { error: `live-session cap reached (${MAX_LIVE_SESSIONS}); terminate one first` });
-  // Optional: spawn this session AS a role — its charter is appended to the system prompt and its identity
-  // stamped on the marker (agent-roles.md). An unknown roleId is a client error, not a silent bare spawn.
-  let roleId: string | null = null;
-  let roleName: string | null = null;
-  let roleColour: string | null = null;
-  if (body.roleId != null && body.roleId !== "") {
-    if (typeof body.roleId !== "string") return sendJson(res, 400, { error: "roleId must be a string" });
-    const role = readRole(repoPath, body.roleId);
-    if (!role) return sendJson(res, 404, { error: `unknown role "${body.roleId}"` });
-    roleId = role.roleId;
-    roleName = role.name;
-    roleColour = role.colour;
-  }
-  // `thread` is the canonical spawn-into scope since §8 step 2; `channel` stays a working alias so live
-  // agents and old recipes don't break mid-transition.
-  const scope = typeof body.thread === "string" && body.thread ? body.thread : body.channel;
-  const threadId = typeof scope === "string" && scope ? scope : null;
-  // Worktree isolation (Stage 1): run this session in its own git worktree instead of the shared board root.
-  // Resolve the cwd BEFORE spawning — a bad request (worktree with no thread) or a git failure must 4xx/5xx,
-  // not leave a live process pointed at the wrong tree.
-  const wantWorktree = body.worktree === true;
-  const base = typeof body.base === "string" && body.base ? body.base : null;
-  const explicitKey = typeof body.worktreeKey === "string" && body.worktreeKey ? body.worktreeKey : null;
-  let cwd = repoPath;
-  let worktree: ReturnType<typeof ensureWorktree> | null = null;
-  try {
-    const resolved = resolveSpawnCwd(repoPath, { threadId, roleId, worktree: wantWorktree, base, explicitKey });
-    cwd = resolved.cwd;
-    worktree = resolved.worktree;
-  } catch (err) {
-    return sendJson(res, 400, { error: "worktree spawn rejected", detail: String(err) });
-  }
-  const id = crypto.randomUUID();
-  try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd);
-  } catch (err) {
-    return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
-  }
-  // A worker spawned into a channel starts its inbox at the channel's TAIL (history:"future"), seeded HERE —
-  // not via the snapshot-racing member:open onboarding — so its first read is its assignment, not the whole
-  // backlog (the replay-burial failure mode that made a returning session dismiss its task as old history).
-  if (threadId) {
-    pendingHistoryMode.set(historyKey(threadId, id), "future");
-    const live = liveSessions.get(id);
-    if (live) {
-      live.read[threadId] = seedCursor("future", threadLog(boardId, threadId));
-      persistSessionState(live);
-    }
-  }
-  // Optionally drop the session's canvas card (and, with `channel`, its member:open edge) HERE on the
-  // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
-  // reads the channel card's position from the last snapshot and places the worker beside it, vs an agent
-  // guessing coordinates badly) AND robustness: dispatchBusCommand records the member:open in the
-  // immediate-membership registry, so a task the Coordinator posts right after this reliably wakes the worker even
-  // before the snapshot round-trips. `carded` reports whether a live tab applied it. Browser-initiated
-  // spawns omit these params and keep placing their own card. `card:true` = a standalone card, no edge.
-  let carded = false;
-  if (threadId || body.card === true) {
-    const records = boardSnapshotRecords(boardId);
-    const node = `node:live:${id}`;
-    const nodePayload: Record<string, unknown> = {
-      id: node, type: "session", title: id, color: roleColour ?? "blue", ...placeWorkerCard(records, threadId),
-    };
-    if (roleName) nodePayload.name = `${roleName}.${id.slice(0, 8)}`;
-    carded = dispatchBusCommand(boardId, { type: "addNode", actor: "system", payload: nodePayload }, origin) > 0;
-    if (threadId)
-      dispatchBusCommand(
-        boardId,
-        { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${threadId}`, from: node, to: threadId, type: "member:open" } },
-        origin,
-      );
-  }
-  if (typeof body.prompt === "string" && body.prompt.trim()) sendSessionInput(id, body.prompt);
-  sendJson(res, 200, {
-    id, roleId, roleName, roleColour, carded,
-    ...(worktree ? { worktree: { path: worktree.path, branch: worktree.branch, reused: worktree.reused, linked: worktree.linked } } : {}),
-  });
-}
+// handleSessionSpawn (POST /api/session/spawn) moved to routes/sessions.ts (god-file split, Phase 4). It
+// reaches the spawn primitives it shares with serverSpawnWorker below — liveSessionCount / MAX_LIVE_SESSIONS
+// / resolveSpawnCwd / placeWorkerCard / ensureLiveSession / sendSessionInput — plus the snapshot/thread
+// resolvers, through the ServerContext; those definitions stay here (Phase-5 engine territory).
 
 // ── P2/W5: server-spawn-from-a-durable-record (auto-wake.js) ─────────────────────────────────────────
 // The SERVER reconstitutes a session from a durable record on a qualifying wake — a comment/answer on a
@@ -2521,67 +2357,11 @@ function standingJobsTick(): void {
   }
 }
 
-// POST /api/session/<id>/input  { text } → write a prompt into the live process. Session-internal: no
-// canvas-log entry, no editor.commit (session-timelines §4). 409 if the session isn't live.
-async function handleSessionInput(req: IncomingMessage, res: ServerResponse, id: string): Promise<void> {
-  if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  let body: { text?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.text !== "string" || !body.text.trim())
-    return sendJson(res, 400, { error: "missing text" });
-  if (!sendSessionInput(id, body.text)) return sendJson(res, 409, { error: "session not running" });
-  sendJson(res, 200, { ok: true });
-}
-
-// POST /api/session/<id>/resume → recommence a historical session live, IN PLACE. Seed the live
-// buffer from its .jsonl (so the history survives the feed superseding the static transcript) and
-// spawn `claude --resume <id>`. The card keys its feed off session:<id>, so the SAME card flips from
-// historical to live duplex — no new card, no new id. This is the unify-on-resume handoff (slice 3).
-function handleSessionResume(req: IncomingMessage, res: ServerResponse, repoPath: string, id: string): void {
-  if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!readSessionFile(sessionTranscriptDir(repoPath, id), id))
-    return sendJson(res, 404, { error: "no transcript for that session" });
-  try {
-    ensureLiveSession(id, repoPath, true, originOf(req));
-  } catch (err) {
-    return sendJson(res, 500, { error: "failed to resume", detail: String(err) });
-  }
-  sendJson(res, 200, { ok: true });
-}
-
-// POST /api/session/<id>/interrupt → halt the live session's current turn (no body). Session-internal,
-// like input/resume: a POST, never editor.commit, never a canvas-log entry. 409 if it isn't live.
-function handleSessionInterrupt(res: ServerResponse, id: string): void {
-  if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!sendSessionInterrupt(id)) return sendJson(res, 409, { error: "session not running" });
-  sendJson(res, 200, { ok: true });
-}
-
-// POST /api/session/<id>/terminate → kill the live process and free its cap slot (clean teardown for an
-// agent that spawned a helper, replacing OS-level PID-hunting). The `exit` handler flips status to
-// "exited" and republishes; we drop the registry entry so the slot frees immediately. The canvas card is
-// left as-is (it flips to the historical/exited state) — remove it separately via removeNode if wanted.
-// 409 if the session isn't live. Idempotent-ish: a second call 409s once it's already gone.
-function handleSessionTerminate(res: ServerResponse, id: string): void {
-  if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!endSession(id, "terminated")) return sendJson(res, 409, { error: "session not live" });
-  sendJson(res, 200, { ok: true, terminated: id });
-}
-
-// POST /api/session/<id>/done → the EXPLICIT "I'm finished" teardown (Phase 2). Same mechanics as
-// /terminate — kill the process, free the cap slot — but records `endReason:"done"` so the card paints
-// the calm "✓ done" band instead of the neutral terminated one. The human "End session" button and an
-// agent that has wrapped up both curl this. No ?board= needed: the live session knows its own repoPath.
-// 409 if the session isn't live (you can only end one that's running).
-function handleSessionDone(res: ServerResponse, id: string): void {
-  if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!endSession(id, "done")) return sendJson(res, 409, { error: "session not live" });
-  sendJson(res, 200, { ok: true, done: id });
-}
+// handleSessionInput / handleSessionResume / handleSessionInterrupt / handleSessionTerminate /
+// handleSessionDone (POST /api/session/<id>/{input,resume,interrupt,terminate,done}) moved to
+// routes/sessions.ts (god-file split, Phase 4). They reach the process/teardown engine — sendSessionInput,
+// sendSessionInterrupt, ensureLiveSession, endSession (below), readSessionFile, originOf — through the
+// ServerContext; those definitions stay here (Phase-5 session-host territory).
 
 // Shared teardown for /terminate and /done: stamp the end reason (durably, BEFORE the kill — the exit
 // handler reads s.endReason to decide it wasn't a crash), kill the child, free the cap slot, republish so
@@ -3447,6 +3227,21 @@ setServerContext({
   forgetDurableMember,
   republishThreadSeatOccupants,
   serverSpawnWorker,
+  // Sessions (Phase 4) — the read/list + lifecycle/spawn route modules (routes/sessions.ts) reach the
+  // session-host spawn/process engine + the transcript/feed machinery through these. Definitions stay here
+  // (Phase-5 territory); the seam injects the operations, same as the effects above.
+  sessionsDir,
+  readSessionFile,
+  sessionStatus,
+  liveSessionCount,
+  MAX_LIVE_SESSIONS,
+  resolveSpawnCwd,
+  placeWorkerCard,
+  ensureLiveSession,
+  sendSessionInput,
+  sendSessionInterrupt,
+  endSession,
+  ensureSessionFeed,
 });
 
 // ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────
@@ -3468,31 +3263,11 @@ setServerContext({
 const GLOBAL_ROUTES: GlobalRoute[] = [
   // The feeds stream is global (one connection per tab; feed names are themselves board-suffixed).
   { match: exact("/api/feeds"), run: (req, res) => handleFeeds(req, res) },
-  // Session reads/spawns ARE board-scoped (?board=, default board if omitted) — the transcripts dir and the
-  // spawn cwd are this board's repo. input/interrupt/resume address a live process by its globally-unique
-  // id; only spawn + resume need the repo (cwd / transcript seed).
-  {
-    method: "POST",
-    match: exact("/api/session/spawn"),
-    run: (req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return void handleSessionSpawn(req, res, b.repoPath, b.boardId, originOf(req));
-    },
-  },
-  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/input$/), run: (req, res, _url, g) => void handleSessionInput(req, res, g[0]!) },
-  {
-    method: "POST",
-    match: re(/^\/api\/session\/([\w-]+)\/resume$/),
-    run: (req, res, url, g) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleSessionResume(req, res, b.repoPath, g[0]!);
-    },
-  },
-  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/interrupt$/), run: (_req, res, _url, g) => handleSessionInterrupt(res, g[0]!) },
-  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/terminate$/), run: (_req, res, _url, g) => handleSessionTerminate(res, g[0]!) },
-  { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/done$/), run: (_req, res, _url, g) => handleSessionDone(res, g[0]!) },
+  // Session lifecycle + spawn (routes/sessions.ts): POST /api/session/spawn then POST /api/session/<id>/
+  // {input,resume,interrupt,terminate,done} — same six arms, same order/method/gate-stage the inline entries
+  // held. The load-bearing ordering (spawn exact → /<id>/* regex → the bare /api/session read below in
+  // sessionReadRoutes) is preserved by the two spread points.
+  ...sessionLifecycleRoutes,
   // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision buttons, and
   // the headless list. Ids are global UUIDs — no ?board= anywhere here. (routes/permissions.ts)
   ...permissionRoutes,
@@ -3504,22 +3279,10 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   // GET .../jobs and GET .../worktrees reads — same three arms, same order/method/gate-stage. The action
   // regex ordering relative to the bare /api/threads list below stays load-bearing (unchanged).
   ...threadRoutes,
-  {
-    match: exact("/api/session"),
-    run: (_req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleSession(res, sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath);
-    },
-  },
-  {
-    match: exact("/api/sessions"),
-    run: (_req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleSessions(res, sessionsDir(b.repoPath), b.repoPath);
-    },
-  },
+  // Session read + list (routes/sessions.ts): GET /api/session (transcript tail) then GET /api/sessions
+  // (list) — same two arms, same order/method/gate-stage, spread here after the thread routes and before
+  // the bare /api/threads list, exactly where the inline entries sat.
+  ...sessionReadRoutes,
   {
     match: oneOf("/api/threads", "/api/channels"),
     run: (_req, res, url) => {

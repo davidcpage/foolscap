@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
-import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, SessionBand, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 import type { WorkIntent } from "./work-intent.js";
+import type { EnsuredWorktree } from "./worktrees.js";
 
 // ── the ServerContext seam ────────────────────────────────────────────────────────────────────────
 // The second seam of the god-file split (server-http.ts is the first). Where server-http.ts holds the
@@ -117,6 +118,38 @@ export interface ServerContext {
     claimKey: string;
     firstPrompt: string;
   }) => string | null;
+  // Sessions routes (Phase 4). The read/list + lifecycle/spawn handlers (routes/sessions.ts) drive the
+  // session-host spawn/process ENGINE and the live-session feed/registry machinery — Phase-5 territory that
+  // stays in the shell. So, exactly like serverSpawnWorker above, these expose the ENGINE operations the
+  // routes need (definitions stay in vite-fs-plugin.ts, injected once via setServerContext); each is shared
+  // (a caller outside the route set — serverSpawnWorker, the idle reaper, the feed startup, the shadow-git /
+  // adoption paths), so none could sink into the route module. Resolvers/consts first, then the effects.
+  sessionsDir: (repoPath: string) => string; // a board's Claude-Code transcripts dir (projectsDirForCwd)
+  readSessionFile: (dir: string, id: string) => { content: string; truncated: boolean } | null; // one transcript, tail-capped
+  sessionStatus: (repoPath: string, id: string) => SessionBand | null; // the ONE whole-session status band
+  liveSessionCount: () => number; // live (status !== "exited") sessions across every board — the spawn cap input
+  MAX_LIVE_SESSIONS: number; // the concurrent-live-session ceiling the spawn guard 429s against
+  resolveSpawnCwd: (
+    repoPath: string,
+    opts: { threadId: string | null; roleId: string | null; worktree: boolean; base: string | null; explicitKey: string | null },
+  ) => { cwd: string; worktree: EnsuredWorktree | null; key: string | null }; // worktree-or-board-root spawn cwd
+  placeWorkerCard: (
+    records: Array<Record<string, unknown>> | null,
+    threadId: string | null,
+  ) => { x: number; y: number; w: number; h: number }; // server-side worker-card placement beside its channel
+  ensureLiveSession: (
+    id: string,
+    repoPath: string,
+    resume?: boolean,
+    origin?: string,
+    roleId?: string | null,
+    threadId?: string | null,
+    cwd?: string,
+  ) => LiveSession; // spawn/adopt a live process into the registry (session-host engine)
+  sendSessionInput: (id: string, text: string, opts?: { keepWaitingOn?: boolean }) => boolean; // write a prompt to stdin
+  sendSessionInterrupt: (id: string) => boolean; // halt the current turn via the stdin control channel
+  endSession: (id: string, endReason: "done" | "terminated") => boolean; // teardown: kill + free the cap slot
+  ensureSessionFeed: (dir: string, id: string, repoPath: string) => void; // start live-tailing a transcript
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter
