@@ -577,21 +577,32 @@ export function addSessionsCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
-// The channels browser card (card-types/channels) — the sessions card's twin: a persistent on-canvas list of
-// this board's channels; drag a row out (or double-click) to REOPEN that channel as a card (openChannel). Its
-// body reads the off-log `channelList` projection (content.ts, /api/channels), so this addNode is the only
-// thing it ever logs — the list churns off-log like the sessions card. A stable singleton id (node:channels) →
-// idempotent: re-adding is a no-op rather than littering the board. actor "user" + selected, like addSessionsCard.
+// The Threads indicator — a corner-pinned HUD element (hud.ts), no longer a world card. Its body reads the
+// off-log `channelList` projection (content.ts, /api/channels) through granted capabilities: the live list of
+// this board's threads with unread counts + waiting highlights, and click/double-click/drag-out to open a
+// thread (openChannel). So this addNode is the only thing it ever logs — the list churns off-log like the
+// clock/usage/sessions cards. anchor:"screen" routes it to the ScreenLayer, where HUD membership corner-locks
+// it in the top-left stack and toggles it with the minimap (Alt tap) — the stored x/y are a headless fallback
+// overridden by the derived corner position. Seeded hidden (seedHud), not menu-spawnable. Stable singleton id
+// (node:channels) → idempotent across reloads/StrictMode. Compact height: the interior list scrolls.
+export const CHANNELS_HUD_W = 280;
+export const CHANNELS_HUD_H = 300;
 export function addChannelsCard(m: InteractionManager, at?: Pos): void {
-  const w = 280;
-  const h = 360;
-  const id = "node:channels" as Id<"node">;
   m.editor.commit({
     type: "addNode",
-    actor: "user",
-    payload: { id, type: "channels", title: "", text: "", color: "purple", ...(at ?? spawnAt(m, w, h)), w, h },
+    actor: "system",
+    payload: {
+      id: "node:channels" as Id<"node">,
+      type: "channels",
+      title: "",
+      text: "",
+      color: "purple",
+      anchor: "screen",
+      ...(at ?? spawnAt(m, CHANNELS_HUD_W, CHANNELS_HUD_H)),
+      w: CHANNELS_HUD_W,
+      h: CHANNELS_HUD_H,
+    },
   });
-  m.selection.set([id]);
 }
 
 // The roles browser card (card-types/roles, agent-roles.md) — the channels/sessions card's twin: a persistent

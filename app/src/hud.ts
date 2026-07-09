@@ -7,8 +7,10 @@
 // is NOT a HUD card, so it stays draggable and always visible, unaffected by the HUD toggle.
 
 // The ordered HUD stack: first entry sits at the top-left corner, each next below the one before. The
-// usage card leads (the primary read); the clock stacks under it.
-export const HUD_CARDS = ["node:usage", "node:clock"];
+// usage card leads (the primary read); the clock stacks under it; the Threads indicator (channels) sits
+// below — a live status glance (unread counts + waiting highlights, click-to-open) rather than a pinned
+// canvas card.
+export const HUD_CARDS = ["node:usage", "node:clock", "node:channels"];
 
 export function isHudCard(id: string): boolean {
   return HUD_CARDS.includes(id);

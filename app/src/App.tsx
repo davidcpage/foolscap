@@ -36,6 +36,8 @@ import {
   addProvenanceCard,
   addSessionsCard,
   addChannelsCard,
+  CHANNELS_HUD_W,
+  CHANNELS_HUD_H,
   addStickyNote,
   addUsageCard,
   addWeatherCard,
@@ -151,16 +153,33 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
   return { m, undo, persistence };
 }
 
-// Ensure the HUD chrome exists on this board. Usage + clock are HUD-only elements now (hud.ts) — removed
-// from the Add menu — so a board that never had them (a fresh one, or one cleared) still gets the corner
-// chrome. Idempotent: addUsageCard/addClock use stable singleton ids, and we skip them if the node is
-// already present, so a returning board neither duplicates nor re-logs. Seeded hidden — the HUD group is
-// off until the Alt tap, exactly like the minimap; the cards' stored x/y are a headless fallback the
-// corner geometry overrides at render.
+// Ensure the HUD chrome exists on this board. Usage + clock + the Threads indicator (channels) are HUD-only
+// elements now (hud.ts) — removed from the Add menu — so a board that never had them (a fresh one, or one
+// cleared) still gets the corner chrome. Idempotent: the seeders use stable singleton ids, and we skip them
+// if the node is already present, so a returning board neither duplicates nor re-logs. Seeded hidden — the
+// HUD group is off until the Alt tap, exactly like the minimap; the cards' stored x/y are a headless
+// fallback the corner geometry overrides at render.
+//
+// The Threads card was a WORLD card before this change, so a returning board can carry a pinned-to-canvas
+// node:channels. Migrate it into the HUD in place: flip its anchor to "screen" (HUD membership then corner-
+// locks it) and reset it to the compact HUD box, so the old canvas card doesn't linger as a duplicate.
 function seedHud(m: InteractionManager): void {
   const store = m.editor.store;
   if (!store.get<"node">("node:usage" as Id<"node">)) addUsageCard(m);
   if (!store.get<"node">("node:clock" as Id<"node">)) addClock(m);
+  const channels = store.get<"node">("node:channels" as Id<"node">);
+  if (!channels) {
+    addChannelsCard(m);
+  } else {
+    const l = store.get<"layout">(layoutId("node:channels" as Id<"node">)) as LayoutRecord | undefined;
+    if (l && l.anchor !== "screen") {
+      m.editor.commit({
+        type: "setAnchor",
+        actor: "system",
+        payload: { id: "node:channels" as Id<"node">, anchor: "screen", x: 16, y: 16, w: CHANNELS_HUD_W, h: CHANNELS_HUD_H },
+      });
+    }
+  }
 }
 
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.
@@ -1023,7 +1042,8 @@ function CanvasMenu({
         <button onClick={() => run(() => addSessionsCard(m, at))}>Sessions</button>
         <button onClick={() => run(() => addRolesCard(m, at))}>Roles</button>
         <button onClick={() => run(() => void createThread(m.editor, at))}>New thread</button>
-        <button onClick={() => run(() => addChannelsCard(m, at))}>Threads</button>
+        {/* The Threads indicator is HUD-only chrome now (hud.ts) — seeded at boot (seedHud) and toggled
+            with the minimap by the Alt tap, not a spawnable world card. */}
         <div className="menu-section">Files</div>
         <NewFileItem m={m} at={at} onClose={onClose} />
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
