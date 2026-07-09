@@ -50,6 +50,13 @@ function fmtSize(bytes) {
   return kb < 1024 ? `${Math.round(kb)} KB` : `${(kb / 1024).toFixed(1)} MB`;
 }
 
+// The NON-TERMINAL session states — a session still in flight, whatever it's blocked on. Mirrors the
+// lifecycle band (app/src/session-status.ts): working (running), waiting (on the human), waiting-agent
+// (on a peer), scheduled (asleep on a timer between heartbeats). done/crashed/ended are terminal and
+// excluded. The header's running badge counts these, so a glance at the HUD tells you how many agents
+// are live without opening a single card.
+const RUNNING_STATUS = new Set(["working", "waiting", "waiting-agent", "scheduled"]);
+
 export default {
   contract: 1,
   render(card) {
@@ -60,10 +67,18 @@ export default {
     const del = card.signals.sessionDelete; // hide-from-list action (Shift+Delete on a selected row)
     const open = card.signals.sessionOpen; // double-click → open this session as a card (drag-out's twin)
     const count = sessions ? sessions.length : 0;
+    // Running = non-terminal sessions (still in flight — see RUNNING_STATUS). The header badge is the
+    // at-a-glance "how many agents are live" read the HUD placement is for.
+    const running = (sessions ?? []).filter((s) => RUNNING_STATUS.has(s.status)).length;
 
     return html`
       <div class="file-head">
         <span class="file-name">sessions</span>
+        ${running
+          ? html`<span class="ses-running" title=${`${running} session${running === 1 ? "" : "s"} running`}
+              >${running} running</span
+            >`
+          : ""}
         ${refresh
           ? html`<button
               class="ses-refresh"

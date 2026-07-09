@@ -5,13 +5,15 @@
 // on the full-viewport .screen-layer) and can't be dragged. A user-PINNED floating card (the `p` key) is
 // NOT a HUD card, so it stays draggable and always visible, unaffected by the HUD toggle.
 //
-// The three HUD cards no longer share one top-left column (that stack overflowed the viewport). Each now
-// has its OWN corner (hudPlacementFor):
-//   • usage    — top-LEFT, the primary read.
+// The HUD cards no longer share one top-left column (that stack overflowed the viewport). They split
+// across corners (hudPlacementFor):
+//   • usage    — top-LEFT, the primary read, at the left-column width (MINIMAP_WIDTH).
+//   • sessions — LEFT column, directly beneath usage at matching width, a viewport-capped scrolling list
+//                (the sessions browser: historical + live agent sessions, with a running-count badge).
 //   • clock    — top-CENTRE, frameless (a bare face, not a boxed card).
 //   • channels — top-RIGHT, directly under the minimap at matching width, a viewport-capped scrolling list
 //                (the Threads indicator: unread counts + waiting highlights, click-to-open).
-export const HUD_CARDS = ["node:usage", "node:clock", "node:channels"];
+export const HUD_CARDS = ["node:usage", "node:sessions", "node:clock", "node:channels"];
 
 export function isHudCard(id: string): boolean {
   return HUD_CARDS.includes(id);
@@ -28,6 +30,15 @@ const MINIMAP_WIDTH = 240; // .minimap-hud width — the Threads card matches it
 const MINIMAP_HEIGHT = 180; // .minimap-hud height — the Threads card starts one gap below its bottom edge
 const THREADS_TOP = HUD_TOP + MINIMAP_HEIGHT + HUD_GAP; // top of the Threads card, flush under the minimap
 const CLOCK_SIZE = 72; // the top-centre clock renders compact (its stored 180×210 would dominate frameless)
+
+// The LEFT column: usage on top, sessions flush beneath it, both at MINIMAP_WIDTH so the two columns
+// (usage/sessions vs minimap/threads) read as a matched pair. The usage size is DERIVED here (set on the
+// placement, not the stored layout) so the stack is deterministic regardless of a board's migrated
+// node:usage record; SESSIONS_TOP is computed from it so the sessions card always sits one gap below the
+// usage box's bottom edge, exactly as THREADS_TOP tracks the minimap.
+const USAGE_WIDTH = MINIMAP_WIDTH; // left column matches the minimap column width
+const USAGE_HEIGHT = 300; // trimmed from the stored 320; drives the sessions-card top below
+const SESSIONS_TOP = HUD_TOP + USAGE_HEIGHT + HUD_GAP; // top of the sessions card, flush under usage
 
 // The screen placement of a HUD card: a `top` plus ONE horizontal anchor (left | right | centreX), with
 // optional size overrides (the Threads card matches the minimap's width; the clock renders compact) and a
@@ -50,7 +61,14 @@ export type HudPlacement = {
 export function hudPlacementFor(id: string): HudPlacement | null {
   switch (id) {
     case "node:usage":
-      return { top: HUD_TOP, left: HUD_LEFT };
+      return { top: HUD_TOP, left: HUD_LEFT, width: USAGE_WIDTH, height: USAGE_HEIGHT };
+    case "node:sessions":
+      return {
+        top: SESSIONS_TOP,
+        left: HUD_LEFT,
+        width: MINIMAP_WIDTH,
+        maxHeight: `calc(100vh - ${SESSIONS_TOP + HUD_GAP}px)`,
+      };
     case "node:clock":
       return { top: HUD_TOP, centreX: true, width: CLOCK_SIZE, height: CLOCK_SIZE, frameless: true };
     case "node:channels":

@@ -541,6 +541,11 @@ export function addStickyNote(m: InteractionManager, at?: Pos): void {
 // ScreenLayer, where being a HUD card corner-locks it at the top-LEFT and toggles it with the HUD group
 // (the stored x/y are a headless fallback, overridden by the derived corner position). A stable singleton
 // id → idempotent. Left untitled so it shows the plan bars alone.
+// The left HUD column matches the minimap column width (hud.ts USAGE_WIDTH / MINIMAP_WIDTH); the derived
+// HUD placement overrides these stored values at render, so they're the headless fallback + the record the
+// migration in seedHud resets an old (300×320 world) usage card to, keeping the two in step.
+export const USAGE_HUD_W = 240;
+export const USAGE_HUD_H = 300;
 export function addUsageCard(m: InteractionManager, at?: Pos): void {
   m.editor.commit({
     type: "addNode",
@@ -552,29 +557,41 @@ export function addUsageCard(m: InteractionManager, at?: Pos): void {
       text: "",
       color: "green",
       anchor: "screen",
-      ...(at ?? spawnAt(m, 300, 320)),
-      w: 300,
-      h: 320,
+      ...(at ?? spawnAt(m, USAGE_HUD_W, USAGE_HUD_H)),
+      w: USAGE_HUD_W,
+      h: USAGE_HUD_H,
     },
   });
 }
 
-// The sessions browser card (card-types/sessions, Phase C) — a persistent on-canvas list of historical
-// agent sessions; drag a row out to OPEN that session as a card (the directory card's drag-out, applied to
-// sessions). Its body reads the off-log `sessionList` projection (content.ts, /api/sessions), so this
-// addNode is the only thing it ever logs — the list churns off-log like the clock/feeds. A stable
-// singleton id → idempotent: re-adding is a no-op rather than littering the board. actor "user" + selected,
-// matching the directory browser card it's modelled on (a deliberate placement the user's ⌘Z can undo).
+// The sessions browser — a corner-pinned HUD element (hud.ts), no longer a world card. Its body reads the
+// off-log `sessionList` projection (content.ts, /api/sessions): the list of this board's historical + live
+// agent sessions, with drag-out / double-click to open one as a card (loader.openSession) and a running-
+// count badge in the header. So this addNode is the only thing it ever logs — the list churns off-log like
+// the clock/usage/channels cards. anchor:"screen" routes it to the ScreenLayer, where HUD membership
+// corner-locks it in the LEFT column flush beneath the usage card, at matching width and a viewport-capped
+// scrolling height, and toggles it with the minimap (Alt tap) — the stored x/y/w/h are a headless fallback
+// overridden by the derived placement. Seeded hidden (seedHud), not menu-spawnable. Stable singleton id
+// (node:sessions) → idempotent across reloads/StrictMode. Mirrors addChannelsCard, its twin in the right
+// column. The height is a compact default the interior list scrolls within (HudFrame also viewport-caps it).
+export const SESSIONS_HUD_W = 240;
+export const SESSIONS_HUD_H = 300;
 export function addSessionsCard(m: InteractionManager, at?: Pos): void {
-  const w = 280;
-  const h = 360;
-  const id = "node:sessions" as Id<"node">;
   m.editor.commit({
     type: "addNode",
-    actor: "user",
-    payload: { id, type: "sessions", title: "", text: "", color: "blue", ...(at ?? spawnAt(m, w, h)), w, h },
+    actor: "system",
+    payload: {
+      id: "node:sessions" as Id<"node">,
+      type: "sessions",
+      title: "",
+      text: "",
+      color: "blue",
+      anchor: "screen",
+      ...(at ?? spawnAt(m, SESSIONS_HUD_W, SESSIONS_HUD_H)),
+      w: SESSIONS_HUD_W,
+      h: SESSIONS_HUD_H,
+    },
   });
-  m.selection.set([id]);
 }
 
 // The Threads indicator — a corner-pinned HUD element (hud.ts), no longer a world card. Its body reads the
