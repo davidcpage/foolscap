@@ -50,8 +50,20 @@ const META = new Set(["type", "start", "end", "loc", "range", "sourceType", "dir
 export function analyzeCell(source, opts) {
   const src = String(source ?? "");
   // A2 lib loading: the ESM CDN base a BARE import specifier resolves to (a full URL passes through). One knob,
-  // resolved once here so a future import-map (A3) slots in at resolveSpecifierUrl. Default esm.sh.
+  // resolved once here; the import-map (A3) slots in at resolveSpecifierUrl. Default esm.sh.
   const cdnBase = (opts && typeof opts.cdnBase === "string" && opts.cdnBase) || DEFAULT_CDN_BASE;
+  // A3 import map (`{ name → url }`): pins the URL an EXPLICIT bare import resolves to (via resolveSpecifierUrl)
+  // AND supplies the URL for an AMBIENT auto-import (opts.ambient — see below). Null = no map (A2 behaviour).
+  const importMap = opts && opts.importMap && typeof opts.importMap === "object" ? opts.importMap : null;
+  // A3 parse-time reference resolution (Phase 2): the caller (computeEffective) has decided that these free-read
+  // names are neither a local binding nor a sibling export, but ARE in the import map — so they should be
+  // auto-imported. We synthesize a dynamic-import prologue (`const d3 = await import(<url>)`), exactly as an
+  // explicit `import * as d3 from "d3"` would, so NO value crosses postMessage — the realm imports it itself.
+  // Guard each name against the map so a stale request can't emit `undefined`.
+  const ambient =
+    opts && Array.isArray(opts.ambient) && importMap
+      ? opts.ambient.filter((n) => typeof importMap[n] === "string")
+      : [];
   let ast;
   try {
     ast = parse(src, PARSE_OPTS);
@@ -78,11 +90,18 @@ export function analyzeCell(source, opts) {
   const rest = ast.body.filter((s) => s.type !== "ImportDeclaration");
   const imports = importsFromDecls(importDecls, src);
 
-  // A cell is a STATEMENT BLOCK when it has any import (must be stripped) or more than one top-level
-  // statement — the worker runs it as a function body whose value is its LAST top-level expression. A single
-  // statement with NO imports keeps the single-EXPRESSION path verbatim, so an object literal `{a:1}` (which
-  // parses as a block statement) still evaluates as an expression via the worker's paren-wrap (no regression).
-  const block = importDecls.length > 0 || rest.length > 1;
+  // A3 ambient prologue: the auto-import statements for the caller-approved ambient names (never a locally
+  // bound name — a `const d3 = …` in the cell wins, so we'd never shadow it with an import). Empty unless
+  // this cell references a mapped lib with no import line. An ambient import injects STATEMENTS, so it forces
+  // block mode (a bare expression can't carry a preceding `const … = await import()`).
+  const ambientNames = ambient.filter((n) => !bound.has(n));
+  const ambientPrologue = buildAmbientPrologue(ambientNames, importMap);
+  // A cell is a STATEMENT BLOCK when it has any import (must be stripped), more than one top-level statement,
+  // or an ambient prologue to prepend — the worker runs it as a function body whose value is its LAST top-level
+  // expression. A single statement with NO imports/ambient keeps the single-EXPRESSION path verbatim, so an
+  // object literal `{a:1}` (which parses as a block statement) still evaluates as an expression via the
+  // worker's paren-wrap (no regression).
+  const block = importDecls.length > 0 || rest.length > 1 || ambientPrologue !== "";
   // OUTPUT SUPPRESSION (Jupyter/MATLAB/Observable `;`): the cell runs normally but DISPLAYS no value when its
   // final statement ends in a statement-terminating semicolon. AST-based, not string-trim: acorn extends an
   // ExpressionStatement past its inner expression ONLY for a real `;` terminator, so a `;` inside a string or
@@ -91,9 +110,12 @@ export function analyzeCell(source, opts) {
   const suppress = endsWithStatementSemicolon(src, ast);
   let defines, valueSource, keyedExports;
   if (block) {
-    const b = buildBlockSource(src, importDecls, rest, cdnBase);
+    const b = buildBlockSource(src, importDecls, rest, cdnBase, importMap);
     defines = b.defines;
-    valueSource = b.body;
+    // Prepend the ambient auto-import prologue (A3, Phase 2). It carries NO newline, so the block body's line
+    // numbers are untouched (a runtime error still points at the user's code); buildBlockSource already emitted
+    // its own return/exports epilogue, so the ambient const declarations simply sit ahead of the body.
+    valueSource = ambientPrologue + b.body;
     keyedExports = b.keyedExports;
   } else {
     const d = detectDefine(ast, src); // ast.body carries no imports here, so the step-4a logic applies as-is
@@ -113,7 +135,10 @@ export function analyzeCell(source, opts) {
   const externalImports = importDecls.some(
     (d) => d.source && typeof d.source.value === "string" && !isRelativeSpecifier(d.source.value),
   );
-  const domCandidate = externalImports || reads.some((n) => DOM_GLOBALS.has(n));
+  // An AMBIENT import loads an external lib exactly as an explicit one does, so it routes the cell to the
+  // main-thread realm the same way (a bare `Plot.plot(...)` needs real layout; a pure `d3.max` over-routes
+  // harmlessly, as today). ambientNames is the effective set actually injected into the prologue.
+  const domCandidate = externalImports || ambientNames.length > 0 || reads.some((n) => DOM_GLOBALS.has(n));
   return { ok: true, reads, defines, imports, valueSource, block, keyedExports, suppress, domCandidate };
 }
 
@@ -343,15 +368,29 @@ function isRelativeSpecifier(p) {
   return p.startsWith("./") || p.startsWith("../") || p.startsWith("/");
 }
 
-// ── A2 external-library loading: a non-relative specifier → the URL a dynamic import() loads ────────────
-// The SINGLE place a bare/URL import specifier becomes a URL — so a future import-map (A3) slots in right
-// here. A full URL (any scheme, or a protocol-relative `//cdn`) passes through UNCHANGED; a bare specifier
-// (`d3`, `d3-array`, `@scope/pkg`) maps onto a configurable ESM CDN base (default esm.sh, e.g.
-// `https://esm.sh/d3`). Relative specifiers never reach this — isRelativeSpecifier routes them to the
-// cross-card edge/input path instead.
+// ── A2 external-library loading + A3 import-map: a non-relative specifier → the URL a dynamic import() loads ─
+// The SINGLE place a bare/URL import specifier becomes a URL. Resolution order:
+//   1. the notebook IMPORT MAP (A3) — a `{ name → url }` override keyed by the bare specifier: pins a lib's
+//      URL (and version) consistently across the whole notebook. A user-written `d3@6` (its own version) is a
+//      DIFFERENT specifier, so it is never overridden — the map only pins the plain `d3` form.
+//   2. a full URL (any scheme, or a protocol-relative `//cdn`) passes through UNCHANGED.
+//   3. a bare specifier (`d3`, `d3-array`, `@scope/pkg`) maps onto a configurable ESM CDN base (default esm.sh).
+// Relative specifiers never reach this — isRelativeSpecifier routes them to the cross-card edge/input path.
 export const DEFAULT_CDN_BASE = "https://esm.sh/";
-export function resolveSpecifierUrl(spec, base = DEFAULT_CDN_BASE) {
+
+// The small, DELIBERATE default import map (A3): the two libs a notebook can reference with NO import line,
+// version-pinned so every cell resolves the same URL. Kept tiny on purpose — auto-importing a bare reference
+// means a typo matching an entry silently imports, so the blast radius stays minimal (a notebook extends it
+// via a `type="importmap"` cell). Keyed by the REFERENCE NAME the cell writes (`d3`, `Plot`); Plot's npm
+// specifier is `@observablehq/plot`, but the identifier you use is `Plot` — the map keys on the identifier.
+export const DEFAULT_IMPORT_MAP = Object.freeze({
+  d3: "https://esm.sh/d3@7",
+  Plot: "https://esm.sh/@observablehq/plot@0.6",
+});
+
+export function resolveSpecifierUrl(spec, base = DEFAULT_CDN_BASE, map = null) {
   const s = String(spec ?? "");
+  if (map && typeof map[s] === "string") return map[s]; // A3: the import map pins this specifier's URL
   if (/^[a-z][a-z0-9+.-]*:/i.test(s) || s.startsWith("//")) return s; // has a URI scheme, or protocol-relative
   return base + s; // a bare specifier → the CDN base
 }
@@ -377,7 +416,7 @@ function importedName(node) {
 //     last statement isn't an expression (a loop, a bare declaration) yields undefined, as a REPL block would.
 //
 // Returns the rewritten body, the define names, and keyedExports (true for the { value, exports } define form).
-function buildBlockSource(src, importDecls, rest, cdnBase) {
+function buildBlockSource(src, importDecls, rest, cdnBase, importMap) {
   const body0 = maskSpans(src, importDecls); // ALL import spans blanked; every other offset preserved (same length)
   // A2 LIB LOADING: a NON-relative import (bare `"d3"` / a full ESM URL) is neither a cross-card edge nor
   // runnable as a static `import` in the worker — but the worker runs the body via `new Function` in a module
@@ -385,7 +424,7 @@ function buildBlockSource(src, importDecls, rest, cdnBase) {
   // PREPEND it as a prologue. The import spans stay blanked in body0 above, so every downstream AST offset is
   // intact; the prologue carries NO newline, so the user's line 1 is still line 1 (as the define prologue relies
   // on). Empty string when the block has no non-relative import — the common case adds nothing.
-  const libPrologue = buildLibPrologue(importDecls, cdnBase);
+  const libPrologue = buildLibPrologue(importDecls, cdnBase, importMap);
   // Collect the names of every TOP-LEVEL `name = expr` assignment, in source order (no duplicates).
   const defines = [];
   for (const s of rest) {
@@ -423,12 +462,29 @@ function buildBlockSource(src, importDecls, rest, cdnBase) {
 // `const … = await import(<url>);` statement, joined on a SINGLE line (no newlines → line numbers preserved)
 // with a trailing space so it sits cleanly before the (blanked) body. Relative imports are skipped — they are
 // cross-card edges (injected as inputs, blanked from the body). Returns "" when there are none.
-function buildLibPrologue(importDecls, cdnBase) {
+function buildLibPrologue(importDecls, cdnBase, importMap) {
   const stmts = [];
   for (const d of importDecls) {
     const spec = d.source && typeof d.source.value === "string" ? d.source.value : "";
     if (!spec || isRelativeSpecifier(spec)) continue;
-    stmts.push(dynamicImportStatement(d, resolveSpecifierUrl(spec, cdnBase)));
+    stmts.push(dynamicImportStatement(d, resolveSpecifierUrl(spec, cdnBase, importMap)));
+  }
+  return stmts.length ? stmts.join(" ") + " " : "";
+}
+
+// The dynamic-import PROLOGUE for the A3 AMBIENT auto-imports (Phase 2): each caller-approved reference name
+// becomes `const <name> = await import(<url>);`, joined on a SINGLE line (no newlines → the block body's line
+// numbers are preserved) with a trailing space so it sits cleanly before the body. This is a NAMESPACE bind
+// (the whole module object, like `import * as d3 from "d3"`) — the shape d3/Plot expect, where `.max`/`.plot`
+// are named exports on the namespace. `url` comes from the import map (already a full, JSON-safe URL). Returns
+// "" when there are no ambient names, so a cell that references no mapped lib adds nothing.
+function buildAmbientPrologue(names, importMap) {
+  if (!importMap) return "";
+  const stmts = [];
+  for (const name of names) {
+    const url = importMap[name];
+    if (typeof url !== "string") continue;
+    stmts.push("const " + name + " = await import(" + JSON.stringify(url) + ");");
   }
   return stmts.length ? stmts.join(" ") + " " : "";
 }

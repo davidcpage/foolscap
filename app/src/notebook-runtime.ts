@@ -1,7 +1,7 @@
 import type { Subscribable } from "./lib";
 import { fileContentSignal } from "./content";
 import { activeBoardId } from "./board";
-import { analyzeCell, analyzeMarkdown } from "../vendor/notebook-infer.js";
+import { analyzeCell, analyzeMarkdown, DEFAULT_IMPORT_MAP } from "../vendor/notebook-infer.js";
 import { runMainThreadCell, isNode, serializeView, cloneSafe } from "./notebook-main-exec.js";
 
 // The notebook RUNTIME (docs/notebook-card.md §3/§5/§6) — an app subsystem, NOT the card template
@@ -424,7 +424,7 @@ function buildGraph(nb: NB): void {
 // verbatim; only an ABSENT declaration is filled from inference. Cross-card imports (a `path` set) are
 // always explicit (the step-2 attribute), so a cell with only cross-card imports still gets its LOCAL reads
 // inferred. The result is the EFFECTIVE spec set the rest of the runtime (graph, exports, worker) uses.
-function computeEffective(modules: CellSpec[]): CellSpec[] {
+function computeEffective(modules: CellSpec[], importMap: Record<string, string>): CellSpec[] {
   // Pass 1: per-cell analysis + everything the notebook PRODUCES, which a sibling's reads can match: the
   // effective EXPORT names (explicit data-out or inferred defines) AND the RE-EXPORTS — the local names a
   // cross-card `import {y} from "./nb"` republishes as notebook-local exports (Observable's import-cell, so
@@ -438,7 +438,10 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
     // A markdown/html cell is COMPILED to a template literal (analyzeMarkdown) and runs like a single-
     // expression cell; a `module` cell is analyzed as code. A prose cell with no live `${ }` interpolation is
     // pure content — drop it from the graph entirely (no worker run, no output); the card renders its source.
-    const a = c.type === "module" ? analyzeCell(c.source) : analyzeMarkdown(c.source);
+    // Thread the import map into analyzeCell so an EXPLICIT bare import (`import * as d3 from "d3"`) pins to
+    // the notebook's URL for that lib (A3, Phase 1). Ambient auto-import (Phase 2) is decided below, once the
+    // notebook's full set of produced names is known (precedence: a sibling export wins over an ambient lib).
+    const a = c.type === "module" ? analyzeCell(c.source, { importMap }) : analyzeMarkdown(c.source);
     if (c.type !== "module" && !("interpolated" in a && (a as { interpolated?: boolean }).interpolated)) continue;
     analysis.set(c.id, a);
     effOut.set(c.id, c.outNames.length ? c.outNames : a.defines);
@@ -456,7 +459,16 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
   // shape). An explicit data-in wins outright (the override). Either way `runSource`/`block` come from
   // inference — the worker always runs the import-stripped body, since it can't execute `import`.
   return scheduled.map((c) => {
-    const a = analysis.get(c.id)!;
+    let a = analysis.get(c.id)!;
+    // PARSE-TIME REFERENCE RESOLUTION (A3, Phase 2, module cells only): a free read that is NOT produced by a
+    // sibling and IS a known lib (in the import map) is AUTO-IMPORTED — re-analyze the cell so analyzeCell
+    // synthesizes the `const name = await import(url)` prologue (and routes it to the main-thread realm). This
+    // enforces the precedence local > sibling > ambient: `reads` already excludes local bindings, and filtering
+    // out `produced` lets a sibling cell exporting `d3` shadow the ambient lib (never shadowing user data).
+    if (c.type === "module") {
+      const ambient = a.reads.filter((n) => !produced.has(n) && typeof importMap[n] === "string");
+      if (ambient.length) a = analyzeCell(c.source, { importMap, ambient });
+    }
     const hasExplicitIn = importsOf(c).length > 0;
     const inferredIn = !hasExplicitIn;
     const inferredLocal: CellImport[] = a.reads.filter((n) => produced.has(n)).map((name) => ({ name, path: null, export: null }));
@@ -478,21 +490,46 @@ function computeEffective(modules: CellSpec[]): CellSpec[] {
   });
 }
 
+// The notebook's effective import map (A3): the small built-in defaults (d3/Plot, version-pinned) overlaid
+// with any `type="importmap"` cell's JSON — a flat `{ name: url }` table (a `{ imports: {…} }` wrapper is also
+// accepted). Later cells win; malformed JSON / non-string values are ignored (best-effort — never throw,
+// matching the format parser's posture). Keys are REFERENCE NAMES (the identifier a cell writes: `d3`, `Plot`)
+// → the ESM URL to import, used for BOTH explicit-import pinning and ambient auto-import.
+function extractImportMap(rawCells: CellSpec[]): Record<string, string> {
+  const map: Record<string, string> = { ...DEFAULT_IMPORT_MAP };
+  for (const c of rawCells) {
+    if (c.type !== "importmap") continue;
+    let obj: unknown;
+    try {
+      obj = JSON.parse(c.source);
+    } catch {
+      continue; // a half-typed / invalid map — keep the last-good map, never throw
+    }
+    if (!obj || typeof obj !== "object") continue;
+    const wrapped = (obj as { imports?: unknown }).imports;
+    const table = wrapped && typeof wrapped === "object" ? (wrapped as Record<string, unknown>) : (obj as Record<string, unknown>);
+    for (const [k, v] of Object.entries(table)) if (typeof v === "string") map[k] = v;
+  }
+  return map;
+}
+
 // ── sync: the template feeds the parsed cells in; we diff and (re)schedule ────────────────────────
 export function syncCells(cardKey: string, rawCells: CellSpec[]): void {
+  const importMap = extractImportMap(rawCells); // A3: defaults + any type="importmap" cell (before scheduling)
   const rawScheduled = rawCells.filter(isScheduled); // module cells + interpolated markdown cells
   // The signature is over the RAW cells the template parsed — what the user actually wrote (type + source +
-  // explicit data-in/data-out/policy). Inference is a pure function of those sources, so an unchanged raw
-  // signature means an unchanged EFFECTIVE graph: gate on it FIRST, so a mere re-render (an output change)
-  // never re-parses every cell with acorn — only a real source/wiring edit pays for computeEffective. `type`
-  // is in the signature so a markdown↔module conversion (same source) still re-syncs.
-  const sig = JSON.stringify(rawScheduled.map((c) => [c.id, c.type, c.source, importsOf(c), c.outNames, c.policy]));
+  // explicit data-in/data-out/policy) — PLUS the import map (an importmap-cell edit changes resolution but not
+  // any scheduled cell, so it must be in the signature or the change would be gated out). Inference is a pure
+  // function of these, so an unchanged signature means an unchanged EFFECTIVE graph: gate on it FIRST, so a
+  // mere re-render (an output change) never re-parses every cell with acorn — only a real source/wiring/map
+  // edit pays for computeEffective. `type` is in the signature so a markdown↔module conversion still re-syncs.
+  const sig = JSON.stringify([importMap, rawScheduled.map((c) => [c.id, c.type, c.source, importsOf(c), c.outNames, c.policy])]);
   let nb = nbs.get(cardKey);
   if (nb && nb.sig === sig) return; // a pure re-render (outputs changed) — same graph, nothing to do
 
   // The graph actually changed → fold in acorn inference to get the EFFECTIVE specs (inferred reads/defines
   // where no explicit declaration was written) that the rest of the runtime schedules and runs.
-  const modules = computeEffective(rawScheduled);
+  const modules = computeEffective(rawScheduled, importMap);
 
   const prev = nb;
   const prevSpecs = prev?.specs ?? new Map<string, CellSpec>();
