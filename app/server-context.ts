@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
-import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo } from "./vite-fs-plugin.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { WorkIntent } from "./work-intent.js";
 
 // ── the ServerContext seam ────────────────────────────────────────────────────────────────────────
 // The second seam of the god-file split (server-http.ts is the first). Where server-http.ts holds the
@@ -65,6 +66,57 @@ export interface ServerContext {
     rel: string,
     eventKind: "note" | "answer" | "suggestion",
   ) => void;
+  // Threads / inbox / asks (Phase 3). The extracted thread/inbox/ask route modules call heavily into the
+  // channel-delivery / wake / spawn engine — which is Phase-5 territory and stays in the shell. So, exactly
+  // like publishSession/maybeWakeDocWorker, these expose the ENGINE OPERATIONS the routes need (definitions
+  // stay in vite-fs-plugin.ts, injected once via setServerContext); each is cross-cutting (engine callers
+  // outside the routes). Snapshot/log resolvers first (they read boards / the emitted+durable membership
+  // bridge / threadLogs), then the delivery/wake/persist/spawn effects. The pure record/history helpers
+  // (threadNode/sessionNodeForSid/sessionNameForSid/seedCursor/historyKey) are on the context — not sunk
+  // into a route module — because the shell (maybeAnnounceMembership, sessionThreads, boot paths) still
+  // calls them too and cannot import from routes/ (cycle); they are resolvers, categorically like reqBoard.
+  boardSnapshotRecords: (boardId: string) => Array<Record<string, unknown>> | null;
+  threadNode: (records: Array<Record<string, unknown>>, threadId: string) => SnapNode | null;
+  sessionNodeForSid: (records: Array<Record<string, unknown>>, sid: string) => string | null;
+  sessionNameForSid: (records: Array<Record<string, unknown>>, sid: string) => string | null;
+  threadMemberSids: (records: Array<Record<string, unknown>>, threadId: string) => string[];
+  sessionThreads: (records: Array<Record<string, unknown>>, sid: string) => string[];
+  threadLog: (boardId: string, threadId: string) => ThreadMsg[];
+  seedCursor: (mode: "full" | "future", log: ThreadMsg[]) => number;
+  historyKey: (threadId: string, sid: string) => string;
+  appendThreadMsg: (
+    boardId: string,
+    threadId: string,
+    from: string,
+    text: string,
+    extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
+  ) => ThreadMsg;
+  wakeThreadMembers: (
+    boardId: string,
+    threadId: string,
+    exceptSid: string,
+    opts: { broadcast: boolean; mentioned?: Set<string>; origin?: string },
+  ) => number;
+  publishThreadFeed: (boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean) => void;
+  flushNudge: (s: LiveSession) => void;
+  persistSessionState: (s: LiveSession) => void;
+  dispatchBusCommand: (
+    boardId: string,
+    cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
+    origin: string,
+  ) => number;
+  forgetDurableMember: (repoPath: string | undefined, threadId: string, sid: string) => void;
+  republishThreadSeatOccupants: (repoPath: string, threadId: string) => void;
+  serverSpawnWorker: (opts: {
+    boardId: string;
+    repoPath: string;
+    origin: string;
+    roleId: string | null;
+    threadId: string | null;
+    anchorNodeId: string | null;
+    claimKey: string;
+    firstPrompt: string;
+  }) => string | null;
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter

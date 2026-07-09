@@ -11,27 +11,25 @@ import { canvasSessionsDir, isCanvasSession, listSessions, markCanvasSession, pr
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, markSeenMentions, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readSeenMentions, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, sessionIdleIntent, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
-import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, ownBlockedIntentKeys, readPins, readSeenMentions, readThreadLog, readThreadMeta, removeThreadMember, seatForSid, sessionDeclaredDone, sessionIdleIntent, threadLevelForSid, threadMembersFromMeta, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
-import { unreadMentions } from "./cas-guard.js";
 import { connectedEdgeIds } from "./node-cascade.js";
-import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
-import { isNotificationLevel, NOTIFICATION_LEVELS, wakesSeat } from "./notification-levels.js";
+import { intentLine, type WorkIntent } from "./work-intent.js";
+import { wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
 import { readWatchers } from "./doc-watch.js";
 import { claimSurface, docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, reapKeepAliveMs, releaseSurface, seatSurfaceKey, shouldReapIdle, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
+import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
 import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { canvasRolesDir, listRoles, readRole } from "./role-ledger.js";
-import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey, parseWorktreePorcelain, worktreeOnboarding } from "./worktrees.js";
+import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, parseWorktreePorcelain, worktreeOnboarding } from "./worktrees.js";
 import { sessionSummaryFromText } from "./session-summary.js";
 import { boardPersistMtime, describeBoardEvents, readBoardPersist, readBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
-import { sendJson, readBody, openSse, windowParam, type SseClient } from "./server-http.js";
+import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
@@ -44,6 +42,9 @@ import { boardPersistRoutes } from "./routes/board-persist.js";
 import { fileRootRoutes } from "./routes/files.js";
 import { annotationBoardRoutes } from "./routes/annotations.js";
 import { rootsBoardRoutes } from "./routes/roots.js";
+import { inboxRoutes } from "./routes/inbox.js";
+import { askRoutes } from "./routes/asks.js";
+import { threadRoutes } from "./routes/threads.js";
 import { isInternalPath, openRootWatcher } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -676,7 +677,7 @@ function startRolesFeed(boardId: string, repoPath: string): void {
 // watcher on every reload.
 // One channel's off-log message log (4e): the durable-for-the-process record of a channel's conversation,
 // the source for both the channel:<id> feed (the card's conversation view) and the agent's GET /api/inbox.
-interface ThreadMsg {
+export interface ThreadMsg {
   seq: number; // monotonic per channel — a session's read cursor is "last seq pulled"
   ts: number;
   from: string; // sender session id, or "human" / "system"
@@ -694,7 +695,7 @@ interface ThreadMsg {
 // the durable log stays broadcast-only). The HTTP response is parked until reply or timeout. Pinned in
 // fsState so the queue survives a hot re-eval; the held `res`/`timer` are process-bound (a restart times
 // them out, which is the correct degradation).
-interface PendingAsk {
+export interface PendingAsk {
   askId: string;
   threadId: string;
   from: string; // asker sid (its /ask connection is held open)
@@ -3126,7 +3127,7 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
 // never has to construct node/edge ids — it works in thread ids + its own sid only.
 
-interface SnapNode {
+export interface SnapNode {
   typeName: "node";
   id: string;
   type: string;
@@ -3144,25 +3145,6 @@ function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> |
   if (!b) return null;
   const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
   return snap?.records ?? null;
-}
-
-// T3b: block a join until its member:open edge lands in the DURABLE snapshot — poll the saved records for
-// the edge id until it appears or the deadline passes. The tab applies the addEdge then persists on a
-// ~400ms debounce, so a caller that messages/asks the instant /join returns would otherwise race that save
-// and 403 ("not a member") off a snapshot that doesn't list the edge yet. Bounded and returns false (rather
-// than hanging the request) on timeout — the in-memory emitted-membership bridge still covers the window,
-// so a timeout degrades to the old best-effort behaviour, never a broken join. Kept well under the agent's
-// Bash/curl timeout.
-const JOIN_PERSIST_TIMEOUT_MS = 5000;
-const JOIN_PERSIST_POLL_MS = 75;
-async function waitForEdgePersisted(boardId: string, edgeId: string, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const recs = boardSnapshotRecords(boardId);
-    if (recs && recs.some((r) => r.typeName === "edge" && r.id === edgeId)) return true;
-    if (Date.now() >= deadline) return false;
-    await new Promise((resolve) => setTimeout(resolve, JOIN_PERSIST_POLL_MS));
-  }
 }
 
 // A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /
@@ -3261,7 +3243,6 @@ const announceKey = (id: string, type: string): string => `${id}|${type}`;
 // their first inbox read (Slack public-channel style). "future" is the opt-out (start at the tail).
 const pendingHistoryMode = (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
 const historyKey = (threadId: string, sid: string): string => `${threadId}|${sid}`;
-const historyMode = (v: unknown): "full" | "future" | undefined => (v === "full" || v === "future" ? v : undefined);
 // The read cursor that gives `sid` the chosen visibility of `log`: full ⇒ 0 (everything is unread), future
 // ⇒ the current tail (only messages from here on). The single source of "how much backlog replays".
 const seedCursor = (mode: "full" | "future", log: ThreadMsg[]): number =>
@@ -3375,437 +3356,6 @@ function maybeAnnounceMembership(
   }
 }
 
-async function handleThreadMessage(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; text?: unknown; force?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-
-  const from = body.from;
-  const members = threadMemberSids(records, threadId);
-  // Consent: a SESSION must have joined to post (symmetry with receiving). A non-session `from` (the human
-  // at the channel card) is the board owner and may post to any channel — §7, legibility not authz.
-  if (sessionNodeForSid(records, from) && !members.includes(from))
-    return sendJson(res, 403, { error: "sender is not a member of this channel" });
-
-  // W11 — mention-gated CAS guard (compare-and-swap on the poster's read cursor). A live SESSION poster may
-  // not post over a message that @-mentioned it and still sits unread past its cursor: it must read the
-  // thread first (structurally, not just by norm). Exempt a non-session `from` (the human at the card sees
-  // the whole thread), and honor an explicit `force:true` override. The 409 hands back the blocking unread
-  // so one read-then-repost clears it (no archaeology — the poster GETs /api/inbox to advance its cursor,
-  // then reposts). Card-only intents/pins go through their own handlers, so this path is real messages only.
-  const posting = liveSessions.get(from);
-  if (posting && body.force !== true) {
-    const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
-    const blocking = unreadMentions({
-      log: threadLogs.get(threadId) ?? [],
-      cursor: posting.read[threadId] ?? 0,
-      from,
-      members: memberEntries,
-    });
-    if (blocking.length)
-      return sendJson(res, 409, {
-        error: "unread @-mention: read the thread (GET /api/inbox) before posting, or pass force:true",
-        channel: threadId,
-        cursor: posting.read[threadId] ?? 0,
-        unread: blocking.map((m) => ({ seq: m.seq, from: m.from, text: m.text, ts: m.ts })),
-      });
-  }
-
-  // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
-  // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
-  const msg = appendThreadMsg(boardId, threadId, from, body.text);
-  // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
-  // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
-  // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
-  const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
-  const { wakeAll, human, members: tagged, unknown } = resolveTags(body.text, memberEntries);
-  const ss = liveSessions.get(from);
-  if (ss) {
-    ss.read[threadId] = msg.seq;
-    // Blue "waiting on an agent": the sender named a specific peer (not @all, not the human) and will idle
-    // after this turn waiting on them. Inferred from the tag — no self-report. Each of the sender's posts
-    // OVERWRITES this: tagging a peer sets it; a broadcast / human-directed / untagged post clears it (the
-    // sender's intent moved on). It then persists across nudges (sendSessionInput keepWaitingOn) until the
-    // awaited peer replies (below) — so the blue holds instead of evaporating on the next bit of traffic.
-    const peers = tagged.filter((sid) => sid !== from);
-    ss.waitingOn = !wakeAll && !human && peers.length ? peers : null;
-    persistSessionState(ss);
-    // Instant path (mrcmofwf-10): the sender's own band just moved (idle+waitingOn ⇒ blue "waiting-agent",
-    // or cleared ⇒ back to orange). It's the sender's own post, not a process event, so nothing else would
-    // republish its card until the loopTick safety net — push now so the card matches the pill immediately.
-    publishSession(ss);
-  }
-  // The awaited peer just spoke: anyone waiting on `from` has had their wait answered — drop `from` from
-  // their waitingOn (→ null when empty) and republish so their card/surfaces fall out of blue. This is the
-  // deliberate end of the wait (paired with the no-clear-on-nudge above). Republish goes through THIS (the
-  // request handler's) publishSession, so it carries the current feed shape.
-  for (const w of liveSessions.values()) {
-    if (w.waitingOn?.includes(from)) {
-      const rest = w.waitingOn.filter((sid) => sid !== from);
-      w.waitingOn = rest.length ? rest : null;
-      persistSessionState(w);
-      publishSession(w);
-    }
-  }
-  // @-tags decide the wake set, now gated by each member's seat level (P1/W4): `@all` is a room broadcast
-  // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an untagged
-  // post is ambient (neither — wakes no one).
-  const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin: originOf(req) });
-  // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role
-  // COLD-SPAWNS a fresh session into the thread — the mention itself is the summons (role/seat-based only).
-  const spawned = spawnMentionedWorkers(boardId, threadId, unknown, originOf(req));
-  sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified, spawned });
-}
-
-// §step5 (threads-as-cards roadmap: @Role mention → cold-spawn). Each UNKNOWN @-tag (one resolveTags left
-// unmatched — no member, no keyword) that NAMES A KNOWN ROLE summons a fresh session INTO this thread,
-// reusing the seat-creating serverSpawnWorker cascade (card + member:open edge + server-side placement). The
-// role gets its FIRST seat here (the member:open onboarding fills it from the card name), self-limiting at one
-// seat per role. A token that is not a known role stays inert prose (no spawn — the pre-existing silent
-// discard, no regression). (A seatless reserved-keyword path once cold-spawned a plain worker per mention; it
-// was REMOVED as a footgun — naming the token in prose triggered a runaway spawn cascade.) The worker is
-// seeded from the thread's FULL backlog, so the triggering message replays on its first inbox read: it wakes
-// onto the task. NOT the dormant-seat path — an existing seat (live or dormant) resolves to a MEMBER and rides
-// maybeRespawnDormantSeat; this is first-contact only. Returns the spawns for the response (legibility/tests).
-function spawnMentionedWorkers(
-  boardId: string,
-  threadId: string,
-  unknownTags: string[],
-  origin: string,
-): Array<{ token: string; sid: string; role: string | null }> {
-  const spawned: Array<{ token: string; sid: string; role: string | null }> = [];
-  if (!unknownTags?.length) return spawned;
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return spawned;
-  const roles = listRoles(repoPath);
-  const records = boardSnapshotRecords(boardId);
-  const title = (records ? threadNode(records, threadId) : null)?.title || threadId;
-  for (const tok of unknownTags) {
-    const hit = classifyMentionSpawn(tok, roles);
-    if (!hit) continue; // not a known role — leave as inert prose (no regression)
-    // A role summons into its named seat, single-flight per seat so a duplicate tag in the same burst doesn't
-    // race a second worker onto it.
-    const claimKey = seatSurfaceKey(threadId, hit.name);
-    if (isSurfaceClaimed(claimKey)) continue;
-    const sid = serverSpawnWorker({
-      boardId, repoPath, origin,
-      roleId: hit.roleId,
-      threadId, anchorNodeId: threadId, claimKey,
-      firstPrompt: mentionSpawnBrief(origin, hit.name, title),
-    });
-    if (sid) spawned.push({ token: tok, sid, role: hit.name });
-  }
-  return spawned;
-}
-
-// The first-turn brief for a session COLD-SPAWNED by an @-mention (spawnMentionedWorkers). A fresh session
-// (not a resume): its thread cursor is seeded to the full backlog, so the summoning message replays on the
-// first inbox read below. `role` names the seat it occupies.
-function mentionSpawnBrief(origin: string, role: string, threadTitle: string): string {
-  const who = `the ${role} for thread "${threadTitle}" — your role's seat on this thread is now yours`;
-  return (
-    `[canvas] You've been SUMMONED into a thread by an @-mention — you are ${who}. This is a FRESH session (not a resume); read the thread to catch up on the task.\n` +
-    `- Read your inbox: GET http://${origin}/api/inbox?session=<your session id> — the message that summoned you is there (the full backlog replays on this first read).\n` +
-    `- Read the thread, respond to what was asked, and do the work; post status/blockers back to the thread.\n` +
-    `- Leave anything durable in the thread before you wind down (a fresh session can't recover your process state).\n` +
-    `- When your part is done: POST http://${origin}/api/session/<your session id>/done.`
-  );
-}
-
-// Resolve a channel id + a session sid to the membership edge between them (any member:* phase), so join
-// can UPGRADE a pending invite in place (same edge id) and leave can find what to remove.
-function memberEdge(
-  records: Array<Record<string, unknown>>,
-  sessionNode: string,
-  threadId: string,
-): string | null {
-  const e = records.find(
-    (r) => r.typeName === "edge" && r.from === sessionNode && r.to === threadId && String(r.type).startsWith("member:"),
-  );
-  return e ? String(e.id) : null;
-}
-
-async function handleThreadMembership(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-  action: "join" | "leave" | "invite",
-  origin: string,
-): Promise<void> {
-  let body: { from?: unknown; target?: unknown; history?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-
-  // For join/leave the actor is the joining session; for invite it's the target being proposed.
-  const subjectSid = action === "invite" ? (typeof body.target === "string" ? body.target : "") : body.from;
-  if (!subjectSid) return sendJson(res, 400, { error: "missing target" });
-  const sessionNode = sessionNodeForSid(records, subjectSid);
-  if (!sessionNode) return sendJson(res, 400, { error: `no session card on this board for ${subjectSid}` });
-
-  // An optional history choice rides the invite/join — stash it for the member:open onboarding to consume
-  // when it seeds the cursor (a pending invite carries it through to the eventual accept). Absent ⇒ default.
-  if (action !== "leave") {
-    const mode = historyMode(body.history);
-    if (mode) pendingHistoryMode.set(historyKey(threadId, subjectSid), mode);
-  }
-
-  let cmd: { type: string; payload: Record<string, unknown>; actor: string };
-  if (action === "leave") {
-    const id = memberEdge(records, sessionNode, threadId);
-    if (!id) return sendJson(res, 404, { error: "not a member of this channel" });
-    cmd = { type: "removeEdge", actor: body.from, payload: { id } };
-    // Release the seat this leaver holds (§5): a seat survives a process EXIT (respawn re-fills it), but an
-    // explicit LEAVE is a deliberate departure — give the seat back so the next same-role join fills fresh,
-    // and self-heal a seat stuck to a departed sid. Best-effort; keyed on the leaver's sid, not the role.
-    // Drop the durable membership too: THIS is a real leave (unlike a card delete, which keeps membership).
-    const repoPath = boards.get(boardId)?.repoPath;
-    if (repoPath) releaseSeat(repoPath, threadId, body.from);
-    forgetDurableMember(repoPath, threadId, body.from);
-  } else {
-    const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
-    const type = action === "join" ? "member:open" : "member:pending";
-    cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
-  }
-  const delivered = dispatchBusCommand(boardId, cmd, origin);
-  if (delivered === 0) return sendJson(res, 503, { error: "no tab of this board is live to apply it", delivered: 0 });
-  // T3b: a join doesn't return until its member:open edge is in the saved snapshot (waitForEdgePersisted),
-  // so the caller can message/ask straight away without racing the ~400ms persist. `persisted:false` means
-  // the block timed out (the emitted-membership bridge still covers membership); leave/invite don't wait.
-  const persisted = action === "join" ? await waitForEdgePersisted(boardId, String(cmd.payload.id), JOIN_PERSIST_TIMEOUT_MS) : undefined;
-  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid, ...(persisted === undefined ? {} : { persisted }) });
-}
-
-// POST /api/thread/<id>/history { target, mode:"full"|"future" } — set how much of the backlog a member
-// sees. For a LIVE open member it re-seeds the read cursor now (full ⇒ the backlog is unread again, replayed
-// on the next inbox read, and we nudge them; future ⇒ jump past it to the tail). For a not-yet-onboarded
-// invitee it stashes the choice for join time. This is the human's per-member control on the channel card;
-// agents get the same at join time via the /join,/invite body. Returns where it applied (now | on-join).
-async function handleThreadHistory(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { target?: unknown; mode?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  const mode = historyMode(body.mode);
-  if (!mode) return sendJson(res, 400, { error: 'mode must be "full" or "future"' });
-  if (typeof body.target !== "string" || !body.target) return sendJson(res, 400, { error: "missing target" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-
-  const sid = body.target;
-  const live = liveSessions.get(sid);
-  if (live && live.status !== "exited" && threadMemberSids(records, threadId).includes(sid)) {
-    live.read[threadId] = seedCursor(mode, threadLog(boardId, threadId));
-    let notified = 0;
-    if (mode === "full") {
-      live.nudge = true; // the backlog is unread for them again — wake them to (re-)read it
-      if (live.status === "idle") flushNudge(live);
-      notified = 1;
-    }
-    return sendJson(res, 200, { ok: true, channel: threadId, target: sid, mode, applied: "now", notified });
-  }
-  pendingHistoryMode.set(historyKey(threadId, sid), mode); // not onboarded yet — apply when they go open
-  sendJson(res, 200, { ok: true, channel: threadId, target: sid, mode, applied: "on-join" });
-}
-
-// ── §16 ask/reply: synchronous consultation over channel membership ───────────────────────────────────
-const ASK_TIMEOUT_DEFAULT = 30_000;
-const ASK_TIMEOUT_MAX = 60_000; // capped under the agent's Bash tool timeout so the socket never out-waits it
-
-// Resolve a parked /ask connection exactly once (reply or timeout), clearing its timer and registry entry.
-function settleAsk(askId: string, payload: Record<string, unknown>): void {
-  const ask = pendingAsks.get(askId);
-  if (!ask) return;
-  clearTimeout(ask.timer);
-  pendingAsks.delete(askId);
-  try {
-    sendJson(ask.res, 200, payload);
-  } catch {
-    /* asker disconnected before the answer landed — nothing to do */
-  }
-}
-
-// POST /api/thread/<id>/ask { from, to, text, timeoutMs? } — a binary consultation: BOTH must be members
-// (consent, mirroring handleThreadMessage), the answerer is nudged, and the asker's connection is HELD
-// until /reply or timeout. Never touches threadLogs — the broadcast log stays untouched (§16).
-async function handleThreadAsk(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; to?: unknown; text?: unknown; timeoutMs?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (typeof body.to !== "string" || !body.to) return sendJson(res, 400, { error: "missing to" });
-  if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
-  if (body.to === body.from) return sendJson(res, 400, { error: "cannot ask yourself" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-  const members = threadMemberSids(records, threadId);
-  if (!members.includes(body.from)) return sendJson(res, 403, { error: "asker is not a member of this channel" });
-  if (!members.includes(body.to)) return sendJson(res, 403, { error: "answerer is not a member of this channel" });
-  const answerer = liveSessions.get(body.to);
-  if (!answerer || answerer.status === "exited")
-    return sendJson(res, 409, { error: "answerer is not a live session" });
-
-  const askId = crypto.randomUUID();
-  const wanted = Number(body.timeoutMs);
-  const timeoutMs = Math.min(Number.isFinite(wanted) && wanted > 0 ? wanted : ASK_TIMEOUT_DEFAULT, ASK_TIMEOUT_MAX);
-  const timer = setTimeout(() => settleAsk(askId, { askId, timedOut: true }), timeoutMs);
-  pendingAsks.set(askId, { askId, threadId, from: body.from, to: body.to, text: body.text, ts: Date.now(), res, timer });
-  // Nudge ONLY the answerer (reuse the §15 coalescing): idle → wake now; busy → fire at the result boundary.
-  answerer.nudge = true;
-  if (answerer.status === "idle") flushNudge(answerer);
-  // No sendJson here — the response is parked until settleAsk fires (reply or timeout).
-}
-
-// GET /api/asks?session=<sid> — the answerer's pending-consultation queue (parallel to /api/inbox). The
-// HELD asks addressed to this session; read-only, resolves nothing.
-function handleAsksRead(res: ServerResponse, sid: string | null): void {
-  if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
-  const asks = [...pendingAsks.values()]
-    .filter((a) => a.to === sid)
-    .map((a) => ({ askId: a.askId, channel: a.threadId, from: a.from, text: a.text, ts: a.ts }));
-  sendJson(res, 200, { asks, count: asks.length });
-}
-
-// POST /api/thread/<id>/reply { from, askId, text } — ONLY the addressee answers. Resolves the asker's
-// held connection and echoes a card-only Q→A summary (kind:"ask") so the channel card stays legible
-// without waking the other members (§16 seam).
-async function handleThreadReply(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; askId?: unknown; text?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (typeof body.askId !== "string" || !body.askId) return sendJson(res, 400, { error: "missing askId" });
-  if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
-  const ask = pendingAsks.get(body.askId);
-  if (!ask) return sendJson(res, 404, { error: "no such pending ask (already answered or timed out)" });
-  if (ask.threadId !== threadId) return sendJson(res, 400, { error: "askId belongs to a different channel" });
-  if (ask.from === body.from) return sendJson(res, 403, { error: "the asker cannot answer its own ask" });
-  if (ask.to !== body.from) return sendJson(res, 403, { error: "only the addressee may answer this ask" });
-
-  settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
-  // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
-  sendJson(res, 200, { ok: true, askId: ask.askId, channel: threadId, delivered: true });
-}
-
-// POST /api/thread/<id>/intent { from, intent, note? } — the work-intent typed act (threads-as-cards §6,
-// migration §8 step 1). `idle+working`, `idle+blocked:human`, and `idle+done` are indistinguishable at the
-// process layer, so the agent DECLARES which it is: a structured entry in the channel's log, card-only
-// (rendered as a small status line; inbox/nudge skip it — an agent's own bookkeeping must not wake the
-// room). The latest declaration per member also rides the channel's meta marker (`intents`, keyed by sid —
-// the seat record's forerunner; step 2 moves the key to the seat so it survives an occupant respawn), which
-// is what /api/threads serves and what the thread-state projection (thread-state.js) ranges over. `done` doubles
-// as the cooperative-yield signal — for now it informs slot management (a Coordinator/human can see who is safe to
-// terminate); the reflex scheduler acting on it comes with the projection.
-async function handleThreadIntent(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; intent?: unknown; note?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (!isWorkIntent(body.intent))
-    return sendJson(res, 400, { error: `intent must be one of ${WORK_INTENTS.map((i) => `"${i}"`).join(" | ")}` });
-  if (body.note != null && typeof body.note !== "string")
-    return sendJson(res, 400, { error: "note must be a string" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-  // Consent mirrors handleThreadMessage: a session must have joined to declare; a non-session `from`
-  // (the human at the card) is the board owner and may mark any channel.
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this channel" });
-
-  const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
-  const { msg, seat } = recordThreadIntent(boardId, threadId, body.from, body.intent, note);
-  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
-}
-
-// Record a work-intent typed act — the shared core of a declaration (the HTTP handler above) AND the
-// server's own auto-freshen (clearBlockedIntents below): append the card entry (kind:"intent", so it
-// renders on the thread and the roster pill reads it, but never wakes the room) AND replace the
-// latest-per-participant slot on the meta marker. Full-object replace onto the marker — appendThreadMsg's
-// own meta upsert shallow-merges around it, so activity bumps never clobber it (pinned by the ledger test).
-// Keyed by the declarer's SEAT when it holds one (§5: the declared state must survive an occupant respawn —
-// a fresh session re-fills the seat and inherits/overwrites the same slot), else by sid; the record's own
-// `sid` field says which occupant actually spoke.
-function recordThreadIntent(
-  boardId: string,
-  threadId: string,
-  from: string,
-  intent: WorkIntent,
-  note?: string,
-): { msg: ThreadMsg; seat: string | null } {
-  const msg = appendThreadMsg(boardId, threadId, from, intentLine(intent, note), { kind: "intent", intent });
-  const repoPath = boards.get(boardId)?.repoPath;
-  let seat: string | null = null;
-  if (repoPath) {
-    const meta = readThreadMeta(repoPath, threadId);
-    seat = seatForSid(meta?.seats, from);
-    const prior = meta?.intents ?? {};
-    upsertThreadMeta(repoPath, threadId, {
-      intents: { ...prior, [seat ?? from]: { intent, ts: msg.ts, sid: from, ...(note ? { note } : {}) } },
-    });
-    // Instant path (mrcmofwf-10): a declared blocked:human/blocked:peer refines the declarer's idle band
-    // (orange/blue), but a declaration is card-only bookkeeping — it fires no process event, so the card's
-    // pushed band would otherwise wait for the loopTick safety net. Republish the declarer now if it's live.
-    const declarer = liveSessions.get(from);
-    if (declarer) publishSession(declarer);
-  }
-  return { msg, seat };
-}
-
 // Part 2 — the work-intent self-freshen. A session going idle→running means a wake landed and it is
 // computing again: the block (if any) has been ANSWERED, so no agent action is needed to retire it. Sweep
 // every thread this session participates in and auto-transition any `blocked:*` it declared → `working`.
@@ -3850,358 +3400,6 @@ function resumeRunning(s: LiveSession): void {
   }
 }
 
-// POST /api/thread/<id>/level { from, level } — set the caller's notification LEVEL on this thread (P1/W4,
-// notification-levels.js): `all` (the default — any room broadcast wakes it), `mentions` (only an @-address
-// wakes it), or `paused` (nothing auto-wakes; an @-mention still overrides). The level rides the caller's
-// SEAT when it holds one (durable across respawn), else a sid-keyed fallback. It is NOT a card entry — it
-// changes only the wake fan-out condition (wakeThreadMembers), never the message record. Consent mirrors
-// intent: a member (or the human at the card) may set a level. 400 on a bad level; 403 for a non-member.
-async function handleThreadLevel(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; level?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (!isNotificationLevel(body.level))
-    return sendJson(res, 400, { error: `level must be one of ${NOTIFICATION_LEVELS.map((l) => `"${l}"`).join(" | ")}` });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
-  const { seat, level } = setThreadLevel(repoPath, threadId, body.from, body.level);
-  // Nudge the rail so a listing re-pull reflects the change (like an intent/pin does).
-  publishFeed("threads:" + boardId, { ts: Date.now() });
-  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, level });
-}
-
-// POST /api/thread/<id>/pin { from, seq, pinned } — flag (or unflag) a message as HEAD CONTEXT (R-PIN,
-// wakeable-substrate-plan W7). Pins are the thread's durable head: re-read on every wake ahead of the recent
-// tail, so the task statement, the `Done when:` condition (R5), and any load-bearing framing stay present
-// however long the log grows. The pinned message keeps its chronological place in the log; the card renders a
-// collapsible tray and the inbox surfaces the pins on every read. `pinned` defaults to true (a bare pin call
-// pins). Pinning snapshots the message onto the marker (thread-ledger), so a pin survives the log's bounded
-// tail. Consent mirrors handleThreadMessage/Intent: a member (or the human at the card) may pin.
-async function handleThreadPin(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; seq?: unknown; pinned?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (typeof body.seq !== "number" || !Number.isInteger(body.seq) || body.seq < 1)
-    return sendJson(res, 400, { error: "seq must be a positive integer" });
-  if (body.pinned != null && typeof body.pinned !== "boolean")
-    return sendJson(res, 400, { error: "pinned must be a boolean" });
-  const pinned = body.pinned !== false; // default true — a bare pin call pins
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
-
-  let pins: PinnedMsg[];
-  if (pinned) {
-    // Find the message to snapshot: the in-memory tail first (the common case), else the full ledger (a pin
-    // of an older message that has scrolled out of the bounded tail — the very case snapshotting exists for).
-    const log = threadLog(boardId, threadId);
-    let msg = log.find((mng) => mng.seq === body.seq) as ThreadMsg | undefined;
-    if (!msg) msg = readThreadLog(repoPath, threadId).find((mng) => mng.seq === body.seq) as ThreadMsg | undefined;
-    if (!msg) return sendJson(res, 404, { error: "no message at that seq in this thread" });
-    pins = pinMessage(repoPath, threadId, msg, body.from, Date.now());
-  } else {
-    pins = unpinMessage(repoPath, threadId, body.seq);
-  }
-  // Republish the conversation feed so the card's pinned tray updates live (pins ride the same feed).
-  const log = threadLog(boardId, threadId);
-  publishThreadFeed(boardId, threadId, log, false);
-  // Nudge the rail (threads:<board>) so a listing re-pull reflects the change, like an intent does.
-  publishFeed("threads:" + boardId, { ts: Date.now() });
-  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
-}
-
-// POST /api/thread/<id>/seen { from, seqs } — mark @you/@human MENTION seqs the human has now VIEWED (user
-// waiting-state + you-pill). Driven by the thread card's viewport observer: when a still-unseen mention
-// scrolls into the log while the card is focused, its seq is POSTed here and unioned into the durable
-// `seenMentions` set (thread-ledger.markSeenMentions), which drops it from the unseen count individually
-// (per-viewed-message clearing — NOT clear-on-reply, NOT clear-on-focus). Idempotent: re-marking a seen seq is
-// a no-op. Consent mirrors handleThreadPin — a member (or the human at the card, who is not a session node)
-// may mark seen. `seqs` must be an array of positive integers.
-async function handleThreadSeen(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; seqs?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  if (!Array.isArray(body.seqs) || !body.seqs.every((s) => Number.isInteger(s) && (s as number) >= 1))
-    return sendJson(res, 400, { error: "seqs must be an array of positive integers" });
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
-  // Existence gate is the LEDGER marker, NOT a canvas node. A thread persists in `.canvas/threads/` with no
-  // card on the board — the rail lists EVERY thread, and opening one adds its card CLIENT-side, which may not
-  // have reached the server snapshot yet (a thread deleted from the canvas still lists too). Requiring the
-  // node 404'd every seen-POST for an off-canvas thread, so a rail-badged thread never cleared on open — only
-  // a later deselect/reselect worked, once the client's addNode had persisted. Marking mentions seen is a
-  // durable ledger op that doesn't need the node.
-  if (!readThreadMeta(repoPath, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  // Consent mirrors handleThreadPin: a SESSION sender must be a member (checked against the live snapshot when
-  // one exists); the human at the card is not a session node and always may. An absent/node-less snapshot
-  // therefore never blocks the human — the only caller the rail badge depends on.
-  const records = boardSnapshotRecords(boardId);
-  if (records && sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
-  const seen = markSeenMentions(repoPath, threadId, body.seqs as number[]);
-  // Republish the card feed (shrinks youWaitingSeqs) + nudge the rail (clears/decrements signal (a)) so both
-  // surfaces reflect the newly-viewed mentions live, exactly like a pin does.
-  publishThreadFeed(boardId, threadId, threadLog(boardId, threadId), false);
-  publishFeed("threads:" + boardId, { ts: Date.now() });
-  sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seen });
-}
-
-// POST /api/thread/<id>/worktree — manage the thread's work-item worktrees. `op:"remove"` (Stage 1) is the
-// EXPLICIT teardown fired on WORK-ITEM completion, guarded: it skips+warns on a dirty tree or unmerged branch
-// unless `force`. `op:"merge"` (Stage 3) is merge-on-green: green-gate the branch in its worktree (skip with
-// `noVerify`), then `git merge --no-ff` into `base` (default main) from the canonical checkout and tear the
-// worktree down — refusing on a dirty worktree / dirty|wrong-branch canonical / a failing gate, and aborting
-// cleanly on a merge conflict. `op:"list"` returns the recorded worktrees. The work-item key is derived like
-// a spawn's: explicit `key`, else `roleId`'s seat, else the thread itself. Consent mirrors pin/intent: a
-// member (or the human at the card) may act.
-async function handleThreadWorktree(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; op?: unknown; key?: unknown; roleId?: unknown; force?: unknown; base?: unknown; noVerify?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  const op = typeof body.op === "string" ? body.op : "list";
-  if (op !== "list" && op !== "remove" && op !== "merge") return sendJson(res, 400, { error: `unknown op "${op}" (list|remove|merge)` });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
-
-  if (op === "list") return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(repoPath, threadId) });
-  const explicitKey = typeof body.key === "string" && body.key ? body.key : null;
-  const roleId = typeof body.roleId === "string" && body.roleId ? body.roleId : null;
-  const key = workItemKey({ threadId, roleId, explicitKey });
-
-  if (op === "merge") {
-    const base = typeof body.base === "string" && body.base ? body.base : "main";
-    const result = mergeWorktree(repoPath, threadId, key!, { base, noVerify: body.noVerify === true, force: body.force === true });
-    publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a merged worktree drops off the marker)
-    return sendJson(res, result.merged ? 200 : 409, { thread: threadId, key, ...result });
-  }
-
-  const result = removeWorktree(repoPath, threadId, key!, { force: body.force === true });
-  publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a removed worktree drops off the marker)
-  return sendJson(res, result.removed ? 200 : 409, { thread: threadId, key, ...result });
-}
-
-// POST /api/thread/<id>/job — create/update or remove a STANDING JOB (R6, W6, standing-jobs.js). A standing
-// job is a periodic server-fired worker on this thread's durable marker: every `intervalMs` the server spawns
-// a fresh worker (the one serverSpawnWorker primitive, single-flight) seeded with `instruction`, then it acts
-// or (finding nothing) winds down silently. Jobs survive their creator AND a server restart — they live on the
-// marker, not the session. Create/update: { from, instruction, intervalMs?, role?, jobId? } — `jobId` updates
-// an existing job in place; a named `role` fires INTO that role's seat, else a bare worker; `intervalMs` is
-// clamped up to the 60s floor. Remove: { from, jobId, remove:true }. Consent mirrors intent/pin/level: a
-// member (or the human at the card) may manage a thread's jobs. Read the current jobs with GET .../jobs.
-async function handleThreadJob(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  threadId: string,
-): Promise<void> {
-  let body: { from?: unknown; instruction?: unknown; intervalMs?: unknown; role?: unknown; jobId?: unknown; remove?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
-
-  // Remove a job by id.
-  if (body.remove === true) {
-    if (typeof body.jobId !== "string" || !body.jobId) return sendJson(res, 400, { error: "remove needs a jobId" });
-    const { removed, jobs } = removeJob(repoPath, threadId, body.jobId);
-    publishFeed("threads:" + boardId, { ts: Date.now() }); // nudge the rail to re-pull like an intent does
-    if (removed) republishThreadSeatOccupants(repoPath, threadId); // mrcmofwf-10: the seat's `scheduled` band may have dropped
-    return sendJson(res, removed ? 200 : 404, { ok: removed, thread: threadId, removed, jobs });
-  }
-  // Create or update.
-  if (typeof body.instruction !== "string" || !body.instruction.trim())
-    return sendJson(res, 400, { error: "missing instruction" });
-  if (body.intervalMs != null && !Number.isFinite(Number(body.intervalMs)))
-    return sendJson(res, 400, { error: "intervalMs must be a number of milliseconds" });
-  if (body.role != null && typeof body.role !== "string")
-    return sendJson(res, 400, { error: "role must be a string (a role id) or omitted" });
-  const { job, jobs } = upsertJob(repoPath, threadId, {
-    id: typeof body.jobId === "string" ? body.jobId : undefined,
-    role: typeof body.role === "string" ? body.role : null,
-    intervalMs: body.intervalMs,
-    instruction: body.instruction,
-    by: body.from,
-  });
-  publishFeed("threads:" + boardId, { ts: Date.now() });
-  republishThreadSeatOccupants(repoPath, threadId); // mrcmofwf-10: the seat's occupant may now read `scheduled`
-  sendJson(res, 200, { ok: true, thread: threadId, job, jobs });
-}
-
-// The agent-facing shape of an inbox message — DENSER and more LEGIBLE than the stored ThreadMsg. Two
-// changes vs the raw record: `from` is a short HANDLE not a 36-char UUID (see inboxHandle), and `ts` (an
-// opaque 13-digit epoch-ms) becomes `t`, a compact local `MM-DD HH:MM` (see fmtTs) — which is both readable
-// AND fewer bytes than the epoch it replaces, while still carrying date + time so timing conflicts and
-// natural-language references ("continuing yesterday's work") survive. `seq` still gives strict ordering, so
-// seconds/year are dropped as redundant noise. 92% of a backlog read is message text; this is a readability
-// win first, a few-percent size win second.
-interface InboxMsg {
-  seq: number;
-  t: string; // compact local timestamp, `MM-DD HH:MM`
-  from: string; // a short, @-taggable handle (see inboxHandle), not the full session UUID
-  text: string;
-}
-
-// A sender's short handle for the agent-facing inbox: its role name (`RoleName.<short-sid>`, when spawned as
-// a role) else an 8-char sid prefix — both of which are valid `@`-tag / prefix handles, so a reader can reply
-// to or tag the sender straight from what it sees. `human`/`system` pass through unchanged. (The full sid for
-// `/ask`'s `to` / `/invite`'s `target` stays available from the channel's member roster, as it always was.)
-function inboxHandle(records: Array<Record<string, unknown>>, from: string): string {
-  if (from === "human" || from === "system") return from;
-  return sessionNameForSid(records, from) ?? from.slice(0, 8);
-}
-
-// A stored epoch-ms `ts` → compact LOCAL `MM-DD HH:MM`. Local (the board is single-user, on this machine) so
-// the time reads as the human/agent would discuss it; minute precision (seq carries exact order, so seconds
-// add nothing); month-day so a cross-day reference still resolves; year dropped (rarely ambiguous in a live
-// channel — re-add if a board ever spans new year).
-function fmtTs(ts: number): string {
-  const d = new Date(ts);
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
-}
-
-// Opt-in WINDOWING of a channel's unread tail (CLAUDE.md truncation discipline: bound in ONE place, keep the
-// TAIL — recent matters most for a scroll-to-bottom log — and surface a `truncated` flag; never a silent
-// drop). Applies a max message COUNT (`limit`) and/or a max TEXT-BYTE budget (`bytes`) to `fresh`, keeping
-// the most recent. Always keeps ≥1 message (a budget smaller than the last message still yields it, flagged).
-// Returns the kept tail + how many older messages were omitted (0 ⇒ nothing trimmed).
-function windowTail(fresh: ThreadMsg[], limit: number | null, bytes: number | null): { kept: ThreadMsg[]; omitted: number } {
-  if (limit == null && bytes == null) return { kept: fresh, omitted: 0 };
-  let kept = limit != null && fresh.length > limit ? fresh.slice(fresh.length - limit) : fresh.slice();
-  if (bytes != null) {
-    const out: ThreadMsg[] = [];
-    let used = 0;
-    for (let i = kept.length - 1; i >= 0; i--) {
-      const size = Buffer.byteLength(kept[i]!.text, "utf8");
-      if (out.length > 0 && used + size > bytes) break; // always keep ≥1, then stop once the budget is spent
-      out.unshift(kept[i]!);
-      used += size;
-    }
-    kept = out;
-  }
-  return { kept, omitted: fresh.length - kept.length };
-}
-
-// GET /api/inbox?session=<sid> — the read tool. Returns this session's UNREAD channel messages (across all
-// channels it's joined to), grouped by channel, and advances its read cursors. The agent fetches this with
-// Bash, so the messages land in TOOL OUTPUT, never as a user turn — the whole point of 4e. Content lives
-// only in the off-log channel log; this is the read side of it.
-function handleInboxRead(res: ServerResponse, sid: string | null, limit: number | null, bytes: number | null): void {
-  if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
-  const s = liveSessions.get(sid);
-  if (!s) return sendJson(res, 404, { error: "no such live session" });
-  const boardId = boardIdentity(s.repoPath).boardId;
-  const records = boardSnapshotRecords(boardId);
-  // `pinned` is the thread's HEAD CONTEXT (R-PIN): re-read on EVERY wake ahead of the recent tail, so the
-  // task statement / `Done when:` condition / load-bearing framing stay present however far the log has
-  // scrolled. Surfaced on any thread that has fresh messages this read (a wake implies fresh content there),
-  // in the same compact shape as messages. It does NOT advance the cursor and is not counted as unread.
-  type OutChan = {
-    channel: string;
-    title: string;
-    messages: InboxMsg[];
-    pinned?: InboxMsg[];
-    truncated?: { omitted: number; hint: string };
-  };
-  const channels: OutChan[] = [];
-  if (records) {
-    for (const threadId of sessionThreads(records, sid)) {
-      let log = threadLog(boardId, threadId);
-      const since = s.read[threadId] ?? 0;
-      if (log.length && log[0]!.seq > since + 1) {
-        // The in-memory tail (MAX_THREAD_MSGS — a feed-republish bound, not a read cap) starts past this
-        // member's cursor: the older unread live only on disk. Serve THIS read from the full ledger
-        // instead of re-dropping content a memory bound already paid for (CLAUDE.md truncation rule —
-        // only the caller's own opt-in ?limit/?bytes window may cut, and it surfaces `truncated`).
-        const full = readThreadLog(s.repoPath, threadId);
-        if (full.length) log = full;
-      }
-      const fresh = log.filter((mng) => mng.seq > since && !cardOnly(mng)); // ask-echoes / intent acts are card-only
-      // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
-      // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
-      // which re-seeds the cursor to 0). Surfaced as `truncated`, never silently dropped (CLAUDE.md).
-      const { kept, omitted } = windowTail(fresh, limit, bytes);
-      if (kept.length) {
-        const out: OutChan = {
-          channel: threadId,
-          title: threadNode(records, threadId)?.title || "",
-          messages: kept.map((m) => ({ seq: m.seq, t: fmtTs(m.ts), from: inboxHandle(records, m.from), text: m.text })),
-        };
-        if (omitted > 0)
-          out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
-        // Head context: attach the pins so a woken agent re-reads the task/done-condition/framing (R-PIN).
-        const pins = readPins(s.repoPath, threadId);
-        if (pins.length)
-          out.pinned = pins.map((p) => ({ seq: p.seq, t: fmtTs(p.ts), from: inboxHandle(records, p.from), text: p.text }));
-        channels.push(out);
-      }
-      if (log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
-    }
-    persistSessionState(s);
-  }
-  const count = channels.reduce((n, c) => n + c.messages.length, 0);
-  sendJson(res, 200, { channels, count });
-}
-
 // Wire the ServerContext seam ONCE at module load (before configureServer runs). The references handed in
 // are the same globalThis-pinned singletons the rest of this file holds, so a route handler lifted into a
 // `routes/*.ts` module in a later phase reaches identical state via getServerContext() — no fork across a
@@ -4228,6 +3426,27 @@ setServerContext({
   startBoardFeeds,
   announceNewMemberships,
   maybeWakeDocWorker,
+  // Threads / inbox / asks (Phase 3) — snapshot/log resolvers + delivery/wake/spawn effects the extracted
+  // routes/{threads,inbox,asks}.ts call. Definitions stay here (the delivery/wake engine is Phase-5
+  // territory); the seam injects the operations, same as the effects above.
+  boardSnapshotRecords,
+  threadNode,
+  sessionNodeForSid,
+  sessionNameForSid,
+  threadMemberSids,
+  sessionThreads,
+  threadLog,
+  seedCursor,
+  historyKey,
+  appendThreadMsg,
+  wakeThreadMembers,
+  publishThreadFeed,
+  flushNudge,
+  persistSessionState,
+  dispatchBusCommand,
+  forgetDurableMember,
+  republishThreadSeatOccupants,
+  serverSpawnWorker,
 });
 
 // ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────
@@ -4277,55 +3496,14 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision buttons, and
   // the headless list. Ids are global UUIDs — no ?board= anywhere here. (routes/permissions.ts)
   ...permissionRoutes,
-  // The channel-message read tool (session id is a global UUID, so no ?board= needed).
-  { method: "GET", match: exact("/api/inbox"), run: (_req, res, url) => handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes")) },
-  // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
-  { method: "GET", match: exact("/api/asks"), run: (_req, res, url) => handleAsksRead(res, url.searchParams.get("session")) },
-  // Threads (§8 step 2 — /api/thread/… is canonical; /api/channel/… stays a working alias). The thread id
-  // is a node id carrying a colon, so the client percent-encodes it — match any non-slash segment and decode.
-  {
-    method: "POST",
-    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|seen|job|worktree)$/),
-    run: (req, res, url, g) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      const threadId = decodeURIComponent(g[0]!);
-      const action = g[1]!;
-      if (action === "message") return void handleThreadMessage(req, res, b.boardId, threadId);
-      if (action === "history") return void handleThreadHistory(req, res, b.boardId, threadId);
-      if (action === "ask") return void handleThreadAsk(req, res, b.boardId, threadId);
-      if (action === "reply") return void handleThreadReply(req, res, b.boardId, threadId);
-      if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
-      if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
-      if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
-      if (action === "seen") return void handleThreadSeen(req, res, b.boardId, threadId);
-      if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
-      if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);
-      return void handleThreadMembership(req, res, b.boardId, threadId, action as "join" | "leave" | "invite", originOf(req));
-    },
-  },
-  // GET /api/thread/<id>/jobs — read this thread's standing jobs (R6/W6, for the CLI + smoke test).
-  {
-    method: "GET",
-    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/jobs$/),
-    run: (_req, res, url, g) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      const threadId = decodeURIComponent(g[0]!);
-      return sendJson(res, 200, { thread: threadId, jobs: readJobs(b.repoPath, threadId) });
-    },
-  },
-  // GET /api/thread/<id>/worktrees — read this thread's recorded work-item worktrees (Stage 1, for the CLI).
-  {
-    method: "GET",
-    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/worktrees$/),
-    run: (_req, res, url, g) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      const threadId = decodeURIComponent(g[0]!);
-      return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(b.repoPath, threadId) });
-    },
-  },
+  // The channel-message read tool (routes/inbox.ts) — same GET arm, same position.
+  ...inboxRoutes,
+  // §16 the answerer's pending-consultation queue (routes/asks.ts) — same GET arm, same position.
+  ...askRoutes,
+  // Threads (routes/threads.ts): the POST /api/(thread|channel)/<id>/<action> verb-dispatch arm, then the
+  // GET .../jobs and GET .../worktrees reads — same three arms, same order/method/gate-stage. The action
+  // regex ordering relative to the bare /api/threads list below stays load-bearing (unchanged).
+  ...threadRoutes,
   {
     match: exact("/api/session"),
     run: (_req, res, url) => {
