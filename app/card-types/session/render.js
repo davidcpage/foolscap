@@ -596,9 +596,10 @@ export default {
     // A looping ROLE (the Coordinator) idle between server heartbeats isn't waiting on YOU — it's asleep on a timer.
     // The feed carries a server-derived `scheduled` (an ACTUAL live standing job on this session's seat — NOT the
     // static `loops` role flag, which asserted "scheduled" even with no job to ever wake it); render it calm teal
-    // "scheduled", not the loud amber "your turn". Ranks below waiting-on-agent (a named peer-wait is the more
-    // specific signal) and never overrides neverRun.
-    const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.scheduled);
+    // "scheduled", not the loud amber "your turn". Ranks ABOVE waiting-on-agent, matching the server's idle
+    // precedence (vite-fs-plugin.ts sessionStatus: scheduled > waitingOn), so this bandless FALLBACK can't disagree
+    // with the server band the primary path reads. Never overrides neverRun.
+    const scheduled = status === "idle" && !neverRun && !!(live && live.scheduled);
     // The status BAND is the ONE whole-session value the server computes (vite-fs-plugin.ts sessionStatus),
     // carried on the feed as `band` — the SAME value the thread participant pill reads, so the card's frame
     // and the pill can never disagree (thread mrcmofwf-10). The card no longer re-derives the band from raw
@@ -614,7 +615,7 @@ export default {
           : status === "running"
             ? "working"
             : status === "idle"
-              ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
+              ? neverRun ? null : scheduled ? "scheduled" : waitingOnAgent ? "waiting-agent" : "waiting"
               : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
@@ -637,10 +638,10 @@ export default {
         : status === "idle"
           ? neverRun
             ? html`<span class="ses-live">● live</span>`
-            : waitingOnAgent
-              ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
-              : scheduled
-                ? html`<span class="ses-live ses-scheduled">◷ scheduled</span>`
+            : scheduled
+              ? html`<span class="ses-live ses-scheduled">◷ scheduled</span>`
+              : waitingOnAgent
+                ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
                 : html`<span class="ses-live ses-idle">○ waiting</span>`
           : status === "exited"
             ? endPill("✕ exited", "ses-exited")
