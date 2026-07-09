@@ -17,6 +17,7 @@ import {
   workItemKey,
   worktreesDir,
   linkNodeModules,
+  worktreeOnboarding,
 } from "../worktrees.js";
 import { readThreadMeta } from "../thread-ledger.js";
 
@@ -313,4 +314,31 @@ test("merge with no worktree recorded is a no-op refusal, not a throw", () => {
   const r = mergeWorktree(repo, "node:thread:abc", "node:thread:abc");
   assert.equal(r.merged, false);
   assert.match(r.reason, /no worktree/);
+});
+
+// The isolation-onboarding block a --worktree worker gets appended to its system prompt. The bug it closes:
+// a worktree worker's cwd is its isolated checkout, but every path pointer in its onboarding names the main
+// checkout, so without an explicit confine-edits-here instruction it anchors on main and dirties it.
+test("worktreeOnboarding names the worktree cwd, the main checkout, and the confinement rule", () => {
+  const cwd = "/repo/.canvas/worktrees/node-mrdl7er8-i";
+  const repoPath = "/repo";
+  const block = worktreeOnboarding({ cwd, repoPath, branch: "agent/node-mrdl7er8-i" });
+
+  // Both directories are stated verbatim so the worker can distinguish where it edits vs. what it only reads.
+  assert.ok(block.includes(cwd), "block should name the worktree cwd");
+  assert.ok(block.includes(repoPath), "block should name the main checkout");
+  assert.ok(block.includes("agent/node-mrdl7er8-i"), "block should carry the branch when supplied");
+  // The load-bearing instruction and the self-verify step.
+  assert.match(block, /confine ALL edits|MUST live under your worktree/i);
+  assert.match(block, /git -C .* status/);
+  // NEVER edit main is stated outright.
+  assert.match(block, /NEVER Edit or Write a path under the main checkout/);
+});
+
+test("worktreeOnboarding is robust to a missing branch (git miss)", () => {
+  const block = worktreeOnboarding({ cwd: "/wt", repoPath: "/repo" });
+  assert.ok(block.includes("/wt"));
+  assert.ok(block.includes("/repo"));
+  // No dangling "(branch ``)" artifact when the branch is unknown.
+  assert.ok(!block.includes("(branch"), "should omit the branch label entirely when unknown");
 });

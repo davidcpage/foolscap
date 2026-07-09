@@ -32,6 +32,39 @@ export function worktreesDir(repoPath) {
   return path.join(repoPath, ".canvas", "worktrees");
 }
 
+// The ISOLATION onboarding a `--worktree` worker gets appended to its system prompt (vite-fs-plugin.ts,
+// only when the session's process cwd differs from the board's canonical checkout). The bug this closes:
+// a worktree worker's process cwd is correctly its isolated checkout, but EVERY path pointer in its
+// onboarding — the harness recipe leaves ({{harnessDir}}), examples in CLAUDE.md/memory — names the MAIN
+// checkout (the dev server's own app dir, which is where those files are READ from and is correct for
+// reading). With no explicit statement that EDITS must be confined to the worktree, the worker anchors on
+// those main-checkout absolute paths and edits there — dirtying `main` and breaking isolation. Until now
+// the guardrail existed only as ad-hoc Coordinator discipline pasted per-assignment; a worktree worker whose
+// Coordinator forgot to paste it reproduced the bug. This bakes the invariant into the spawn onboarding so
+// EVERY worktree worker gets it, unprompted. Pure (branch passed in) so it's unit-testable without git.
+export function worktreeOnboarding({ cwd, repoPath, branch = "" } = {}) {
+  return [
+    "## You are running in an ISOLATED git worktree — confine ALL edits to it",
+    "",
+    "Your process working directory is an isolated git worktree:",
+    `  ${cwd}${branch ? `   (branch \`${branch}\`)` : ""}`,
+    "The board's MAIN checkout is a DIFFERENT directory:",
+    `  ${repoPath}`,
+    "",
+    "**Every file you Edit, Write, or create MUST live under your worktree above.** Read-only reference paths",
+    "in this prompt (the harness recipe leaves, examples in CLAUDE.md/memory) may point at the main checkout —",
+    "reading those is fine. But NEVER Edit or Write a path under the main checkout: doing so dirties `main` and",
+    "blocks every peer (a dirty main is the one invariant nobody may break, per Principle 6).",
+    "",
+    "The Edit/Write tools require ABSOLUTE paths, so build them from your worktree dir above — do not copy an",
+    "absolute main-checkout path out of a reference and edit it. After your FIRST edit, verify it landed right:",
+    `  git -C ${cwd} status      # should show your change`,
+    `  git -C ${repoPath} status      # the main checkout — must stay clean`,
+    "If your change shows up on the main checkout instead, STOP and report it in your thread — that IS the",
+    "isolation bug: a path resolved to main despite your cwd.",
+  ].join("\n");
+}
+
 /**
  * The DURABLE work-item key a worktree is keyed by. Precedence: an explicit override, else the role SEAT
  * (role-spawned workers of the same role re-fill the same seat, so they share a worktree), else the thread
