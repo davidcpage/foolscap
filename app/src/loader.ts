@@ -805,11 +805,19 @@ export function consumePendingJump(threadId: string): number | null {
   return seq;
 }
 
+// Opening a thread from the rail must clear its unseen-mention badge, but the ThreadView's clear-on-focus
+// effect is edge-triggered on the `selected` signal: reopening a card that is ALREADY the selected card
+// re-asserts the same selection, produces no edge, and so never re-fires the clear (the deselect/reselect
+// dance the human had to do by hand). This broadcast makes "open" an explicit clear trigger regardless of
+// whether selection actually changed — an already-open card catches it and marks its mentions seen.
+export const THREAD_OPEN_EVENT = "canvas:thread-open";
+
 export function openChannel(m: InteractionManager, threadId: string, title: string, text: string, at?: Pos): void {
   const id = threadId as Id<"node">;
   if (m.editor.store.get<"node">(id)) {
     m.selection.set([id]);
     m.fitSelection();
+    window.dispatchEvent(new CustomEvent(THREAD_OPEN_EVENT, { detail: { threadId: id } }));
     return;
   }
   m.editor.commit({
