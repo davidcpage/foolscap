@@ -34,8 +34,12 @@ import { sessionSummaryFromText } from "./session-summary.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
-import { sendJson, readBody, readBodyBuffer, openSse, windowParam, type SseClient } from "./server-http.js";
+import { sendJson, readBody, readBodyBuffer, openSse, windowParam, readText, MAX_BYTES, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
+import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
+import { exact, oneOf, prefix, re } from "./routes/router.js";
+import { weatherRoutes } from "./routes/weather.js";
+import { cardTypeRoutes, handleCardTypeAsset, CARD_TYPES_DIR } from "./routes/card-types.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -498,10 +502,8 @@ const TEXT_EXT = new Set([
   ".md", ".markdown", ".txt", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".json", ".css", ".html", ".py", ".yaml", ".yml", ".toml", ".sh",
 ]);
-const MAX_BYTES = 128 * 1024; // a file card shows a preview, not the whole file — but 128KB shows the
-// great majority of real source files IN FULL (6KB cut almost everything mid-file). Head-kept: a file
-// reads top-down, so the start is the part you want (unlike a transcript). Flagged `truncated` when it
-// bites; raised here because every too-stingy cap in this app has cost more in debugging than memory.
+// MAX_BYTES (the file-card preview byte cap) + readText now live in server-http.ts (the stateless-helpers
+// seam) so the extracted route modules share the one definition; imported at the top of this file.
 
 // IMAGE assets (the image card, image-cards-on-canvas). Binaries can't ride the text file endpoints
 // (TEXT_EXT-gated, utf8) so they get their OWN /api/asset read/write, with a parallel extension gate and
@@ -522,14 +524,6 @@ function safeResolve(root: string, rel: string): string | null {
   return abs === root || abs.startsWith(root + path.sep) ? abs : null;
 }
 
-function readText(abs: string): { content: string; truncated: boolean } | null {
-  try {
-    const buf = fs.readFileSync(abs);
-    return { content: buf.subarray(0, MAX_BYTES).toString("utf8"), truncated: buf.length > MAX_BYTES };
-  } catch {
-    return null;
-  }
-}
 
 // W12 — the doc's optimistic-concurrency version: a content hash of its FULL on-disk bytes (not the
 // MAX_BYTES preview), so the CAS detects a change anywhere in the file, and `null` for a file that doesn't
@@ -3722,84 +3716,8 @@ function startUsageFeed(): void {
   void poll();
 }
 
-// ── weather (card-types/weather): Open-Meteo, keyed by a free-text location ──────────────────────
-// GET /api/weather?q=<place> → geocode the place (Open-Meteo geocoding, keyless) then fetch its current
-// conditions (Open-Meteo forecast, keyless). Done SERVER-SIDE so the card interior never touches the
-// public internet (the card-type contract: external data is polled by the host, the interior reads a
-// granted signal) and there's no API key or CORS to handle in the browser. Cached per normalized query
-// with a short TTL: weather drifts slowly and the public endpoint asks callers to be gentle, so a fleet
-// of cards (or a tab reopen) collapses onto one fetch per location per window. Never throws to the
-// client — an unresolved place or an offline upstream comes back as a 200 with an `error` tag the card
-// renders as a message, mirroring the usage feed's last-good-with-an-error-pill discipline.
-interface WeatherCacheEntry {
-  ts: number;
-  data: unknown;
-}
-const weatherCache = new Map<string, WeatherCacheEntry>();
-const WEATHER_TTL_MS = 10 * 60_000;
-
-async function handleWeather(res: ServerResponse, q: string): Promise<void> {
-  const query = q.trim();
-  if (!query) return sendJson(res, 200, { q, resolved: false, error: "no-location", fetchedAt: Date.now() });
-  const key = query.toLowerCase();
-  const hit = weatherCache.get(key);
-  if (hit && Date.now() - hit.ts < WEATHER_TTL_MS) return sendJson(res, 200, hit.data);
-
-  const cache = (data: unknown): void => void weatherCache.set(key, { ts: Date.now(), data });
-  try {
-    const geoRes = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=1&language=en&format=json`,
-    );
-    const geo = (await geoRes.json()) as { results?: Array<Record<string, unknown>> };
-    const loc = geo.results?.[0];
-    if (!loc) {
-      const data = { q: query, resolved: false, error: "not-found", fetchedAt: Date.now() };
-      cache(data); // a misspelling shouldn't re-hit the geocoder every refresh tick
-      return sendJson(res, 200, data);
-    }
-    const lat = Number(loc.latitude);
-    const lon = Number(loc.longitude);
-    const wxRes = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-        `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,wind_speed_10m&timezone=auto`,
-    );
-    const wx = (await wxRes.json()) as {
-      current?: Record<string, number | string>;
-      current_units?: Record<string, string>;
-    };
-    const c = wx.current ?? {};
-    const u = wx.current_units ?? {};
-    const data = {
-      q: query,
-      resolved: true,
-      name: loc.name as string,
-      country: (loc.country as string | undefined) ?? undefined,
-      admin1: (loc.admin1 as string | undefined) ?? undefined,
-      latitude: lat,
-      longitude: lon,
-      current: {
-        temperature: Number(c.temperature_2m),
-        apparentTemperature: Number(c.apparent_temperature),
-        humidity: Number(c.relative_humidity_2m),
-        windSpeed: Number(c.wind_speed_10m),
-        weatherCode: Number(c.weather_code),
-        isDay: Number(c.is_day) === 1,
-        time: String(c.time ?? ""),
-      },
-      units: { temperature: u.temperature_2m ?? "°C", windSpeed: u.wind_speed_10m ?? "km/h" },
-      error: null,
-      fetchedAt: Date.now(),
-    };
-    cache(data);
-    sendJson(res, 200, data);
-  } catch {
-    // offline / upstream down — serve the last good reading with a staleness tag if we have one, else
-    // a bare offline marker. Either way a 200 the card can render, never a 5xx it would have to special-case.
-    const stale = weatherCache.get(key);
-    if (stale) return sendJson(res, 200, { ...(stale.data as object), error: "offline", fetchedAt: Date.now() });
-    sendJson(res, 200, { q: query, resolved: false, error: "offline", fetchedAt: Date.now() });
-  }
-}
+// /api/weather (Open-Meteo, keyed by a free-text location) now lives in routes/weather.ts — a fully
+// self-contained extraction (god-file split, Phase 1); its route is spread into GLOBAL_ROUTES below.
 
 // The repo-scoped feeds for one board (git HEAD + the sessions-list ping), started once per board: at
 // startup for the default board, and on mount for the rest (handleBoardMount). Idempotent via
@@ -3967,53 +3885,11 @@ function startFeeds(): void {
 }
 
 // ── card types (card-types-as-data.md §3/§7: type definitions are data in the folder) ──────────
-// The type registry's server half: list card-types/*/ (type.yaml + the render.js the browser will
-// import()), and watch the folder so a template edit on disk reaches the canvas live. The change
-// notification rides the EXISTING feed bus ("cardtypes") — a template edit is just one more named
-// off-log event the client turns into a signal; the browser-side registry re-imports the module.
-
-const CARD_TYPES_DIR = path.resolve(here, "card-types");
-
-function handleCardTypesList(res: ServerResponse): void {
-  let entries: fs.Dirent[] = [];
-  try {
-    entries = fs.readdirSync(CARD_TYPES_DIR, { withFileTypes: true });
-  } catch {
-    // no card-types folder yet — an empty registry, not an error
-  }
-  const types = entries
-    .filter((e) => e.isDirectory())
-    .flatMap((e) => {
-      const yaml = readText(path.join(CARD_TYPES_DIR, e.name, "type.yaml"));
-      return yaml ? [{ type: e.name, yaml: yaml.content }] : [];
-    });
-  sendJson(res, 200, { types });
-}
-
-// Serve card-types/* RAW — straight off disk, Cache-Control: no-store, never through Vite's
-// transform pipeline. The pipeline caches per module and only Vite's own watcher invalidates that
-// cache, so a feed-triggered re-import racing that watcher could be served the PREVIOUS code (the
-// "save twice" dropped-update bug — two independent chokidars, no ordering). A template is runtime
-// data under the v1 contract — plain ESM importing only /vendor/lit-html.js — so the bundler has
-// nothing to add: read the file, send it, fresh every request. Read in FULL (not via readText, whose
-// MAX_BYTES preview cap is for file-card bodies) — a template is code the browser must parse, and a
-// truncated module is a syntax error.
-function handleCardTypeAsset(res: ServerResponse, pathname: string): void {
-  const rel = decodeURIComponent(pathname.slice("/card-types/".length));
-  const abs = path.resolve(CARD_TYPES_DIR, rel);
-  if (!abs.startsWith(CARD_TYPES_DIR + path.sep)) return sendJson(res, 400, { error: "bad path" });
-  let content: string;
-  try {
-    content = fs.readFileSync(abs, "utf8");
-  } catch {
-    return sendJson(res, 404, { error: "not found" });
-  }
-  res.writeHead(200, {
-    "Content-Type": abs.endsWith(".js") ? "text/javascript" : "text/plain",
-    "Cache-Control": "no-store",
-  });
-  res.end(content);
-}
+// The type-registry ROUTE handlers (/api/card-types list + the raw /card-types/* asset serve) now live in
+// routes/card-types.ts (god-file split, Phase 1), which OWNS the CARD_TYPES_DIR path and exports it. The
+// WATCH feed below stays here for now (it's stateful — rides the "cardtypes" feed bus) and imports the dir:
+// a template edit on disk pings the client, whose registry re-imports the module. CARD_TYPES_DIR is also
+// imported by the HMR guard in configureServer (keep template files out of Vite's transform pipeline).
 
 function startCardTypesFeed(): void {
   let t: ReturnType<typeof setTimeout> | null = null;
@@ -5333,29 +5209,10 @@ setServerContext({
 // A route with a `method` only matches that verb and otherwise FALLS THROUGH to later entries, exactly as
 // the ladder's `&& req.method === "POST"` arms did; a route without one matches any verb and branches on
 // the method inside its handler (the ladder's `if (req.method === "POST") … else …` arms).
-type RouteMatch = (pathname: string) => string[] | null; // capture groups (or [] for a plain match); null = no match
-const exact = (p: string): RouteMatch => (path) => (path === p ? [] : null);
-const oneOf = (...ps: string[]): RouteMatch => (path) => (ps.includes(path) ? [] : null);
-const prefix = (p: string): RouteMatch => (path) => (path.startsWith(p) ? [] : null);
-const re = (r: RegExp): RouteMatch => (path) => {
-  const m = r.exec(path);
-  return m ? m.slice(1) : null;
-};
-interface GlobalRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[]) => void;
-}
-interface BoardRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo) => void;
-}
-interface RootRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo, root: string) => void;
-}
+// The matcher combinators (exact/oneOf/prefix/re) + the three staged route shapes (GlobalRoute/BoardRoute/
+// RootRoute) now live in routes/router.ts so an extracted route module declares its registrations in the
+// same vocabulary; imported at the top of this file. Extracted concerns (Phase 1: weather, card-types)
+// export a route array that is SPREAD into the stage table at the arm-order position their inline entry held.
 
 // STAGE 1 — GLOBAL routes (tried before the shared board gate; board-scoped ones call reqBoard themselves).
 const GLOBAL_ROUTES: GlobalRoute[] = [
@@ -5473,7 +5330,7 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
       return handleRoles(res, b.repoPath);
     },
   },
-  { match: exact("/api/card-types"), run: (_req, res) => handleCardTypesList(res) },
+  ...cardTypeRoutes, // /api/card-types (routes/card-types.ts) — same GET arm, same position
   { method: "POST", match: exact("/api/boards"), run: (req, res) => void handleBoardMount(req, res) },
   { match: exact("/api/boards"), run: (_req, res) => handleBoards(res) },
   // The durable board store (step 4): the browser's persistence backends live here now.
@@ -5540,7 +5397,7 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
       return handleNotebookOutputsGet(res, b.boardId, id);
     },
   },
-  { match: exact("/api/weather"), run: (_req, res, url) => void handleWeather(res, url.searchParams.get("q") ?? "") },
+  ...weatherRoutes, // /api/weather (routes/weather.ts) — self-contained, same position
 ];
 
 // STAGE 2 — BOARD routes (reached only after the shared board gate resolved `board`/`boardId`).
