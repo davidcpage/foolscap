@@ -330,6 +330,41 @@ test("sessions template lists the off-log session list, each row draggable, with
   assert.ok(empty.includes("no sessions on disk"), "an empty list → empty marker");
 });
 
+test("sessions template header shows a RUNNING count of non-terminal sessions (HUD at-a-glance)", async () => {
+  const mod = await loadTemplate("sessions");
+
+  // The header running badge counts only NON-terminal statuses (working | waiting | waiting-agent |
+  // scheduled), mirroring the lifecycle band in session-status.ts; done/crashed/ended are terminal and
+  // excluded. It's the HUD's at-a-glance "how many agents are live" read. Here: 3 of the 5 are live.
+  const mixed = [
+    { id: "s1", mtime: 1, bytes: 10, status: "working" },
+    { id: "s2", mtime: 1, bytes: 10, status: "waiting" },
+    { id: "s3", mtime: 1, bytes: 10, status: "scheduled" },
+    { id: "s4", mtime: 1, bytes: 10, status: "done" },
+    { id: "s5", mtime: 1, bytes: 10, status: "crashed" },
+  ];
+  const out = flatten(mod.render({ fields: { title: "", text: "", color: "blue" }, signals: { sessionList: mixed } }));
+  assert.ok(out.includes("ses-running"), "the running badge renders when ≥1 session is live");
+  assert.ok(out.includes("3 running"), "counts working + waiting + scheduled, excludes done + crashed");
+  assert.ok(out.includes('file-ext">5<'), "the total count still reflects the full list length");
+
+  // waiting-agent (blocked on a peer) is non-terminal too → counted. A single live session reads "1 running".
+  const one = flatten(
+    mod.render({ fields: { title: "", text: "", color: "blue" }, signals: { sessionList: [{ id: "a", mtime: 1, bytes: 10, status: "waiting-agent" }] } }),
+  );
+  assert.ok(one.includes("1 running"), "waiting-agent is non-terminal → counted; singular label");
+
+  // No live sessions (all terminal, or a legacy row with no status field) → the badge is absent entirely,
+  // so its mere presence signals activity.
+  const none = flatten(
+    mod.render({
+      fields: { title: "", text: "", color: "blue" },
+      signals: { sessionList: [{ id: "a", mtime: 1, bytes: 10, status: "ended" }, { id: "b", mtime: 1, bytes: 10 }] },
+    }),
+  );
+  assert.ok(!none.includes("ses-running"), "no running badge when every session is terminal / statusless");
+});
+
 test("channels template renders the two differentiated waiting signals (user waiting-state + you-pill): unseen mentions + agent-awaiting", async () => {
   const mod = await loadTemplate("channels");
   assert.equal(mod.contract, 1);

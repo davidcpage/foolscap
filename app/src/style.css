@@ -226,6 +226,20 @@ body {
   border-radius: 4px;
   padding: 1px 5px;
 }
+/* The sessions card's running-count badge — a calm green pill (matching the `working` band hue in
+   session-status.ts) that reads at a glance as "N agents live". Only rendered when running > 0, so its
+   presence alone signals activity; it sits between the card name and the ⟳ refresh in the header. */
+.ses-running {
+  flex: none;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #15803d;
+  background: #16a34a1a;
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
 .file-dir {
   padding: 1px 10px 0;
   font-size: 10px;
@@ -3637,6 +3651,14 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .hud-frame > .node.channels .file-name { font-size: 11px; }
 .hud-frame > .node.channels .ses-row-title { font-size: 11px; }
 .hud-frame > .node.channels .ses-row-meta { font-size: 9.5px; }
+
+/* The sessions browser (node:sessions) sits in the LEFT column beneath the usage card at matching width
+   (hud.ts), a height-capped frame whose .dir-body scrolls a long list inside the viewport — the twin of
+   the Threads indicator above, so it takes the same compact row type to stay legible in the narrow HUD
+   panel without crowding. */
+.hud-frame > .node.sessions .file-name { font-size: 11px; }
+.hud-frame > .node.sessions .ses-row-title { font-size: 11px; }
+.hud-frame > .node.sessions .ses-row-meta { font-size: 9.5px; }
 
 /* The minimap HUD — navigation chrome pinned top-right, OUTSIDE the canvas subtree. It fades in on
    camera activity / held-Alt (the .show class) and out otherwise; pointer-transparent while hidden so
