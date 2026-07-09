@@ -19,14 +19,20 @@
 //
 // The `human` flag comes from thread-tags.js `resolveTags` — the single source of truth for what a mention
 // IS (HUMAN_TOKENS = @human/@user). It's independent of the member list, so we pass none. Card-only entries
-// (work-intents / ask echoes, `kind != null`) are bookkeeping, not messages that address the human — skipped,
-// mirroring the unread/nudge path in vite-fs-plugin.ts (`cardOnly`).
+// (work-intents / ask echoes, `kind != null`) are bookkeeping, not messages that address the human — skipped
+// via the shared `cardOnly` predicate below (vite-fs-plugin.ts's unread/nudge path imports the same one).
 //
 // FUTURE (out of scope now): pending ASKS addressed to the human would OR into this — but the `/ask` channel
 // can't target the human today, so there's no such signal yet; the shape (`waiting = mention || ask`) leaves
 // room for it.
 
 import { resolveTags } from "./thread-tags.js";
+
+// A "card-only" thread entry — a work-intent act or an ask echo, marked by a non-null `kind`. These are
+// bookkeeping painted on the card, not messages that WAKE a member or address the human, so both the unread/
+// nudge count (vite-fs-plugin.ts) and the human-waiting derivation below skip them. A falsy entry is treated
+// as card-only too (there's nothing to address). One predicate so the two paths can't diverge.
+export const cardOnly = (m) => !m || m.kind != null;
 
 // Hover-preview bounds (Phase 3): the pill/row hover reveals the ACTUAL waiting messages, not just a count.
 // Bounded in the derivation (one place) so no consumer re-drops: keep the TAIL — the most recent mentions are
@@ -55,7 +61,7 @@ export function humanWaiting(log, seenMentions) {
   const seen = seenMentions instanceof Set ? seenMentions : new Set(seenMentions ?? []);
   const unseen = [];
   for (const m of msgs) {
-    if (!m || m.kind != null) continue; // card-only (intent/ask) entries don't address the human
+    if (cardOnly(m)) continue; // card-only (intent/ask) entries don't address the human
     if (seen.has(m.seq)) continue; // the human has already viewed this mention (per-viewed clearing)
     if (resolveTags(m.text ?? "", []).human) unseen.push(m); // an @human / @user mention
   }

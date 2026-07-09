@@ -13,7 +13,7 @@ import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from
 import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, markSeenMentions, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readSeenMentions, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, sessionIdleIntent, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
-import { humanWaiting } from "./thread-waiting.js";
+import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "./work-intent.js";
@@ -29,7 +29,8 @@ import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
 import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
-import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey } from "./worktrees.js";
+import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey, parseWorktreePorcelain } from "./worktrees.js";
+import { sessionSummaryFromText } from "./session-summary.js";
 import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
@@ -228,19 +229,7 @@ function listWorktrees(canonicalPath: string): RootInfo[] {
   } catch {
     return []; // not a git repo / git absent — no worktrees, just the canonical root
   }
-  const raw: { path?: string; branch?: string; head?: string }[] = [];
-  let cur: { path?: string; branch?: string; head?: string } = {};
-  const flush = (): void => {
-    if (cur.path) raw.push(cur);
-    cur = {};
-  };
-  for (const line of out.split("\n")) {
-    if (line.startsWith("worktree ")) (flush(), (cur.path = line.slice(9)));
-    else if (line.startsWith("HEAD ")) cur.head = line.slice(5, 12);
-    else if (line.startsWith("branch ")) cur.branch = line.slice(7).replace("refs/heads/", "");
-    else if (line === "detached") cur.branch = "(detached)";
-  }
-  flush();
+  const raw = parseWorktreePorcelain(out); // shared with worktreeExists (worktrees.js) — one format parser
   // EXCLUDE this board's OWN checkout — it's already the canonical "repo" root (added by boardRoots). It
   // isn't necessarily the first entry: `git worktree list` always prints the MAIN checkout first, so a
   // board rooted at a LINKED worktree must drop the matching entry by realpath, not by position. Every
@@ -251,7 +240,7 @@ function listWorktrees(canonicalPath: string): RootInfo[] {
   // flood the file tree with one full tree per live agent). Drop anything under this board's `.canvas/`.
   const canvasHome = realpath(path.join(canonicalPath, ".canvas")) + path.sep;
   return raw
-    .map((r) => ({ real: realpath(r.path!), branch: r.branch ?? "", head: r.head ?? "" }))
+    .map((r) => ({ real: realpath(r.path), branch: r.branch, head: r.head }))
     .filter((r) => r.real !== canon && !r.real.startsWith(canvasHome))
     .map((r) => {
       let id = slug(path.basename(r.real));
@@ -1224,19 +1213,6 @@ const summaryCache = new Map<
   { mtime: number; title: string | null; turns: number; messages: number }
 >();
 
-function userText(content: unknown): string | null {
-  if (typeof content === "string") return content.trim() || null;
-  if (Array.isArray(content)) {
-    const parts = content
-      .filter((p): p is { type?: unknown; text?: unknown } => !!p && typeof p === "object")
-      .filter((p) => p.type === "text" && typeof p.text === "string")
-      .map((p) => (p.text as string).trim())
-      .filter(Boolean);
-    return parts.length ? parts.join(" ") : null;
-  }
-  return null;
-}
-
 function sessionSummary(
   abs: string,
   mtime: number,
@@ -1244,39 +1220,18 @@ function sessionSummary(
   const hit = summaryCache.get(abs);
   if (hit && hit.mtime === mtime)
     return { title: hit.title, turns: hit.turns, messages: hit.messages };
-  let aiTitle: string | null = null;
-  let firstPrompt: string | null = null;
-  let turns = 0;
-  let messages = 0;
+  let summary: { title: string | null; turns: number; messages: number };
   try {
-    const text = fs.readFileSync(abs, "utf8").slice(0, MAX_SESSION_BYTES);
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      let o: { type?: string; aiTitle?: unknown; message?: { content?: unknown } };
-      try {
-        o = JSON.parse(line);
-      } catch {
-        continue;
-      }
-      if (o.type === "ai-title" && typeof o.aiTitle === "string" && o.aiTitle.trim()) {
-        aiTitle = o.aiTitle.trim();
-      } else if (o.type === "user" || o.type === "assistant") {
-        messages++;
-        if (o.type === "user") {
-          const t = userText(o.message?.content);
-          if (t) {
-            turns++;
-            if (firstPrompt === null) firstPrompt = t;
-          }
-        }
-      }
-    }
+    // Scan the WHOLE transcript (session-summary.js explains why a head/tail slice corrupts the counts and
+    // title). Memory is bounded here by parsing at most once per mtime; the byte cap lives at the file reads
+    // that serve content to the browser (readSessionFile / the live feed), not on this metadata pass.
+    summary = sessionSummaryFromText(fs.readFileSync(abs, "utf8"));
   } catch {
     // unreadable transcript → no summary; the client falls back to the bare id
+    summary = { title: null, turns: 0, messages: 0 };
   }
-  const title = aiTitle ?? (firstPrompt ? firstPrompt.slice(0, 80) : null);
-  summaryCache.set(abs, { mtime, title, turns, messages });
-  return { title, turns, messages };
+  summaryCache.set(abs, { mtime, ...summary });
+  return summary;
 }
 
 // The lifecycle BAND a session reads, in the SAME categories the session card paints
@@ -1614,8 +1569,8 @@ interface ThreadMsg {
   intent?: WorkIntent;
 }
 // A card-only entry never wakes a member and never counts as inbox content — the shared gate for every
-// unread filter (an agent's own bookkeeping must not wake the room).
-const cardOnly = (m: ThreadMsg): boolean => m.kind != null;
+// unread filter (an agent's own bookkeeping must not wake the room). `cardOnly` is shared with
+// thread-waiting.js's human-waiting derivation so the two can't drift on what counts as bookkeeping.
 // §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —
 // the durable log stays broadcast-only). The HTTP response is parked until reply or timeout. Pinned in
 // fsState so the queue survives a hot re-eval; the held `res`/`timer` are process-bound (a restart times
@@ -2917,9 +2872,11 @@ function flushNudge(s: LiveSession): void {
 // fire the timer. This USED to be a bespoke per-session loop here (a cadence timer that nudged every already-
 // live looping session). It has been RETIRED and CONVERGED onto the general STANDING-JOB machinery (R6/W6):
 // the Coordinator heartbeat is now a standing job on the Coordinator's thread (`coordinator-heartbeat.js`),
-// fired by `standingJobsTick` through the one `serverSpawnWorker` primitive with WAKE-LIVE-ELSE-RESPAWN — so
-// it nudges a live+idle Coordinator (cheap) AND, unlike the old bespoke path, reconstitutes a DORMANT one.
-// One driver, no fork. Enabling that job is the AUTONOMY SWITCH and is human-gated (`scripts/canvas job
+// fired by `standingJobsTick`, which under TIMERS-NUDGE-NEVER-SPAWN only NUDGES a live+idle Coordinator
+// (cheap — context intact) and does nothing for a dormant seat (a timer can't create a session; a real
+// event — @-mention/ask/human — is what revives one). Reap-only-on-done keeps that live seat PARKED between
+// nudges, so the heartbeat keeps finding it. One driver, no fork. Enabling that job is the AUTONOMY SWITCH
+// and is human-gated (`scripts/canvas job
 // coordinator <thread>`); absent the job there is no auto-heartbeat, which is the correct gated-off state.
 // The `loops` role flag survives only as LEGIBILITY: an idle looping session reads the calm `scheduled` band
 // (sessionStatus) rather than the loud amber "waiting", since its wake comes from a scheduled job not a human.
@@ -3147,12 +3104,14 @@ async function handleSessionSpawn(
 // (thread history / the doc's annotation queue + the memory brief ensureLiveSession already bakes in), claim
 // the surface single-flight, drop a card, and send the first-turn worker brief. `--resume` is deliberately
 // NOT used (R1): reconstitution is a FRESH spawn seeded from the durable substrate, never a transcript
-// replay. W6 (standing jobs) rides this same function. Returns the new sid, or null if it couldn't spawn
+// replay. Only Triggers 1 & 2 spawn — standing jobs (W6) do NOT ride this: under TIMERS-NUDGE-NEVER-SPAWN a
+// timer may only nudge a live seat, never mint a session. Returns the new sid, or null if it couldn't spawn
 // (cap reached / spawn error — logged, never thrown: a wake is best-effort, it degrades to pull).
-const IDLE_KEEPALIVE_MS = 15 * 60_000; // R1: an undeclared-idle auto-wake worker idles this long, then the reaper
-// winds it down. Extended from 5 min — 5 was aggressive and churned Coordinators mid-task. A DECLARED block
-// overrides this per session (reapKeepAliveMs): blocked:human is never idle-reaped, blocked:peer gets a longer
-// backstop. The Coordinator heartbeat (4 min) stays well inside this so a live Coordinator is nudged, not reaped.
+const IDLE_KEEPALIVE_MS = 15 * 60_000; // R1: a DONE auto-wake worker idles this long, then the reaper winds it
+// down. Extended from 5 min — 5 was aggressive and churned Coordinators mid-task. Under REAP-ONLY-ON-DONE
+// (reapKeepAliveMs) this window applies ONLY to a session that has declared `done`; every other stance —
+// working, blocked:*, undeclared — is PARKED and never idle-reaped. The Coordinator heartbeat (4 min) stays
+// well inside this so a live Coordinator is nudged, not reaped.
 
 function serverSpawnWorker(opts: {
   boardId: string;
@@ -3325,7 +3284,7 @@ function autoWakeReapTick(): void {
     }
     // Reap only a session that has FINISHED (declared done, active nowhere); everything else parks (→ null).
     const done = sessionDeclaredDone(metas, s.id);
-    const keepAlive = reapKeepAliveMs(done ? "done" : null, IDLE_KEEPALIVE_MS);
+    const keepAlive = reapKeepAliveMs(done, IDLE_KEEPALIVE_MS);
     if (!shouldReapIdle(s, now, keepAlive)) continue;
     console.warn(
       `[auto-wake] reaping idle worker ${s.id} (declared done, idle ${Math.round((now - s.idleSince!) / 1000)}s ≥ ` +
@@ -3365,13 +3324,12 @@ function ensureCoordinatorHeartbeat(repoPath: string, threadId: string): void {
 }
 
 // Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
-// heartbeat, fire the standing jobs that have come due across every board's threads. WAKE-LIVE-ELSE-RESPAWN
-// (the efficiency norm — human's W6 concern, seq 104): a role-seat job whose seat is still occupied by a LIVE
-// session NUDGES that session (cheap — context intact), and only a DORMANT target pays a fresh respawn via the
-// serverSpawnWorker primitive (the same path doc-wake and dormant-seat respawn ride). This makes the
-// "<5min ⇒ wake existing / >5min ⇒ full respawn" split FALL OUT of the keep-alive window automatically:
-// a short interval finds the occupant still alive (nudge); an interval past keep-alive finds it reaped
-// (respawn). SINGLE-FLIGHT: a job whose prior fire is still running (its surface claimed, or the live occupant
+// heartbeat, fire the standing jobs that have come due across every board's threads. TIMERS NUDGE, NEVER
+// SPAWN (human-locked invariant, thread mrcauz0v-f): a role-seat job whose seat is still occupied by a LIVE
+// session NUDGES that session (cheap — context intact); a DORMANT (or reaped) target is left alone — the timer
+// does NOT respawn it (see planRoleJobFire below). Reviving a dormant seat waits for a real event (@-mention/
+// ask/human); reap-only-on-done keeps a wound-down Coordinator PARKED so the nudge keeps finding it rather
+// than the old runaway of a timer respawning it in a loop. SINGLE-FLIGHT: a job whose prior fire is still running (its surface claimed, or the live occupant
 // mid-turn) is SKIPPED this tick and retried next — no double-fire, never talk over a working session.
 // FIRE-NEXT-DUE: stampFired re-bases the schedule to now only on a REAL fire, so a boot-time overdue job fires
 // once (never replaying missed fires) and a cap-skipped / busy-skipped fire retries next tick. Jobs live on
@@ -3408,7 +3366,7 @@ function standingJobsTick(): void {
         //     re-evaluates next tick. A wound-down Coordinator is kept PARKED by the reaper (reap-only-on-done),
         //     so the nudge keeps finding it; a truly-exited seat waits for a real event (@-mention/ask/human).
         if (!job.role) continue; // bare job: no live seat to nudge, and timers don't spawn → no-op
-        const sid = readThreadMeta(board.repoPath, t.threadId)?.seats?.[job.role]?.sid;
+        const sid = tMeta?.seats?.[job.role]?.sid; // reuse the marker read once at the top of this thread
         const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
         if (planRoleJobFire(live?.status ?? null, seatIntent) !== "nudge") continue; // skip / none → no fire, no stamp
         sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });

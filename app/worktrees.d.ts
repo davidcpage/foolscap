@@ -78,3 +78,12 @@ export function mergeWorktree(
   opts?: { base?: string; noVerify?: boolean; force?: boolean },
 ): MergeResult;
 export function linkNodeModules(canonicalPath: string, wtPath: string): string[];
+
+// One parsed entry from `git worktree list --porcelain`. `branch` is "" when git prints neither a `branch`
+// nor a `detached` line; `head` is the short 7-char sha (or "" if absent).
+export interface WorktreePorcelainEntry {
+  path: string;
+  branch: string;
+  head: string;
+}
+export function parseWorktreePorcelain(out: string): WorktreePorcelainEntry[];

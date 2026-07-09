@@ -12,7 +12,7 @@ export function surfaceClaimant(key: string): string | null;
 export function isSurfaceClaimed(key: string): boolean;
 export function clearAllClaims(): void;
 
-export function reapKeepAliveMs(intent: string | null | undefined, defaultMs: number): number | null;
+export function reapKeepAliveMs(done: boolean, defaultMs: number): number | null;
 export function shouldReapIdle(
   session: { autoWake?: boolean; status?: string; idleSince?: number } | null | undefined,
   now: number,

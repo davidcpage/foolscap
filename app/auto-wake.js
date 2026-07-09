@@ -88,13 +88,13 @@ export function annotationWakeClass(eventKind) {
  * without declaring `done` parks harmlessly rather than being churned; a real event (@-mention/ask/human)
  * still wakes any parked session reactively.
  *
- * Pure/unit-testable; the reaper tick supplies `"done"` when the session has finished
- * (thread-ledger.sessionDeclaredDone) else null, and the default window (IDLE_KEEPALIVE_MS). A `null` return
- * threads through shouldReapIdle as never-reap.
+ * Pure/unit-testable; the reaper tick supplies `done` (thread-ledger.sessionDeclaredDone) and the default
+ * window (IDLE_KEEPALIVE_MS). Since REAP-ONLY-ON-DONE collapsed the old per-intent policy to a single bit,
+ * the param is now just that bit — not the intent string. A `null` return threads through shouldReapIdle as
+ * never-reap.
  */
-export function reapKeepAliveMs(intent, defaultMs) {
-  if (intent === "done") return defaultMs; // finished — reclaim the slot after the ordinary grace window
-  return null; // every other stance (working / blocked:* / undeclared) → NEVER idle-reap; park it
+export function reapKeepAliveMs(done, defaultMs) {
+  return done ? defaultMs : null; // done → reclaim after the grace window; every other stance → park (never reap)
 }
 
 /**
