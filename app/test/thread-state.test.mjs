@@ -83,40 +83,35 @@ test("isThreadState / THREAD_STATES", () => {
   assert.ok(!isThreadState(null));
 });
 
-// memberPillState — the unified per-pill fusion that superseded memberDisplayIntent. The pill wears the SAME
-// slot as the session card's band; the full server band (not a working-only bit) drives it, with this
-// thread's declared intent folded on top for the two states the server can't observe per-thread.
+// memberPillState — a PURE rendering of the ONE whole-session server band, the SAME value the card frame
+// reads. The band already carries the whole-session intent refinement (folded server-side, sessionStatus ×
+// sessionIdleIntent), so the pill does NOT fold per-thread intent — it maps the band to its slot. The only
+// use of the declared intent left here is the no-live-row fallback (a durable exited seat).
 
-// Every server band, with nothing declared, maps to the card's slot for that band — the "card and pill never
-// disagree" contract. (These are the Done-when divergence cases.)
+// Every server band maps to the card's slot for that band — the "card and pill never disagree" contract.
+// (These are the Done-when divergence cases.)
 test("memberPillState: each process-observed band drives the pill exactly as it drives the card", () => {
   assert.equal(memberPillState("working", null), "working");
   assert.equal(memberPillState("waiting", null), "blocked-human"); // idle "your turn" / permission-held → orange
-  assert.equal(memberPillState("waiting-agent", null), "blocked-peer"); // server-inferred blue, free
+  assert.equal(memberPillState("waiting-agent", null), "blocked-peer"); // server-inferred (or declared) blue
   assert.equal(memberPillState("scheduled", null), "scheduled"); // teal
   assert.equal(memberPillState("crashed", null), "crashed"); // red
   assert.equal(memberPillState("done", null), "done"); // grey
   assert.equal(memberPillState("ended", null), "done"); // grey (shares the done slot)
 });
 
-test("memberPillState: a RUNNING turn stays green regardless of a stale declaration (the contradiction it kills)", () => {
+test("memberPillState: the band ALWAYS wins over a per-thread declaration — no client-side fold (the drift this unification removed)", () => {
+  // A running turn is green whatever's declared — the "blocked pill on a green card" contradiction.
   assert.equal(memberPillState("working", "blocked:human"), "working");
-  assert.equal(memberPillState("working", "blocked:peer"), "working");
   assert.equal(memberPillState("working", "done"), "working");
-});
-
-test("memberPillState: done-on-a-still-live idle session → grey (the one thing only the declaration carries)", () => {
-  assert.equal(memberPillState("waiting", "done"), "done"); // idle-live, wound up its part here
-  assert.equal(memberPillState("waiting-agent", "done"), "done");
-  assert.equal(memberPillState("scheduled", "done"), "done");
-  // ...but never over a real exit band — a crash is not "done".
-  assert.equal(memberPillState("crashed", "done"), "crashed");
-});
-
-test("memberPillState: an untagged blocked:peer promotes the idle orange band to blue (the server can't see it)", () => {
-  assert.equal(memberPillState("waiting", "blocked:peer"), "blocked-peer");
-  // server already blue (an @-tagged peer) — declaration just agrees.
-  assert.equal(memberPillState("waiting-agent", "blocked:peer"), "blocked-peer");
+  // `done` declared on a still-live idle session does NOT grey the band — it shows grey only once the PROCESS
+  // exits (endReason → the "done"/"ended" band). The old done-on-live→grey fold is gone (folded whole-session).
+  assert.equal(memberPillState("waiting", "done"), "blocked-human");
+  assert.equal(memberPillState("waiting-agent", "done"), "blocked-peer");
+  assert.equal(memberPillState("scheduled", "done"), "scheduled");
+  // A blocked:peer promotion is handled whole-session now (sessionIdleIntent → the band reads waiting-agent),
+  // NOT re-derived per-thread here: given a `waiting` band the pill stays orange (the band is the source).
+  assert.equal(memberPillState("waiting", "blocked:peer"), "blocked-human");
 });
 
 test("memberPillState: no live row → fall back to the durable declared intent (a seat outlives its occupant)", () => {
@@ -157,5 +152,18 @@ test("drift lock: every pill slot has a .chan-member.i-<slot> rule in style.css"
   const css = readFileSync(fileURLToPath(new URL("../src/style.css", import.meta.url)), "utf8");
   for (const slot of PILL_STATES) {
     assert.match(css, new RegExp(`\\.chan-member\\.i-${slot}\\b`), `no pill CSS for i-${slot}`);
+  }
+});
+
+// The CARD side of the same lock: the session card frame renders each server band through a `.ses-frame-<x>`
+// class (card-types/session/render.js), where `done` shares the grey `ended` band (there is no ses-frame-done)
+// and every other band maps 1:1. If a band gained no frame rule, the card would paint nothing while the pill
+// still coloured — exactly the re-fork this enforces against. Kept next to the pill lock so the two can't drift.
+test("drift lock: every SessionStatus band has a .ses-frame-<class> rule in style.css (card side)", () => {
+  const BANDS = ["working", "waiting", "waiting-agent", "scheduled", "done", "crashed", "ended"];
+  const bandToFrame = (b) => (b === "done" ? "ended" : b); // render.js: done shares the grey ended band
+  const css = readFileSync(fileURLToPath(new URL("../src/style.css", import.meta.url)), "utf8");
+  for (const b of BANDS) {
+    assert.match(css, new RegExp(`\\.ses-frame-${bandToFrame(b)}\\b`), `no card frame CSS for band ${b}`);
   }
 });

@@ -74,37 +74,28 @@ export function intentPillState(intent) {
 }
 
 /**
- * The pill state for ONE participant in ONE thread — the fusion the roster pill renders, superseding the
- * old working-only `memberDisplayIntent`. It fuses the whole-session server band (what the canvas OBSERVES
- * of the process) with THIS thread's latest declared work-intent (what the session SAYS about its work
- * here).
+ * The pill state for a participant — a PURE rendering of the ONE whole-session server band (SessionMeta.status,
+ * session-status.ts), the SAME value the session card paints its frame from, so the two surfaces can never
+ * disagree (thread mrcmofwf-10). This does NOT fold in this thread's declared intent: the intent refinement
+ * now happens ONCE, server-side and WHOLE-SESSION (vite-fs-plugin.ts sessionStatus × sessionIdleIntent), and
+ * arrives already baked into `band`. Folding per-thread here is exactly the drift this unification removes —
+ * a session in many threads must show the SAME pill everywhere, not one coloured by each thread's local
+ * declaration. So: idle+blocked:human (any thread) already reads `waiting`; idle+blocked:peer already reads
+ * `waiting-agent`; a `done` on a still-live session does NOT grey the band (it shows grey only once the
+ * PROCESS exits, via endReason) — the old done-on-live→grey and untagged-blocked:peer→blue folds are gone,
+ * lifted whole-session into the band.
  *
- * Process-observed bands are GLOBAL: they drive the pill exactly as they drive the card (both surfaces show
- * the same slot, so they can never disagree). Two things only the per-thread declaration carries are folded
- * on top — the states the server can't see per-thread:
- *   • done-on-a-still-live session: the agent wound up ITS part here though the process runs on (idle, or
- *     busy in another thread) → grey, even while the card (whole-session) still reads waiting/etc. NOT
- *     applied over a RUNNING turn (`working`): a live turn is demonstrably not done, and a grey pill on a
- *     green/running card is the exact "stale declaration contradicts the live process" bug this fusion was
- *     built to kill. NOT applied over `crashed` either — a real exit is not "done".
- *   • blocked:peer with no @-tag: the server only infers `waiting-agent` (blue) from an @-tagged peer, so a
- *     peer named in prose leaves the band at `waiting` (orange). A declared blocked:peer promotes it to blue.
- *     (A running turn stays green — see above; the promotion only lifts the idle orange band.)
+ * The one thing left here is the no-live-row fallback: with no session row (band null/undefined) the seat may
+ * still carry a durable declaration — an exited seat holding `blocked:human`, or a `done` — so fall back to
+ * the declared intent alone; null → a neutral "no status declared" pill (never fabricate one).
  *
- * With no live session row (band null/undefined) the seat may still carry a durable declaration — an exited
- * seat holding `blocked:human`, or a `done` — so fall back to the declared intent alone; null → a neutral
- * "no status declared" pill (never fabricate one, same honesty rule the old fn kept).
- *
- * @param {string|null|undefined} band  the session's SessionMeta.status, or null when there's no live row
- * @param {string|null|undefined} declaredIntent  this thread's latest declared work-intent, or null
+ * @param {string|null|undefined} band  the session's whole-session SessionMeta.status, or null when there's no live row
+ * @param {string|null|undefined} declaredIntent  this thread's latest declared work-intent — used ONLY for the no-row fallback
  * @returns {string|null} a PILL_STATES member, or null for a neutral pill
  */
 export function memberPillState(band, declaredIntent) {
   const base = band ? (BAND_TO_PILL[band] ?? null) : null;
-  if (!base) return intentPillState(declaredIntent);
-  if (declaredIntent === "done" && base !== "working" && base !== "crashed") return "done";
-  if (declaredIntent === "blocked:peer" && base === "blocked-human") return "blocked-peer";
-  return base;
+  return base ?? intentPillState(declaredIntent);
 }
 
 /**

@@ -11,7 +11,7 @@ import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession, re
 import { localProc, remoteProc, type SessionProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, markSeenMentions, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readSeenMentions, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, markSeenMentions, migrateChannelLedger, ownBlockedIntentKeys, pinMessage, readPins, readSeenMentions, readThreadLog, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, sessionDeclaredDone, sessionIdleIntent, setThreadLevel, threadLevelForSid, threadMembersFromMeta, unpinMessage, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
 import { classifyMentionSpawn, resolveTags } from "./thread-tags.js";
 import { humanWaiting } from "./thread-waiting.js";
 import { unreadMentions, contentVersion, isStaleWrite } from "./cas-guard.js";
@@ -1302,20 +1302,36 @@ function hasScheduledWake(repoPath: string, id: string): boolean {
     return false;
   }
 }
-function sessionStatus(repoPath: string, id: string): SessionBand {
+// The ONE whole-session status band both surfaces render from (thread mrcmofwf-10): the session card's
+// frame band (card-types/session/render.js) AND that session's participant pill in every thread
+// (thread-state.js memberPillState) read THIS value, so they can never disagree. Process-observed bands
+// (working/scheduled/crashed/ended) are authoritative and GLOBAL; only the *idle* band takes a declared-
+// intent refinement, folded WHOLE-SESSION (across every thread the session is in — sessionIdleIntent), per
+// the v2 precedence. `null` = bandless (a never-run session that has handed you nothing yet, or an unknown
+// session): both surfaces render neutral, never a fabricated "your turn".
+function sessionStatus(repoPath: string, id: string): SessionBand | null {
   const live = liveSessions.get(id);
   if (live) {
     // A held permission prompt outranks everything live: the process is technically mid-turn
     // ("running"), but it's blocked on a HUMAN click — the one state the loud band exists for.
     if (live.status !== "exited" && [...pendingPermissions.values()].some((p) => p.sid === id)) return "waiting";
     if (live.status === "running") return "working";
-    // Idle: blocked on a peer (blue) > asleep on the loop heartbeat (calm teal `scheduled`, a looping role
-    // between ticks — no human demand) > the default loud amber "your turn". `scheduled` is gated on an ACTUAL
-    // live scheduled wake (hasScheduledWake), not the static `loops` flag — a looping role with no standing job
-    // will never wake on a timer, so it's "waiting" (a real demand on you), not asleep.
     if (live.status === "idle") {
+      // Never-run: idle with no output yet has handed you nothing back, so the loud amber "your turn" is
+      // wrong — stay bandless until the first turn produces output and idles again (which IS your turn).
+      if (live.lines.length === 0) return null;
+      // Idle band precedence (v2, whole-session): scheduled (a looping role asleep on its heartbeat — teal,
+      // no human demand; gated on an ACTUAL live wake, not the static `loops` flag) > declared blocked:human
+      // (loud orange) > declared blocked:peer (blue) > a server-inferred @-tag peer-wait (blue `waitingOn`,
+      // free) > the default orange "your turn". Declared intent is aggregated across ALL the session's
+      // threads; `done`/`working` don't paint the idle band (done never colours a live session — it shows
+      // only once the process exits, via endReason grey). One listThreads read shared by both consults.
+      const metas = listThreads(repoPath);
+      if (live.loops && sessionHasScheduledWake(metas, id)) return "scheduled";
+      const idleIntent = sessionIdleIntent(metas, id);
+      if (idleIntent === "blocked:human") return "waiting";
+      if (idleIntent === "blocked:peer") return "waiting-agent";
       if (live.waitingOn?.length) return "waiting-agent";
-      if (live.loops && hasScheduledWake(repoPath, id)) return "scheduled";
       return "waiting";
     }
     if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
@@ -2153,6 +2169,11 @@ function publishSession(s: LiveSession): void {
     content,
     truncated,
     status: s.status,
+    // The ONE whole-session status band (sessionStatus) the card renders its frame from — the SAME value
+    // the thread participant pill reads off /api/sessions, so the two surfaces can't drift. Sent on every
+    // publish (including `null` = bandless/never-run) so the card stops recomputing the band client-side;
+    // it falls back to its own derivation only when this key is absent (a slice-1 file-tail feed).
+    band: sessionStatus(s.repoPath, s.id),
     skills: s.skills ?? undefined,
     verb: s.verb ?? undefined, // live progress label for the status pill (channel-1 chrome)
     usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn

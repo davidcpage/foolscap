@@ -599,14 +599,23 @@ export default {
     // "scheduled", not the loud amber "your turn". Ranks below waiting-on-agent (a named peer-wait is the more
     // specific signal) and never overrides neverRun.
     const scheduled = status === "idle" && !neverRun && !waitingOnAgent && !!(live && live.scheduled);
+    // The status BAND is the ONE whole-session value the server computes (vite-fs-plugin.ts sessionStatus),
+    // carried on the feed as `band` — the SAME value the thread participant pill reads, so the card's frame
+    // and the pill can never disagree (thread mrcmofwf-10). The card no longer re-derives the band from raw
+    // process signals; it maps the server band to its frame class (`done` shares the grey `ended` band; a
+    // `null` band = bandless/never-run → no frame). The client derivation below survives ONLY as a fallback
+    // for a slice-1 file-tail/historical feed that carries no server band (`band` key absent).
+    const serverBand = live && "band" in live ? live.band : undefined;
     const frameState =
-      needsPermission
-        ? "waiting"
-        : status === "running"
-          ? "working"
-          : status === "idle"
-            ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
-            : ended ? endFrame : null;
+      serverBand !== undefined
+        ? (serverBand === "done" ? "ended" : serverBand || null)
+        : needsPermission
+          ? "waiting"
+          : status === "running"
+            ? "working"
+            : status === "idle"
+              ? neverRun ? null : waitingOnAgent ? "waiting-agent" : scheduled ? "scheduled" : "waiting"
+              : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
     // Pill mirrors the band so the two never disagree on one card: a live process shows its status (verb

@@ -430,11 +430,11 @@ function ThreadView({
   const youWaitingKey = (youWaitingSeqs ?? []).join(",");
   const pins = feed?.pins ?? [];
   const pinnedSeqs = useMemo(() => new Set(pins.map((p) => p.seq)), [pins]);
-  // The server's whole-session status band per member, for the pill fusion. `SessionMeta.status` rides
-  // /api/sessions keyed by sid = the session node's `title` (the same node↔session join Minimap/App use).
-  // The pill consumes the FULL band (working / waiting / waiting-agent / scheduled / done / crashed / ended)
-  // — not a working-only boolean — so all seven card bands reach the pill instead of collapsing to idle;
-  // memberPillState then maps the band to a pill slot and folds this thread's declared intent on top.
+  // The server's ONE whole-session status band per member — the SAME value the session card paints its frame
+  // from, so pill and card can't disagree (thread mrcmofwf-10). `SessionMeta.status` rides /api/sessions keyed
+  // by sid = the session node's `title` (the same node↔session join Minimap/App use). It already carries the
+  // whole-session intent refinement (folded server-side, sessionStatus × sessionIdleIntent), so the pill just
+  // maps the band to its slot — no per-thread fold here (that was the drift this unification removed).
   const sessions = useSignal(sessionListSignal);
   const bandBySid = useMemo(() => {
     const map: Record<string, string> = {};
@@ -845,14 +845,13 @@ function ThreadView({
           <span className="chan-empty">no agents yet — alt-drag a session card onto this channel to join it</span>
         ) : (
           members.map((mem) => {
-            // Colour the pill by this member's UNIFIED status slot — the SAME band the session card wears, so
-            // the two surfaces can never disagree (green = working, orange = blocked:human, blue =
-            // blocked:peer, teal = scheduled, red = crashed, grey = done). memberPillState fuses the full
-            // server band (process-observed, whole-session — permission-hold, crash, scheduled all reach the
-            // pill now, not just running) with THIS thread's declared intent (done-on-live → grey; an untagged
-            // blocked:peer promotes idle orange → blue). A running turn stays green regardless of a stale
-            // declaration — the "blocked pill on a green/running card" contradiction this fusion kills. A
-            // member with nothing observed and nothing declared falls back to the open/pending styling.
+            // Colour the pill by this member's UNIFIED status slot — the SAME whole-session band the session
+            // card wears, so the two surfaces can never disagree (green = working, orange = blocked:human,
+            // blue = blocked:peer/waiting-agent, teal = scheduled, red = crashed, grey = done/ended). The band
+            // already carries the whole-session intent refinement (folded server-side), so memberPillState is a
+            // pure band→slot map; a running turn is green, a permission-hold/crash/scheduled all reach the pill.
+            // The declared intent is passed only for the no-live-row fallback (a durable exited seat). A member
+            // with no row and nothing declared falls back to the open/pending styling.
             const ci = mem.open ? currentIntent[mem.sid] : undefined;
             const pillState: PillState | null = mem.open
               ? memberPillState(bandBySid[mem.sid] ?? null, ci?.intent ?? null)
