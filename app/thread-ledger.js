@@ -267,6 +267,38 @@ export function sessionDeclaredDone(metas, sid) {
 }
 
 /**
+ * The declared-intent refinement for a session's IDLE status band, aggregated WHOLE-SESSION across every
+ * thread it participates in (single-source unification, thread mrcmofwf-10). The server's process-observed
+ * band is authoritative for running/scheduled/exited; only the *idle* band takes an intent refinement, and
+ * only these two intents paint (v2 precedence): `blocked:human` (→ the loud orange "your turn") outranks
+ * `blocked:peer` (→ blue "waiting on an agent"), whole-session. `working` and `done` are deliberately NOT
+ * returned — an idle `working` is the same orange as an undeclared idle, and `done` must NEVER colour a
+ * still-live session (it only shows once the PROCESS exits, via endReason grey); folding done here would
+ * reintroduce the "grey pill on a live card" contradiction this unification exists to kill.
+ *
+ * "Its own" mirrors sessionDeclaredDone / ownBlockedIntentKeys: a sid-stamped record (covers a seat-keyed
+ * OR bare-sid self-declaration), never another (now-exited) occupant's seat-inherited intent — a fresh
+ * occupant wears only what IT declared, not the block its predecessor left on the seat. Pure; short-circuits
+ * to `blocked:human` on the first one seen (it can't be outranked).
+ *
+ * @param {Array<{ intents?: Record<string, {intent?: string, sid?: string}> }>|undefined} metas  listThreads markers
+ * @param {string} sid
+ * @returns {"blocked:human"|"blocked:peer"|null}
+ */
+export function sessionIdleIntent(metas, sid) {
+  let peer = false;
+  for (const meta of metas ?? []) {
+    for (const [key, rec] of Object.entries(meta?.intents ?? {})) {
+      if (key !== sid && rec?.sid !== sid) continue;
+      const it = rec?.intent;
+      if (it === "blocked:human") return "blocked:human"; // highest — can't be outranked, stop
+      if (it === "blocked:peer") peer = true;
+    }
+  }
+  return peer ? "blocked:peer" : null;
+}
+
+/**
  * The occupant sid of a thread's `role` seat that an UNTAGGED post should NUDGE, or null (untagged→Coordinator,
  * Option B). An untagged post (neither a room `broadcast` nor an @-`mentioned` post) wakes no member by the
  * normal seat-level fan-out — the ambient case principle 3 keeps quiet. But a role like the Coordinator is the

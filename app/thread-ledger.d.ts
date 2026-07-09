@@ -92,6 +92,10 @@ export function sessionDeclaredDone(
   metas: ThreadMetaMarker[] | undefined,
   sid: string,
 ): boolean;
+export function sessionIdleIntent(
+  metas: ThreadMetaMarker[] | undefined,
+  sid: string,
+): "blocked:human" | "blocked:peer" | null;
 export function untaggedSeatNudgeTarget(
   meta: ThreadMetaMarker | null | undefined,
   role: string,

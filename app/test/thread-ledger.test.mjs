@@ -21,6 +21,7 @@ import {
   seatForSid,
   ownBlockedIntentKeys,
   sessionDeclaredDone,
+  sessionIdleIntent,
   setThreadLevel,
   threadLevelForSid,
   readPins,
@@ -230,6 +231,41 @@ test("sessionDeclaredDone: sid-keyed OR seat-keyed (sid-stamped) self-declaratio
   // a `done` a DIFFERENT (exited) occupant left on a seat this session later re-filled is NOT this session's —
   // the fresh occupant must not be reaped on the departed's behalf.
   assert.equal(sessionDeclaredDone([{ intents: { Coordinator: { intent: "done", sid: "sid-old" } } }], "sid-new"), false);
+});
+
+// sessionIdleIntent — the whole-session declared-intent refinement for the IDLE status band (thread
+// mrcmofwf-10). blocked:human outranks blocked:peer whole-session; working/done never paint the idle band.
+test("sessionIdleIntent: blocked:human > blocked:peer, aggregated across all the session's threads", () => {
+  const meta = (intents) => ({ intents });
+  // a single declared block on the session's one thread
+  assert.equal(sessionIdleIntent([meta({ x: { intent: "blocked:human", sid: "s" } })], "s"), "blocked:human");
+  assert.equal(sessionIdleIntent([meta({ x: { intent: "blocked:peer", sid: "s" } })], "s"), "blocked:peer");
+  // blocked:human on ANY thread outranks a blocked:peer on another (whole-session precedence)
+  assert.equal(
+    sessionIdleIntent([meta({ a: { intent: "blocked:peer", sid: "s" } }), meta({ b: { intent: "blocked:human", sid: "s" } })], "s"),
+    "blocked:human",
+  );
+});
+
+test("sessionIdleIntent: working and done NEVER paint the idle band (done shows only once the process exits)", () => {
+  const meta = (intents) => ({ intents });
+  assert.equal(sessionIdleIntent([meta({ x: { intent: "working", sid: "s" } })], "s"), null);
+  assert.equal(sessionIdleIntent([meta({ x: { intent: "done", sid: "s" } })], "s"), null);
+  // a done on one thread + a blocked:peer on another → blue (done is inert, the peer-wait wins)
+  assert.equal(
+    sessionIdleIntent([meta({ a: { intent: "done", sid: "s" } }), meta({ b: { intent: "blocked:peer", sid: "s" } })], "s"),
+    "blocked:peer",
+  );
+  assert.equal(sessionIdleIntent([], "s"), null);
+  assert.equal(sessionIdleIntent(undefined, "s"), null);
+});
+
+test("sessionIdleIntent: sid-stamped self-declaration only, never another (exited) occupant's seat-inherited block", () => {
+  // matches a bare sid key and a seat-keyed record stamped with this sid
+  assert.equal(sessionIdleIntent([{ intents: { "sid-a": { intent: "blocked:human", sid: "sid-a" } } }], "sid-a"), "blocked:human");
+  assert.equal(sessionIdleIntent([{ intents: { Reviewer: { intent: "blocked:peer", sid: "sid-a" } } }], "sid-a"), "blocked:peer");
+  // a block a DIFFERENT (exited) occupant left on a seat this session re-filled is NOT this session's
+  assert.equal(sessionIdleIntent([{ intents: { Coordinator: { intent: "blocked:human", sid: "sid-old" } } }], "sid-new"), null);
 });
 
 test("ownBlockedIntentKeys: NEVER a seat-inherited block another (exited) occupant left — the sacred waiting state", () => {
