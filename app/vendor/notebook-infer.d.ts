@@ -47,6 +47,16 @@ export interface AnalyzeOptions {
 
 export function analyzeCell(source: string, opts?: AnalyzeOptions): CellAnalysis;
 
+/** The identifiers a standalone function SOURCE references but does not bind (params, inner declarations, and a
+ *  named function expression's own name are bound). Parsed as an expression — the shape the consumer rebuilds.
+ *  Returns null when the source doesn't re-parse standalone. Used by function transport to detect unsafe closures. */
+export function freeIdentifiers(source: string): string[] | null;
+
+/** The free identifiers of a transported function that would be UNRESOLVED in the consumer: neither a closure
+ *  snapshot binding (`closureNames`) nor a realm global. Non-empty ⇒ the function must degrade to a display
+ *  string rather than ship a descriptor (it would throw ReferenceError when called). */
+export function unresolvableFreeVars(source: string, closureNames: string[]): string[];
+
 /** The default ESM CDN base a bare import specifier maps onto (A2 lib loading), e.g. `https://esm.sh/`. */
 export const DEFAULT_CDN_BASE: string;
 

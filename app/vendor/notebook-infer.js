@@ -146,6 +146,63 @@ export function analyzeCell(source, opts) {
 // deliberately small — `document`/`window` are the roots every hand-rolled DOM/SVG build goes through.
 const DOM_GLOBALS = new Set(["document", "window"]);
 
+// ── transported-function free-variable analysis (function transport across cells/notebooks) ─────────
+// A function value can't be structured-cloned, so it travels as SOURCE and is rebuilt in the CONSUMER realm as
+// `new Function(...closureNames, "return (" + source + ")")(...closureVals)`. That stays callable only if EVERY
+// identifier the function reads freely resolves there: a snapshotted closure binding (a sibling/imported value
+// the runtime captured) or a realm GLOBAL (Math, JSON, fetch, …). A function that closes over a cell-LOCAL const
+// (`const k = 5; f = x => x + k`) or references its OWN name (anonymous recursion, `f = n => n * f(n - 1)`) has
+// a free identifier that is NEITHER, so it rehydrates but throws ReferenceError at call time. This analysis lets
+// the runtime detect that and DEGRADE such a function to its display string (the documented fallback) instead of
+// shipping a landmine descriptor.
+
+// The identifiers a standalone function SOURCE references but does not itself bind. Parsed as an EXPRESSION (the
+// exact shape the consumer rebuilds), so an arrow, an anonymous `function (…) {…}`, and a NAMED function
+// expression (whose own name IS a binding — so a named recursive function is NOT flagged) all analyse uniformly.
+// Coarse (whole-source, not scope-precise), matching analyzeCell: a name bound anywhere counts as bound. Returns
+// null when the source doesn't re-parse standalone (the caller then keeps its existing behaviour).
+export function freeIdentifiers(source) {
+  const src = String(source ?? "");
+  let ast;
+  try {
+    // Wrap in parens and parse the WHOLE thing — the exact shape the consumer rebuilds with
+    // `new Function("return (" + source + ")")`. A source that leaves trailing garbage (`m() {}` → `(m() {})`)
+    // fails here and returns null, matching the consumer (which would also fail to rebuild it).
+    ast = parse("(" + src + ")", { ecmaVersion: "latest", allowAwaitOutsideFunction: true });
+  } catch {
+    return null;
+  }
+  const bound = new Set();
+  collectBindings(ast, bound);
+  const referenced = new Set();
+  collectReferences(ast, referenced);
+  return [...referenced].filter((n) => !bound.has(n));
+}
+
+// The free identifiers of a transported function that would be UNRESOLVED in the consumer: neither a name the
+// runtime will bind as a closure snapshot (`closureNames`) nor a realm global. A non-empty result means the
+// function must NOT ship as a descriptor (it would throw ReferenceError when called) and should degrade to its
+// display string. Empty — including for a source that doesn't re-parse — means it transports cleanly, as today.
+export function unresolvableFreeVars(source, closureNames) {
+  const free = freeIdentifiers(source);
+  if (!free || !free.length) return [];
+  const provided = new Set(closureNames || []);
+  return free.filter((n) => !provided.has(n) && !isRealmGlobal(n));
+}
+
+// Is `name` a binding available in ANY realm the rebuilt function might run in (worker / main thread / node)? A
+// property of globalThis (Math, JSON, Object, Array, Promise, fetch, console, …) or the implicit function-scope
+// `arguments`. Conservative by design: a name that isn't clearly global degrades the function to a display
+// string — the safe, documented direction (never a call-time ReferenceError).
+function isRealmGlobal(name) {
+  if (name === "arguments") return true;
+  try {
+    return typeof globalThis !== "undefined" && name in globalThis;
+  } catch {
+    return false;
+  }
+}
+
 // True when the cell's LAST top-level statement is an ExpressionStatement terminated by an explicit `;` — the
 // output-suppression signal. Acorn sets an ExpressionStatement's `end` to just past its inner expression when
 // there's NO semicolon (ASI), and just past the `;` when there is one; so the span between them contains the

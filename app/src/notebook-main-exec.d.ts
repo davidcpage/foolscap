@@ -20,3 +20,7 @@ export function serializeView(node: Node): { kind: "svg" | "html" | "dom"; marku
 /** Clone-safe a NON-node value for exportsVal (twin of the worker's cloneSafe): a function → a source
  *  descriptor, a non-clonable value → a string, primitives/JSON-ish pass through. */
 export function cloneSafe(value: unknown): unknown;
+
+/** Rehydrate a transported value: turn {__fn__} descriptors back into callables and deep-COPY arrays/objects
+ *  (never mutating the input — this realm holds the runtime's shared exports). Preserves cycles in the copy. */
+export function rehydrate(value: unknown, seen?: Map<unknown, unknown>): unknown;

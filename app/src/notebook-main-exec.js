@@ -139,8 +139,15 @@ function fnDescriptor(fn) {
 // Rehydrate a transported value on the way IN — a duplicate of the worker's rehydrate (see the module header
 // for WHY it's duplicated, not imported). Turns every {__fn__} descriptor back into a real callable by
 // re-evaluating its source with its captured closure bound as parameters; recurses into the closure and into
-// plain arrays/objects so a whole-notebook object import has callable members. `seen` guards cyclic input.
-function rehydrate(value, seen) {
+// plain arrays/objects so a whole-notebook object import has callable members.
+//
+// COPY-ON-REHYDRATE (never mutate the input): unlike the worker — which receives a structured-clone copy over
+// postMessage and so can mutate in place harmlessly — this MAIN-THREAD realm is handed the runtime's REAL
+// shared reactive values (exportsVal atoms, resolved inputs). Mutating `value[i] = …` / `value[k] = …` in place
+// would rewrite that shared export graph, corrupting later worker consumers and re-runs that read the same
+// atom. So we build a NEW array/object and leave the input untouched. `seen` maps each input container to its
+// copy, so a cyclic input rebuilds the SAME cycle in the copy (and is still guarded against infinite recursion).
+export function rehydrate(value, seen) {
   if (value === null || typeof value !== "object") return value;
   if (value.__fn__ === true && typeof value.source === "string") {
     const closure = value.closure && typeof value.closure === "object" ? value.closure : {};
@@ -152,13 +159,16 @@ function rehydrate(value, seen) {
       return value.source; // not re-evaluable here — hand back the source (display fallback)
     }
   }
-  seen = seen || new Set();
-  if (seen.has(value)) return value;
-  seen.add(value);
+  seen = seen || new Map(); // input container → its copy (preserves shared refs + cycles without mutating input)
+  if (seen.has(value)) return seen.get(value);
   if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) value[i] = rehydrate(value[i], seen);
-    return value;
+    const copy = new Array(value.length);
+    seen.set(value, copy);
+    for (let i = 0; i < value.length; i++) copy[i] = rehydrate(value[i], seen);
+    return copy;
   }
-  for (const k of Object.keys(value)) value[k] = rehydrate(value[k], seen);
-  return value;
+  const copy = {};
+  seen.set(value, copy);
+  for (const k of Object.keys(value)) copy[k] = rehydrate(value[k], seen);
+  return copy;
 }

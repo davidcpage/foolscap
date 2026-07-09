@@ -7,6 +7,7 @@ import { activeBoardId } from "./board";
 import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
+import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
 import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
@@ -1789,6 +1790,10 @@ function TemplateCard({
     applied.current = template;
     return () => {
       m0.dispose();
+      // Release any notebook-runtime state this card held (nbs/outputs/subscriptions/timers/chart DOM). A no-op
+      // for non-notebook cards. This fires only on a REAL unmount (card removed / id change), never a template
+      // hot-reload (handled in place by the swap effect below), so it doesn't wipe state on a re-render.
+      teardownNotebook(id);
       mount.current = null;
     };
     // `template` is intentionally excluded — see above; the swap effect handles a hot-reload in place.
