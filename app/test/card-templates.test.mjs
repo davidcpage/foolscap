@@ -1412,6 +1412,44 @@ test("session card idle FALLBACK matches server precedence: scheduled outranks w
   assert.ok(noSched.includes("waiting on agent"), "…and its pill too");
 });
 
+// Single-source pill/frame (card side, thread mrdj958k-d — the follow-up bug from the pre-push review):
+// the PILL must read the same server `band` the FRAME does, so the two can't diverge. The reachable hole
+// was blocked:peer declared WITHOUT an @-tag: sessionStatus paints band "waiting-agent" (blue frame) but
+// `waitingOn` is never set, so the client-derived pill fell through to amber "○ waiting" — frame blue,
+// pill amber, on one card. With the fix the pill is derived from the band too, so both read blue.
+test("session card pill mirrors the server band: blocked:peer-without-@tag reads blue on BOTH surfaces", async () => {
+  const mod = await loadTemplate("session");
+  const turn = JSON.stringify({ type: "user", message: { role: "user", content: "go" } });
+  // The server-authoritative feed: idle + band "waiting-agent", but NO `waitingOn` (the untagged case).
+  const card = {
+    fields: { title: "abcd1234", text: "", color: "blue" },
+    signals: { session: { content: turn, truncated: false, status: "idle", band: "waiting-agent" } },
+  };
+  const out = flatten(mod.render(card));
+  assert.ok(!("waitingOn" in card.signals.session), "fixture sets NO waitingOn (the untagged blocked:peer case)");
+  assert.ok(out.includes("ses-frame-waiting-agent"), "frame reads the blue waiting-agent band");
+  assert.ok(out.includes("○ waiting on agent"), "PILL now mirrors the band — blue waiting-on-agent, not amber");
+  assert.ok(!out.includes("○ waiting</span>"), "the old amber '○ waiting' pill is gone (no frame/pill divergence)");
+
+  // Every server band paints the frame and pill to the SAME colour family — the whole point of the unification.
+  const cases = [
+    { band: "working", frame: "ses-frame-working", pill: "● Working…" },
+    { band: "waiting", frame: "ses-frame-waiting", pill: "○ waiting" },
+    { band: "waiting-agent", frame: "ses-frame-waiting-agent", pill: "○ waiting on agent" },
+    { band: "scheduled", frame: "ses-frame-scheduled", pill: "◷ scheduled" },
+    { band: "done", frame: "ses-frame-ended", pill: "✓ done" },
+    { band: "crashed", frame: "ses-frame-crashed", pill: "✕ crashed" },
+  ];
+  for (const c of cases) {
+    // `done`/`crashed` are end states — their pill flavour rides `endReason`, which the band was derived from.
+    const endReason = c.band === "done" ? "done" : c.band === "crashed" ? "crashed" : undefined;
+    const feed = { content: turn, truncated: false, band: c.band, ...(endReason ? { status: "exited", endReason } : { status: c.band === "working" ? "running" : "idle" }) };
+    const o = flatten(mod.render({ ...card, signals: { session: feed } }));
+    assert.ok(o.includes(c.frame), `band ${c.band}: frame ${c.frame}`);
+    assert.ok(o.includes(c.pill), `band ${c.band}: pill "${c.pill}" agrees with the frame`);
+  }
+});
+
 // worktree-activity slices A/C: the session card's touched-files activity strip — derived from the same
 // tool_use blocks as the turns — dedupes by path (newest touch wins), marks edited files as written
 // (sticky even after a later read), and colours each dot by the WORKTREE the absolute path falls under.

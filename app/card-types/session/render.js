@@ -619,9 +619,9 @@ export default {
               : ended ? endFrame : null;
     const frame = frameState ? html`<div class="ses-frame ses-frame-${frameState}"></div>` : "";
 
-    // Pill mirrors the band so the two never disagree on one card: a live process shows its status (verb
-    // while running, amber "waiting" idle); an ended one reads its end-reason ("✓ done" / "✕ crashed" /
-    // neutral "✕ ended" / the bare "✕ exited"/"○ inactive" fallbacks); a status-less live tail stays green.
+    // The pill reads the SAME server band the frame does (bandPill below), so the two can never disagree on
+    // one card. An ended session picks its flavour from the end-reason the band was derived from ("✓ done" /
+    // "✕ crashed" / neutral "✕ ended" / the bare "✕ exited"/"○ inactive" fallbacks).
     const endPill = (fallbackLabel, fallbackClass) =>
       endReason === "done"
         ? html`<span class="ses-live ses-done">✓ done</span>`
@@ -630,26 +630,57 @@ export default {
           : endReason === "terminated"
             ? html`<span class="ses-live ses-inactive">✕ ended</span>`
             : html`<span class="ses-live ${fallbackClass}">${fallbackLabel}</span>`;
+    // Map the ONE server band to its pill — the SAME map the frame uses for its class above, so the pill and
+    // frame can never diverge (thread mrdj958k-d). This closes the blocked:peer-without-@tag hole: such a
+    // session gets band "waiting-agent" server-side but never sets `waitingOn`, so the raw client derivation
+    // below painted it amber "waiting" while the frame went blue — now both read the blue "waiting on agent".
+    // The three end bands (done/crashed/ended) route through endPill, reading the endReason the band was
+    // derived from for its flavour. A `null` band (bandless/never-run) maps to the neutral "● live".
+    const bandPill = (band) => {
+      switch (band) {
+        case "working":
+          return html`<span class="ses-live ses-running">● ${verb}…</span>`;
+        case "waiting":
+          return needsPermission
+            ? html`<span class="ses-live ses-idle">⚠ permission</span>`
+            : html`<span class="ses-live ses-idle">○ waiting</span>`;
+        case "waiting-agent":
+          return html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`;
+        case "scheduled":
+          return html`<span class="ses-live ses-scheduled">◷ scheduled</span>`;
+        case "done":
+        case "crashed":
+        case "ended":
+          return endPill("✕ exited", "ses-exited");
+        default:
+          return html`<span class="ses-live">● live</span>`;
+      }
+    };
+    // Primary path: derive the pill from the server band, exactly as the frame does. The raw client
+    // derivation survives ONLY as the fallback for a slice-1 file-tail / historical feed carrying no band
+    // (`serverBand === undefined`) — mirroring the frame's own `serverBand !== undefined` split above.
     const pill =
-      needsPermission
-        ? html`<span class="ses-live ses-idle">⚠ permission</span>`
-        : status === "running"
-          ? html`<span class="ses-live ses-running">● ${verb}…</span>`
-        : status === "idle"
-          ? neverRun
-            ? html`<span class="ses-live">● live</span>`
-            : scheduled
-              ? html`<span class="ses-live ses-scheduled">◷ scheduled</span>`
-              : waitingOnAgent
-                ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
-                : html`<span class="ses-live ses-idle">○ waiting</span>`
-          : status === "exited"
-            ? endPill("✕ exited", "ses-exited")
-            : inactive
-              ? endPill("○ inactive", "ses-inactive")
-              : live
-                ? html`<span class="ses-live">● live</span>`
-                : "";
+      serverBand !== undefined
+        ? bandPill(serverBand)
+        : needsPermission
+          ? html`<span class="ses-live ses-idle">⚠ permission</span>`
+          : status === "running"
+            ? html`<span class="ses-live ses-running">● ${verb}…</span>`
+          : status === "idle"
+            ? neverRun
+              ? html`<span class="ses-live">● live</span>`
+              : scheduled
+                ? html`<span class="ses-live ses-scheduled">◷ scheduled</span>`
+                : waitingOnAgent
+                  ? html`<span class="ses-live ses-waiting-agent">○ waiting on agent</span>`
+                  : html`<span class="ses-live ses-idle">○ waiting</span>`
+            : status === "exited"
+              ? endPill("✕ exited", "ses-exited")
+              : inactive
+                ? endPill("○ inactive", "ses-inactive")
+                : live
+                  ? html`<span class="ses-live">● live</span>`
+                  : "";
 
     // Live token counts for the current/last turn (server-folded from the stream's usage frames):
     // ↑ context size going in, ↓ output accrued. Shown for a live process while running or idle (the
