@@ -10,16 +10,26 @@ import assert from "node:assert/strict";
 const { runJob, cloneSafe, rehydrate, fnDescriptor } = await import(
   new URL("../public/notebook-worker.js", import.meta.url)
 );
+// The runtime's REAL degradation gate (snapshotClosure calls this): a transported function whose source has a
+// free identifier that is neither a closure binding nor a realm global would throw ReferenceError in the
+// consumer, so it must degrade to its display string instead. Exercising it here proves both directions.
+const { unresolvableFreeVars } = await import(new URL("../vendor/notebook-infer.js", import.meta.url));
 
-// Model the runtime's export step: run the producer cell in the worker, then attach the closure snapshot the
-// runtime would (its resolved inputs), yielding the descriptor as it lands in exportsVal. `inputs` here are
-// the producer cell's resolved inputs — for a cross-cell reader they come from the same notebook's exportsVal,
-// for a cross-notebook reader from the target notebook's exportsVal; the transport is identical either way.
+// Model the runtime's export step (snapshotClosure): run the producer cell in the worker, then — if the value
+// is a function descriptor — apply the runtime's degrade-vs-ship gate and, when shipping, attach the closure
+// snapshot the runtime would (its resolved inputs). `inputs` here are the producer cell's resolved inputs — for
+// a cross-cell reader they come from the same notebook's exportsVal, for a cross-notebook reader from the
+// target notebook's exportsVal; the transport is identical either way. This mirrors notebook-runtime's
+// snapshotClosure exactly, calling the SAME unresolvableFreeVars it does.
 async function exportFrom(source, inputs = {}, block = false) {
   const r = await runJob({ source, inputs, block });
   assert.equal(r.ok, true, `producer cell should run ok: ${r.error ?? ""}`);
-  if (r.value && typeof r.value === "object" && r.value.__fn__) return { ...r.value, closure: { ...inputs } };
-  return r.value;
+  const v = r.value;
+  if (v && typeof v === "object" && v.__fn__) {
+    if (unresolvableFreeVars(v.source, Object.keys(inputs)).length) return v.source; // degrade to display string
+    return { ...v, closure: { ...inputs } };
+  }
+  return v;
 }
 
 // Model the runtime's consumer step: bind the imported value(s) as inputs and run the reader cell.
@@ -114,6 +124,39 @@ test("fallback — a method-shorthand callable (non-re-evaluable) stays a displa
 test("fallback — a descriptor whose source can't be rebuilt returns the source string, never crashes", () => {
   const out = rehydrate({ __fn__: true, source: "this is not valid js (" });
   assert.equal(out, "this is not valid js (");
+});
+
+// ── closures over cell-locals + recursion (thread node:mrdj957r-b, Fix B #1) ──────────────────────────
+// A function only transports usably if every free identifier in its source resolves in the consumer — a closure
+// snapshot binding or a realm global. One that closes over a cell-LOCAL const, or an anonymous function that
+// references its OWN name (recursion), has a free var that is NEITHER, so it used to rehydrate into a landmine
+// that threw ReferenceError at call time. snapshotClosure now DEGRADES those to a display string (documented
+// fallback); a NAMED recursive function and a function reading only a global still transport.
+
+test("degrade — a function closing over a cell-LOCAL const (unresolvable free var) becomes a display string", async () => {
+  // `f = x => x + k` where `k` is not one of the cell's inputs (a cell-local `const k = …`, not an export).
+  // Old behaviour shipped a descriptor with an empty closure whose rebuilt fn threw `k is not defined` on call.
+  const f = await exportFrom("x => x + k", {});
+  assert.equal(typeof f, "string", "degrades to the source string, not a landmine descriptor");
+  assert.match(f, /x \+ k/);
+});
+
+test("degrade — an ANONYMOUS recursive function (closes over its own name) becomes a display string", async () => {
+  const fac = await exportFrom("n => (n <= 1 ? 1 : n * fac(n - 1))", {});
+  assert.equal(typeof fac, "string", "the arrow's own name `fac` is an unresolvable free var → display string");
+});
+
+test("usable — a NAMED recursive function transports and recurses (its own name IS a binding)", async () => {
+  const fac = await exportFrom("function fac(n){ return n <= 1 ? 1 : n * fac(n - 1); }", {});
+  assert.equal(fac.__fn__, true, "a named function expression binds its own name → still a descriptor");
+  assert.equal(await readWith("fac(5)", { fac }), 120, "recursion works in the consumer");
+  assert.equal(await readWith("return (fac(6))", { fac }, true), 720);
+});
+
+test("usable — a function reading only a GLOBAL (Math) transports with no closure entry needed", async () => {
+  const f = await exportFrom("x => Math.sqrt(x)", {});
+  assert.equal(f.__fn__, true, "Math is a realm global, not an unresolvable free var");
+  assert.equal(await readWith("f(16)", { f }), 4);
 });
 
 test("rehydrate leaves ordinary data untouched and tolerates cycles", () => {

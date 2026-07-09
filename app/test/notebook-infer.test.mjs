@@ -5,8 +5,16 @@ import assert from "node:assert/strict";
 // the vendored acorn and reports its free variables (`reads`), the name(s) it defines via the `name = …`
 // convention (`defines`), and the expression the worker should run (`valueSource`). It imports acorn through
 // a relative ./acorn.js, which node resolves on disk — no data:-URL rewrite needed (unlike the templates).
-const { analyzeCell, analyzeMarkdown, compileMarkdown, resolveSpecifierUrl, DEFAULT_CDN_BASE, DEFAULT_IMPORT_MAP } =
-  await import(new URL("../vendor/notebook-infer.js", import.meta.url));
+const {
+  analyzeCell,
+  analyzeMarkdown,
+  compileMarkdown,
+  resolveSpecifierUrl,
+  DEFAULT_CDN_BASE,
+  DEFAULT_IMPORT_MAP,
+  freeIdentifiers,
+  unresolvableFreeVars,
+} = await import(new URL("../vendor/notebook-infer.js", import.meta.url));
 // The worker's core — reused to prove a rewritten import-block actually RUNS (import → compute), exactly as the
 // scheduler would post it. No network: a `data:text/javascript,…` URL is the stubbed CDN, loaded by real import().
 const { runJob } = await import(new URL("../public/notebook-worker.js", import.meta.url));
@@ -625,4 +633,52 @@ test("E2E: a bare (unimported) reference auto-imports through the map and comput
   const r = await runJob({ source: a.valueSource, inputs: {}, block: a.block });
   assert.equal(r.ok, true, `the auto-imported block should run: ${r.error ?? ""}`);
   assert.equal(r.value, 42, "the bare reference resolved to the imported module and computed");
+});
+
+// ── free-variable analysis for function transport (thread node:mrdj957r-b, Fix B #1) ──────────────────
+// freeIdentifiers reports the names a standalone function SOURCE reads but does not bind — parsed as an
+// expression (the exact shape the consumer rebuilds), so arrows, anonymous, and named function expressions all
+// analyse uniformly. unresolvableFreeVars then subtracts the closure names the runtime will bind AND realm
+// globals, yielding the free vars that would throw ReferenceError in the consumer (a non-empty result → the
+// runtime degrades the function to its display string).
+
+test("freeIdentifiers: an arrow closing over a name reports that free var", () => {
+  assert.deepEqual(freeIdentifiers("x => x + k"), ["k"], "x is a param (bound); k is free");
+});
+
+test("freeIdentifiers: a no-free-var function reports none", () => {
+  assert.deepEqual(freeIdentifiers("x => x + 1"), []);
+});
+
+test("freeIdentifiers: an anonymous recursive arrow reports its OWN name as free", () => {
+  assert.deepEqual(freeIdentifiers("n => (n <= 1 ? 1 : n * fac(n - 1))"), ["fac"]);
+});
+
+test("freeIdentifiers: a NAMED function expression binds its own name → not free (recursion works)", () => {
+  assert.deepEqual(freeIdentifiers("function fac(n){ return n <= 1 ? 1 : n * fac(n - 1); }"), []);
+});
+
+test("freeIdentifiers: destructured params + inner declarations are bound, not free", () => {
+  assert.deepEqual(sorted(freeIdentifiers("({a, b}) => { const s = a + b; return s + c; }")), ["c"]);
+});
+
+test("freeIdentifiers: returns null for a source that doesn't re-parse standalone", () => {
+  assert.equal(freeIdentifiers("m() {}"), null, "method shorthand isn't a standalone expression");
+});
+
+test("unresolvableFreeVars: a closure-provided name is resolved", () => {
+  assert.deepEqual(unresolvableFreeVars("x => x + a", ["a"]), [], "a is a closure binding");
+});
+
+test("unresolvableFreeVars: a realm global (Math) is resolved without a closure entry", () => {
+  assert.deepEqual(unresolvableFreeVars("x => Math.sqrt(x)", []), []);
+});
+
+test("unresolvableFreeVars: a cell-local / own-name free var is unresolvable → degrade", () => {
+  assert.deepEqual(unresolvableFreeVars("x => x + k", []), ["k"]);
+  assert.deepEqual(unresolvableFreeVars("n => (n <= 1 ? 1 : n * fac(n - 1))", []), ["fac"]);
+});
+
+test("unresolvableFreeVars: a non-re-parseable source is treated as clean (keeps existing behaviour)", () => {
+  assert.deepEqual(unresolvableFreeVars("m() {}", []), []);
 });

@@ -1,7 +1,7 @@
 import type { Subscribable } from "./lib";
 import { fileContentSignal } from "./content";
 import { activeBoardId } from "./board";
-import { analyzeCell, analyzeMarkdown, DEFAULT_IMPORT_MAP } from "../vendor/notebook-infer.js";
+import { analyzeCell, analyzeMarkdown, DEFAULT_IMPORT_MAP, unresolvableFreeVars } from "../vendor/notebook-infer.js";
 import { runMainThreadCell, isNode, serializeView, cloneSafe } from "./notebook-main-exec.js";
 
 // The notebook RUNTIME (docs/notebook-card.md §3/§5/§6) — an app subsystem, NOT the card template
@@ -965,6 +965,14 @@ function snapshotClosure(nb: NB, spec: CellSpec, val: unknown): unknown {
   if (!isFnDescriptor(val)) return val;
   const closure: Record<string, unknown> = {};
   for (const imp of importsOf(spec)) closure[imp.name] = resolveInput(nb, imp);
+  // A transported function stays callable in the consumer ONLY if every free identifier in its source resolves
+  // there — a snapshotted closure binding (above) or a realm global. A function closing over a cell-LOCAL const
+  // (`const k = 5; f = x => x + k`) or referencing its OWN name (anonymous recursion, `f = n => n * f(n - 1)`)
+  // has a free var that is neither, so it would rehydrate but throw ReferenceError at call time — contradicting
+  // the documented "degrade to display string" contract. Detect that (acorn, in notebook-infer) and hand back
+  // the source STRING instead of a landmine descriptor. A NAMED recursive function (`function f(n){…f…}`) binds
+  // its own name, so it is not flagged and transports normally.
+  if (unresolvableFreeVars(val.source, Object.keys(closure)).length) return val.source;
   return { ...val, closure };
 }
 
@@ -1007,4 +1015,38 @@ function computeExports(spec: CellSpec, value: unknown): Map<string, unknown> {
 // overriding its policy.
 export function runCell(cardKey: string, cellId: string): void {
   trigger(cardKey, cellId);
+}
+
+// ── card teardown (thread node:mrdj957r-b, Fix B #2) ──────────────────────────────────────────────
+// Release EVERYTHING a notebook card holds when it unmounts (closed / removed from the board), so a card
+// opened-then-closed leaves behind no live chart DOM, no file-content or cross-card subscriptions, and no
+// scheduler state. Without this the per-card maps (nbs/outputs/signals/subs/extState) and the cross-card
+// registries (pathImporters, nbByPath) accumulate for every notebook ever opened, and each open notebook's
+// debounce/relay timers keep firing. Idempotent and safe on a NON-notebook card key — every map simply has no
+// entry. The single shared worker is board-wide, not per-card, so it is deliberately NOT torn down here.
+export function teardownNotebook(cardKey: string): void {
+  const nb = nbs.get(cardKey);
+  if (nb) {
+    for (const t of nb.timer.values()) clearTimeout(t); // pending debounce timers
+    nb.timer.clear();
+    // Drop this notebook's published address so a stale import can't resolve to a dead card (it instead waits
+    // for a re-open, per the extensionless-import rule). Guarded: another card may have taken the address.
+    if (nbByPath.get(nb.pathKey) === cardKey) nbByPath.delete(nb.pathKey);
+    nbs.delete(cardKey);
+  }
+  // This card's cross-card + data-file subscriptions (pathImporters entries + file-content unsubscribes). Spread
+  // the keys first — tearDownExt mutates the per-card extState map as it removes each cell.
+  for (const cellId of [...(extState.get(cardKey)?.keys() ?? [])]) tearDownExt(cardKey, cellId);
+  extState.delete(cardKey);
+  // In-flight worker jobs for this card: drop their pending entries (a late reply already no-ops once the nb is
+  // gone, but the map would otherwise retain the cardKey/cellId reference).
+  for (const [jobId, job] of [...pending]) if (job.cardKey === cardKey) pending.delete(jobId);
+  const pt = pushTimers.get(cardKey); // the debounced outputs-relay timer
+  if (pt) (clearTimeout(pt), pushTimers.delete(cardKey));
+  redo.delete(cardKey);
+  // The off-log output projection + its signal/subscribers — dropping outputs releases the live chart DOM nodes
+  // (B2 views) it referenced, so they can be garbage-collected with the unmounted card.
+  outputs.delete(cardKey);
+  signals.delete(cardKey);
+  subs.delete(cardKey);
 }
