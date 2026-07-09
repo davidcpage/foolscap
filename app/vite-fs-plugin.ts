@@ -28,14 +28,22 @@ import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterv
 import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, removeDocJob, stampDocFired, upsertDocJob } from "./doc-jobs.js";
 import { reanchorFile } from "./annotation-reanchor.js";
-import { canvasRolesDir, createRole, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
+import { canvasRolesDir, listRoles, readRole, bundledRoleFileFor } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, removeWorktree, mergeWorktree, workItemKey, parseWorktreePorcelain, worktreeOnboarding } from "./worktrees.js";
 import { sessionSummaryFromText } from "./session-summary.js";
-import { appendBoardEvent, boardPersistMtime, clearBoardPersist, compactBoardEvents, describeBoardEvents, importBoardPersist, readBoardPersist, readBoardSnapshot, writeBoardSnapshot } from "./board-persist.js";
+import { boardPersistMtime, describeBoardEvents, readBoardPersist, readBoardSnapshot } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
-import { sendJson, readBody, readBodyBuffer, openSse, windowParam, type SseClient } from "./server-http.js";
+import { sendJson, readBody, readBodyBuffer, openSse, windowParam, readText, MAX_BYTES, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
+import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
+import { exact, oneOf, prefix, re } from "./routes/router.js";
+import { weatherRoutes } from "./routes/weather.js";
+import { cardTypeRoutes, handleCardTypeAsset, CARD_TYPES_DIR } from "./routes/card-types.js";
+import { roleRoutes } from "./routes/roles.js";
+import { permissionRoutes, settlePermission, PERMISSION_HOLD_MS } from "./routes/permissions.js";
+import { boardRoutes } from "./routes/boards.js";
+import { boardPersistRoutes } from "./routes/board-persist.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -111,7 +119,7 @@ const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Se
 // LAZY (started when a tab actually mounts), so a long registry doesn't fan out watchers for boards
 // nobody opens. The default board is implicit and never recorded.
 const BOARDS_FILE = path.join(ROOTS.repo!, ".canvas", "boards.json");
-interface BoardRegistryEntry {
+export interface BoardRegistryEntry {
   boardId: string;
   name: string;
   repoPath: string;
@@ -199,23 +207,9 @@ function reqBoard(url: URL): (BoardInfo & { boardId: string }) | null {
   return b ? { boardId: id, ...b } : null;
 }
 
-function boardJson(boardId: string, b: { name: string; repoPath: string }): {
-  boardId: string;
-  name: string;
-  repoPath: string;
-  default: boolean;
-} {
-  return { boardId, name: b.name, repoPath: b.repoPath, default: boardId === DEFAULT_BOARD.boardId };
-}
-
-function handleBoards(res: ServerResponse): void {
-  // lastOpened rides along from the registry (0 for the default board / anything unrecorded) so the
-  // picker can sort by recency without a second endpoint.
-  const opened = new Map(readBoardRegistry().map((e) => [e.boardId, e.lastOpened]));
-  sendJson(res, 200, {
-    boards: [...boards.entries()].map(([id, b]) => ({ ...boardJson(id, b), lastOpened: opened.get(id) ?? 0 })),
-  });
-}
+// /api/boards (list + mount) now lives in routes/boards.ts (god-file split, Phase 1); boardJson moved
+// there with it. The mount orchestration reaches boardIdentity/readBoardRegistry/recordBoardOpened/
+// ensureCanvasExcluded/startBoardFeeds through the ServerContext (wired at setServerContext below).
 
 // ── worktrees as ROOTS (worktree-activity slice B) ────────────────────────────────────────────────
 // A board is a workspace that can serve MORE THAN ONE root: its canonical checkout (rootId "repo") plus
@@ -327,132 +321,13 @@ function ensureCanvasExcluded(repoPath: string): void {
   }
 }
 
-// Mount a target repo as a board (POST /api/boards { repoPath }). Idempotent: the boardId is a pure
-// function of the realpath, so re-mounting the same repo returns the same id without duplicating. The dev
-// server runs with full fs privileges and is 127.0.0.1-only, but we still validate the path exists and is
-// a directory before adding it — the canvas serves a real folder, not an arbitrary string.
-async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: { repoPath?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.repoPath !== "string" || !body.repoPath)
-    return sendJson(res, 400, { error: "missing repoPath" });
-  let real: string;
-  try {
-    real = fs.realpathSync(body.repoPath);
-  } catch {
-    return sendJson(res, 404, { error: "path not found" });
-  }
-  if (!fs.statSync(real).isDirectory()) return sendJson(res, 400, { error: "not a directory" });
-  const id = boardIdentity(real);
-  if (!boards.has(id.boardId)) {
-    boards.set(id.boardId, { root: real, name: id.name, repoPath: id.repoPath });
-    console.log(`[boards] mounted ${id.boardId} → ${real}`);
-  }
-  // Every mount POST (a tab opening ?repo=, including a re-open) bumps the registry's lastOpened; the
-  // default board is implicit and stays out of the file.
-  if (id.boardId !== DEFAULT_BOARD.boardId) recordBoardOpened(id.boardId, id.name, id.repoPath);
-  ensureCanvasExcluded(id.repoPath); // keep the target repo's git status clean of `.canvas/`
-  startBoardFeeds(id.boardId, id.repoPath); // git HEAD + sessions-list feeds for this repo
-  sendJson(res, 200, boardJson(id.boardId, boards.get(id.boardId)!));
-}
+// The board MOUNT handler (POST /api/boards) moved to routes/boards.ts with the list handler above.
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) ─────────────
-// The browser's EventStore/SnapshotStore (core's persistence seam) are now HTTP clients over these
-// endpoints (app/src/remote-store.ts); board-persist.js owns the files under `<repo>/.canvas/board/`.
-// IndexedDB is retired as the durable tier — a board opened in any browser/profile/machine hydrates
-// from the repo's own `.canvas/`, and `import` adopts a board's pre-existing IndexedDB state once.
-// Writes THROW on failure and 500 here — the client store retries; a swallowed event is data loss.
-async function handleBoardPersistWrite(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  repoPath: string,
-  kind: "event" | "snapshot" | "import",
-): Promise<void> {
-  let body: Record<string, unknown>;
-  try {
-    body = JSON.parse(await readBody(req)) as Record<string, unknown>;
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  try {
-    if (kind === "event") {
-      if (typeof body.event !== "object" || body.event === null)
-        return sendJson(res, 400, { error: "missing event" });
-      const ev = body.event as Record<string, unknown>;
-      // Second-writer tripwire: tabs mint their own seq (core/src/log.ts), so the log is single-
-      // sequencer only while ONE tab writes. A non-monotonic append means a second writer (another
-      // tab, a leaked headless probe) is interleaving — the append still lands (refusing would lose
-      // a real gesture), but the collision must be LOUD, not discovered at hydrate. Seeded from the
-      // snapshot watermark on the first append after boot, so a stale writer trips even then.
-      const lastEventSeq = (fsState.lastEventSeq ??= new Map<string, number>());
-      if (typeof ev.seq === "number") {
-        const stored = readBoardSnapshot(repoPath) as { seq?: unknown } | null;
-        const last = lastEventSeq.get(boardId) ?? (stored && typeof stored.seq === "number" ? stored.seq : undefined);
-        if (last !== undefined && ev.seq <= last)
-          console.warn(
-            `[boards] event seq collision on ${boardId}: got ${ev.seq} after ${last} — ` +
-              `a second writer is appending (another tab or a leaked probe); the log now holds conflicting seqs`,
-          );
-        if (last === undefined || ev.seq > last) lastEventSeq.set(boardId, ev.seq);
-      }
-      appendBoardEvent(repoPath, ev);
-      return sendJson(res, 200, { ok: true });
-    }
-    if (kind === "snapshot") {
-      if (typeof body.snapshot !== "object" || body.snapshot === null)
-        return sendJson(res, 400, { error: "missing snapshot" });
-      const snap = body.snapshot as { seq?: unknown; records?: Array<Record<string, unknown>> };
-      // Capture the snapshot being replaced FIRST: the before↔after membership diff below is how a
-      // human-drawn thread join/leave (a local commit that never crosses the bus) reaches onboarding.
-      const before = readBoardSnapshot(repoPath) as { seq?: unknown; records?: Array<Record<string, unknown>> } | null;
-      // Watermark guard: never roll the snapshot BACKWARDS. A stale tab (behind because another tab
-      // kept committing) would otherwise clobber the newer save — events replay heals the content,
-      // but the membership diff below would then see phantom joins on the next good save. 409 is
-      // deliberate (4xx): remote-store must NOT retry a save that will never become fresh; the error
-      // surfaces via Persistence.onError in the stale tab, which is exactly where the news belongs.
-      if (
-        before && typeof before.seq === "number" && typeof snap.seq === "number" && snap.seq < before.seq
-      ) {
-        console.warn(
-          `[boards] STALE snapshot save refused for ${boardId}: seq ${snap.seq} < stored ${before.seq} — ` +
-            `a second writer is behind the board (another tab or a leaked probe)`,
-        );
-        return sendJson(res, 409, { error: "stale snapshot", storedSeq: before.seq, gotSeq: snap.seq });
-      }
-      writeBoardSnapshot(repoPath, snap as Record<string, unknown>);
-      sendJson(res, 200, { ok: true });
-      try {
-        announceNewMemberships(boardId, before ? (before.records ?? []) : null, snap.records ?? [], originOf(req));
-      } catch (err) {
-        console.warn("[threads] membership announce from snapshot diff failed:", err);
-      }
-      return;
-    }
-    // import: the one-time IndexedDB adoption. Refused (imported:false) once any server state exists.
-    const events = Array.isArray(body.events) ? (body.events as Record<string, unknown>[]) : [];
-    const snapshot =
-      typeof body.snapshot === "object" && body.snapshot !== null
-        ? (body.snapshot as Record<string, unknown>)
-        : null;
-    const imported = importBoardPersist(repoPath, events, snapshot);
-    // ALWAYS log adoptions: whichever tab wins this race seeds the board's durable state forever, and
-    // the wrong winner is invisible after the fact. The user-agent is what tells a leaked HEADLESS
-    // probe tab (this exact incident: a stale HeadlessChrome's near-empty IndexedDB beat the real
-    // browser to the import and "reset" the board) apart from the browser the human is actually in.
-    console.log(
-      `[boards] persist import ${imported ? "ACCEPTED" : "refused (state exists)"} for ${boardId}: ` +
-        `${events.length} events, snapshot=${snapshot ? "yes" : "no"} — ua: ${req.headers["user-agent"] ?? "?"}`,
-    );
-    return sendJson(res, 200, { imported });
-  } catch (e) {
-    return sendJson(res, 500, { error: e instanceof Error ? e.message : String(e) });
-  }
-}
+// handleBoardPersistWrite + the /api/board/persist route (GET/DELETE/POST event|snapshot|import) now live
+// in routes/board-persist.ts (god-file split, Phase 1). The second-writer tripwire (fsState.lastEventSeq)
+// and the membership-diff onboarding (announceNewMemberships) are reached through the ServerContext; the
+// board-persist.js file store is imported directly there.
 
 // Claude Code's transcripts live in ~/.claude/projects/<slug> — resolved PER BOARD by sessionsDir(repoPath)
 // above (the session handlers thread the board's dir), so the cards serve the right repo's history.
@@ -498,10 +373,8 @@ const TEXT_EXT = new Set([
   ".md", ".markdown", ".txt", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".json", ".css", ".html", ".py", ".yaml", ".yml", ".toml", ".sh",
 ]);
-const MAX_BYTES = 128 * 1024; // a file card shows a preview, not the whole file — but 128KB shows the
-// great majority of real source files IN FULL (6KB cut almost everything mid-file). Head-kept: a file
-// reads top-down, so the start is the part you want (unlike a transcript). Flagged `truncated` when it
-// bites; raised here because every too-stingy cap in this app has cost more in debugging than memory.
+// MAX_BYTES (the file-card preview byte cap) + readText now live in server-http.ts (the stateless-helpers
+// seam) so the extracted route modules share the one definition; imported at the top of this file.
 
 // IMAGE assets (the image card, image-cards-on-canvas). Binaries can't ride the text file endpoints
 // (TEXT_EXT-gated, utf8) so they get their OWN /api/asset read/write, with a parallel extension gate and
@@ -522,14 +395,6 @@ function safeResolve(root: string, rel: string): string | null {
   return abs === root || abs.startsWith(root + path.sep) ? abs : null;
 }
 
-function readText(abs: string): { content: string; truncated: boolean } | null {
-  try {
-    const buf = fs.readFileSync(abs);
-    return { content: buf.subarray(0, MAX_BYTES).toString("utf8"), truncated: buf.length > MAX_BYTES };
-  } catch {
-    return null;
-  }
-}
 
 // W12 — the doc's optimistic-concurrency version: a content hash of its FULL on-disk bytes (not the
 // MAX_BYTES preview), so the CAS detects a change anywhere in the file, and `null` for a file that doesn't
@@ -1443,36 +1308,8 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
   sendJson(res, 200, { threads, channels: threads });
 }
 
-// GET /api/roles → every role this board has on disk (by name), for the role-picker on "new session".
-// Mirrors handleThreads: a cheap read of the `.canvas/roles/` markers, NOT the charters — the picker
-// wants name/colour, the charter is read only when a role is actually instantiated (handleSessionSpawn).
-function handleRoles(res: ServerResponse, repoPath: string): void {
-  sendJson(res, 200, { roles: listRoles(repoPath) });
-}
-
-// POST /api/roles { name, charter?, colour? } → create a role (writes `.canvas/roles/<roleId>/role.md`).
-// 400 on a bad/missing name, 409 if a role with that id already exists. Returns the created role.
-async function handleRolesCreate(req: IncomingMessage, res: ServerResponse, repoPath: string): Promise<void> {
-  let body: { name?: unknown; charter?: unknown; colour?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.name !== "string" || !body.name) return sendJson(res, 400, { error: "missing name" });
-  try {
-    const role = createRole(repoPath, {
-      name: body.name,
-      charter: typeof body.charter === "string" ? body.charter : "",
-      colour: typeof body.colour === "string" ? body.colour : undefined,
-    });
-    publishFeed("roles:" + boardIdentity(repoPath).boardId, { ts: Date.now() }); // nudge any open picker to re-pull
-    sendJson(res, 200, { role });
-  } catch (err) {
-    const msg = String(err instanceof Error ? err.message : err);
-    return sendJson(res, /already exists/.test(msg) ? 409 : 400, { error: msg });
-  }
-}
+// /api/roles (list + create) now lives in routes/roles.ts (god-file split, Phase 1); the create path
+// reaches publishFeed through the ServerContext to nudge an open picker.
 
 // ── threads-list feed (the threads browser card's live push) ─────────────────────────────────────
 // The threads-list mirror of startSessionsFeed: watch `.canvas/threads/` and PING the `threads:<boardId>`
@@ -1607,7 +1444,7 @@ interface PendingAsk {
 // clicks allow/deny on the session card or the hold times out. Same lifetime rules as PendingAsk: pinned
 // in fsState across a hot re-eval; the held `res`/`timer` are process-bound (a restart fails the relay's
 // fetch, which denies fail-closed with an honest "the human never saw this" message).
-interface PendingPermission {
+export interface PendingPermission {
   permId: string;
   sid: string; // the session whose tool call is blocked (its card renders the prompt)
   toolName: string; // e.g. "Bash" — the tool the CLI is asking about
@@ -1948,7 +1785,8 @@ const BASELINE_ALLOWED_TOOLS = [
 // the blocked turn is blocked on them regardless); the CLI-side MCP tool timeout must outlast it, so
 // it's set a minute above via MCP_TOOL_TIMEOUT on the spawn env (sidecar pass-through — an OLD sidecar
 // ignores env and the CLI's default tool timeout applies: prompts then die early but still fail closed).
-const PERMISSION_HOLD_MS = 10 * 60_000;
+// PERMISSION_HOLD_MS now lives in routes/permissions.ts (with the permission handlers) and is imported at
+// the top of this file — the spawn path below reads it to size MCP_TOOL_TIMEOUT a minute above the hold.
 const PERMISSION_TOOL = "mcp__canvas__permission_prompt"; // mcp__<server>__<tool> under --mcp-config's "canvas"
 
 // AskUserQuestion is auto-cancelled in `-p` headless mode (VERIFIED: the CLI synthesises an
@@ -3504,107 +3342,16 @@ function endSession(id: string, endReason: "done" | "terminated"): boolean {
 // rides the session's feed (`permissions`) so the card paints buttons + the loud waiting band, and
 // /api/sessions' status derives "waiting" from it (sessionStatus) so the minimap/list/stack agree.
 
-// Resolve one parked relay POST exactly once (decision, timeout, or teardown), clearing its timer and
-// registry entry and repainting the card (the pending block + waiting band live on the session feed).
-function settlePermission(permId: string, payload: Record<string, unknown>): void {
-  const p = pendingPermissions.get(permId);
-  if (!p) return;
-  clearTimeout(p.timer);
-  pendingPermissions.delete(permId);
-  try {
-    sendJson(p.res, 200, payload);
-  } catch {
-    /* relay disconnected — the CLI already gave up on this prompt; nothing left to answer */
-  }
-  const s = liveSessions.get(p.sid);
-  if (s) publishSession(s);
-}
+// settlePermission + the three /api/permission* handlers moved to routes/permissions.ts (god-file split,
+// Phase 1); settlePermission is imported at the top of this file so the teardown path below can call it.
+// They reach the shared pending-prompt registry (fsState.pendingPermissions), liveSessions, and
+// publishSession through the ServerContext.
 
 // Deny every prompt a session still holds — the teardown path (terminate/done/exit). The human can no
 // longer meaningfully answer, and a relay still waiting should hear an honest reason, not a hangup.
 function denySessionPermissions(sid: string, message: string): void {
   for (const p of [...pendingPermissions.values()])
     if (p.sid === sid) settlePermission(p.permId, { behavior: "deny", message });
-}
-
-// POST /api/permission/request { session, toolName, input, toolUseId? } — the MCP relay's held call.
-// Only a LIVE registry session may hold a prompt (404 otherwise — the relay turns that into its own
-// fail-closed deny). No sendJson on the success path: the response parks until /decision or timeout.
-async function handlePermissionRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-  let body: { session?: unknown; toolName?: unknown; input?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof body.session !== "string" || !body.session) return sendJson(res, 400, { error: "missing session" });
-  if (typeof body.toolName !== "string" || !body.toolName) return sendJson(res, 400, { error: "missing toolName" });
-  const s = liveSessions.get(body.session);
-  if (!s || s.status === "exited") return sendJson(res, 404, { error: "not a live canvas session" });
-  const permId = crypto.randomUUID();
-  const timer = setTimeout(
-    () =>
-      settlePermission(permId, {
-        behavior: "deny",
-        message:
-          `no human decision within ${Math.round(PERMISSION_HOLD_MS / 60_000)} minutes — denied by default. ` +
-          "The human never saw or refused this; retry when they're around, or post in your thread.",
-      }),
-    PERMISSION_HOLD_MS,
-  );
-  pendingPermissions.set(permId, { permId, sid: s.id, toolName: body.toolName, input: body.input ?? {}, ts: Date.now(), res, timer });
-  // The relay side can drop first (claude killed mid-hold, or its MCP tool timeout fired despite our
-  // margin): un-park without answering, so the card doesn't keep offering a decision nobody is owed.
-  // Fires on the success path too (every response's socket eventually closes) — the map guard makes
-  // that a no-op because settlePermission already removed the entry.
-  res.on("close", () => {
-    const gone = pendingPermissions.get(permId);
-    if (!gone || gone.res !== res) return;
-    clearTimeout(gone.timer);
-    pendingPermissions.delete(permId);
-    const live = liveSessions.get(gone.sid);
-    if (live) publishSession(live);
-  });
-  publishSession(s); // paint the prompt (and flip the band to waiting) immediately
-}
-
-// POST /api/permission/<permId>/decision { behavior: "allow"|"deny", message? } — the card's buttons
-// (or a shell twin via /api/permissions). Allow echoes the tool input back unchanged (updatedInput is
-// the CLI's contract); deny carries the human's message when given.
-async function handlePermissionDecision(req: IncomingMessage, res: ServerResponse, permId: string): Promise<void> {
-  let body: { behavior?: unknown; message?: unknown };
-  try {
-    body = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (body.behavior !== "allow" && body.behavior !== "deny")
-    return sendJson(res, 400, { error: 'behavior must be "allow" or "deny"' });
-  const p = pendingPermissions.get(permId);
-  if (!p) return sendJson(res, 404, { error: "no such pending permission (already decided or timed out)" });
-  settlePermission(
-    permId,
-    body.behavior === "allow"
-      ? { behavior: "allow", updatedInput: p.input }
-      : {
-          behavior: "deny",
-          message:
-            typeof body.message === "string" && body.message
-              ? body.message
-              : "denied by the human on the canvas card",
-        },
-  );
-  sendJson(res, 200, { ok: true, id: permId, behavior: body.behavior });
-}
-
-// GET /api/permissions[?session=<sid>] — the pending prompts, board-wide or per session: the headless
-// twin of the card's block, so a shell can see (and answer, via /decision) prompts without a tab.
-function handlePermissionsRead(res: ServerResponse, sid: string | null): void {
-  const permissions = [...pendingPermissions.values()]
-    .filter((p) => !sid || p.sid === sid)
-    .sort((a, b) => a.ts - b.ts)
-    .map((p) => ({ id: p.permId, session: p.sid, toolName: p.toolName, input: p.input, ts: p.ts }));
-  sendJson(res, 200, { permissions, count: permissions.length });
 }
 
 // Feed: one true-internet source for flavour — the current Hacker News #1 story (keyless API).
@@ -3722,84 +3469,8 @@ function startUsageFeed(): void {
   void poll();
 }
 
-// ── weather (card-types/weather): Open-Meteo, keyed by a free-text location ──────────────────────
-// GET /api/weather?q=<place> → geocode the place (Open-Meteo geocoding, keyless) then fetch its current
-// conditions (Open-Meteo forecast, keyless). Done SERVER-SIDE so the card interior never touches the
-// public internet (the card-type contract: external data is polled by the host, the interior reads a
-// granted signal) and there's no API key or CORS to handle in the browser. Cached per normalized query
-// with a short TTL: weather drifts slowly and the public endpoint asks callers to be gentle, so a fleet
-// of cards (or a tab reopen) collapses onto one fetch per location per window. Never throws to the
-// client — an unresolved place or an offline upstream comes back as a 200 with an `error` tag the card
-// renders as a message, mirroring the usage feed's last-good-with-an-error-pill discipline.
-interface WeatherCacheEntry {
-  ts: number;
-  data: unknown;
-}
-const weatherCache = new Map<string, WeatherCacheEntry>();
-const WEATHER_TTL_MS = 10 * 60_000;
-
-async function handleWeather(res: ServerResponse, q: string): Promise<void> {
-  const query = q.trim();
-  if (!query) return sendJson(res, 200, { q, resolved: false, error: "no-location", fetchedAt: Date.now() });
-  const key = query.toLowerCase();
-  const hit = weatherCache.get(key);
-  if (hit && Date.now() - hit.ts < WEATHER_TTL_MS) return sendJson(res, 200, hit.data);
-
-  const cache = (data: unknown): void => void weatherCache.set(key, { ts: Date.now(), data });
-  try {
-    const geoRes = await fetch(
-      `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(query)}&count=1&language=en&format=json`,
-    );
-    const geo = (await geoRes.json()) as { results?: Array<Record<string, unknown>> };
-    const loc = geo.results?.[0];
-    if (!loc) {
-      const data = { q: query, resolved: false, error: "not-found", fetchedAt: Date.now() };
-      cache(data); // a misspelling shouldn't re-hit the geocoder every refresh tick
-      return sendJson(res, 200, data);
-    }
-    const lat = Number(loc.latitude);
-    const lon = Number(loc.longitude);
-    const wxRes = await fetch(
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-        `&current=temperature_2m,relative_humidity_2m,apparent_temperature,is_day,weather_code,wind_speed_10m&timezone=auto`,
-    );
-    const wx = (await wxRes.json()) as {
-      current?: Record<string, number | string>;
-      current_units?: Record<string, string>;
-    };
-    const c = wx.current ?? {};
-    const u = wx.current_units ?? {};
-    const data = {
-      q: query,
-      resolved: true,
-      name: loc.name as string,
-      country: (loc.country as string | undefined) ?? undefined,
-      admin1: (loc.admin1 as string | undefined) ?? undefined,
-      latitude: lat,
-      longitude: lon,
-      current: {
-        temperature: Number(c.temperature_2m),
-        apparentTemperature: Number(c.apparent_temperature),
-        humidity: Number(c.relative_humidity_2m),
-        windSpeed: Number(c.wind_speed_10m),
-        weatherCode: Number(c.weather_code),
-        isDay: Number(c.is_day) === 1,
-        time: String(c.time ?? ""),
-      },
-      units: { temperature: u.temperature_2m ?? "°C", windSpeed: u.wind_speed_10m ?? "km/h" },
-      error: null,
-      fetchedAt: Date.now(),
-    };
-    cache(data);
-    sendJson(res, 200, data);
-  } catch {
-    // offline / upstream down — serve the last good reading with a staleness tag if we have one, else
-    // a bare offline marker. Either way a 200 the card can render, never a 5xx it would have to special-case.
-    const stale = weatherCache.get(key);
-    if (stale) return sendJson(res, 200, { ...(stale.data as object), error: "offline", fetchedAt: Date.now() });
-    sendJson(res, 200, { q: query, resolved: false, error: "offline", fetchedAt: Date.now() });
-  }
-}
+// /api/weather (Open-Meteo, keyed by a free-text location) now lives in routes/weather.ts — a fully
+// self-contained extraction (god-file split, Phase 1); its route is spread into GLOBAL_ROUTES below.
 
 // The repo-scoped feeds for one board (git HEAD + the sessions-list ping), started once per board: at
 // startup for the default board, and on mount for the rest (handleBoardMount). Idempotent via
@@ -3967,53 +3638,11 @@ function startFeeds(): void {
 }
 
 // ── card types (card-types-as-data.md §3/§7: type definitions are data in the folder) ──────────
-// The type registry's server half: list card-types/*/ (type.yaml + the render.js the browser will
-// import()), and watch the folder so a template edit on disk reaches the canvas live. The change
-// notification rides the EXISTING feed bus ("cardtypes") — a template edit is just one more named
-// off-log event the client turns into a signal; the browser-side registry re-imports the module.
-
-const CARD_TYPES_DIR = path.resolve(here, "card-types");
-
-function handleCardTypesList(res: ServerResponse): void {
-  let entries: fs.Dirent[] = [];
-  try {
-    entries = fs.readdirSync(CARD_TYPES_DIR, { withFileTypes: true });
-  } catch {
-    // no card-types folder yet — an empty registry, not an error
-  }
-  const types = entries
-    .filter((e) => e.isDirectory())
-    .flatMap((e) => {
-      const yaml = readText(path.join(CARD_TYPES_DIR, e.name, "type.yaml"));
-      return yaml ? [{ type: e.name, yaml: yaml.content }] : [];
-    });
-  sendJson(res, 200, { types });
-}
-
-// Serve card-types/* RAW — straight off disk, Cache-Control: no-store, never through Vite's
-// transform pipeline. The pipeline caches per module and only Vite's own watcher invalidates that
-// cache, so a feed-triggered re-import racing that watcher could be served the PREVIOUS code (the
-// "save twice" dropped-update bug — two independent chokidars, no ordering). A template is runtime
-// data under the v1 contract — plain ESM importing only /vendor/lit-html.js — so the bundler has
-// nothing to add: read the file, send it, fresh every request. Read in FULL (not via readText, whose
-// MAX_BYTES preview cap is for file-card bodies) — a template is code the browser must parse, and a
-// truncated module is a syntax error.
-function handleCardTypeAsset(res: ServerResponse, pathname: string): void {
-  const rel = decodeURIComponent(pathname.slice("/card-types/".length));
-  const abs = path.resolve(CARD_TYPES_DIR, rel);
-  if (!abs.startsWith(CARD_TYPES_DIR + path.sep)) return sendJson(res, 400, { error: "bad path" });
-  let content: string;
-  try {
-    content = fs.readFileSync(abs, "utf8");
-  } catch {
-    return sendJson(res, 404, { error: "not found" });
-  }
-  res.writeHead(200, {
-    "Content-Type": abs.endsWith(".js") ? "text/javascript" : "text/plain",
-    "Cache-Control": "no-store",
-  });
-  res.end(content);
-}
+// The type-registry ROUTE handlers (/api/card-types list + the raw /card-types/* asset serve) now live in
+// routes/card-types.ts (god-file split, Phase 1), which OWNS the CARD_TYPES_DIR path and exports it. The
+// WATCH feed below stays here for now (it's stateful — rides the "cardtypes" feed bus) and imports the dir:
+// a template edit on disk pings the client, whose registry re-imports the module. CARD_TYPES_DIR is also
+// imported by the HMR guard in configureServer (keep template files out of Vite's transform pipeline).
 
 function startCardTypesFeed(): void {
   let t: ReturnType<typeof setTimeout> | null = null;
@@ -5321,6 +4950,17 @@ setServerContext({
   rootDir,
   boardRoots,
   originOf,
+  // State-dependent EFFECTS the Phase-1 route modules call (roles/permissions/boards/board-persist). The
+  // definitions stay here; the seam only injects the operation so a route handler reaches shared state
+  // without importing this file (no runtime cycle — server-context.ts type-imports only).
+  publishFeed,
+  publishSession,
+  boardIdentity,
+  readBoardRegistry,
+  recordBoardOpened,
+  ensureCanvasExcluded,
+  startBoardFeeds,
+  announceNewMemberships,
 });
 
 // ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────
@@ -5333,29 +4973,10 @@ setServerContext({
 // A route with a `method` only matches that verb and otherwise FALLS THROUGH to later entries, exactly as
 // the ladder's `&& req.method === "POST"` arms did; a route without one matches any verb and branches on
 // the method inside its handler (the ladder's `if (req.method === "POST") … else …` arms).
-type RouteMatch = (pathname: string) => string[] | null; // capture groups (or [] for a plain match); null = no match
-const exact = (p: string): RouteMatch => (path) => (path === p ? [] : null);
-const oneOf = (...ps: string[]): RouteMatch => (path) => (ps.includes(path) ? [] : null);
-const prefix = (p: string): RouteMatch => (path) => (path.startsWith(p) ? [] : null);
-const re = (r: RegExp): RouteMatch => (path) => {
-  const m = r.exec(path);
-  return m ? m.slice(1) : null;
-};
-interface GlobalRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[]) => void;
-}
-interface BoardRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo) => void;
-}
-interface RootRoute {
-  method?: string;
-  match: RouteMatch;
-  run: (req: IncomingMessage, res: ServerResponse, url: URL, g: string[], boardId: string, board: BoardInfo, root: string) => void;
-}
+// The matcher combinators (exact/oneOf/prefix/re) + the three staged route shapes (GlobalRoute/BoardRoute/
+// RootRoute) now live in routes/router.ts so an extracted route module declares its registrations in the
+// same vocabulary; imported at the top of this file. Extracted concerns (Phase 1: weather, card-types)
+// export a route array that is SPREAD into the stage table at the arm-order position their inline entry held.
 
 // STAGE 1 — GLOBAL routes (tried before the shared board gate; board-scoped ones call reqBoard themselves).
 const GLOBAL_ROUTES: GlobalRoute[] = [
@@ -5387,10 +5008,8 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/terminate$/), run: (_req, res, _url, g) => handleSessionTerminate(res, g[0]!) },
   { method: "POST", match: re(/^\/api\/session\/([\w-]+)\/done$/), run: (_req, res, _url, g) => handleSessionDone(res, g[0]!) },
   // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision buttons, and
-  // the headless list. Ids are global UUIDs — no ?board= anywhere here.
-  { method: "POST", match: exact("/api/permission/request"), run: (req, res) => void handlePermissionRequest(req, res) },
-  { method: "POST", match: re(/^\/api\/permission\/([\w-]+)\/decision$/), run: (req, res, _url, g) => void handlePermissionDecision(req, res, g[0]!) },
-  { method: "GET", match: exact("/api/permissions"), run: (_req, res, url) => handlePermissionsRead(res, url.searchParams.get("session")) },
+  // the headless list. Ids are global UUIDs — no ?board= anywhere here. (routes/permissions.ts)
+  ...permissionRoutes,
   // The channel-message read tool (session id is a global UUID, so no ?board= needed).
   { method: "GET", match: exact("/api/inbox"), run: (_req, res, url) => handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes")) },
   // §16: the answerer's pending-consultation queue (session id is a global UUID, so no ?board=).
@@ -5464,43 +5083,11 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
       return handleThreads(res, b.boardId, b.repoPath);
     },
   },
-  {
-    match: exact("/api/roles"),
-    run: (req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      if (req.method === "POST") return void handleRolesCreate(req, res, b.repoPath);
-      return handleRoles(res, b.repoPath);
-    },
-  },
-  { match: exact("/api/card-types"), run: (_req, res) => handleCardTypesList(res) },
-  { method: "POST", match: exact("/api/boards"), run: (req, res) => void handleBoardMount(req, res) },
-  { match: exact("/api/boards"), run: (_req, res) => handleBoards(res) },
-  // The durable board store (step 4): the browser's persistence backends live here now.
-  {
-    match: prefix("/api/board/persist"),
-    run: (req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      if (url.pathname === "/api/board/persist" && req.method === "GET") {
-        // Compact on the boot read (once per page load): drop events the snapshot absorbed, beyond a
-        // generous tail — see board-persist.js. Never silent when it bites.
-        const { dropped } = compactBoardEvents(b.repoPath);
-        if (dropped > 0) console.log(`[boards] compacted ${b.boardId}: dropped ${dropped} events below the snapshot watermark tail`);
-        return sendJson(res, 200, readBoardPersist(b.repoPath));
-      }
-      if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
-        clearBoardPersist(b.repoPath);
-        return sendJson(res, 200, { ok: true });
-      }
-      if (req.method === "POST") {
-        const kind = url.pathname.slice("/api/board/persist/".length);
-        if (kind === "event" || kind === "snapshot" || kind === "import")
-          return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind);
-      }
-      return sendJson(res, 404, { error: "unknown board-persist endpoint" });
-    },
-  },
+  ...roleRoutes, // /api/roles list + create (routes/roles.ts) — same arm, same position
+  ...cardTypeRoutes, // /api/card-types (routes/card-types.ts) — same GET arm, same position
+  ...boardRoutes, // /api/boards POST(mount)+GET(list) (routes/boards.ts) — same two arms, same order
+  // The durable board store (step 4): the browser's persistence backends live here now. (routes/board-persist.ts)
+  ...boardPersistRoutes,
   // The agent bus IS board-scoped now (Phase 3): ?board=<id> picks which board's tabs a command reaches and
   // which board's snapshot is read back (default board if omitted).
   {
@@ -5540,7 +5127,7 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
       return handleNotebookOutputsGet(res, b.boardId, id);
     },
   },
-  { match: exact("/api/weather"), run: (_req, res, url) => void handleWeather(res, url.searchParams.get("q") ?? "") },
+  ...weatherRoutes, // /api/weather (routes/weather.ts) — self-contained, same position
 ];
 
 // STAGE 2 — BOARD routes (reached only after the shared board gate resolved `board`/`boardId`).
