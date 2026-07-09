@@ -11,6 +11,7 @@ import {
   markCanvasSession,
   isCanvasSession,
   listSessions,
+  projectsDirForCwd,
   readCanvasSession,
   recordSessionEnd,
   updateCanvasSession,
@@ -48,6 +49,41 @@ test("listSessions returns ONLY canvas-owned transcripts — externals are filte
   assert.ok(ids.includes("ours") && ids.includes("alsoOurs"), "canvas-owned sessions are listed");
   assert.ok(!ids.includes("external"), "an external terminal transcript is NOT listed");
   assert.equal(ids.length, 2);
+});
+
+test("listSessions finds a WORKTREE session's transcript via its marker cwd, not the board-root dir", () => {
+  // The regression: a Coordinator worker runs in a worktree, so Claude Code writes its transcript into a
+  // DIFFERENT projects dir than the board root's. Enumerating only the board-root dir dropped it. Driving
+  // off the marker set + resolving each transcript dir from the marker's cwd is the fix.
+  const repo = tmpRepo();
+  const boardRootDir = transcriptsWith(["rootSession"]); // a board-root (browser-tab) session
+  const worktreeDir = transcriptsWith(["wtSession"]); // a worktree (Coordinator-worker) session — separate dir
+  markCanvasSession(repo, "rootSession", { spawnedAt: 1 }); // no cwd → board-root fallback
+  markCanvasSession(repo, "wtSession", { spawnedAt: 2, cwd: "/some/board/.canvas/worktrees/w-1" });
+
+  // dirForCwd stands in for projectsDirForCwd (a test can't seed the real ~/.claude/projects): the one
+  // worktree cwd maps to worktreeDir; anything else is unmapped.
+  const dirForCwd = (cwd) => (cwd === "/some/board/.canvas/worktrees/w-1" ? worktreeDir : "/nope");
+  const ids = listSessions(boardRootDir, repo, dirForCwd).map((s) => s.id);
+  assert.deepEqual(ids, ["wtSession", "rootSession"], "both list; worktree session resolved via marker cwd, newest first");
+});
+
+test("listSessions skips an owned session whose transcript is missing (deleted / not yet written)", () => {
+  const repo = tmpRepo();
+  const dir = transcriptsWith(["present"]);
+  markCanvasSession(repo, "present", { spawnedAt: 1 });
+  markCanvasSession(repo, "gone", { spawnedAt: 2 }); // marker exists but no .jsonl in dir
+  assert.deepEqual(listSessions(dir, repo).map((s) => s.id), ["present"], "orphan marker is skipped, not listed with bogus stats");
+});
+
+test("projectsDirForCwd slugs BOTH '/' and '.' — a board root is dotless but a worktree carries `.canvas`", () => {
+  // The board root (no dots) is unchanged from the old '/'-only rule, so this stays back-compatible…
+  assert.ok(projectsDirForCwd("/Users/me/foolscap").endsWith("-Users-me-foolscap"));
+  // …but a worktree cwd's `.canvas` MUST slug the dot too, or the computed dir won't match Claude Code's.
+  assert.ok(
+    projectsDirForCwd("/Users/me/foolscap/.canvas/worktrees/w-1").endsWith("-Users-me-foolscap--canvas-worktrees-w-1"),
+    "'/.canvas' → '--canvas' (both the slash and the dot become '-')",
+  );
 });
 
 test("with no markers the list is empty, not the raw transcript dir (pre-ledger / all-external)", () => {
