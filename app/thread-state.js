@@ -12,8 +12,13 @@
 // One participant = one agent on the thread: `processState` is what the canvas observes of its process
 // ("running" | "idle" | "exited"), `intent` its latest declared work-intent (work-intent.js), or null
 // if it never declared. Intents are seat-keyed upstream, so a declaration survives its occupant's
-// respawn — which is why an EXITED participant can still carry a live `blocked:human` (the question it
-// asked is still on the table; the loud state must survive the asker's crash).
+// respawn — an EXITED participant can still CARRY a `blocked:human` on its seat. But the `waiting`
+// (orange "your turn") state requires a *live* (non-exited) participant to hold that block: a thread
+// with no live sessions is never loud. An exited-only blocked:human falls to `dormant` and re-activates
+// non-destructively on the next event (the question is preserved in the thread log, not in a loud rail
+// signal that can outlive every session that could act on it). This deliberately supersedes the earlier
+// "the loud state survives the asker's crash" design — a dead asker's stale block used to light the rail
+// forever with no one able to clear it (per human feedback, seq 122/124 on this thread).
 
 export const THREAD_STATES = ["active", "waiting", "dormant"];
 
@@ -106,16 +111,22 @@ export function memberPillState(band, declaredIntent) {
  * Derive a thread's state from its participants (§4 table, in precedence order):
  *
  *   active  — any participant computing (`running`), or live and (declared-or-default) `working`.
- *   waiting — none active, and ≥1 participant declared `blocked:human` (regardless of liveness — the
- *             seat-keyed declaration outlives its occupant). Deliberately NARROW: waiting is the state
- *             the whole design treats as sacred ("your turn", surfaced loud, never archived), and it
- *             stays meaningful only if it can't be entered by accident. The lifecycle doc's other
+ *   waiting — none active, and ≥1 *live* (non-exited) participant is effectively `blocked:human`. The
+ *             liveness guard is what keeps this honest: a `blocked:human` on an EXITED seat no longer
+ *             counts (it falls through to `dormant`), so a thread whose only asker has died is never
+ *             loud — orange ⟺ a currently-live agent is blocked on the human. Deliberately NARROW:
+ *             waiting is the state the whole design treats as sacred ("your turn", surfaced loud, never
+ *             archived), and it stays meaningful only if it can't be entered by accident — nor left
+ *             stuck on by a stale intent no session can clear. The lifecycle doc's other
  *             waiting trigger — inferring a provisional blocked:human from a trailing question to the
  *             human (§6/§8 fallback) — is an upstream EMITTER's job, not this machine's; when built it
  *             declares the intent and this function never knows the difference.
- *   dormant — every participant `done`/`exited`, none `blocked:human`: nobody is working it and nobody
- *             needs a person. The archive predicate — both conjuncts, per §4 (quorum, not first-mover:
- *             one `done` never archives a thread someone else is still working). An UNSTAFFED thread
+ *   dormant — every participant `done`/`exited`, with no LIVE `blocked:human`: nobody is working it and
+ *             no live agent needs a person. (An exited seat still holding `blocked:human` lands here now,
+ *             not in `waiting` — the liveness guard above dropped it; the question survives in the thread
+ *             log and the first re-activation surfaces it again.) The archive predicate — both conjuncts,
+ *             per §4 (quorum, not first-mover: one `done` never archives a thread someone else is still
+ *             working). An UNSTAFFED thread
  *             (no agent participants at all — freshly created, or everyone left) is dormant by the
  *             same predicate: nothing is computing and no one declared a human-block. Its card is
  *             still wherever the human put it, and the first join/message re-activates it — archiving
@@ -135,7 +146,8 @@ export function deriveThreadState(participants) {
   if (participants.some((p) => p.processState === "running")) return "active";
   if (participants.some((p) => p.processState !== "exited" && effectiveIntent(p) === "working"))
     return "active";
-  if (participants.some((p) => effectiveIntent(p) === "blocked:human")) return "waiting";
+  if (participants.some((p) => p.processState !== "exited" && effectiveIntent(p) === "blocked:human"))
+    return "waiting";
   if (participants.every((p) => p.processState === "exited" || effectiveIntent(p) === "done"))
     return "dormant";
   return "active"; // live blocked:peer chains — see the doc comment above

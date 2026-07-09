@@ -1370,17 +1370,6 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   align-items: center;
   gap: 4px;
 }
-/* (b)'s marker — a small amber 'your turn' chip (no count; a blocked agent is binary). */
-.ses-row-turn {
-  font-size: 9px;
-  font-weight: 700;
-  color: #b45309;
-  background: #fbe2c2;
-  border-radius: 8px;
-  padding: 0 6px;
-  line-height: 15px;
-  white-space: nowrap;
-}
 /* (a)'s count badge — indigo, echoing the row's unseen hue; position:relative anchors the popover. */
 .ses-row-unseen {
   position: relative;

@@ -47,9 +47,11 @@ test("blocked:human with no one active → waiting (the loud state)", () => {
   assert.equal(deriveThreadState([p("idle", "blocked:human"), p("exited")]), "waiting");
 });
 
-test("a seat-keyed blocked:human survives its occupant's exit → still waiting (the question is still on the table)", () => {
-  assert.equal(deriveThreadState([p("exited", "blocked:human")]), "waiting");
-  assert.equal(deriveThreadState([p("exited", "blocked:human"), p("exited", "done")]), "waiting");
+test("an exited seat's blocked:human no longer lights waiting → dormant (orange requires a LIVE asker; a dead asker's stale block can't stay loud forever with no one to clear it)", () => {
+  assert.equal(deriveThreadState([p("exited", "blocked:human")]), "dormant");
+  assert.equal(deriveThreadState([p("exited", "blocked:human"), p("exited", "done")]), "dormant");
+  // but a LIVE (idle) blocked:human alongside an exited one still counts — the live asker holds the turn.
+  assert.equal(deriveThreadState([p("exited", "blocked:human"), p("idle", "blocked:human")]), "waiting");
 });
 
 test("all done (live) → dormant (the cooperative yield: safe to park, reversible)", () => {
