@@ -1,5 +1,5 @@
 import type { IncomingMessage } from "node:http";
-import type { BoardInfo, CanvasFsState, LiveSession, RootInfo } from "./vite-fs-plugin.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo } from "./vite-fs-plugin.js";
 
 // ── the ServerContext seam ────────────────────────────────────────────────────────────────────────
 // The second seam of the god-file split (server-http.ts is the first). Where server-http.ts holds the
@@ -34,6 +34,26 @@ export interface ServerContext {
   rootDir: (boardId: string, rootId: string | null) => string | null;
   boardRoots: (boardId: string) => RootInfo[];
   originOf: (req: IncomingMessage) => string;
+  // State-dependent EFFECTS the extracted route handlers call (Phase 1: roles/permissions/boards/board-
+  // persist). These are operations, categorically identical to the resolvers above — the handler reaches
+  // shared cross-request state (the feed bus, the live-session registry, the board registry, the feeds
+  // subsystem, the membership dedup) THROUGH them without importing the god-file. Their DEFINITIONS stay
+  // in vite-fs-plugin.ts (moving publishFeed/publishSession — 26/19 callers — is a later phase); this seam
+  // only exposes the operation, injected once via setServerContext at load. Expose operations, never raw
+  // state maps, wherever the operation is the safer surface.
+  publishFeed: (feed: string, value: unknown) => void; // push a named off-log event to every feed subscriber
+  publishSession: (s: LiveSession) => void; // re-render a live session's card feed (band, permissions, tail)
+  boardIdentity: (repoPath: string) => { boardId: string; name: string; repoPath: string }; // realpath→stable id
+  readBoardRegistry: () => BoardRegistryEntry[]; // the durable mounted-board registry (lastOpened recency)
+  recordBoardOpened: (boardId: string, name: string, repoPath: string) => void; // upsert a mount into the registry
+  ensureCanvasExcluded: (repoPath: string) => void; // keep a mounted repo's git status clean of .canvas/
+  startBoardFeeds: (boardId: string, repoPath: string) => void; // git-HEAD + sessions-list feeds for a board
+  announceNewMemberships: (
+    boardId: string,
+    before: Array<Record<string, unknown>> | null,
+    after: Array<Record<string, unknown>> | null,
+    origin: string,
+  ) => void; // onboarding from a snapshot's membership-edge diff
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter
