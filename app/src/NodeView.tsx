@@ -10,6 +10,7 @@ import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
 import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
+import { type HudPlacement } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
@@ -58,9 +59,9 @@ export const NodeView = memo(function NodeView({
   id: Id<"node">;
   screen?: boolean;
   // When set (only in the screen layer), the card is corner-LOCKED HUD chrome (hud.ts) instead of a
-  // free-floating pinned card: rendered in HudFrame at this screen position rather than the draggable
-  // FloatingFrame. `top`/`left` anchor it to the viewport's top-left corner so it tracks a resize.
-  hud?: { top: number; left: number };
+  // free-floating pinned card: rendered in HudFrame at this derived screen placement rather than the
+  // draggable FloatingFrame. The placement (a viewport corner + optional size/frameless) tracks a resize.
+  hud?: HudPlacement;
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -136,10 +137,10 @@ export const NodeView = memo(function NodeView({
   );
 });
 
-// The wrapper for a corner-locked HUD card (usage / clock — see hud.ts). Unlike FloatingFrame it is NOT
-// draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (from the top-left
-// corner + the HUD stack, passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS
-// top/left on the full-viewport .screen-layer means a window resize re-lays it out with no JS. Like the
+// The wrapper for a corner-locked HUD card (usage / clock / threads — see hud.ts). Unlike FloatingFrame it
+// is NOT draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (a viewport corner,
+// passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS on the full-viewport
+// .screen-layer means a window resize re-lays it out with no JS. Like the
 // minimap, a mousedown preventDefaults so a press on the card doesn't blur the canvas (keeping the
 // number-key / Alt-tap shortcuts live) — but ONLY off an interactive interior: the Threads indicator's rows
 // are focusable (tabindex) and drag-out-able (draggable="true"), and preventDefault on mousedown would
@@ -154,14 +155,33 @@ function HudFrame({
 }: {
   id: Id<"node">;
   layout: LayoutRecord;
-  placement: { top: number; left: number };
+  placement: HudPlacement;
   children: React.ReactNode;
 }) {
+  // Build the anchored style from the placement: `top` plus ONE horizontal anchor (centreX → centred with a
+  // translate; else right; else left). Size falls back to the logged w/h but a placement may override it
+  // (the clock renders compact; the Threads card matches the minimap width). `maxHeight` caps the frame so
+  // a long interior scrolls inside the viewport instead of overflowing the bottom.
+  const style: React.CSSProperties = {
+    top: placement.top,
+    width: placement.width ?? layout.w,
+    height: placement.height ?? layout.h,
+    zIndex: layout.z,
+  };
+  if (placement.centreX) {
+    style.left = "50%";
+    style.transform = "translateX(-50%)";
+  } else if (placement.right !== undefined) {
+    style.right = placement.right;
+  } else {
+    style.left = placement.left ?? 0;
+  }
+  if (placement.maxHeight) style.maxHeight = placement.maxHeight;
   return (
     <div
       data-node-id={id}
-      className="hud-frame"
-      style={{ top: placement.top, left: placement.left, width: layout.w, height: layout.h, zIndex: layout.z }}
+      className={`hud-frame${placement.frameless ? " frameless" : ""}`}
+      style={style}
       onMouseDown={(e) => {
         if (e.target instanceof Element && e.target.closest("input, textarea, button, [data-interactive]")) return;
         e.preventDefault();

@@ -4,7 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
-import { HUD_CARDS, HUD_LEFT, hudTopFor, isHudCard } from "./hud";
+import { HUD_CARDS, hudPlacementFor, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -91,21 +91,21 @@ function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean
   // corner-locked and toggled as a group with the minimap, and ordinary user-PINNED cards (the `p` key),
   // which are draggable and always shown. Split them so the HUD toggle only touches the former.
   const free = floating.filter((l) => !isHudCard(l.nodeId));
-  // HUD cards in the fixed stack order (hud.ts), each placed below the minimap and the cards above it.
+  // HUD cards, each corner-anchored by its own derived placement (hud.ts): usage top-left, clock
+  // top-centre, threads top-right under the minimap.
   const hud = hudShown
     ? HUD_CARDS.map((id) => floating.find((l) => l.nodeId === id)).filter((l): l is NonNullable<typeof l> => !!l)
     : [];
   if (free.length === 0 && hud.length === 0) return null;
-  const heightsAbove: number[] = [];
   return (
     <div className="screen-layer">
       {free.map((l) => (
         <NodeView key={l.nodeId} m={m} id={l.nodeId} screen />
       ))}
       {hud.map((l) => {
-        const top = hudTopFor(heightsAbove);
-        heightsAbove.push(l.h);
-        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={{ top, left: HUD_LEFT }} />;
+        const placement = hudPlacementFor(l.nodeId);
+        if (!placement) return null;
+        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={placement} />;
       })}
     </div>
   );
