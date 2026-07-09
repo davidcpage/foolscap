@@ -1,4 +1,4 @@
-import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { layoutId, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
@@ -9,7 +9,7 @@ import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
-import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT } from "./loader";
+import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
@@ -671,16 +671,35 @@ function ThreadView({
   // clear on the next focus. Scoped to `youWaitingSeqs` (mentions only). Best-effort POST — a dropped mark
   // just leaves the mention flagged and the next focus retries. (This replaced the per-message
   // IntersectionObserver, which also moots its ≥60%-visibility threshold bug.)
-  useEffect(() => {
-    if (!selected) return; // only a focused card clears — focusing greens the pill but clears nothing
+  // Mark ALL of this card's currently-unseen @you/@human mentions seen (POST /seen → they drop out). Shared
+  // by the two triggers below. Best-effort — a dropped mark just leaves the mention flagged and the next
+  // trigger retries. Reads the current unseen set off `youWaitingKey`, so the callback re-binds as it changes.
+  const markMentionsSeen = useCallback(() => {
     const seqs = (youWaitingKey ? youWaitingKey.split(",") : []).map(Number).filter((n) => n >= 1);
     if (seqs.length === 0) return;
     void fetch(`/api/thread/${encodeURIComponent(id)}/seen`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ from: "human", seqs }),
-    }).catch(() => {}); // best-effort — a dropped mark just leaves the mention flagged; the next focus retries
-  }, [selected, id, youWaitingKey]);
+    }).catch(() => {});
+  }, [id, youWaitingKey]);
+  useEffect(() => {
+    if (!selected) return; // only a focused card clears — focusing greens the pill but clears nothing
+    markMentionsSeen();
+  }, [selected, markMentionsSeen]);
+  // The clear-on-focus effect above is edge-triggered on `selected`, so REopening a card that is already the
+  // selected card (a rail click on the currently-open thread) produces no edge and never re-fires it — which
+  // is why the badge used to persist until a manual deselect/reselect. openChannel broadcasts THREAD_OPEN_EVENT
+  // on every rail open; catch it here and clear regardless of the selection edge, so a jump from the rail is
+  // always enough to dismiss the badge.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const detail = (e as CustomEvent<{ threadId: string }>).detail;
+      if (detail?.threadId === id) markMentionsSeen();
+    };
+    window.addEventListener(THREAD_OPEN_EVENT, onOpen as EventListener);
+    return () => window.removeEventListener(THREAD_OPEN_EVENT, onOpen as EventListener);
+  }, [id, markMentionsSeen]);
 
   // Cross-card jump (user waiting-state, P3): the rail's preview popover transports here and asks the log to
   // scroll to a specific mention. A freshly-OPENED card reads the pending request on mount (consumePendingJump);
