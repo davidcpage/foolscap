@@ -103,10 +103,22 @@ function ScreenLayer({ m, hudShown, hudEditing }: { m: InteractionManager; hudSh
   // screen falls off the right edge / bottom of a smaller one. Shrink the whole HUD group as one unit to fit
   // the live viewport (hudFitScale) — never enlarge, never mutate the stored positions (a user's Alt-drag and
   // the undo log stay clean). Scale from the top-left corner so the right/bottom columns pull inward together.
-  // Editing suspends the fit (scale 1) so drag math — which reads raw clientX/Y against unscaled layout — isn't
-  // thrown off by the transform. Only the HUD singletons are fitted; user-pinned cards keep their own placement.
+  // Only the HUD singletons are fitted; user-pinned cards keep their own placement.
+  //
+  // The fit stays LIVE during edit (no jump to full size on Alt-hold) — but the drag/resize gestures read
+  // pointer deltas in unscaled layout space, so they divide by this scale (NodeView, `hudScale` prop) to track
+  // the pointer 1:1 under the transform. We FREEZE the scale for the duration of edit mode: growing a card
+  // otherwise pushes the group past the viewport, which shrinks hudFitScale mid-gesture — a moving target that
+  // makes the handle chase the pointer. Capture the live fit at the moment edit ENGAGES (false→true) and hold
+  // it until Alt clears — capturing on the transition (not "last inert render") gets the real fitted scale even
+  // when Alt-hold reveals a hidden HUD straight into edit, where hudShown and hudEditing flip true together.
   const { w: vw, h: vh } = useViewportSize();
-  const scale = hudEditing ? 1 : hudFitScale(hud, vw, vh);
+  const liveScale = hudFitScale(hud, vw, vh);
+  const editScaleRef = useRef(1);
+  const wasEditingRef = useRef(false);
+  if (hudEditing && !wasEditingRef.current) editScaleRef.current = liveScale; // capture at edit-start
+  wasEditingRef.current = hudEditing;
+  const scale = hudEditing ? editScaleRef.current : liveScale;
   if (free.length === 0 && hud.length === 0) return null;
   const hudStyle: React.CSSProperties =
     scale < 1 ? { position: "absolute", inset: 0, transformOrigin: "top left", transform: `scale(${scale})` } : {};
@@ -119,7 +131,9 @@ function ScreenLayer({ m, hudShown, hudEditing }: { m: InteractionManager; hudSh
         {hud.map((l) => {
           const chrome = hudChrome(l.nodeId);
           if (!chrome) return null;
-          return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} hudEditing={hudEditing} />;
+          return (
+            <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} hudEditing={hudEditing} hudScale={scale} />
+          );
         })}
       </div>
     </div>

@@ -57,6 +57,7 @@ export const NodeView = memo(function NodeView({
   screen,
   hud,
   hudEditing,
+  hudScale,
 }: {
   m: InteractionManager;
   id: Id<"node">;
@@ -70,6 +71,10 @@ export const NodeView = memo(function NodeView({
   // UNLOCKED — draggable + resizable with grid snap, exactly like a free pinned card — and reverts to inert
   // chrome the moment it clears. Ignored for a free pinned card (never locked to begin with).
   hudEditing?: boolean;
+  // The live viewport-fit scale the HUD group is rendered under (CanvasView `.hud-fit`, frozen during edit).
+  // The move/resize gestures divide their screen-px pointer delta by it so the handle tracks the pointer 1:1
+  // inside the scaled container. Only passed for HUD cards; a free pinned card renders unscaled (defaults 1).
+  hudScale?: number;
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -146,7 +151,7 @@ export const NodeView = memo(function NodeView({
   // positioned from its own stored layout x/y/w/h. The `hud` descriptor (present only for chrome) locks it
   // and picks the HUD panel styling; absent, it's a draggable pinned card. Same card render above either way.
   return (
-    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud} hudEditing={hudEditing}>
+    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud} hudEditing={hudEditing} hudScale={hudScale}>
       {card}
     </ScreenCardFrame>
   );
@@ -183,6 +188,7 @@ function ScreenCardFrame({
   selected,
   hud,
   hudEditing,
+  hudScale,
   children,
 }: {
   m: InteractionManager;
@@ -191,6 +197,7 @@ function ScreenCardFrame({
   selected: boolean;
   hud?: HudChrome;
   hudEditing?: boolean;
+  hudScale?: number;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -200,6 +207,12 @@ function ScreenCardFrame({
   const editing = !!hud && !!hudEditing;
   const locked = !!hud && !editing;
   const snap = editing ? HUD_SNAP : 0;
+  // The HUD renders under a `transform: scale(hudScale)` (CanvasView `.hud-fit`), so a screen-px pointer delta
+  // maps to delta/scale in the stored (unscaled) layout space. Read through a ref so the pointermove closure
+  // always sees the current scale without re-attaching the listener; frozen during edit, so it's stable across
+  // a gesture. Absent (free pinned card, rendered unscaled) → 1.
+  const scaleRef = useRef(hudScale ?? 1);
+  scaleRef.current = hudScale ?? 1;
   useEffect(() => {
     if (locked) return; // locked HUD chrome — no move gesture
     const el = ref.current;
@@ -217,9 +230,11 @@ function ScreenCardFrame({
       const onMove = (ev: PointerEvent) => {
         // Snap the ABSOLUTE position to the grid lattice (not the delta) so every snapped card lands on the
         // same global 8px grid — that's what makes two cards line up edge-to-edge. Free pinned cards (snap 0)
-        // stay pixel-continuous.
-        const rawX = l0.x + (ev.clientX - px);
-        const rawY = l0.y + (ev.clientY - py);
+        // stay pixel-continuous. The screen-px delta is divided by the HUD fit scale so the card tracks the
+        // pointer 1:1 inside the scaled `.hud-fit` container (snap then quantizes in unscaled layout space).
+        const s = scaleRef.current || 1;
+        const rawX = l0.x + (ev.clientX - px) / s;
+        const rawY = l0.y + (ev.clientY - py) / s;
         const nx = snap ? Math.round(rawX / snap) * snap : Math.round(rawX);
         const ny = snap ? Math.round(rawY / snap) * snap : Math.round(rawY);
         gesture ??= m.editor.beginGesture("moveNode", "user"); // open lazily: a click with no move logs nothing
@@ -263,7 +278,7 @@ function ScreenCardFrame({
       }
     >
       {children}
-      {!locked && selected && <FloatingResizeHandles m={m} id={id} snap={snap} />}
+      {!locked && selected && <FloatingResizeHandles m={m} id={id} snap={snap} scale={hudScale} />}
     </div>
   );
 }
@@ -279,8 +294,23 @@ function ScreenCardFrame({
 // native. Only mounted when the card is selected, mirroring the world SelectionOverlay's lone-selection
 // handles; the container is pointer-transparent so only the four dots take the press.
 const FLOAT_CORNERS: readonly Corner[] = ["nw", "ne", "sw", "se"];
-function FloatingResizeHandles({ m, id, snap = 0 }: { m: InteractionManager; id: Id<"node">; snap?: number }) {
+function FloatingResizeHandles({
+  m,
+  id,
+  snap = 0,
+  scale,
+}: {
+  m: InteractionManager;
+  id: Id<"node">;
+  snap?: number;
+  scale?: number;
+}) {
   const ref = useRef<HTMLDivElement>(null);
+  // The HUD renders under `transform: scale(scale)` (CanvasView `.hud-fit`); a screen-px handle delta maps to
+  // delta/scale in the stored (unscaled) layout box. Read through a ref so the pointermove closure sees the
+  // current (frozen-during-edit) scale without re-attaching listeners. Absent (unscaled card) → 1.
+  const scaleRef = useRef(scale ?? 1);
+  scaleRef.current = scale ?? 1;
   useEffect(() => {
     const host = ref.current;
     if (!host) return;
@@ -303,11 +333,16 @@ function FloatingResizeHandles({ m, id, snap = 0 }: { m: InteractionManager; id:
         let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
         const onMove = (ev: PointerEvent) => {
           gesture ??= m.editor.beginGesture("resizeNode", "user"); // open lazily: a click with no move logs nothing
-          // Snap the pointer DELTA to the grid step (HUD edit mode only; snap 0 = continuous). Snapping the
-          // delta rather than the box edges keeps resizeBox's aspect math intact — the round clock stays
-          // square because its derived dimension is computed from the already-snapped driving delta.
-          const dx = snap ? Math.round((ev.clientX - px) / snap) * snap : ev.clientX - px;
-          const dy = snap ? Math.round((ev.clientY - py) / snap) * snap : ev.clientY - py;
+          // The screen-px delta is divided by the HUD fit scale first, so the handle tracks the pointer 1:1
+          // inside the scaled `.hud-fit` container (the stored box is unscaled). THEN snap the resulting layout
+          // DELTA to the grid step (HUD edit mode only; snap 0 = continuous). Snapping the delta rather than the
+          // box edges keeps resizeBox's aspect math intact — the round clock stays square because its derived
+          // dimension is computed from the already-snapped driving delta.
+          const s = scaleRef.current || 1;
+          const ldx = (ev.clientX - px) / s;
+          const ldy = (ev.clientY - py) / s;
+          const dx = snap ? Math.round(ldx / snap) * snap : ldx;
+          const dy = snap ? Math.round(ldy / snap) * snap : ldy;
           const box = resizeBox(startBox, corner, dx, dy, MIN_SIZE, aspect);
           gesture.update(() => store.update<LayoutRecord>(layoutId(id), box));
         };
