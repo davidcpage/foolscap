@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import chokidar from "chokidar";
-import { getServerContext } from "./server-context.js";
+import { getPendingHistoryMode, getPendingPermissions, getServerContext } from "./server-context.js";
 import { markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
 import { localProc, remoteProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
@@ -823,7 +823,7 @@ export function serverSpawnWorker(opts: {
 }): string | null {
   const { fsState, historyKey, seedCursor, threadLog, persistSessionState, boardSnapshotRecords, dispatchBusCommand } =
     getServerContext();
-  const pendingHistoryMode = fsState.pendingHistoryMode!;
+  const pendingHistoryMode = getPendingHistoryMode(fsState);
   // Replicate handleSessionSpawn's cap guard — a server-fired spawn must not blow past MAX_LIVE_SESSIONS.
   // No silent drop (repo principle): LOG the skip so a doc/seat that should've been serviced isn't left
   // invisibly waiting. It re-fires on the next qualifying activity (a deferred-wake queue is a follow-up).
@@ -930,7 +930,7 @@ export function autoWakeReapTick(): void {
 // Deny every prompt a session still holds — the teardown path (terminate/done/exit). The human can no
 // longer meaningfully answer, and a relay still waiting should hear an honest reason, not a hangup.
 function denySessionPermissions(sid: string, message: string): void {
-  const pendingPermissions = getServerContext().fsState.pendingPermissions!;
+  const pendingPermissions = getPendingPermissions(getServerContext().fsState);
   for (const p of [...pendingPermissions.values()])
     if (p.sid === sid) settlePermission(p.permId, { behavior: "deny", message });
 }
@@ -1035,7 +1035,7 @@ function hasScheduledWake(repoPath: string, id: string): boolean {
 // session): both surfaces render neutral, never a fabricated "your turn".
 export function sessionStatus(repoPath: string, id: string): SessionBand | null {
   const { liveSessions, fsState } = getServerContext();
-  const pendingPermissions = fsState.pendingPermissions!;
+  const pendingPermissions = getPendingPermissions(fsState);
   const live = liveSessions.get(id);
   if (live) {
     // A held permission prompt outranks everything live: the process is technically mid-turn
@@ -1083,7 +1083,7 @@ export function persistSessionState(s: LiveSession): void {
 // The pending permission prompts addressed to one session, in card-render shape (no held internals).
 // Oldest-first so the card shows them in arrival order.
 function permissionsOf(sid: string): Array<{ id: string; toolName: string; input: unknown; ts: number }> {
-  const pendingPermissions = getServerContext().fsState.pendingPermissions!;
+  const pendingPermissions = getPendingPermissions(getServerContext().fsState);
   return [...pendingPermissions.values()]
     .filter((p) => p.sid === sid)
     .sort((a, b) => a.ts - b.ts)

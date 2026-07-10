@@ -1,14 +1,14 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
-import { getServerContext } from "../server-context.js";
+import { getPendingPermissions, getServerContext } from "../server-context.js";
 import { exact, re, type GlobalRoute } from "./router.js";
 
 // ── permissions (--permission-prompt-tool: the held tool-call prompts) — god-file split, Phase 1 ────
 // The server half of --permission-prompt-tool: the MCP relay's held POST parks here, the card's decision
 // buttons (or a shell twin via /api/permissions) resolve it, and a hold timeout denies-by-default. The
-// held prompts live in the shared registry `fsState.pendingPermissions` (reached via ServerContext — the
-// map is ??=-initialized at god-file load, so it is always present by request time). The concern-owned
+// held prompts live in the shared registry `fsState.pendingPermissions`, reached via the getPendingPermissions
+// (fsState) lazy accessor (server-context.ts) — initialized in place on first read, no shell load-order dependency. The concern-owned
 // `settlePermission` moved here with its handlers (3 callers, all permission/teardown-scoped); the god-
 // file's teardown path (denySessionPermissions) imports it back. The cross-cutting `publishSession` +
 // `liveSessions` stay in the god-file and are reached through the context. PERMISSION_HOLD_MS lives here
@@ -22,7 +22,7 @@ export const PERMISSION_HOLD_MS = 10 * 60_000;
 // repaint the blocked session's card. A no-op if the id is already gone (double-settle, close-after-decide).
 export function settlePermission(permId: string, payload: Record<string, unknown>): void {
   const ctx = getServerContext();
-  const pending = ctx.fsState.pendingPermissions!;
+  const pending = getPendingPermissions(ctx.fsState);
   const p = pending.get(permId);
   if (!p) return;
   clearTimeout(p.timer);
@@ -41,7 +41,7 @@ export function settlePermission(permId: string, payload: Record<string, unknown
 // fail-closed deny). No sendJson on the success path: the response parks until /decision or timeout.
 async function handlePermissionRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const ctx = getServerContext();
-  const pending = ctx.fsState.pendingPermissions!;
+  const pending = getPendingPermissions(ctx.fsState);
   let body: { session?: unknown; toolName?: unknown; input?: unknown };
   try {
     body = JSON.parse(await readBody(req));
@@ -91,7 +91,7 @@ async function handlePermissionDecision(req: IncomingMessage, res: ServerRespons
   }
   if (body.behavior !== "allow" && body.behavior !== "deny")
     return sendJson(res, 400, { error: 'behavior must be "allow" or "deny"' });
-  const p = getServerContext().fsState.pendingPermissions!.get(permId);
+  const p = getPendingPermissions(getServerContext().fsState).get(permId);
   if (!p) return sendJson(res, 404, { error: "no such pending permission (already decided or timed out)" });
   settlePermission(
     permId,
@@ -111,7 +111,7 @@ async function handlePermissionDecision(req: IncomingMessage, res: ServerRespons
 // GET /api/permissions[?session=<sid>] — the pending prompts, board-wide or per session: the headless
 // twin of the card's block, so a shell can see (and answer, via /decision) prompts without a tab.
 function handlePermissionsRead(res: ServerResponse, sid: string | null): void {
-  const permissions = [...getServerContext().fsState.pendingPermissions!.values()]
+  const permissions = [...getPendingPermissions(getServerContext().fsState).values()]
     .filter((p) => !sid || p.sid === sid)
     .sort((a, b) => a.ts - b.ts)
     .map((p) => ({ id: p.permId, session: p.sid, toolName: p.toolName, input: p.input, ts: p.ts }));

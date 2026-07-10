@@ -4,7 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import type { IncomingMessage } from "node:http";
 import chokidar from "chokidar";
-import { getServerContext } from "./server-context.js";
+import { getServerContext, getWsClients } from "./server-context.js";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
@@ -42,7 +42,7 @@ type ShadowRootHandle = ReturnType<typeof watchRoot>;
 export function publishFeed(feed: string, value: unknown): void {
   const { fsState } = getServerContext();
   const { feedClients, feedValues } = fsState;
-  const wsClients = fsState.wsClients!;
+  const wsClients = getWsClients(fsState);
   feedValues.set(feed, value);
   const frame = `data: ${JSON.stringify({ feed, value })}\n\n`;
   for (const c of feedClients) c.res.write(frame);

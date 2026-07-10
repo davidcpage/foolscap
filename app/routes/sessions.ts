@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
-import { getServerContext } from "../server-context.js";
+import { getPendingHistoryMode, getServerContext } from "../server-context.js";
 import { exact, re, type GlobalRoute } from "./router.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession } from "../session-ledger.js";
 import { sessionSummaryFromText } from "../session-summary.js";
@@ -126,7 +126,7 @@ async function handleSessionSpawn(
     boardSnapshotRecords, placeWorkerCard, dispatchBusCommand, sendSessionInput,
     persistSessionState, historyKey, seedCursor, threadLog, fsState,
   } = getServerContext();
-  const pendingHistoryMode = fsState.pendingHistoryMode!;
+  const pendingHistoryMode = getPendingHistoryMode(fsState);
   let body: {
     prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
     worktree?: unknown; base?: unknown; worktreeKey?: unknown;

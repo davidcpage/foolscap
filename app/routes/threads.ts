@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
-import { getServerContext } from "../server-context.js";
+import { getPendingHistoryMode, getServerContext } from "../server-context.js";
 import { re, type GlobalRoute } from "./router.js";
 import { classifyMentionSpawn, resolveTags } from "../thread-tags.js";
 import { unreadMentions } from "../cas-guard.js";
@@ -250,7 +250,7 @@ async function handleThreadMembership(
 ): Promise<void> {
   const { boardSnapshotRecords, threadNode, sessionNodeForSid, boards, dispatchBusCommand, forgetDurableMember, historyKey } =
     getServerContext();
-  const pendingHistoryMode = getServerContext().fsState.pendingHistoryMode!;
+  const pendingHistoryMode = getPendingHistoryMode(getServerContext().fsState);
   let body: { from?: unknown; target?: unknown; history?: unknown };
   try {
     body = JSON.parse(await readBody(req));
@@ -314,7 +314,7 @@ async function handleThreadHistory(
 ): Promise<void> {
   const { boardSnapshotRecords, threadNode, liveSessions, threadMemberSids, seedCursor, threadLog, flushNudge, historyKey } =
     getServerContext();
-  const pendingHistoryMode = getServerContext().fsState.pendingHistoryMode!;
+  const pendingHistoryMode = getPendingHistoryMode(getServerContext().fsState);
   let body: { target?: unknown; mode?: unknown };
   try {
     body = JSON.parse(await readBody(req));
