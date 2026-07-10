@@ -281,6 +281,7 @@ function FloatingResizeHandles({ m, id }: { m: InteractionManager; id: Id<"node"
       const corner = el.dataset.corner as Corner;
       const onDown = (e: PointerEvent) => {
         e.stopPropagation(); // pre-empt the frame's move listener + the canvas's native listener
+        e.preventDefault(); // and don't let the press anchor a native text selection that drags across cards (Bug D)
         m.selection.set([id]);
         // Read the live layout at grab time (a closure over `layout` would be one render stale).
         const l0 = store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;

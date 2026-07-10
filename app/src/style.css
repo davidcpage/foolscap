@@ -3600,6 +3600,13 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   position: absolute;
   pointer-events: auto;
   cursor: grab;
+  /* Mirror `.node`'s user-select:none so a move/resize drag off the frame OR its screen-space resize
+     handles never anchors a native text selection that then bleeds across other cards (Bug D — the
+     handles inherit this, and it's the same mechanism that keeps world-card drags from selecting text).
+     The `.node.selected [data-text]` rule is more specific, so ⌘C inside a selected floating card still
+     works, and form controls stay selectable regardless. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 /* Selection is drawn by the inner card's own .node.selected ring (so a floating card reads exactly like
    a world card) — the frame adds no second outline. SelectionOverlay's resize handles are skipped for
