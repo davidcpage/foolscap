@@ -1,5 +1,5 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { layoutId, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
+import { layoutId, resizeBox, MIN_SIZE, type Corner, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
 import { feedSignal, shortSha, timeAgo, type GitHead, type HnStory } from "./feeds";
@@ -134,7 +134,7 @@ export const NodeView = memo(function NodeView({
   return hud ? (
     <HudFrame id={id} layout={layout} placement={hud}>{card}</HudFrame>
   ) : (
-    <FloatingFrame m={m} id={id} layout={layout}>{card}</FloatingFrame>
+    <FloatingFrame m={m} id={id} layout={layout} selected={selected}>{card}</FloatingFrame>
   );
 });
 
@@ -206,11 +206,13 @@ function FloatingFrame({
   m,
   id,
   layout,
+  selected,
   children,
 }: {
   m: InteractionManager;
   id: Id<"node">;
   layout: LayoutRecord;
+  selected: boolean;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -252,6 +254,66 @@ function FloatingFrame({
       style={{ left: layout.x, top: layout.y, width: layout.w, height: layout.h, zIndex: layout.z }}
     >
       {children}
+      {selected && <FloatingResizeHandles m={m} id={id} />}
+    </div>
+  );
+}
+
+// Screen-space resize handles for a floating (pinned) card. A pinned card lives in the screen layer,
+// where its layout x/y/w/h are SCREEN pixels — so SelectionOverlay (which works in PAGE space) drops it
+// and its world-card handles never render (that was Bug B: a pinned card could move but not resize). These
+// handles live INSIDE the FloatingFrame instead and own their own resize gesture the way the frame owns
+// its move gesture: they drive the SAME clamped resizeBox corner math world cards use, but with a straight
+// screen-px delta (the screen layer has no camera transform, so no screenToPage). Wired with NATIVE
+// pointerdown (not React synthetic) and a stopPropagation, so the press pre-empts the frame's own move
+// listener AND the canvas's native listener before either fires — the same reason FloatingFrame's move is
+// native. Only mounted when the card is selected, mirroring the world SelectionOverlay's lone-selection
+// handles; the container is pointer-transparent so only the four dots take the press.
+const FLOAT_CORNERS: readonly Corner[] = ["nw", "ne", "sw", "se"];
+function FloatingResizeHandles({ m, id }: { m: InteractionManager; id: Id<"node"> }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const host = ref.current;
+    if (!host) return;
+    const store = m.editor.store;
+    const cleanups: Array<() => void> = [];
+    host.querySelectorAll<HTMLElement>("[data-corner]").forEach((el) => {
+      const corner = el.dataset.corner as Corner;
+      const onDown = (e: PointerEvent) => {
+        e.stopPropagation(); // pre-empt the frame's move listener + the canvas's native listener
+        m.selection.set([id]);
+        // Read the live layout at grab time (a closure over `layout` would be one render stale).
+        const l0 = store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
+        if (!l0) return;
+        const startBox = { x: l0.x, y: l0.y, w: l0.w, h: l0.h };
+        const px = e.clientX;
+        const py = e.clientY;
+        // A card type may pin its resize ratio (the round clock stays square); honour it like the world tool.
+        const aspect = m.aspectLock?.(id) ?? undefined;
+        let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
+        const onMove = (ev: PointerEvent) => {
+          gesture ??= m.editor.beginGesture("resizeNode", "user"); // open lazily: a click with no move logs nothing
+          const box = resizeBox(startBox, corner, ev.clientX - px, ev.clientY - py, MIN_SIZE, aspect);
+          gesture.update(() => store.update<LayoutRecord>(layoutId(id), box));
+        };
+        const onUp = () => {
+          window.removeEventListener("pointermove", onMove);
+          window.removeEventListener("pointerup", onUp);
+          gesture?.end({ ids: [id] }, "resizeNode");
+        };
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+      };
+      el.addEventListener("pointerdown", onDown);
+      cleanups.push(() => el.removeEventListener("pointerdown", onDown));
+    });
+    return () => cleanups.forEach((fn) => fn());
+  }, [m, id]);
+  return (
+    <div ref={ref} className="floating-resize" aria-hidden="true">
+      {FLOAT_CORNERS.map((c) => (
+        <div key={c} data-corner={c} className={`floating-resize-handle resize-${c}`} />
+      ))}
     </div>
   );
 }

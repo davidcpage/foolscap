@@ -3611,6 +3611,32 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   height: 100%;
 }
 
+/* Screen-space resize handles on a SELECTED floating (pinned) card — the pinned-card twin of the world
+   SelectionOverlay's corner dots (Bug B). The container spans the frame but is pointer-transparent, so
+   the gaps between corners fall through to the card; only the four dots take a press (they own the resize
+   gesture in FloatingResizeHandles). Look mirrors .resize-handle; positioned/cursored per corner here
+   since these — unlike the world dots — are the actual event target. */
+.floating-resize {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.floating-resize-handle {
+  position: absolute;
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
+  background: #fff;
+  border: 1px solid #6366f1;
+  border-radius: 2px;
+  pointer-events: auto;
+  z-index: 2147483647;
+}
+.floating-resize-handle.resize-nw { top: 0; left: 0; transform: translate(-50%, -50%); cursor: nwse-resize; }
+.floating-resize-handle.resize-ne { top: 0; right: 0; transform: translate(50%, -50%); cursor: nesw-resize; }
+.floating-resize-handle.resize-sw { bottom: 0; left: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
+.floating-resize-handle.resize-se { bottom: 0; right: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
+
 /* A corner-locked HUD card (usage / clock — hud.ts): anchored to the viewport's top-left corner via
    top/left (set inline from the HUD stack), so it tracks a window resize with no JS. Unlike a floating
    card it isn't draggable (no grab cursor, no move gesture) — it's chrome, positioned for you. The card
