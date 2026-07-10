@@ -39,6 +39,7 @@ import { inboxRoutes } from "./routes/inbox.js";
 import { askRoutes } from "./routes/asks.js";
 import { threadRoutes } from "./routes/threads.js";
 import { sessionLifecycleRoutes, sessionReadRoutes } from "./routes/sessions.js";
+import { kernelRoutes } from "./routes/kernel.js";
 import { isInternalPath, openRootWatcher } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -540,6 +541,7 @@ export interface CanvasFsState {
   shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher
   busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
+  liveKernels?: Map<string, unknown>; // boardId\0nodeId → live Jupyter kernel (server-kernel.ts; typed there to avoid a cycle; lazy-init via `??=`)
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
   lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
@@ -1159,6 +1161,10 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   // held. The load-bearing ordering (spawn exact → /<id>/* regex → the bare /api/session read below in
   // sessionReadRoutes) is preserved by the two spread points.
   ...sessionLifecycleRoutes,
+  // Jupyter kernel broker (routes/kernel.ts, Path B): POST /api/kernel/<nodeId>/{run,run-all,interrupt,
+  // restart,shutdown}. Node id is a percent-encoded PATH segment (carries node:<root>:<path>), board is
+  // ?board= — self-resolved like the session /<id>/* routes. Distinct path prefix, so array position is free.
+  ...kernelRoutes,
   // Permission prompts (permission-prompt-tool): the relay's held POST, the card's decision buttons, and
   // the headless list. Ids are global UUIDs — no ?board= anywhere here. (routes/permissions.ts)
   ...permissionRoutes,

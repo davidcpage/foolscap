@@ -119,14 +119,23 @@ function fitRenderBudget(nb, budget) {
   return { trimmed: dropped > 0, dropped };
 }
 
-// Transform a `.ipynb`'s raw JSON text for one of the two paths. Returns { content, trimmed, parsed }:
+// Transform a `.ipynb`'s raw JSON text for one of THREE paths. Returns { content, trimmed, parsed }:
 //   • parsed=false when the text isn't valid notebook JSON (malformed, or already byte-clipped upstream) —
 //     content is the ORIGINAL text, unchanged, so the card's own parse-guard shows its "couldn't parse" /
 //     "too large" notice and an agent sees the raw bytes. We never GUESS truncation here.
 //   • otherwise content is the transformed, re-serialized, still-valid JSON and `trimmed` says whether any
 //     elision/drop happened.
+//
+// Modes:
+//   • "render" — the card view: keep images, drop WHOLE outputs only past a generous budget (never lossy JSON).
+//   • "agent"  — the default read: elide base64 images to markers, clamp huge text (legible, not megabytes).
+//   • "full"   — FULL-FIDELITY identity projection for WRITE-BACK (the kernel broker's cell-output merge):
+//     no elision, no drop — the on-disk record must be complete. It still routes through the codec (rather
+//     than a bare JSON.stringify at the call site) so notebook-shape validation and the __foolscap strip
+//     live in ONE place: the render path injects `metadata.__foolscap` as a card-only banner flag; it must
+//     NEVER be persisted back to the file, so "full" strips it. This is the ONLY sanctioned write projection.
 export function transformNotebook(text, opts = {}) {
-  const mode = opts.mode === "render" ? "render" : "agent";
+  const mode = opts.mode === "render" ? "render" : opts.mode === "full" ? "full" : "agent";
   const maxTextChars = opts.maxTextChars ?? DEFAULT_MAX_TEXT_CHARS;
   const renderBudget = opts.renderBudget ?? DEFAULT_RENDER_BUDGET;
 
@@ -138,6 +147,12 @@ export function transformNotebook(text, opts = {}) {
   }
   if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) {
     return { content: text, trimmed: false, parsed: false };
+  }
+
+  if (mode === "full") {
+    // Identity + strip the render-only banner flag. Nothing elided or dropped — full fidelity.
+    if (nb.metadata && typeof nb.metadata === "object") delete nb.metadata.__foolscap;
+    return { content: JSON.stringify(nb, null, 1), trimmed: false, parsed: true };
   }
 
   let trimmed = false;

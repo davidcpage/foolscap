@@ -566,6 +566,70 @@ textarea.file-source {
   color: #b45309;
 }
 
+/* Path-B kernel controls (docs/notebook-card.md §2): a toolbar under the file head with a kernel-state dot
+   + Run all / Interrupt / Restart, and a per-cell Run button in the code gutter. Buttons carry
+   data-interactive="1" so pointer events drive the button, not the canvas drag. */
+.ipynb-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 10px 0;
+  padding: 4px 0;
+  border-top: 1px solid #0000000d;
+  font-size: 10px;
+}
+.ipynb-kernel-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #d4d4d8; /* none */
+  flex: none;
+}
+.ipynb-kernel-idle { background: #22c55e; }
+.ipynb-kernel-busy { background: #f59e0b; animation: ipynb-pulse 1s ease-in-out infinite; }
+.ipynb-kernel-starting { background: #f59e0b; }
+.ipynb-kernel-dead { background: #ef4444; }
+@keyframes ipynb-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.ipynb-kernel-label {
+  color: #71717a;
+  margin-right: auto;
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ipynb-tool,
+.ipynb-run {
+  cursor: pointer;
+  border: 1px solid #0000001a;
+  background: #fbfbfa;
+  color: #3f3f46;
+  border-radius: 4px;
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 2px 6px;
+}
+.ipynb-tool:hover:not(:disabled),
+.ipynb-run:hover:not(:disabled) {
+  background: #f4f4f5;
+  border-color: #00000033;
+}
+.ipynb-tool:disabled,
+.ipynb-run:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.ipynb-run {
+  flex: none;
+  margin-top: 3px;
+  padding: 1px 5px;
+}
+.ipynb-cell.ipynb-running .ipynb-source {
+  border-color: #f59e0b66;
+  background: #fffbeb;
+}
+.ipynb-cell-status {
+  margin: 3px 0 0 10px;
+  color: #b45309;
+  font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 /* Frontmatter "properties" strip (card-types/file/render.js): a compact key/value panel above the prose
    for markdown files that open with YAML frontmatter (memory files, role.md, …), instead of the raw
    `---` fence rendering as an <hr> + run-on paragraph. Muted, monospace keys — reads as metadata, not body. */

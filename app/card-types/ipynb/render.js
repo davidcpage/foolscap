@@ -117,8 +117,12 @@ function renderOutput(out) {
 }
 
 // One notebook cell: markdown → prose (shared codec), code → highlighted source + its outputs, raw → <pre>.
-// A code cell shows its execution count (`In [n]`) as a gutter label, Jupyter-style.
-function renderCell(cell, lang) {
+// A code cell shows its execution count (`In [n]`) as a gutter label, Jupyter-style, plus a per-cell Run
+// button (Path B). `kernel` = { run(sel), status } — `run` is null when the kernel capabilities aren't
+// granted (headless mock / older card); `status` is the live `kernelStatus` feed frame (or null). The cell
+// selects itself by nbformat id (preferred) with the document index as a fallback (a notebook that predates
+// nbformat 4.5 cell ids runs the first time by index; the broker assigns ids + persists, then id-keys after).
+function renderCell(cell, index, lang, kernel) {
   if (!cell || typeof cell !== "object") return "";
   const src = joinSource(cell.source);
   if (cell.cell_type === "markdown")
@@ -126,20 +130,44 @@ function renderCell(cell, lang) {
   if (cell.cell_type === "code") {
     const count = cell.execution_count;
     const outputs = Array.isArray(cell.outputs) ? cell.outputs : [];
+    const st = kernel && kernel.status;
+    const running = !!(st && st.status === "busy" && st.runningCellId && cell.id && st.runningCellId === cell.id);
+    const run = kernel && kernel.run;
     return html`
-      <div class="ipynb-cell ipynb-code">
+      <div class="ipynb-cell ipynb-code ${running ? "ipynb-running" : ""}">
         <div class="ipynb-in">
-          <span class="ipynb-prompt">In [${count == null ? " " : count}]:</span>
+          <span class="ipynb-prompt">In [${running ? "*" : count == null ? " " : count}]:</span>
+          ${run
+            ? html`<button
+                class="ipynb-run"
+                data-interactive="1"
+                title="Run this cell"
+                ?disabled=${running}
+                @click=${() => run({ cellId: cell.id, cellIndex: index })}
+              >
+                ▶ Run
+              </button>`
+            : ""}
           ${renderCode(src, lang)}
         </div>
-        ${outputs.length
-          ? html`<div class="ipynb-outputs">${outputs.map((o) => renderOutput(o))}</div>`
-          : ""}
+        ${running ? html`<div class="ipynb-cell-status">running…</div>` : ""}
+        ${outputs.length ? html`<div class="ipynb-outputs">${outputs.map((o) => renderOutput(o))}</div>` : ""}
       </div>
     `;
   }
   // raw cell (and any other kind): show its source verbatim.
   return html`<div class="ipynb-cell ipynb-raw"><pre class="ipynb-source">${src}</pre></div>`;
+}
+
+// Human label for the kernel lifecycle state carried by the `kernelStatus` feed.
+function kernelLabel(state) {
+  switch (state) {
+    case "starting": return "kernel starting…";
+    case "busy": return "running…";
+    case "dead": return "kernel stopped";
+    case "idle": return "kernel ready";
+    default: return "no kernel";
+  }
 }
 
 export default {
@@ -150,12 +178,38 @@ export default {
     // renders headlessly / for the beat before the fileContent signal resolves.
     const text = card.signals.fileContent ?? card.fields.text;
 
+    // Path B kernel wiring. Reading `kernelStatus` here SUBSCRIBES the card to the live feed, so a status
+    // push (starting/busy/idle/errored, a running stdout tail) re-renders. The action fns are bound POSTs
+    // (or absent for the headless mock / a card without the grant). Outputs themselves arrive via the FILE:
+    // the broker merges them into the `.ipynb` and the watch re-renders `fileContent` — this feed is only
+    // the live status channel.
+    const kstatus = card.signals.kernelStatus || null;
+    const run = card.signals.kernelRun || null;
+    const runAll = card.signals.kernelRunAll || null;
+    const interrupt = card.signals.kernelInterrupt || null;
+    const restart = card.signals.kernelRestart || null;
+    const kernel = { run, status: kstatus };
+
+    const kernelState = kstatus && kstatus.status ? kstatus.status : "none";
+    const busy = kernelState === "busy" || kernelState === "starting";
+    const toolbar =
+      runAll || interrupt || restart
+        ? html`<div class="ipynb-toolbar" data-interactive="1">
+            <span class="ipynb-kernel-dot ipynb-kernel-${kernelState}"></span>
+            <span class="ipynb-kernel-label">${kernelLabel(kernelState)}</span>
+            ${runAll ? html`<button class="ipynb-tool" title="Run all cells" ?disabled=${busy} @click=${() => runAll()}>▶▶ Run all</button>` : ""}
+            ${interrupt ? html`<button class="ipynb-tool" title="Interrupt the kernel" ?disabled=${!busy} @click=${() => interrupt()}>■ Interrupt</button>` : ""}
+            ${restart ? html`<button class="ipynb-tool" title="Restart the kernel" @click=${() => restart()}>⟲ Restart</button>` : ""}
+          </div>`
+        : "";
+
     const head = html`
       <div class="file-head">
         <span class="file-name">${base}</span>
         <span class="file-ext">ipynb</span>
       </div>
       ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}
+      ${toolbar}
     `;
 
     // Pre-signal / empty: a calm placeholder, never a broken card.
@@ -198,7 +252,7 @@ export default {
       ${trimNotice}
       <div class="ipynb-body">
         ${cells.length
-          ? cells.map((c) => renderCell(c, lang))
+          ? cells.map((c, i) => renderCell(c, i, lang, kernel))
           : html`<div class="ipynb-notice">Empty notebook — no cells.</div>`}
       </div>
     `;

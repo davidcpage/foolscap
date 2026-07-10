@@ -1,6 +1,10 @@
 # dependencies
 node_modules/
 
+# python venv for the Jupyter kernel sidecar (per-repo, created via `uv venv`; disposable/reproducible).
+# Must stay out of git AND the shadow-git/file-tree watcher — see docs/jupyter-card.md.
+.venv/
+
 # build output
 dist/
 

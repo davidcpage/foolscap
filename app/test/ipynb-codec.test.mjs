@@ -164,3 +164,43 @@ test("agent: image payload given as an array of base64 lines is elided too", () 
   assert.equal(trimmed, true);
   assert.match(JSON.parse(content).cells[0].outputs[0].data["image/jpeg"], /^<image\/jpeg output elided: 8 bytes>$/);
 });
+
+// ── the "full" mode: the WRITE-BACK projection (Path B kernel broker) ─────────────────────────────────
+// Full-fidelity identity — nothing elided or dropped, so the on-disk record is complete — but it strips the
+// render-only `metadata.__foolscap` banner flag (which must never be persisted) and validates notebook shape.
+
+test("full: keeps every output at full fidelity (no elision, no drop)", () => {
+  const bigImg = "A".repeat(50000);
+  const nb = nbWithImage(bigImg);
+  const { content, trimmed, parsed } = transformNotebook(JSON.stringify(nb), { mode: "full" });
+  assert.equal(parsed, true);
+  assert.equal(trimmed, false);
+  const out = JSON.parse(content);
+  assert.equal(out.cells[0].outputs[0].data["image/png"], bigImg); // kept whole — never a marker
+});
+
+test("full: strips the render-only metadata.__foolscap banner flag", () => {
+  const nb = { cells: [{ cell_type: "code", source: [], outputs: [] }], metadata: { __foolscap: { trimmed: true, droppedOutputs: 3 }, kernelspec: { name: "python3" } }, nbformat: 4 };
+  const { content } = transformNotebook(JSON.stringify(nb), { mode: "full" });
+  const out = JSON.parse(content);
+  assert.equal("__foolscap" in out.metadata, false); // never persisted
+  assert.deepEqual(out.metadata.kernelspec, { name: "python3" }); // other metadata untouched
+});
+
+test("full: a merged output survives a round-trip by cell id", () => {
+  const nb = { cells: [{ id: "abc123", cell_type: "code", source: ["1/0"], outputs: [], execution_count: null }], metadata: {}, nbformat: 4, nbformat_minor: 5 };
+  const parsed = JSON.parse(transformNotebook(JSON.stringify(nb), { mode: "full" }).content);
+  parsed.cells[0].outputs = [{ output_type: "error", ename: "ZeroDivisionError", evalue: "division by zero", traceback: ["..."] }];
+  parsed.cells[0].execution_count = 7;
+  const round = JSON.parse(transformNotebook(JSON.stringify(parsed), { mode: "full" }).content);
+  assert.equal(round.cells[0].id, "abc123");
+  assert.equal(round.cells[0].execution_count, 7);
+  assert.equal(round.cells[0].outputs[0].ename, "ZeroDivisionError");
+});
+
+test("full: malformed / non-notebook JSON passes through unchanged (parsed=false)", () => {
+  const clipped = '{"cells":[{"outputs":[{"data":{"image/png":"AAAABBBB'; // byte-clipped
+  const a = transformNotebook(clipped, { mode: "full" });
+  assert.equal(a.parsed, false);
+  assert.equal(a.content, clipped);
+});

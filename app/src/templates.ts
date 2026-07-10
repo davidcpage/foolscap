@@ -348,6 +348,39 @@ export function buildCard(
       signals.syncCells = (cells: CellSpec[], opts?: { mainRealmAllowed?: boolean }): void => syncCells(cardKey, cells, opts);
       continue;
     }
+    // ── the Jupyter kernel BROKER capabilities (ipynb card, Path B — docs/notebook-card.md §2) ──────────
+    // These are the SERVER-driven cousins of the reactive notebook's runCell/cellOutputs above: the ipynb
+    // card runs a REAL Python kernel server-side (routes/kernel.ts → server-kernel.ts) and outputs persist
+    // into the `.ipynb` file, so unlike cellOutputs (client-side, off-log) the durable result arrives via
+    // `fileContent` (the file watch re-renders the card). What flows here is only LIVE STATUS + actions.
+    //
+    // `kernelStatus` — the per-notebook live feed (mirror `session`), BOARD-scoped because a node id
+    // (`node:<root>:<path>`) is not unique across boards: boardFeedSignal appends `:<boardId>`, matching the
+    // server's `kernel:<nodeId>:<boardId>` publish. Reading it re-renders the card on each kernel status push.
+    if (name === "kernelStatus") {
+      const feed = boardFeedSignal("kernel:" + (host?.id ?? nodeSub.get()?.title ?? ""));
+      Object.defineProperty(signals, "kernelStatus", { enumerable: true, get: () => tracked(feed) });
+      continue;
+    }
+    // `kernelRun` / `kernelRunAll` / `kernelInterrupt` / `kernelRestart` — per-card ACTIONS (like sessionInput/
+    // resume): plain POSTs to /api/kernel/<nodeId>/<verb>?board=… keyed by THIS card's node id, never
+    // editor.commit and not read-tracked (running is an act). The node id carries colons/slashes so it's
+    // percent-encoded. `kernelRun` selects a cell by id (preferred) or document index.
+    if (name === "kernelRun" || name === "kernelRunAll" || name === "kernelInterrupt" || name === "kernelRestart") {
+      const id = host?.id ?? nodeSub.get()?.title ?? "";
+      const post = (verb: string, body?: unknown): Promise<boolean> =>
+        fetch(`/api/kernel/${encodeURIComponent(id)}/${verb}?board=${activeBoardId()}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: body === undefined ? undefined : JSON.stringify(body),
+        }).then((r) => r.ok, () => false);
+      if (name === "kernelRun")
+        signals.kernelRun = (sel: { cellId?: string; cellIndex?: number }): Promise<boolean> => post("run", sel ?? {});
+      else if (name === "kernelRunAll") signals.kernelRunAll = (): Promise<boolean> => post("run-all");
+      else if (name === "kernelInterrupt") signals.kernelInterrupt = (): Promise<boolean> => post("interrupt");
+      else signals.kernelRestart = (): Promise<boolean> => post("restart");
+      continue;
+    }
     // `gone` (slice D): true once this card's (root, path) backing is deleted on disk (the watch's unlink
     // or a 404). The file/dir card reads it to render a TOMBSTONE instead of content / a stuck "loading…".
     // Per-card (keyed by this card's root + path). Worktree-removal isn't tracked here — the card derives
