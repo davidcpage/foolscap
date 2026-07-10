@@ -169,6 +169,10 @@ export interface ServerContext {
   sendSessionInterrupt: (id: string) => boolean; // halt the current turn via the stdin control channel
   endSession: (id: string, endReason: "done" | "terminated") => boolean; // teardown: kill + free the cap slot
   ensureSessionFeed: (dir: string, id: string, repoPath: string) => void; // start live-tailing a transcript
+  // Shadow-git fold (P5 sub-step 2): the extracted session engine (server-sessions.ts foldSessionEvent) reaches
+  // the shadow-git committer here. Its DEFINITION is the shadow-git cluster still in the shell (sub-step 3), so
+  // — exactly like the delivery ops — the seam injects the operation and the def repoints when it moves.
+  foldShadowEdits: (s: LiveSession, e: { type?: string; message?: { content?: unknown } }) => void;
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter
