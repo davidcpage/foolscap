@@ -4,7 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
-import { HUD_CARDS, hudChrome, isHudCard } from "./hud";
+import { HUD_CARDS, hudChrome, hudFitScale, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -88,29 +88,57 @@ function ScreenLayer({ m, hudShown, hudEditing }: { m: InteractionManager; hudSh
   const layouts = useSignal(layoutQuery);
   const floating = layouts.filter((l) => l.anchor === "screen");
   // Two kinds of screen-anchored card share this layer AND the same frame (NodeView's ScreenCardFrame): HUD
-  // chrome (usage/sessions/clock/channels — hud.ts), corner-locked and toggled as a group with the minimap,
-  // and ordinary user-PINNED cards (the `p` key), draggable and always shown. Split them so the HUD toggle
-  // only touches the former; both position from their own stored layout x/y/w/h now.
-  const free = floating.filter((l) => !isHudCard(l.nodeId));
+  // chrome (usage/sessions/clock/channels — hud.ts), corner-locked, and ordinary user-PINNED cards (the `p`
+  // key), draggable. Since dropping standalone pinning in favour of the HUD, BOTH toggle as one group with
+  // the HUD — a pinned card is subsumed by the HUD, not a separately-visible layer (consistent with the
+  // singletons). So `free` is gated on hudShown too; both still position from their own stored x/y/w/h.
+  const free = hudShown ? floating.filter((l) => !isHudCard(l.nodeId)) : [];
   // HUD cards render through the same frame with a chrome descriptor (frame style only); position comes from
   // the card's stored layout, seeded from the default-layout spec (hud-layout.js). Iterated in HUD_CARDS
   // order for a deterministic DOM order among equal z.
   const hud = hudShown
     ? HUD_CARDS.map((id) => floating.find((l) => l.nodeId === id)).filter((l): l is NonNullable<typeof l> => !!l)
     : [];
+  // Viewport-FIT: HUD positions are frozen at seed-time width and don't reflow, so a layout seeded on a big
+  // screen falls off the right edge / bottom of a smaller one. Shrink the whole HUD group as one unit to fit
+  // the live viewport (hudFitScale) — never enlarge, never mutate the stored positions (a user's Alt-drag and
+  // the undo log stay clean). Scale from the top-left corner so the right/bottom columns pull inward together.
+  // Editing suspends the fit (scale 1) so drag math — which reads raw clientX/Y against unscaled layout — isn't
+  // thrown off by the transform. Only the HUD singletons are fitted; user-pinned cards keep their own placement.
+  const { w: vw, h: vh } = useViewportSize();
+  const scale = hudEditing ? 1 : hudFitScale(hud, vw, vh);
   if (free.length === 0 && hud.length === 0) return null;
+  const hudStyle: React.CSSProperties =
+    scale < 1 ? { position: "absolute", inset: 0, transformOrigin: "top left", transform: `scale(${scale})` } : {};
   return (
     <div className="screen-layer">
       {free.map((l) => (
         <NodeView key={l.nodeId} m={m} id={l.nodeId} screen />
       ))}
-      {hud.map((l) => {
-        const chrome = hudChrome(l.nodeId);
-        if (!chrome) return null;
-        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} hudEditing={hudEditing} />;
-      })}
+      <div className="hud-fit" style={hudStyle}>
+        {hud.map((l) => {
+          const chrome = hudChrome(l.nodeId);
+          if (!chrome) return null;
+          return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} hudEditing={hudEditing} />;
+        })}
+      </div>
     </div>
   );
+}
+
+// The live viewport size, tracked for the HUD viewport-fit. A resize re-renders the screen layer so the fit
+// scale recomputes; debounced to a rAF is unnecessary here (one cheap min() per resize event).
+function useViewportSize(): { w: number; h: number } {
+  const [size, setSize] = useState(() => ({
+    w: typeof window !== "undefined" ? window.innerWidth : 1440,
+    h: typeof window !== "undefined" ? window.innerHeight : 900,
+  }));
+  useEffect(() => {
+    const onResize = () => setSize({ w: window.innerWidth, h: window.innerHeight });
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  return size;
 }
 
 const ZOOM_SETTLE_MS = 160;

@@ -108,3 +108,29 @@ export function resolveHudPosition(card, viewportW) {
   else x = card.left ?? 0;
   return { x, y: card.top, w: card.w, h: card.h };
 }
+
+// Viewport-FIT for the whole HUD group. HUD positions are concrete screen coordinates resolved ONCE against
+// the seed-time viewport (resolveHudPosition) and then frozen in the store — and, since P2, movable by hand —
+// so they don't reflow on resize: a layout seeded on a wide/tall screen pushes the right column off the right
+// edge and overflows the bottom on a smaller one. Rather than re-resolve (which would clobber a user's drag
+// and pollute undo), the render layer keeps the stored positions and shrinks the group as ONE unit to fit.
+//
+// Given the shown cards' boxes ({x,y,w,h}, top-left origin) and the live viewport, return the uniform scale a
+// `transform: scale(s)` with `transform-origin: top left` should apply. It's the largest s ≤ 1 that brings the
+// content's right and bottom edges inside the viewport less a `margin` of breathing room — so at the seed
+// viewport s is exactly 1 (no scaling, cards untouched), and it only ever shrinks, never enlarges. Scaling
+// from the top-left corner pulls the right/bottom columns inward together, keeping every card fully on-screen
+// and the columns' relative arrangement intact. Empty/degenerate input → 1 (nothing to fit).
+export function hudFitScale(boxes, viewportW, viewportH, margin = HUD_MARGIN) {
+  if (!boxes || boxes.length === 0) return 1;
+  let maxX = 0;
+  let maxY = 0;
+  for (const b of boxes) {
+    if (b.x + b.w > maxX) maxX = b.x + b.w;
+    if (b.y + b.h > maxY) maxY = b.y + b.h;
+  }
+  const availW = viewportW - margin;
+  const availH = viewportH - margin;
+  if (maxX <= 0 || maxY <= 0 || availW <= 0 || availH <= 0) return 1;
+  return Math.min(1, availW / maxX, availH / maxY);
+}

@@ -13,8 +13,14 @@ import {
   HUD_SNAP,
   isHudCard,
   hudChromeFor,
+  hudFitScale,
   resolveHudPosition,
 } from "../hud-layout.js";
+
+// The default HUD boxes as seeded against a reference width, for the viewport-fit tests below.
+function seedBoxes(viewportW) {
+  return DEFAULT_HUD.map((c) => resolveHudPosition(c, viewportW));
+}
 
 test("the HUD card set is the stable singletons, in seed/paint order", () => {
   // Left column (usage → sessions → File Tree), then the centred clock, then the right column
@@ -101,6 +107,45 @@ test("HUD_SNAP is a fine step (P2 edit-mode grid) that the default layout alread
     if (c.left != null) assert.equal(c.left % HUD_SNAP, 0, `${c.id} left edge is on the lattice`);
     assert.equal(c.w % HUD_SNAP, 0, `${c.id} width is on the lattice`);
   }
+});
+
+test("hudFitScale: never enlarges — a viewport at/above the seed size gives scale 1", () => {
+  const boxes = seedBoxes(1440);
+  // At the seed viewport (or larger) the layout already fits: no scaling, cards untouched.
+  assert.equal(hudFitScale(boxes, 1440, 1080), 1);
+  assert.equal(hudFitScale(boxes, 2560, 1440), 1);
+  // Empty / degenerate input is a no-op (nothing to fit).
+  assert.equal(hudFitScale([], 400, 300), 1);
+  assert.equal(hudFitScale(boxes, 0, 0), 1);
+});
+
+test("hudFitScale: shrinks to fit a narrower viewport so the right column stays on-screen", () => {
+  // A layout seeded on a 1440 screen, opened on a 1024-wide one: the right column (minimap/channels) sits at
+  // x = 1440 - 16 - 240 = 1184, so its right edge is 1424 — off a 1024 viewport. The fit scale must bring it in.
+  const boxes = seedBoxes(1440);
+  const maxRight = Math.max(...boxes.map((b) => b.x + b.w)); // 1424
+  const s = hudFitScale(boxes, 1024, 2000, HUD_MARGIN); // tall enough that width binds
+  assert.ok(s < 1, "narrower viewport shrinks the HUD");
+  // The scaled right edge lands within the viewport (at the margin-inset available width).
+  assert.ok(maxRight * s <= 1024 - HUD_MARGIN + 0.5, "right column pulled fully on-screen");
+  assert.equal(s, (1024 - HUD_MARGIN) / maxRight);
+});
+
+test("hudFitScale: shrinks to fit a shorter viewport so the columns don't overflow the bottom", () => {
+  const boxes = seedBoxes(1440);
+  const maxBottom = Math.max(...boxes.map((b) => b.y + b.h)); // left column: 16+300+12+300+12+300 = 940
+  const s = hudFitScale(boxes, 4000, 700, HUD_MARGIN); // wide enough that height binds
+  assert.ok(s < 1, "shorter viewport shrinks the HUD");
+  assert.ok(maxBottom * s <= 700 - HUD_MARGIN + 0.5, "bottom of the columns pulled on-screen");
+  assert.equal(s, (700 - HUD_MARGIN) / maxBottom);
+});
+
+test("hudFitScale: takes the binding (smaller) of the width and height fits", () => {
+  const boxes = seedBoxes(1440);
+  const both = hudFitScale(boxes, 1024, 700, HUD_MARGIN);
+  const widthOnly = hudFitScale(boxes, 1024, 4000, HUD_MARGIN);
+  const heightOnly = hudFitScale(boxes, 4000, 700, HUD_MARGIN);
+  assert.equal(both, Math.min(widthOnly, heightOnly));
 });
 
 test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {

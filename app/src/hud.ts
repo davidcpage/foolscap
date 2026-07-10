@@ -9,10 +9,11 @@
 // A HUD card differs from a free pinned card only in the frame: it is corner chrome — locked (not draggable
 // yet; drag/resize is a later phase), toggled as a group, and drawn as the neutral translucent HUD panel
 // (optionally frameless, or viewport-height-capped so a long list scrolls). A user-PINNED card (the `p` key)
-// is NOT a HUD card, so it stays draggable and always visible, unaffected by the HUD toggle.
-import { DEFAULT_HUD, HUD_GAP, HUD_SNAP, hudChromeFor, isHudCard as _isHudCard } from "../hud-layout.js";
+// is NOT a HUD singleton, so it stays draggable — but since standalone pinning was dropped in favour of the
+// HUD, it now toggles in and out of view WITH the HUD group (CanvasView gates it on hudShown too).
+import { DEFAULT_HUD, HUD_GAP, HUD_SNAP, hudChromeFor, hudFitScale, isHudCard as _isHudCard } from "../hud-layout.js";
 
-export { HUD_GAP, HUD_SNAP };
+export { HUD_GAP, HUD_SNAP, hudFitScale };
 export const HUD_CARDS: string[] = DEFAULT_HUD.map((c) => c.id);
 export function isHudCard(id: string): boolean {
   return _isHudCard(id);

@@ -413,6 +413,10 @@ function Board({ m, undo, persistence }: Engine) {
           actor: "user",
           payload: { id, anchor: "screen", x: Math.round(s.x), y: Math.round(s.y), w: Math.round(l.w * z), h: Math.round(l.h * z) },
         });
+        // Pinning is subsumed by the HUD now (pinned cards render in the HUD group and toggle with it). If the
+        // HUD is hidden, a freshly-pinned card would vanish on commit — so reveal the HUD, mirroring the way
+        // spawning a hidden singleton reveals it (onRevealHud). No-op when the HUD is already shown.
+        setHudMode(1);
       }
     },
     [m],

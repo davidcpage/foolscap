@@ -225,6 +225,11 @@ function rootOfId(id: string): RootId {
 
 // Build the capability object for one card: content fields off the node's channel-1 handle, plus
 // the declared off-log signals. All reads route through tracked(), so render-time access = subscription.
+// The directory card's expand-set (open-folder `treeState`), kept by node id so it survives the card's
+// unmount→remount when the HUD is toggled closed and reopened (a per-mount closure reset it each time). Value
+// only — never persisted to the log or reload (session-local view state, file-trees-on-canvas.md §9).
+const TREE_STATE = new Map<string, unknown>();
+
 export function buildCard(
   nodeSub: Subscribable<{ title: string; text: string; color: string; name?: string } | undefined>,
   capabilities: string[],
@@ -382,15 +387,21 @@ export function buildCard(
     // `treeState` is per-card EPHEMERAL view state (the directory card's expand-set): a tiny read-tracked,
     // settable Subscribable so a LOCAL toggle re-renders the card exactly as a signal change would. It is
     // never committed, never logged, gone on reload — browsing a tree is "derived by default"
-    // (file-trees-on-canvas.md §9), so which folders are open is view state, not authored state. Created
-    // fresh per card (buildCard runs once per mount), so the closure persists across re-renders. The one
+    // (file-trees-on-canvas.md §9), so which folders are open is view state, not authored state. The one
     // bit of mutable view-state the contract grants a template; reading get() during render subscribes the
     // card, set() notifies it.
+    //
+    // The VALUE lives in a module-level map keyed by node id (TREE_STATE), NOT a per-mount closure: the
+    // File Tree HUD card is unmounted when the HUD closes and remounted on reopen, so a per-mount closure
+    // would reset every folder to collapsed each time (the reported bug). Backing it by node id lets the
+    // expand-set survive close→reopen while staying session-local (the map is gone on page reload, matching
+    // the "never persisted" contract). Watchers stay per-mount — the old render's subscribers are gone with
+    // its DOM — so only `value` is shared across mounts, not the notify set.
     if (name === "treeState") {
-      let value: unknown = undefined;
+      const key = host ? host.id : "";
       const watchers = new Set<() => void>();
       const sub: Subscribable<unknown> = {
-        get: () => value,
+        get: () => TREE_STATE.get(key),
         subscribe(fn) {
           watchers.add(fn);
           return () => watchers.delete(fn);
@@ -399,7 +410,7 @@ export function buildCard(
       signals.treeState = {
         get: (): unknown => tracked(sub),
         set: (next: unknown): void => {
-          value = next;
+          TREE_STATE.set(key, next);
           for (const fn of watchers) fn();
         },
       };
