@@ -5,9 +5,10 @@
 // probe of the middleware. Everything here targets a scratch board mounted from a tmpdir — never the
 // dev repo's real board (a curl-write there can poison the one-time IndexedDB adoption).
 //
-// Hermetic (no-server-needed) middleware tests are the planned follow-up to the vite-fs-plugin split
-// (docs/handoff: the handlers become testable once the pinned state rides an explicit context object);
-// this file is the contract net that exists MEANWHILE, and the assertions to port when that lands.
+// Hermetic (no-server-needed) middleware tests — the payoff of the vite-fs-plugin split, once the pinned
+// state rides an explicit context object — now live in middleware-hermetic.test.mjs (pure fs/snapshot
+// resolvers + handlers wired to a fake ServerContext). This file remains the LIVE end-to-end contract net
+// for the status-code semantics that only a real server exercises.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
