@@ -1,0 +1,560 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { execFile } from "node:child_process";
+import type { IncomingMessage } from "node:http";
+import chokidar from "chokidar";
+import { getServerContext } from "./server-context.js";
+import { commitRoot, watchRoot } from "./shadow-git.js";
+import { isInternalPath } from "./server-fs.js";
+import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
+import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, seatForSid, type ThreadMetaMarker } from "./thread-ledger.js";
+import { canvasRolesDir, readRole } from "./role-ledger.js";
+import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, stampFired, upsertJob } from "./standing-jobs.js";
+import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
+import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
+import { readWatchers } from "./doc-watch.js";
+import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, surfaceClaimant } from "./auto-wake.js";
+import { readCanvasSession } from "./session-ledger.js";
+import { CARD_TYPES_DIR } from "./routes/card-types.js";
+import type { LiveSession } from "./vite-fs-plugin.js";
+
+// ── the orchestration ENGINE: feeds + heartbeat/standing-jobs + shadow-git committer (P5 sub-step 3) ──
+// The third ENGINE module of the P5 god-file split (after server-delivery.ts and server-sessions.ts). It
+// owns the STATEFUL, timer-driven orchestration the shell used to define inline: the off-log feed bus
+// (publishFeed + the per-board / global feed SOURCES that poll or watch and push onto it), the operating-
+// loop heartbeat and standing-jobs firing loop (the server-fired half of the wakeable substrate), and the
+// shadow-git committer (per-root work-tree watcher + editor-tool attribution fold). It reaches the shared
+// cross-request state (the fsState feed/shadow maps, the board/live-session registries, the spawn/process
+// ops) THROUGH getServerContext() — the same pinned singletons the shell holds, injected once via
+// setServerContext at plugin load. server-context.ts stays type-imports only, so importing the accessor
+// (a value) here is not a runtime cycle; only TYPES come from vite-fs-plugin. Each moved function is
+// byte-identical to its former shell definition save for a getServerContext()/binding preamble at its top.
+//
+// Board IDENTITY/registry/ROOTS resolution (boardIdentity/reqBoard/rootDir/boardRoots + the boards map and
+// its module-load boot side-effects), the feed STARTUP WIRING (startBoardFeeds/startFeeds/startWorktreesFeed),
+// the WS transport, and the inline route handlers stay in the shell (routing/identity infra); they reach the
+// feed SOURCES + shadow committer + heartbeat here by importing them, and reach board/root resolution back the
+// other way via getServerContext() (all still ctx ops), so there is no runtime import cycle.
+
+type ShadowRootHandle = ReturnType<typeof watchRoot>;
+
+export function publishFeed(feed: string, value: unknown): void {
+  const { fsState } = getServerContext();
+  const { feedClients, feedValues } = fsState;
+  const wsClients = fsState.wsClients!;
+  feedValues.set(feed, value);
+  const frame = `data: ${JSON.stringify({ feed, value })}\n\n`;
+  for (const c of feedClients) c.res.write(frame);
+  for (const c of wsClients) c.send({ ch: "feed", feed, value });
+}
+
+// ── sessions-list feed (the sessions browser card's live push) — pings on transcript + marker churn ──
+export function startSessionsFeed(boardId: string, dir: string, markersDir: string): void {
+  let t: ReturnType<typeof setTimeout> | null = null;
+  const ping = () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("sessions:" + boardId, { ts: Date.now() }), 200);
+  };
+  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", ping);
+  // ignorePermissionErrors + a lazy create: the marker dir may not exist until the first spawn/adoption.
+  chokidar.watch(markersDir, { ignoreInitial: true, depth: 0, ignorePermissionErrors: true }).on("all", ping);
+}
+
+// ── threads-list feed (the threads browser card's live push) ─────────────────────────────────────
+export function startThreadsFeed(boardId: string, repoPath: string): void {
+  const dir = canvasThreadsDir(repoPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
+  let t: ReturnType<typeof setTimeout> | null = null;
+  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("threads:" + boardId, { ts: Date.now() }), 200);
+  });
+}
+
+// ── roles-list feed (the roles browser card's live push) ─────────────────────────────────────────
+export function startRolesFeed(boardId: string, repoPath: string): void {
+  const dir = canvasRolesDir(repoPath);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
+  let t: ReturnType<typeof setTimeout> | null = null;
+  chokidar.watch(dir, { ignoreInitial: true, depth: 1 }).on("all", () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("roles:" + boardId, { ts: Date.now() }), 200);
+  });
+}
+
+// Feed: the repo's HEAD commit. chokidar on .git/HEAD (branch switches) + .git/logs/HEAD (every
+// commit/amend/pull — the reflog is the one file that always moves); on either, ask git for the
+// tip. The walk/watch above EXCLUDE .git wholesale, so this is its own deliberate watch — the
+// file-card pipeline and the commit feed stay separate ingest paths.
+export function startGitHeadFeed(boardId: string, repo: string): void {
+  const feed = "githead:" + boardId;
+  const read = () =>
+    execFile(
+      "git",
+      ["log", "-1", "--format=%H%x1f%an%x1f%ct%x1f%s"],
+      { cwd: repo },
+      (err, stdout) => {
+        if (err) return; // e.g. empty repo — keep the previous value
+        const [sha, author, ct, message] = stdout.trim().split("\x1f");
+        if (sha) publishFeed(feed, { sha, author, message, ts: Number(ct) * 1000 });
+      },
+    );
+
+  let t: ReturnType<typeof setTimeout> | null = null;
+  const debounced = () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(read, 150); // a commit touches several .git files; coalesce to one read
+  };
+  chokidar
+    .watch([path.join(repo, ".git/HEAD"), path.join(repo, ".git/logs/HEAD")], { ignoreInitial: true })
+    .on("all", debounced);
+  read();
+}
+
+// Feed: one true-internet source for flavour — the current Hacker News #1 story (keyless API).
+// Polled server-side so the browser stays a pure SSE consumer like every other feed.
+export function startHnFeed(): void {
+  const poll = async () => {
+    try {
+      const ids = (await (await fetch("https://hacker-news.firebaseio.com/v0/topstories.json")).json()) as number[];
+      const item = (await (
+        await fetch(`https://hacker-news.firebaseio.com/v0/item/${ids[0]}.json`)
+      ).json()) as { id: number; title: string; by: string; score: number };
+      publishFeed("hn", { id: item.id, title: item.title, by: item.by, score: item.score });
+    } catch {
+      // offline / rate-limited — keep the previous value; the card just stops advancing
+    }
+  };
+  void poll();
+  setInterval(poll, 90_000);
+}
+
+// ── usage feed (the canvas mirror of Claude Code's /usage) ──────────────────────────────────────
+// See the shell's historical note: a FREE, rate-bounded metering poll of Anthropic's OAuth usage endpoint,
+// republished as the off-log `usage` feed. The token stays server-side (Authorization header only).
+
+// Read the OAuth access token the way the CLI stores it: the macOS keychain item
+// "Claude Code-credentials" (a JSON blob), falling back to ~/.claude/.credentials.json. Re-read every
+// poll (not cached) so when Claude Code refreshes the token in place we transparently pick up the new
+// one — the pragmatic alternative to reimplementing the OAuth refresh flow here. null ⇒ not logged in.
+function readClaudeOAuthToken(): Promise<string | null> {
+  const fromBlob = (raw: string): string | null => {
+    try {
+      const t = JSON.parse(raw)?.claudeAiOauth?.accessToken;
+      return typeof t === "string" && t ? t : null;
+    } catch {
+      return null;
+    }
+  };
+  const fromFile = (): string | null => {
+    try {
+      return fromBlob(fs.readFileSync(path.join(os.homedir(), ".claude", ".credentials.json"), "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  return new Promise((resolve) => {
+    execFile(
+      "security",
+      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
+      (err, stdout) => resolve((!err && fromBlob(stdout.trim())) || fromFile()),
+    );
+  });
+}
+
+// The required `claude-code/<version>` User-Agent. Resolved once from `claude --version` (so it tracks
+// the installed CLI), cached, with a plain fallback if claude isn't on PATH — the prefix is what the
+// endpoint gates on, not the exact version.
+let claudeUA: string | null = null;
+function claudeUserAgent(): Promise<string> {
+  if (claudeUA) return Promise.resolve(claudeUA);
+  return new Promise((resolve) => {
+    execFile("claude", ["--version"], (err, stdout) => {
+      const v = (!err && stdout.match(/\d+\.\d+\.\d+/)?.[0]) || "2.0.0";
+      resolve((claudeUA = `claude-code/${v}`));
+    });
+  });
+}
+
+const USAGE_POLL_MS = 180_000; // 3 min — safe with the User-Agent; faster trips the 429 bucket
+export function startUsageFeed(): void {
+  const { feedValues } = getServerContext().fsState;
+  let backoff = 0; // extra ms added after a 429, cleared on the next success
+  const last = () => (feedValues.get("usage") as Record<string, unknown> | undefined) ?? {};
+  const poll = async () => {
+    let nextDelay = USAGE_POLL_MS;
+    try {
+      const token = await readClaudeOAuthToken();
+      if (!token) {
+        publishFeed("usage", { error: "no-credentials", fetchedAt: Date.now() });
+      } else {
+        const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "anthropic-beta": "oauth-2025-04-20",
+            "User-Agent": await claudeUserAgent(),
+            "Content-Type": "application/json",
+          },
+        });
+        if (res.status === 429) {
+          // Throttled — keep the last good windows, just flag it, and wait longer next time.
+          backoff = Math.min(backoff ? backoff * 2 : USAGE_POLL_MS, 15 * 60_000);
+          nextDelay = USAGE_POLL_MS + backoff;
+          publishFeed("usage", { ...last(), error: "rate-limited", fetchedAt: Date.now() });
+        } else if (!res.ok) {
+          // 401 ⇒ token expired/needs re-auth; anything else ⇒ the endpoint changed or is down.
+          publishFeed("usage", { ...last(), error: `http-${res.status}`, fetchedAt: Date.now() });
+        } else {
+          backoff = 0;
+          const data = (await res.json()) as Record<string, unknown>;
+          publishFeed("usage", { ...data, error: null, fetchedAt: Date.now() });
+        }
+      }
+    } catch {
+      publishFeed("usage", { ...last(), error: "offline", fetchedAt: Date.now() });
+    }
+    setTimeout(poll, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
+  };
+  void poll();
+}
+
+// ── card types WATCH feed (a template edit on disk pings the client, whose registry re-imports) ──────
+export function startCardTypesFeed(): void {
+  let t: ReturnType<typeof setTimeout> | null = null;
+  let pending: string | null = null;
+  chokidar.watch(CARD_TYPES_DIR, { ignoreInitial: true }).on("all", (_ev, abs) => {
+    pending = path.relative(CARD_TYPES_DIR, abs);
+    if (t) clearTimeout(t);
+    t = setTimeout(() => publishFeed("cardtypes", { path: pending, ts: Date.now() }), 100);
+  });
+}
+
+// ── operating-loop heartbeat (agent-roles.md) ────────────────────────────────────────────────────
+// The Coordinator heartbeat has been RETIRED as a bespoke loop and CONVERGED onto the general STANDING-JOB
+// machinery (R6/W6): standingJobsTick fires it, and under TIMERS-NUDGE-NEVER-SPAWN only NUDGES a live+idle
+// Coordinator (never respawns a dormant seat). One driver, no fork. Enabling the job is the human-gated
+// AUTONOMY SWITCH. The `loops` role flag survives only as legibility (the calm `scheduled` band).
+const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due jobs / reaps idle workers
+
+// One scheduler tick: reap idle auto-wake workers and fire due standing jobs. Both iterate their own records;
+// neither interrupts a RUNNING session (a mid-turn target is skipped and retried next tick).
+function loopTick(): void {
+  autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
+  standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
+  //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
+  reconcileSessionBands(); // mrcmofwf-10: republish any session whose live band has drifted from its last
+  //                          push — the catch-all for out-of-band transitions the instant paths don't cover.
+}
+
+// Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
+// one timer instead of stacking a second (mirrors boardFeedsStarted). One timer drives every board.
+export function startLoopHeartbeat(): void {
+  const g = globalThis as { __canvasLoopHeartbeat?: ReturnType<typeof setInterval> };
+  if (g.__canvasLoopHeartbeat) clearInterval(g.__canvasLoopHeartbeat);
+  g.__canvasLoopHeartbeat = setInterval(loopTick, LOOP_TICK_MS);
+}
+
+// The last request host we saw — the origin a SERVER-FIRED spawn (standingJobsTick) seeds its worker brief /
+// bus commands with, since it has no triggering request of its own. The server is strictPort-pinned to
+// 127.0.0.1:5173, so the constant fallback is correct until the first request refines it.
+let lastKnownOrigin = "127.0.0.1:5173";
+export function originOf(req: IncomingMessage): string {
+  const host = req.headers.host;
+  const origin = typeof host === "string" && host ? host : "localhost:5173";
+  lastKnownOrigin = origin;
+  return origin;
+}
+
+// The doc worker's first-turn brief: service the doc's open-annotation queue, loop-until-dry, wind down.
+// Its own session id is baked into the collab brief (ensureLiveSession), so `<your session id>` resolves.
+function docWorkerBrief(rel: string, origin: string): string {
+  return (
+    `[canvas] You are an auto-spawned DOC WORKER for \`${rel}\`. Activity landed on this doc's annotations and needs servicing.\n` +
+    `- Read the open queue: \`scripts/canvas anno list ${rel}\` (or GET http://${origin}/api/annotations?path=${encodeURIComponent(rel)}).\n` +
+    `- For each ANSWERED question (a human decided): apply the decision by editing the doc, then RESOLVE the question (resolution belongs to the asker — you).\n` +
+    `- For each open COMMENT (note) meant for you: reply and make the change it asks for.\n` +
+    `- LEAVE questions still AWAITING a human — you can't answer those; don't touch or resolve them.\n` +
+    `- Re-read the queue after each pass so a comment that arrived mid-work is caught; LOOP until nothing actionable remains.\n` +
+    `- Then WIND DOWN: POST http://${origin}/api/session/<your session id>/done. Don't linger idle — batch this wake and exit; fresh activity will spawn a new worker.`
+  );
+}
+
+// The dormant-seat reconstitution brief: a FRESH session standing back up an addressed-but-vacant seat.
+function dormantWakeBrief(handle: string, origin: string): string {
+  return (
+    `[canvas] You've been RECONSTITUTED as the \`${handle}\` seat on this thread — a message was addressed to you while the prior session had wound down. This is a FRESH session seeded from the thread's durable history (NOT a resume): read the thread to catch up.\n` +
+    `- Read your inbox: GET http://${origin}/api/inbox?session=<your session id> — the message addressed to you is there (the full backlog replays on this first read).\n` +
+    `- Read the thread, then respond to what was asked and continue the seat's work.\n` +
+    `- Leave anything you need in the thread before you wind down — a fresh session can't recover your process state.\n` +
+    `- When your part is done: POST http://${origin}/api/session/<your session id>/done.`
+  );
+}
+
+// Trigger 1 — DOC-WAKE. Called after a qualifying annotation write (a `note` comment, or an `answer` on a
+// question). If any active watcher's level clears the event (auto-wake.js reuses W4's wakesSeat), service the
+// doc: NUDGE a live worker already on it (R1 keep-alive continuity — a comment within its idle window
+// continues it, no duplicate) or spawn a fresh one. Single-flight per doc; the worker loops-until-dry.
+export function maybeWakeDocWorker(boardId: string, repoPath: string, origin: string, rel: string, eventKind: "note" | "answer" | "suggestion"): void {
+  const { liveSessions, sendSessionInput, serverSpawnWorker } = getServerContext();
+  const qualifying = qualifyingWatchers(readWatchers(repoPath, rel), eventKind);
+  if (qualifying.length === 0) return; // no watcher this activity would wake — nothing to do
+  const key = docSurfaceKey(rel);
+  const claimant = surfaceClaimant(key);
+  if (claimant) {
+    const s = liveSessions.get(claimant);
+    if (s && s.status !== "exited") {
+      // A worker is already servicing this doc — nudge it to re-check rather than spawn a duplicate.
+      sendSessionInput(
+        claimant,
+        `[canvas] new annotation activity on ${rel} — re-check the open queue (\`scripts/canvas anno list ${rel}\`) and keep servicing it; POST /api/session/<your session id>/done when the queue is dry.`,
+      );
+      return;
+    }
+    releaseSurface(key, claimant); // stale claim (worker gone) — clear it and spawn fresh below
+  }
+  // The worker runs as the first qualifying watcher whose role is a real charter'd role; else bare (the
+  // ask-armed watcher's reserved handle isn't a role, so an answer-driven wake spawns a plain doc worker).
+  let roleId: string | null = null;
+  for (const w of qualifying) if (readRole(repoPath, w.role)) { roleId = w.role; break; }
+  serverSpawnWorker({
+    boardId, repoPath, origin, roleId, threadId: null, anchorNodeId: `node:repo:${rel}`,
+    claimKey: key, firstPrompt: docWorkerBrief(rel, origin),
+  });
+}
+
+// Trigger 2 — DORMANT-SEAT RESPAWN (R1). Called from wakeThreadMembers when an @-addressed member has no
+// live session. Reconstitute the seat: read the dormant occupant's role from its marker, spawn fresh into
+// the thread, and re-occupy the SAME seat with the new sid. Single-flight per seat; a bare (unseated)
+// dormant member has no reconstitution identity, so it's left as a dropped nudge (unchanged behaviour).
+export function maybeRespawnDormantSeat(boardId: string, threadId: string, dormantSid: string, origin: string, meta: ThreadMetaMarker | null): void {
+  const { boards, serverSpawnWorker } = getServerContext();
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return;
+  const handle = seatForSid(meta?.seats, dormantSid);
+  if (!handle) return; // a plain sid participant, not a seated role — nothing durable to stand back up
+  const key = seatSurfaceKey(threadId, handle);
+  if (isSurfaceClaimed(key)) return; // already being reconstituted — don't race a second worker onto the seat
+  const roleId = (readCanvasSession(repoPath, dormantSid)?.roleId as string | undefined) ?? null;
+  const newSid = serverSpawnWorker({
+    boardId, repoPath, origin, roleId, threadId, anchorNodeId: threadId,
+    claimKey: key, firstPrompt: dormantWakeBrief(handle, origin),
+  });
+  // Re-occupy the seat immediately with the fresh sid so the next addressed message finds it live/claimed
+  // (onboarding also fills it from the card name; fillSeat is idempotent on the same sid).
+  if (newSid) fillSeat(repoPath, threadId, handle, newSid, Date.now());
+}
+
+// The standing-job NUDGE: the cheap — and now ONLY — wake a standing job can deliver. Under "timers nudge,
+// never spawn" a standing job only ever nudges an ALREADY-LIVE target. The instruction rides the nudge inline.
+function standingJobNudge(job: { instruction: string }, origin: string): string {
+  return (
+    `[canvas] ⏱ STANDING JOB — your scheduled tick (not a human message). YOUR INSTRUCTION:\n${job.instruction}\n\n` +
+    `- Do exactly what it says. **If there's nothing to do, post NOTHING** ("skip days with nothing") — no "all clear" noise.\n` +
+    `- Then go back to sleep (stay live for the next tick). Read your inbox first if you need context: ` +
+    `GET http://${origin}/api/inbox?session=<your session id>.`
+  );
+}
+
+// Part 1 — heartbeat DEFAULT-ON. Auto-enable the Coordinator heartbeat standing job the first time a
+// Coordinator seat is staffed (coordinator-heartbeat.js): staffing a Coordinator IS the (human) autonomy
+// decision that turns it on. Idempotent: skipped when a Coordinator-role job already exists, so a human who
+// deliberately `job rm`'d it isn't overridden. Best-effort; the CLI verb remains the manual override path.
+export function ensureCoordinatorHeartbeat(repoPath: string, threadId: string): void {
+  try {
+    if (readJobs(repoPath, threadId).some((j) => j.role === COORDINATOR_ROLE)) return;
+    upsertJob(repoPath, threadId, coordinatorHeartbeatJobSpec());
+  } catch {
+    /* best-effort — the CLI verb (`scripts/canvas job coordinator`) remains the manual fallback */
+  }
+}
+
+// Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
+// heartbeat, fire the standing jobs that have come due across every board's threads. TIMERS NUDGE, NEVER
+// SPAWN (human-locked invariant, thread mrcauz0v-f): a role-seat job whose seat is a LIVE session NUDGES it;
+// a DORMANT/reaped target is left alone (a real event revives it). SINGLE-FLIGHT: a job whose prior fire is
+// still running (surface claimed, or the live occupant mid-turn) is SKIPPED and retried next tick. FIRE-NEXT-
+// DUE: stampFired re-bases the schedule to now only on a REAL fire. Jobs live on the thread marker, so they
+// survive their creator and a restart.
+function standingJobsTick(): void {
+  const { boards, liveSessions, sendSessionInput } = getServerContext();
+  const now = Date.now();
+  for (const [boardId, board] of boards) {
+    let threads;
+    try {
+      threads = listThreads(board.repoPath);
+    } catch {
+      continue;
+    }
+    for (const t of threads) {
+      // Read the marker once for both the due-check's intent (part 4 backoff) and the seat resolution below.
+      const tMeta = readThreadMeta(board.repoPath, t.threadId);
+      for (const job of readJobs(board.repoPath, t.threadId)) {
+        // Part 4 — intent-keyed backoff: a role-seat job's EFFECTIVE interval slows while its seat's occupant
+        // is parked on the human (blocked:human), keeps the base cadence otherwise. Derived live from the
+        // seat's declared intent — no stored backoff state (heartbeatEffectiveInterval is a no-op unless
+        // blocked:human, so a bare/undeclared job fires exactly as before).
+        const seatIntent = job.role ? tMeta?.intents?.[job.role]?.intent ?? null : null;
+        if (!jobDueWithInterval(job, now, heartbeatEffectiveInterval(job.intervalMs, seatIntent))) continue;
+        const key = jobClaimKey(t.threadId, job);
+        if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
+
+        // TIMERS NUDGE, NEVER SPAWN (human-locked invariant, thread mrcauz0v-f). A standing job may only NUDGE
+        // an already-live seat occupant; it must never create a session. So:
+        //   - a BARE (roleless) job has no seat to nudge → nothing to do (its old "spawn a fresh worker every
+        //     interval" behaviour is removed; re-add an explicit periodic-spawn primitive here if ever needed).
+        //   - a ROLE-seat job (incl. the Coordinator heartbeat): planRoleJobFire → "nudge" a live+idle occupant
+        //     (the only fire a timer may make), "skip" a mid-turn one, or "none" (dormant/absent, or a
+        //     stood-down `done` seat) — both non-nudge outcomes do nothing and do NOT stamp, so the job simply
+        //     re-evaluates next tick. A wound-down Coordinator is kept PARKED by the reaper (reap-only-on-done),
+        //     so the nudge keeps finding it; a truly-exited seat waits for a real event (@-mention/ask/human).
+        if (!job.role) continue; // bare job: no live seat to nudge, and timers don't spawn → no-op
+        const sid = tMeta?.seats?.[job.role]?.sid; // reuse the marker read once at the top of this thread
+        const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
+        if (planRoleJobFire(live?.status ?? null, seatIntent) !== "nudge") continue; // skip / none → no fire, no stamp
+        sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+        stampFired(board.repoPath, t.threadId, job.id, now);
+      }
+    }
+
+    // Doc standing jobs (doc-jobs.js) — the SAME server-fired timer on a DOC's marker, and the SAME invariant:
+    // TIMERS NUDGE, NEVER SPAWN. A due doc job may only nudge a LIVE, idle worker already servicing the doc
+    // (single-flight per doc, docJobClaimKey = docSurfaceKey); a mid-turn worker is skipped (no stamp); a
+    // dead/absent claimant is a no-op (the old fresh-respawn is removed). A doc that needs a worker gets one
+    // reactively via maybeWakeDocWorker (an annotation event), not from this timer.
+    let docPaths: string[];
+    try {
+      docPaths = listDocsWithJobs(board.repoPath);
+    } catch {
+      docPaths = [];
+    }
+    for (const rel of docPaths) {
+      for (const job of dueJobs(readDocJobs(board.repoPath, rel), now)) {
+        const key = docJobClaimKey(rel);
+        const claimant = surfaceClaimant(key);
+        if (!claimant) continue; // no live worker on the doc — timers don't spawn → nothing to do
+        const s = liveSessions.get(claimant);
+        if (!s || s.status === "exited") {
+          releaseSurface(key, claimant); // stale claim (worker gone) — clear it; no respawn
+          continue;
+        }
+        if (s.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
+        sendSessionInput(claimant, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
+        stampDocFired(board.repoPath, rel, job.id, now);
+      }
+    }
+  }
+}
+
+// ── shadow-git committer (docs/shadow-git-ledger.md step 1) ───────────────────────────────────────
+// A SERVER-SIDE watcher per root that commits the work-tree into its shadow repo on settle, preceded by a
+// boot-reconcile bundling offline changes into one `external` commit. Per-session attribution rides on the
+// editor tool calls (foldShadowEdits — claim on tool_use, attributed path-scoped commit on tool_result).
+// Shadow DBs live centrally under the canonical repo's .canvas/ (gitRoot = repoPath); syncShadowRoots re-runs
+// on worktree add/remove so the committer set tracks boardRoots. The shadowRoots map is fsState-pinned
+// (`??=`-init where first read), like server-delivery's announcedMemberships.
+const SHADOW_SETTLE_MS = 800;
+// The shadow committer's watch ignore (Rule B): see `.canvas/` content so it gets versioned, but never the
+// shadow git-dirs under `.canvas/roots/` — a commit writes objects THERE, and watching them would re-commit
+// forever (docs/canvas-home.md §5). This is the load-bearing feedback-loop guard.
+const shadowIgnored = (p: string): boolean => isInternalPath(p);
+
+// Attribution (doc §6): the server already parses each session's stdout, so an editor tool CALL is our
+// honest attribution signal — it names both the session and the exact file. On the assistant `tool_use` we
+// CLAIM the target path (the `external` floor then leaves it for us); on the matching `user` tool_result the
+// write has landed, so we commit JUST that path attributed to the session. Bash/out-of-band writes name no
+// path and keep falling to the `external` floor.
+const EDIT_TOOL_PATH: Record<string, string> = {
+  Edit: "file_path",
+  Write: "file_path",
+  MultiEdit: "file_path",
+  NotebookEdit: "notebook_path",
+};
+
+// Resolve an editor tool's target to a shadow committer: the board root whose work-tree CONTAINS the file
+// (longest prefix — so a worktree session attributes to ITS root, not the canonical repo), the path relative
+// to that root, and the live watcher handle. null when no active committer owns the path.
+function shadowTargetFor(s: LiveSession, filePath: string): { key: string; rel: string; handle: ReturnType<typeof watchRoot> } | null {
+  const { boardIdentity, boardRoots, fsState } = getServerContext();
+  const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const abs = path.resolve(s.repoPath, filePath); // tools usually emit absolute paths; resolve relatives off cwd
+  const boardId = boardIdentity(s.repoPath).boardId;
+  let best: { id: string; path: string } | null = null;
+  for (const r of boardRoots(boardId)) {
+    if ((abs === r.path || abs.startsWith(r.path + path.sep)) && (!best || r.path.length > best.path.length)) best = r;
+  }
+  if (!best) return null;
+  const rel = path.relative(best.path, abs);
+  // Agent worktrees (`spawn --worktree`) live under the board's `.canvas/worktrees/` and are their OWN real
+  // git checkouts — they reach main via merge-on-green, never the shadow ledger. listWorktrees excludes them
+  // from boardRoots, so an edit inside one has no committer of its own and falls through to the canonical
+  // repo root, yielding rel = `.canvas/worktrees/<key>/…`. Staging that with `git add` in the canonical
+  // work-tree hits the nested checkout's gitlink boundary ("is in submodule"). Never shadow-attribute it.
+  const wtHome = path.join(".canvas", "worktrees");
+  if (rel === wtHome || rel.startsWith(wtHome + path.sep)) return null;
+  const key = boardId + "\0" + best.id;
+  const handle = shadowRoots.get(key);
+  return handle ? { key, rel, handle } : null;
+}
+
+export function foldShadowEdits(s: LiveSession, e: { type?: string; message?: { content?: unknown } }): void {
+  const shadowRoots = (getServerContext().fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const content = e.message?.content;
+  if (!Array.isArray(content)) return;
+  if (e.type === "assistant") {
+    // Claim each editor tool_use's target so the floor debounce skips it until the result commits it.
+    for (const b of content as Array<{ type?: string; id?: string; name?: string; input?: Record<string, unknown> }>) {
+      if (b?.type !== "tool_use" || !b.id || !b.name) continue;
+      const field = EDIT_TOOL_PATH[b.name];
+      const fp = field && b.input ? b.input[field] : undefined;
+      if (typeof fp !== "string" || !fp) continue;
+      const tgt = shadowTargetFor(s, fp);
+      if (!tgt) continue;
+      tgt.handle.claim([tgt.rel]);
+      s.pendingEdits.set(b.id, { key: tgt.key, rel: tgt.rel });
+    }
+  } else if (e.type === "user") {
+    // The write has landed — commit each claimed path attributed (or release it if the edit errored/no-op'd).
+    for (const b of content as Array<{ type?: string; tool_use_id?: string }>) {
+      if (b?.type !== "tool_result" || !b.tool_use_id) continue;
+      const pending = s.pendingEdits.get(b.tool_use_id);
+      if (!pending) continue;
+      s.pendingEdits.delete(b.tool_use_id);
+      const handle = shadowRoots.get(pending.key);
+      if (!handle) continue; // committer torn down (worktree vanished mid-turn) — claim is gone with it
+      const author = `session:${s.id.slice(0, 8)} <${s.id}@foolscap.session>`;
+      void handle
+        .commitClaimed([pending.rel], { author, message: `${s.id.slice(0, 8)}: edit ${pending.rel}` })
+        .catch((err: unknown) => console.error("[shadow] session commit:", err instanceof Error ? err.message : err));
+    }
+  }
+}
+
+export function syncShadowRoots(boardId: string, repoPath: string): void {
+  const { boardRoots, fsState } = getServerContext();
+  const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const roots = boardRoots(boardId);
+  const live = new Set(roots.map((r) => boardId + "\0" + r.id));
+  for (const r of roots) {
+    const key = boardId + "\0" + r.id;
+    if (shadowRoots.has(key)) continue;
+    const onErr = (e: unknown): void => console.error(`[shadow] ${r.id}:`, e instanceof Error ? e.message : e);
+    // boot-reconcile: one bundled `external` commit catching offline/unobserved changes before live watching.
+    void commitRoot(r.path, { rootId: r.id, gitRoot: repoPath, message: "external: reconcile on start" }).catch(onErr);
+    const handle = watchRoot(r.path, {
+      rootId: r.id,
+      gitRoot: repoPath,
+      settleMs: SHADOW_SETTLE_MS,
+      ignored: shadowIgnored,
+      onError: onErr,
+    });
+    shadowRoots.set(key, handle);
+  }
+  // tear down watchers for roots that vanished; the shadow DB under .canvas/ stays (history survives removal).
+  for (const [key, h] of shadowRoots) {
+    if (key.startsWith(boardId + "\0") && !live.has(key)) {
+      void h.close();
+      shadowRoots.delete(key);
+    }
+  }
+}
