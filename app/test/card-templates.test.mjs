@@ -48,19 +48,29 @@ globalThis.document = {
 // specifiers at the files on disk. lit-html → its file URL; the markdown codec → a data: module whose
 // OWN lit-html import is likewise rewritten (so the prose codec loads without a server too).
 const litUrl = new URL("vendor/lit-html.js", root).href;
+// The highlight.js bundle imports nothing, so it loads straight from its file URL (like lit-html). The
+// highlight-lit codec imports BOTH lit-html and the bundle, so toVendorData rewrites both specifiers; it's
+// a no-op for the codecs that don't import highlight.js.
+const hljsUrl = new URL("vendor/highlight.js", root).href;
 const toVendorData = (src) =>
-  "data:text/javascript," + encodeURIComponent(src.replaceAll('"/vendor/lit-html.js"', `"${litUrl}"`));
+  "data:text/javascript," +
+  encodeURIComponent(
+    src.replaceAll('"/vendor/lit-html.js"', `"${litUrl}"`).replaceAll('"/vendor/highlight.js"', `"${hljsUrl}"`),
+  );
 const mdUrl = toVendorData(fs.readFileSync(new URL("vendor/markdown.js", root), "utf8"));
 // The notebook template imports the vendored format parser; it depends on no DOM (string-based, so it
 // loads under node without a DOMParser) and imports nothing, so the same data:-URL rewrite suffices.
 const nbFmtUrl = toVendorData(fs.readFileSync(new URL("vendor/notebook-format.js", root), "utf8"));
+// The file template imports the syntax-highlight codec (which itself imports the bundle + lit-html).
+const hlLitUrl = toVendorData(fs.readFileSync(new URL("vendor/highlight-lit.js", root), "utf8"));
 
 async function loadTemplate(type) {
   const src = fs.readFileSync(new URL(`card-types/${type}/render.js`, root), "utf8");
   const rewritten = src
     .replaceAll('"/vendor/lit-html.js"', `"${litUrl}"`)
     .replaceAll('"/vendor/markdown.js"', `"${mdUrl}"`)
-    .replaceAll('"/vendor/notebook-format.js"', `"${nbFmtUrl}"`);
+    .replaceAll('"/vendor/notebook-format.js"', `"${nbFmtUrl}"`)
+    .replaceAll('"/vendor/highlight-lit.js"', `"${hlLitUrl}"`);
   return (await import("data:text/javascript," + encodeURIComponent(rewritten))).default;
 }
 
@@ -139,7 +149,9 @@ test("file template applies the v1 codec: path → basename / dir / kind", async
   assert.ok(out.includes('file-name">store.ts<'), "basename");
   assert.ok(out.includes("core/src/"), "directory meta line");
   assert.ok(out.includes('file-ext">ts<'), "kind from extension");
-  assert.ok(out.includes("export const x = 1;"), "content from the off-log signal");
+  // A .ts body is now syntax-highlighted, so the content reads through as escaped token spans rather than
+  // one contiguous run — assert the tokens are present (`export`, `const`, `1`) instead of the raw string.
+  assert.ok(out.includes(">export<") && out.includes(">const<") && out.includes(">1<"), "content from the off-log signal (highlighted)");
 
   // The signal supersedes a (legacy/stale) static field; and with no signal the field is the fallback,
   // so a card still renders headlessly / for the beat before the signal resolves.
@@ -148,7 +160,8 @@ test("file template applies the v1 codec: path → basename / dir / kind", async
   );
   assert.ok(sup.includes("fresh off disk") && !sup.includes("stale"), "signal supersedes the static field");
   const fallback = flatten(mod.render({ fields: { title: "a.ts", text: "from the field", color: "blue" }, signals: {} }));
-  assert.ok(fallback.includes("from the field"), "falls back to fields.text without the signal");
+  // Highlighted (a.ts): `from` is a keyword token, the rest reads through — the field content still renders.
+  assert.ok(fallback.includes(">from<") && fallback.includes("the field"), "falls back to fields.text without the signal");
 
   // Codec edges: alias (.markdown → md), extensionless and dotfiles → "file", no dir line at root.
   const md = flatten(mod.render({ fields: { title: "notes.markdown", text: "", color: "yellow" }, signals: {} }));
@@ -170,10 +183,50 @@ test("file template renders a .md card as PROSE (shared markdown codec), other k
   assert.ok(md.includes("<strong>bold</strong>") && md.includes("md-icode"), "inline markdown renders");
   assert.ok(md.includes("<ul") && md.includes(">a<") && md.includes(">b<"), "a list renders");
 
-  // A non-prose kind is untouched: source dumped verbatim into the whitespace-preserving raw preview.
+  // A code kind is a <pre> (not prose), now SYNTAX-HIGHLIGHTED: the source is wrapped in escaped token
+  // spans, never markdown-parsed. The verbatim text still reads through (it's escaped-text bindings inside
+  // the spans), so `data-text` offsets still resolve; a `##` in a comment is a comment token, not a heading.
   const ts = flatten(mod.render({ fields: { title: "a.ts", text: "", color: "blue" }, signals: { fileContent: "const x = 1; // ## not a heading" } }));
-  assert.ok(ts.includes('<pre class="file-body" data-text>'), "code stays a raw <pre>");
-  assert.ok(ts.includes("## not a heading") && !ts.includes("md-h"), "no markdown parsing for a .ts file");
+  assert.ok(ts.includes('class="file-body file-code hljs"') && ts.includes("<code>"), "code renders as a highlighted <pre><code>");
+  assert.ok(ts.includes("hljs-keyword") && ts.includes(">const<"), "tokens are highlighted (keyword span)");
+  assert.ok(ts.includes("## not a heading") && !ts.includes("md-h"), "no markdown parsing for a .ts file; source text still reads through");
+
+  // An UNKNOWN kind (no language in the bundle) is left as the plain, whitespace-preserving raw <pre> —
+  // an unhighlightable file is never worse off than before, and never throws.
+  const unknown = flatten(mod.render({ fields: { title: "a.zzz", text: "", color: "blue" }, signals: { fileContent: "just some ## text" } }));
+  assert.ok(unknown.includes('<pre class="file-body" data-text>'), "an unknown kind stays a plain raw <pre>");
+  assert.ok(unknown.includes("just some ## text") && !unknown.includes("hljs-"), "unknown kind is not highlighted");
+});
+
+test("file template SYNTAX-HIGHLIGHTS a Python file (and the common language set), escaping token text", async () => {
+  const mod = await loadTemplate("file");
+
+  // The headline requirement: a .py file opened from the tree renders with visible highlighting. The
+  // codec runs highlight.js and rebuilds its output as an ESCAPED lit tree (no injected HTML — the same
+  // no-unsafeHTML posture as the markdown codec), so a `<` in a string is a token span AND stays escaped.
+  const py = 'def greet(name):\n    return f"hi <{name}>"  # a comment';
+  const out = flatten(mod.render({ fields: { title: "app/greet.py", text: "", color: "blue" }, signals: { fileContent: py } }));
+  // NB: `flatten` renders lit ATTRIBUTE BINDINGS unquoted (`<span class=hljs-keyword>`), while the static
+  // <pre> class keeps its quotes — so token spans are matched by their class + text, the <pre> by its class.
+  assert.ok(out.includes('class="file-body file-code hljs"'), "the python body is a highlighted code <pre>");
+  assert.ok(out.includes("hljs-keyword") && out.includes(">def<"), "the `def` keyword is a highlighted token");
+  assert.ok(out.includes("hljs-string") && out.includes("hljs-comment"), "strings and comments are highlighted");
+  assert.ok(out.includes("greet") && out.includes("a comment"), "the verbatim source text still reads through");
+
+  // A spread of the common set keyed off `kind` (the mapping in vendor/highlight-lit.js): each highlights.
+  const cases = {
+    "a.js": "const x = 1;",
+    "a.ts": "let y: number = 2;",
+    "a.json": '{"k": 1}',
+    "a.yaml": "key: value",
+    "a.css": "a { color: red; }",
+    "a.html": "<div class='x'>hi</div>",
+    "a.sh": "echo hello",
+  };
+  for (const [title, content] of Object.entries(cases)) {
+    const o = flatten(mod.render({ fields: { title, text: "", color: "blue" }, signals: { fileContent: content } }));
+    assert.ok(o.includes("file-code hljs") && o.includes("hljs-"), `${title} is syntax-highlighted`);
+  }
 });
 
 test("file template: in-card raw-source EDIT toggle (writeFile + treeState), truncation-guarded", async () => {
