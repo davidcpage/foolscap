@@ -1,0 +1,235 @@
+import { getServerContext } from "./server-context.js";
+import {
+  addThreadMember,
+  listThreads,
+  readThreadLog,
+  removeThreadMember,
+  threadMembersFromMeta,
+} from "./thread-ledger.js";
+import { readBoardSnapshot } from "./board-persist.js";
+import { publishThreadFeed } from "./server-delivery.js";
+import type { SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+
+// ── the snapshot / thread-log / membership resolvers (P5 sub-step 3) ───────────────────────────────
+// The pure READ side of the orchestration engine (the P3-deferred server-snapshot.ts split): resolving a
+// board's durable snapshot to nodes/edges (session cards, thread nodes, member rosters), the in-memory
+// thread-log tail the feed + inbox read from, the backlog-visibility seed, and the DURABLE membership
+// registry (the emitted-membership bridge + the delete-card-keep-session set) that thread membership unions
+// in. No timers, no process control, no spawning — just record/log resolution and the membership bookkeeping
+// those resolvers share (which is why sub-step 1 deliberately left the registry to migrate here with them).
+//
+// Like server-delivery.ts / server-sessions.ts, every function reaches the shared, cross-request state (the
+// board registry, the fsState-pinned threadLogs / emittedMembers / durableMembers maps) THROUGH
+// getServerContext() — the same pinned singletons the shell holds, injected once via setServerContext at
+// plugin load. server-context.ts stays type-imports-only, so importing the accessor (a value) here is not a
+// runtime cycle; only TYPES come from vite-fs-plugin. Each moved function is byte-identical to its former
+// shell definition save for a getServerContext()/binding preamble (and the fsState-pinned maps are `??=`-init
+// where first read, exactly like server-delivery's announcedMemberships).
+
+export const MAX_THREAD_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
+
+// The in-memory log for a thread, lazily seeded from the ledger on first touch. seedThreadLogs
+// (startBoardFeeds) covers a MOUNTED board at boot, but a board can also be merely re-REGISTERED from
+// boards.json with no tab ever mounting it — its endpoints resolve, its logs were never seeded. An
+// append that started from an empty map would mint seq 1 onto a ledger whose real tail may be hundreds
+// of messages on, corrupting order and every member's read cursor. Same tail trim as the boot seed.
+export function threadLog(boardId: string, threadId: string): ThreadMsg[] {
+  const { boards, fsState } = getServerContext();
+  const threadLogs = fsState.threadLogs;
+  let log = threadLogs.get(threadId);
+  if (!log) {
+    const repoPath = boards.get(boardId)?.repoPath;
+    log = repoPath ? readThreadLog(repoPath, threadId) : [];
+    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS);
+    threadLogs.set(threadId, log);
+  }
+  return log;
+}
+
+// Restore a board's thread logs from `.canvas/threads/*.jsonl` into the in-memory map at boot (once per
+// board, gated by startBoardFeeds, after migrateChannelLedger has moved any pre-rename dir). This is the
+// cold-restart fix: without it, a process restart emptied every thread card's conversation. Republishing
+// each restored log to its `thread:<id>` feed seeds feedValues, so a tab that connects to /api/feeds AFTER
+// the restart gets the history replayed (handleFeeds) — the thread card renders its backlog with no message
+// having to arrive first. Thread ids are globally unique, so the shared (cross-board) threadLogs map is
+// safe to seed per board; a log already in memory (a hot re-eval kept it pinned) is left alone — disk and
+// memory agree, and we don't want to clobber a live tail with a stale read.
+export function seedThreadLogs(repoPath: string): void {
+  const { fsState, boardIdentity } = getServerContext();
+  const threadLogs = fsState.threadLogs;
+  const durableMembers = (fsState.durableMembers ??= new Map<string, Set<string>>());
+  for (const meta of listThreads(repoPath)) {
+    const threadId = meta.threadId as string;
+    // Rehydrate durable membership from the marker (survives a cold restart — the in-memory index doesn't).
+    // Done before the threadLogs short-circuit: a hot re-eval keeps threadLogs but may have dropped the index.
+    const durable = threadMembersFromMeta(meta);
+    if (durable.length) {
+      const set = durableMembers.get(threadId) ?? new Set<string>();
+      for (const sid of durable) set.add(sid);
+      durableMembers.set(threadId, set);
+    }
+    if (threadLogs.has(threadId)) continue; // pinned from before a hot re-eval — keep the live one
+    let log = readThreadLog(repoPath, threadId);
+    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS); // keep the recent tail
+    threadLogs.set(threadId, log);
+    if (log.length) publishThreadFeed(repoPath ? boardIdentity(repoPath).boardId : "", threadId, log, false);
+  }
+  // Backfill durable membership from the persisted snapshot's live member:open EDGES — so a member that
+  // joined BEFORE this became marker-backed (its marker has no `members` yet) is still adopted as durable
+  // on boot. Without this, such a member counts only while its edge lives, and a card delete would drop it
+  // — the migration gap for memberships that predate the fix. Idempotent; writes the marker as it adopts.
+  const snap = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
+  for (const r of snap?.records ?? [])
+    if (r.typeName === "edge" && String(r.type) === "member:open") {
+      const sid = sidFromSessionNode(String(r.from));
+      if (sid) recordDurableMember(repoPath, String(r.to), sid, Date.now());
+    }
+}
+
+// The thread ids a session is an OPEN member of (the reverse of threadMemberSids), for nudge/read.
+// Memberships the SERVER has just emitted (a member:open over the bus), so wake / inbox / message logic
+// counts a new member IMMEDIATELY — before the browser's snapshot round-trips back (the ~500ms-to-seconds
+// window the CLAUDE.md "membership must be in the pushed snapshot" gotcha warns about, and what made a task
+// posted right after a spawn miss the new worker). Keyed edgeId → {thread, sid, ts}; threadMemberSids and
+// sessionThreads UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
+// human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
+const EMITTED_MEMBER_TTL = 60_000;
+export const sidFromSessionNode = (node: string): string | null =>
+  node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
+// Non-expired emitted memberships, pruning stale ones in passing.
+export function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
+  const emittedMembers = (getServerContext().fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+  const now = Date.now();
+  const out: Array<{ thread: string; sid: string }> = [];
+  for (const [edgeId, m] of emittedMembers) {
+    if (now - m.ts > EMITTED_MEMBER_TTL) emittedMembers.delete(edgeId);
+    else out.push({ thread: m.thread, sid: m.sid });
+  }
+  return out;
+}
+// Record/forget a server-emitted membership for the immediate-membership window. Called from
+// dispatchBusCommand for every member:open / removeEdge it sends (spawn, join, invite).
+export function trackEmittedMembership(cmd: { type: string; payload?: Record<string, unknown> }): void {
+  const emittedMembers = (getServerContext().fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+  const p = cmd.payload ?? {};
+  if (cmd.type === "removeEdge") {
+    if (typeof p.id === "string") emittedMembers.delete(p.id);
+    return;
+  }
+  if (cmd.type !== "addEdge" || String(p.type ?? "") !== "member:open") return;
+  const sid = typeof p.from === "string" ? sidFromSessionNode(p.from) : null;
+  if (typeof p.id === "string" && typeof p.to === "string" && sid)
+    emittedMembers.set(p.id, { thread: p.to, sid, ts: Date.now() });
+}
+
+// DURABLE membership (delete-card-keep-session): the sids that JOINED a thread and haven't LEFT, keyed by
+// threadId. The `member:open` edge is the canvas VIEW of a membership and dies with the session's card
+// (removeNode cascades its wires; core is deliberately blind to member semantics). This index is the
+// membership ITSELF — unioned into threadMemberSids / sessionThreads so a cardless session still counts as
+// a member (still logged, still wakeable by @-tag, still in the roster). Marker-backed (thread-ledger's
+// `members`): this in-memory map is the fast read side, the marker the durable tier a cold restart rehydrates
+// from (seedThreadLogs). Recorded on every member:open sighting; dropped only on a REAL leave (not card delete).
+// Record sid as a durable member of a thread (in-memory + marker). Idempotent; needs the board's repoPath.
+export function recordDurableMember(repoPath: string | undefined, threadId: string, sid: string, ts: number): void {
+  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  let set = durableMembers.get(threadId);
+  if (!set) durableMembers.set(threadId, (set = new Set<string>()));
+  set.add(sid);
+  if (repoPath) addThreadMember(repoPath, threadId, sid, ts);
+}
+// Forget a durable membership (in-memory + marker) — the REAL-leave companion, never called on a card delete.
+export function forgetDurableMember(repoPath: string | undefined, threadId: string, sid: string): void {
+  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const set = durableMembers.get(threadId);
+  if (set) { set.delete(sid); if (set.size === 0) durableMembers.delete(threadId); }
+  if (repoPath) removeThreadMember(repoPath, threadId, sid);
+}
+
+export function sessionThreads(records: Array<Record<string, unknown>>, sid: string): string[] {
+  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const out: string[] = [];
+  const node = sessionNodeForSid(records, sid);
+  if (node)
+    for (const r of records)
+      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && threadNode(records, String(r.to)))
+        out.push(String(r.to));
+  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
+  // Durable members whose card/edge is gone: still a member of these threads (the card was only a view).
+  for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
+  return out;
+}
+
+// The records of a board's DURABLE snapshot (`.canvas/board/snapshot.json` — the same one hydrate
+// serves), or null if the board has never saved one. Used for all server-side node/edge resolution
+// (thread membership, session-card lookup, spawn positioning); it no longer needs a live tab, only a
+// board that has persisted at least once. Lags a just-committed change by the ~400ms save debounce —
+// the same window the old tab-push had.
+export function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> | null {
+  const { boards } = getServerContext();
+  const b = boards.get(boardId);
+  if (!b) return null;
+  const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
+  return snap?.records ?? null;
+}
+
+// A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /
+// node:live:<sid>, title = the full sid). Resolve a node id to its session id, or null if the node isn't
+// a session card. Reading the title (not parsing the id) keeps this robust to the id scheme.
+export function nodeSessionId(records: Array<Record<string, unknown>>, nodeId: string): string | null {
+  const n = records.find((r) => r.typeName === "node" && r.id === nodeId) as SnapNode | undefined;
+  return n && n.type === "session" && typeof n.title === "string" && n.title ? n.title : null;
+}
+
+// The reverse: a session id → its card's node id (so an agent that knows only its own sid can join/leave
+// without ever handling a node id). Null if no session card on the board carries that title.
+export function sessionNodeForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
+  const n = records.find(
+    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
+  ) as SnapNode | undefined;
+  return n ? String(n.id) : null;
+}
+
+// The channel card by id (or null if that id isn't a channel node).
+export function threadNode(records: Array<Record<string, unknown>>, threadId: string): SnapNode | null {
+  const n = records.find((r) => r.typeName === "node" && r.id === threadId) as SnapNode | undefined;
+  // "thread" is the node type since §8 step 2; "channel" is the carried-over legacy type (existing
+  // channels live on as long-lived threads — same card, same machinery).
+  return n && (n.type === "thread" || n.type === "channel") ? n : null;
+}
+
+// A session card's display NAME (the new `name` field a role-spawned card carries, `<RoleName>.<short-sid>`),
+// or null if it has none. The renderer falls back to the short sid; tag resolution uses it so `@RoleName`
+// reaches a role by its handle. Found by the same title===sid convention as sessionNodeForSid.
+export function sessionNameForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
+  const n = records.find(
+    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
+  ) as (SnapNode & { name?: unknown }) | undefined;
+  return n && typeof n.name === "string" && n.name ? n.name : null;
+}
+
+// The session ids of a channel's OPEN members (from each member:open edge session→channel).
+export function threadMemberSids(records: Array<Record<string, unknown>>, threadId: string): string[] {
+  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const out: string[] = [];
+  for (const r of records) {
+    if (r.typeName === "edge" && r.to === threadId && String(r.type) === "member:open") {
+      const sid = nodeSessionId(records, String(r.from));
+      if (sid && !out.includes(sid)) out.push(sid);
+    }
+  }
+  for (const m of liveEmittedMembers()) if (m.thread === threadId && !out.includes(m.sid)) out.push(m.sid);
+  // Durable members whose session card was deleted keep their membership (the card was only a view) — a
+  // surviving member here with no edge is exactly the delete-card-keep-session case.
+  for (const sid of durableMembers.get(threadId) ?? []) if (!out.includes(sid)) out.push(sid);
+  return out;
+}
+
+// How much of the backlog a not-yet-onboarded member should see, keyed `<threadId>|<sid>`. Set by an
+// invite/join (or the /history action) that names a mode; consumed + cleared when member:open onboarding
+// seeds the read cursor. ABSENT ⇒ the default, FULL history — a new member replays the whole backlog on
+// their first inbox read (Slack public-channel style). "future" is the opt-out (start at the tail).
+export const historyKey = (threadId: string, sid: string): string => `${threadId}|${sid}`;
+// The read cursor that gives `sid` the chosen visibility of `log`: full ⇒ 0 (everything is unread), future
+// ⇒ the current tail (only messages from here on). The single source of "how much backlog replays".
+export const seedCursor = (mode: "full" | "future", log: ThreadMsg[]): number =>
+  mode === "future" && log.length ? log[log.length - 1]!.seq : 0;

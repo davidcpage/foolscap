@@ -1,50 +1,29 @@
 import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { commitRoot, watchRoot } from "./shadow-git.js";
-import { canvasSessionsDir, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
+import { watchRoot } from "./shadow-git.js";
+import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
 import { type SessionHostClient } from "./session-host-client.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readPins, readSeenMentions, readThreadLog, readThreadMeta, removeThreadMember, seatForSid, sessionIdleIntent, threadLevelForSid, threadMembersFromMeta, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, type ThreadMetaMarker } from "./thread-ledger.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { intentLine, type WorkIntent } from "./work-intent.js";
-import { wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
-import { readWatchers } from "./doc-watch.js";
-import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
-import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
-import { idleBand } from "./session-band-republish.js";
-import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
-import { canvasRolesDir, listRoles, readRole } from "./role-ledger.js";
 import { parseWorktreePorcelain } from "./worktrees.js";
-import { boardPersistMtime, describeBoardEvents, readBoardPersist, readBoardSnapshot } from "./board-persist.js";
+import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import {
-  attachSessionHost,
-  autoWakeReapTick,
-  endSession,
-  ensureLiveSession,
-  ensureSessionFeed,
-  liveSessionCount,
-  MAX_LIVE_SESSIONS,
-  placeWorkerCard,
-  reconcileSessionBands,
-  resolveSpawnCwd,
-  sendSessionInput,
-  sendSessionInterrupt,
-  serverSpawnWorker,
-} from "./server-sessions.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
+import { boardSnapshotRecords, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
+import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
@@ -187,14 +166,7 @@ for (const e of readBoardRegistry()) {
     }
 }
 
-// A board's Claude Code transcripts dir: ~/.claude/projects/<abs path with every non-alnum → ->. Per board
-// (was a single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev
-// repo's. The slug rule lives once in projectsDirForCwd (session-ledger) — a board root has no dots so it's
-// unchanged, but a worktree cwd contains `.canvas` and MUST slug the dot too (`.canvas` → `-canvas`), or its
-// transcript dir won't be found. Passing a worktree cwd here resolves that session's own dir.
-function sessionsDir(repoPath: string): string {
-  return projectsDirForCwd(repoPath);
-}
+// sessionsDir (a board's Claude-Code transcripts dir) moved to server-sessions.ts (P5 sub-step 3).
 
 // sessionTranscriptDir (the per-session transcripts-dir resolver) moved to routes/sessions.ts (god-file
 // split, Phase 4) — only the session read/resume routes called it. It reaches sessionsDir through the
@@ -331,12 +303,7 @@ function ensureCanvasExcluded(repoPath: string): void {
 // and the membership-diff onboarding (announceNewMemberships) are reached through the ServerContext; the
 // board-persist.js file store is imported directly there.
 
-// Claude Code's transcripts live in ~/.claude/projects/<slug> — resolved PER BOARD by sessionsDir(repoPath)
-// above (the session handlers thread the board's dir), so the cards serve the right repo's history.
-const MAX_SESSION_BYTES = 4 * 1024 * 1024; // whole sessions, bounded against a pathological one. The
-// card scrolls, so we serve the full transcript; the cap only guards an extreme outlier (and the
-// card flags it honestly when it bites — the codec marks a partial tail). In-memory spike, so a few
-// MB in node.text is fine.
+// MAX_SESSION_BYTES moved to server-sessions.ts (P5 sub-step 3); handleNotebookOutputsPush imports it.
 
 // The filesystem-serving / confinement helpers (EXCLUDE_DIRS, isInternalPath, TEXT_EXT, IMAGE_EXT/MIME,
 // MAX_ASSET_BYTES, safeResolve, fileVersion, openRootWatcher) now live in the stateless server-fs.ts seam
@@ -344,33 +311,7 @@ const MAX_SESSION_BYTES = 4 * 1024 * 1024; // whole sessions, bounded against a 
 // share one definition. Only isInternalPath (the shadow-git ignore predicate) and openRootWatcher (the WS
 // file-watch) still have callers HERE, so those two are imported back at the top of this file.
 
-// Real Claude Code transcripts in the board's transcripts `dir`: `*.jsonl` minus the `*.usage.jsonl` sidecars (those
-// are a separate usage-logging stream, not conversations). Returned newest-first by mtime so a
-// caller with no id gets the most recent session.
-// GET /api/session?id=<sessionId>  → { id, content, truncated }: one transcript's raw jsonl, bounded.
-// No `id` → the most recent session. The id is an allow-listed shape (no dots/slashes) AND the
-// resolved path is re-checked to sit in the board's transcripts dir — same two guards as the file reads, since this
-// also runs with the dev server's fs privileges. Content is served raw; the jsonl → turns codec is
-// the card's (render.js), keeping the format understood in exactly one place.
-function readSessionFile(dir: string, id: string): { content: string; truncated: boolean } | null {
-  const abs = path.resolve(dir, id + ".jsonl");
-  if (!abs.startsWith(dir + path.sep)) return null; // id re-checked to sit in the board's transcripts dir
-  try {
-    const buf = fs.readFileSync(abs);
-    // Keep the TAIL when capping, never the head: a transcript is append-only and the card reads it
-    // bottom-up (auto-scroll-to-bottom), so the bytes you want are the most RECENT — where you left off.
-    // Head-slicing here would have hidden the live end behind the old opening, the same class of bug as
-    // the card's old turn-slice. The codec tolerates the ragged first line a tail leaves. (The live feed
-    // bounds itself the same way, MAX_SESSION_FEED_BYTES.) `truncated` flags it so the card says so.
-    const over = buf.length > MAX_SESSION_BYTES;
-    return {
-      content: (over ? buf.subarray(buf.length - MAX_SESSION_BYTES) : buf).toString("utf8"),
-      truncated: over,
-    };
-  } catch {
-    return null;
-  }
-}
+// readSessionFile (one transcript's tail-capped read) moved to server-sessions.ts (P5 sub-step 3).
 
 // handleSession + sessionSummary/summaryCache moved to routes/sessions.ts (god-file split, Phase 4) — only
 // the session read/list routes call them. handleSession reaches readSessionFile + ensureSessionFeed, and
@@ -385,87 +326,13 @@ function readSessionFile(dir: string, id: string): { content: string; truncated:
 // minimap dot, the heads-up) agrees with the card instead of re-deriving it.
 export type SessionBand =
   | "working" | "waiting" | "waiting-agent" | "scheduled" | "done" | "crashed" | "ended";
-function endReasonBand(reason: string | undefined): SessionBand {
-  return reason === "done" ? "done" : reason === "crashed" ? "crashed" : "ended";
-}
-// Is a wake ACTUALLY scheduled for this session? The `loops` role flag is static legibility ("this is a
-// looping-TYPE role") and asserts nothing about a timer — real wakes come from live standing JOBS on a thread
-// (standing-jobs.js), which are human-gated and often absent. So an idle looping session reads the calm teal
-// "scheduled" band only when some thread carries a live job whose ROLE-SEAT this session currently occupies
-// (sessionHasScheduledWake); otherwise it's genuinely "waiting", not asleep on a heartbeat. Only consulted for
-// idle looping sessions (callers gate on `loops` first), so the listThreads marker read stays off the hot path.
-function hasScheduledWake(repoPath: string, id: string): boolean {
-  try {
-    return sessionHasScheduledWake(listThreads(repoPath), id);
-  } catch {
-    return false;
-  }
-}
-// The ONE whole-session status band both surfaces render from (thread mrcmofwf-10): the session card's
-// frame band (card-types/session/render.js) AND that session's participant pill in every thread
-// (thread-state.js memberPillState) read THIS value, so they can never disagree. Process-observed bands
-// (working/scheduled/crashed/ended) are authoritative and GLOBAL; only the *idle* band takes a declared-
-// intent refinement, folded WHOLE-SESSION (across every thread the session is in — sessionIdleIntent), per
-// the v2 precedence. `null` = bandless (a never-run session that has handed you nothing yet, or an unknown
-// session): both surfaces render neutral, never a fabricated "your turn".
-function sessionStatus(repoPath: string, id: string): SessionBand | null {
-  const live = liveSessions.get(id);
-  if (live) {
-    // A held permission prompt outranks everything live: the process is technically mid-turn
-    // ("running"), but it's blocked on a HUMAN click — the one state the loud band exists for.
-    if (live.status !== "exited" && [...pendingPermissions.values()].some((p) => p.sid === id)) return "waiting";
-    if (live.status === "running") return "working";
-    if (live.status === "idle") {
-      // Never-run: idle with no output yet has handed you nothing back, so the loud amber "your turn" is
-      // wrong — stay bandless until the first turn produces output and idles again (which IS your turn).
-      if (live.lines.length === 0) return null;
-      // Idle band precedence (v3, whole-session — see idleBand): a DECLARED intent outranks a wake timer —
-      // declared blocked:human (loud orange) > declared blocked:peer (blue) > scheduled (a looping role asleep
-      // on its heartbeat — teal, no human demand; gated on an ACTUAL live wake, not the static `loops` flag) >
-      // a server-inferred @-tag peer-wait (blue `waitingOn`, free) > the default orange "your turn". Declared
-      // intent is aggregated across ALL the session's threads; `done`/`working` don't paint the idle band
-      // (done never colours a live session — it shows only once the process exits, via endReason grey). One
-      // listThreads read shared by both consults.
-      const metas = listThreads(repoPath);
-      const scheduled = !!live.loops && sessionHasScheduledWake(metas, id);
-      return idleBand(sessionIdleIntent(metas, id), scheduled, !!live.waitingOn?.length);
-    }
-    if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
-  }
-  // not live (or exited with no in-memory reason) → the durable marker is the only surviving source
-  return endReasonBand(readCanvasSession(repoPath, id)?.endReason as string | undefined);
-}
+// endReasonBand / hasScheduledWake / sessionStatus (the ONE whole-session status band) moved to
+// server-sessions.ts (P5 sub-step 3). The SessionBand type stays in the shell (above).
 
 // handleSessions (GET /api/sessions) moved to routes/sessions.ts (god-file split, Phase 4). It reaches
 // sessionStatus through the ServerContext (sessionStatus stays here — the band-republish loop calls it too).
 
-// ── sessions-list feed (the sessions browser card's live push) ──────────────────────────────────
-// The session list is built by readdir+parse ON DEMAND (handleSessions); unlike the file tree it had
-// no live push, so a sessions card only refreshed on mount or the ⟳ button — a newly-started session
-// didn't appear until then. Watch the board's transcripts dir and PING the `sessions:<boardId>` feed on any transcript
-// add/change/unlink; the client re-pulls /api/sessions (content.ts, one pull regardless of how many
-// cards are open). A bare ping (just a ts), NOT the list itself — handleSessions stays the single place
-// the list is built, and its parse runs only when a card is actually listening to re-pull. No startup
-// seed: the feed carries nothing until a real change, so a fresh subscriber triggers no redundant pull.
-// Debounced — Claude Code writes a live transcript repeatedly, so a burst of appends (and the
-// `*.usage.jsonl` sidecar landing alongside) coalesces to one ping. `change` is watched too, so an
-// open list also keeps a running session's turn/message counts and title live, not just its arrival.
-// Also watches the board's MARKER dir (`.canvas/sessions/`): the list is now marker-driven, and a WORKTREE
-// session's transcript lands in a projects dir this watcher can't see, so its arrival would otherwise miss
-// the feed and only show on a manual refresh. A spawn writes the marker under the board root, so watching
-// that dir pings the list the moment any owned session (worktree or not) appears or changes end-state.
-// (Like the git/HN/cardtypes feeds, the watcher isn't pinned on fsState — the boardFeedsStarted guard
-// stops a server reload from stacking a second one per board, and a surviving watcher keeps publishing.)
-function startSessionsFeed(boardId: string, dir: string, markersDir: string): void {
-  let t: ReturnType<typeof setTimeout> | null = null;
-  const ping = () => {
-    if (t) clearTimeout(t);
-    t = setTimeout(() => publishFeed("sessions:" + boardId, { ts: Date.now() }), 200);
-  };
-  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", ping);
-  // ignorePermissionErrors + a lazy create: the marker dir may not exist until the first spawn/adoption.
-  chokidar.watch(markersDir, { ignoreInitial: true, depth: 0, ignorePermissionErrors: true }).on("all", ping);
-}
+// startSessionsFeed moved to server-orchestration.ts (P5 sub-step 3).
 
 // The PARTICIPANTS a thread's state derives from (§8 step 3): the union of the current member:open
 // roster (snapshot edges + the emitted-membership registry) and the seats' current occupants — seats
@@ -558,38 +425,9 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
 // /api/roles (list + create) now lives in routes/roles.ts (god-file split, Phase 1); the create path
 // reaches publishFeed through the ServerContext to nudge an open picker.
 
-// ── threads-list feed (the threads browser card's live push) ─────────────────────────────────────
-// The threads-list mirror of startSessionsFeed: watch `.canvas/threads/` and PING the `threads:<boardId>`
-// feed on any marker add/change (a thread gaining its first message, or a title/activity update); the client
-// re-pulls /api/threads once per ping (content.ts). A bare ping, not the list — handleThreads stays the one
-// place the list is built. mkdir first so chokidar has a directory to watch even before any thread has been
-// persisted (a fresh board). Not pinned on fsState — boardFeedsStarted stops a reload from stacking a second.
-function startThreadsFeed(boardId: string, repoPath: string): void {
-  const dir = canvasThreadsDir(repoPath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
-  let t: ReturnType<typeof setTimeout> | null = null;
-  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
-    if (t) clearTimeout(t);
-    t = setTimeout(() => publishFeed("threads:" + boardId, { ts: Date.now() }), 200);
-  });
-}
+// startThreadsFeed moved to server-orchestration.ts (P5 sub-step 3).
 
-// ── roles-list feed (the roles browser card's live push) ─────────────────────────────────────────
-// The roles-list mirror of startThreadsFeed: watch `.canvas/roles/` and PING the `roles:<boardId>` feed on
-// any role create OR edit, so the roles-list card re-pulls /api/roles. POST /api/roles already pings on
-// create, but a role.md edited THROUGH the file write path (/api/file, the role card's save) wouldn't —
-// the watcher generalises it to any change. depth:1 because a role.md sits one level down (roles/<id>/role.md),
-// unlike the flat channel markers. mkdir first so chokidar has a dir to watch on a fresh board; not pinned on
-// fsState — boardFeedsStarted stops a reload from stacking a second.
-function startRolesFeed(boardId: string, repoPath: string): void {
-  const dir = canvasRolesDir(repoPath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
-  let t: ReturnType<typeof setTimeout> | null = null;
-  chokidar.watch(dir, { ignoreInitial: true, depth: 1 }).on("all", () => {
-    if (t) clearTimeout(t);
-    t = setTimeout(() => publishFeed("roles:" + boardId, { ts: Date.now() }), 200);
-  });
-}
+// startRolesFeed moved to server-orchestration.ts (P5 sub-step 3).
 
 // ── feeds (demo §10: "the clock with a fetch in it") ────────────────────────────────────────────
 // A tiny server-side feed registry, multiplexed onto ONE SSE stream (/api/feeds). Each feed is a
@@ -743,12 +581,8 @@ for (const s of liveSessions.values()) {
   }
 }
 
-function publishFeed(feed: string, value: unknown): void {
-  feedValues.set(feed, value);
-  const frame = `data: ${JSON.stringify({ feed, value })}\n\n`;
-  for (const c of feedClients) c.res.write(frame);
-  for (const c of wsClients) c.send({ ch: "feed", feed, value });
-}
+// publishFeed (the off-log feed-bus write) moved to server-orchestration.ts (P5 sub-step 3). handleFeeds (below)
+// + attachWs stay in the shell (SSE/WS transport) and read fsState.feedClients/feedValues directly.
 
 function handleFeeds(req: IncomingMessage, res: ServerResponse): void {
   openSse(req, res, feedClients);
@@ -838,42 +672,11 @@ function attachWs(server: ViteDevServer): void {
   });
 }
 
-// Feed: the repo's HEAD commit. chokidar on .git/HEAD (branch switches) + .git/logs/HEAD (every
-// commit/amend/pull — the reflog is the one file that always moves); on either, ask git for the
-// tip. The walk/watch above EXCLUDE .git wholesale, so this is its own deliberate watch — the
-// file-card pipeline and the commit feed stay separate ingest paths.
-function startGitHeadFeed(boardId: string, repo: string): void {
-  const feed = "githead:" + boardId;
-  const read = () =>
-    execFile(
-      "git",
-      ["log", "-1", "--format=%H%x1f%an%x1f%ct%x1f%s"],
-      { cwd: repo },
-      (err, stdout) => {
-        if (err) return; // e.g. empty repo — keep the previous value
-        const [sha, author, ct, message] = stdout.trim().split("\x1f");
-        if (sha) publishFeed(feed, { sha, author, message, ts: Number(ct) * 1000 });
-      },
-    );
+// startGitHeadFeed (the repo-HEAD commit feed) moved to server-orchestration.ts (P5 sub-step 3).
 
-  let t: ReturnType<typeof setTimeout> | null = null;
-  const debounced = () => {
-    if (t) clearTimeout(t);
-    t = setTimeout(read, 150); // a commit touches several .git files; coalesce to one read
-  };
-  chokidar
-    .watch([path.join(repo, ".git/HEAD"), path.join(repo, ".git/logs/HEAD")], { ignoreInitial: true })
-    .on("all", debounced);
-  read();
-}
-
-// The live-session feed + spawn/permission consts (SESSION_PERMISSION_MODE / BASELINE_ALLOWED_TOOLS /
-// PERMISSION_TOOL / ASK_CONVENTION), collabBrief, and ensureSessionFeed/stopSessionFeed moved to
-// server-sessions.ts (P5 sub-step 2 — session/spawn/host engine). The LiveSession type + MAX_SESSION_FEED_BYTES
-// + persistSessionState/permissionsOf/publishSession/republishThreadSeatOccupants stay in the shell below.
-
-const MAX_SESSION_FEED_BYTES = 512 * 1024; // bound the live buffer — a derived stream stays bounded
-// (§9.4). Keep the most-recent tail; older completed turns drop off (the card scrolls live output).
+// The live-session feed + spawn/permission consts, collabBrief, ensureSessionFeed/stopSessionFeed (P5
+// sub-step 2) and the persist/publish/status cluster + MAX_SESSION_FEED_BYTES (P5 sub-step 3) all live in
+// server-sessions.ts now. The LiveSession + ContentBlock TYPES stay in the shell below (shared vocabulary).
 
 interface ContentBlock {
   type: string;
@@ -949,281 +752,23 @@ export interface LiveSession {
 // stay reachable; sessionCleanupHooked is read/written through fsState so the process-exit kill hook
 // is installed exactly once across reloads, not stacked.
 
-// Persist the live-registry state that must survive a restart — the thread read cursors and waitingOn —
-// onto the session's durable marker. Without this, a restart that keeps the SESSION alive (a --resume, or
-// the session-host sidecar) still resets its cursors to 0 and the next inbox read re-delivers every joined
-// thread's whole backlog as "unread". Debounced per session (reads/posts come in bursts); the timer reads
-// s.read at fire time, so it always writes the latest cursors. Best-effort like every marker write.
-const persistTimers = (fsState.persistTimers ??= new Map<string, ReturnType<typeof setTimeout>>());
-function persistSessionState(s: LiveSession): void {
-  if (persistTimers.has(s.id)) return;
-  persistTimers.set(
-    s.id,
-    setTimeout(() => {
-      persistTimers.delete(s.id);
-      updateCanvasSession(s.repoPath, s.id, { read: s.read, waitingOn: s.waitingOn });
-    }, 500),
-  );
-}
-
-// The pending permission prompts addressed to one session, in card-render shape (no held internals).
-// Oldest-first so the card shows them in arrival order.
-function permissionsOf(sid: string): Array<{ id: string; toolName: string; input: unknown; ts: number }> {
-  return [...pendingPermissions.values()]
-    .filter((p) => p.sid === sid)
-    .sort((a, b) => a.ts - b.ts)
-    .map((p) => ({ id: p.permId, toolName: p.toolName, input: p.input, ts: p.ts }));
-}
-
-// Publish the session's buffer (completed lines + the in-flight synthetic turn) on its feed. Bounded
-// from the tail; `truncated` mirrors the codec's existing cap signal so the card flags a clipped view.
-function publishSession(s: LiveSession): void {
-  const lines = [...s.lines];
-  if (s.inflight && s.inflight.length > 0) {
-    // The live tail: a synthetic assistant message the codec parses exactly like a real one. Only
-    // text/thinking accumulate visibly; a tool_use shows its name until its consolidated event lands.
-    lines.push(JSON.stringify({ type: "assistant", message: { role: "assistant", content: s.inflight } }));
-  }
-  let content = lines.join("\n");
-  let truncated = false;
-  if (Buffer.byteLength(content) > MAX_SESSION_FEED_BYTES) {
-    content = content.slice(content.length - MAX_SESSION_FEED_BYTES);
-    truncated = true;
-  }
-  // Compute the band ONCE and remember it: this pushed value is what the card renders, and the loopTick
-  // safety net compares against `lastBand` to catch it going stale on an out-of-band transition.
-  const band = sessionStatus(s.repoPath, s.id);
-  s.lastBand = band;
-  publishFeed("session:" + s.id, {
-    content,
-    truncated,
-    status: s.status,
-    // The ONE whole-session status band (sessionStatus) the card renders its frame from — the SAME value
-    // the thread participant pill reads off /api/sessions, so the two surfaces can't drift. Sent on every
-    // publish (including `null` = bandless/never-run) so the card stops recomputing the band client-side;
-    // it falls back to its own derivation only when this key is absent (a slice-1 file-tail feed).
-    band,
-    skills: s.skills ?? undefined,
-    verb: s.verb ?? undefined, // live progress label for the status pill (channel-1 chrome)
-    usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
-    endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
-    waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
-    // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:
-    // an idle looping session with no held waitingOn AND a live standing job on its seat (hasScheduledWake).
-    // Computed only for that narrow case (short-circuits on status/loops/waitingOn first) so the marker read
-    // stays off the hot path — publishSession fires on every delta burst. Replaces the old raw `loops` flag,
-    // which asserted "scheduled" for any looping role even when nothing would ever wake it.
-    scheduled: (s.status === "idle" && !s.waitingOn?.length && s.loops && hasScheduledWake(s.repoPath, s.id)) || undefined,
-    // Held permission prompts: the card renders allow/deny buttons and paints the loud waiting band —
-    // the process is mid-turn ("running") but blocked on a HUMAN, and only the server knows that.
-    permissions: (() => { const p = permissionsOf(s.id); return p.length ? p : undefined; })(),
-  });
-}
-
-// Republish every LIVE seat occupant of a thread (mrcmofwf-10 instant path). A standing job created/removed
-// on a seat flips that occupant's `scheduled` band (sessionHasScheduledWake goes true/false) with no process
-// event of its own, so push the affected occupants' feeds now rather than waiting for the loopTick safety
-// net. Cheap: a thread holds a handful of seats, publishSession recomputes the band fresh, and dead/absent
-// occupants are skipped. Best-effort — a read failure leaves the safety net to reconcile.
-function republishThreadSeatOccupants(repoPath: string, threadId: string): void {
-  try {
-    const seats = readThreadMeta(repoPath, threadId)?.seats ?? {};
-    for (const seat of Object.values(seats) as Array<{ sid?: string }>) {
-      const s = seat?.sid ? liveSessions.get(seat.sid) : undefined;
-      if (s && s.status !== "exited") publishSession(s);
-    }
-  } catch { /* best-effort; loopTick reconciles */ }
-}
+// persistSessionState / permissionsOf / publishSession / republishThreadSeatOccupants moved to
+// server-sessions.ts (P5 sub-step 3 — folded into the session engine, alongside sessionStatus/readSessionFile).
 
 // The session-engine stdout-fold helpers (ctxOf/toolVerb/foldSessionEvent/seedFromTranscript/workerBrief),
 // ensureLiveSession, the session-host client (REMOTE_SESSIONS/attachSessionHost/adoptSession/wireSessionHooks),
 // and sendSessionInput moved to server-sessions.ts (P5 sub-step 2).
 
-// ── channel delivery: off-log log + content-free wake (4e; agent-to-agent-messaging.md §9/§15) ────
-// A channel message NEVER enters an agent's stdin as content — that made peer messages masquerade as the
-// human's input and scattered the conversation across session cards. Instead it lands in the channel's
-// off-log LOG (below), which (a) the channel card renders as the legible conversation and (b) the agent
-// READS by tool call (GET /api/inbox → tool output, never a user turn). The only thing pushed to stdin is
-// a content-free NUDGE: "you have N new in channel X — go read it." Coalescing (§9) lives in the nudge:
-// ≤ one wake per idle/result boundary, and an ignored nudge isn't re-fired until NEW traffic arrives.
-const MAX_THREAD_MSGS = 200; // bounded TAIL — the feed republishes the whole buffer, so keep it modest
+// The channel thread-log (threadLog/seedThreadLogs/MAX_THREAD_MSGS) + the emitted/durable membership
+// registry (sidFromSessionNode/liveEmittedMembers/trackEmittedMembership/recordDurableMember/
+// forgetDurableMember) + sessionThreads moved to server-snapshot.ts (P5 sub-step 3).
 
-// The in-memory log for a thread, lazily seeded from the ledger on first touch. seedThreadLogs
-// (startBoardFeeds) covers a MOUNTED board at boot, but a board can also be merely re-REGISTERED from
-// boards.json with no tab ever mounting it — its endpoints resolve, its logs were never seeded. An
-// append that started from an empty map would mint seq 1 onto a ledger whose real tail may be hundreds
-// of messages on, corrupting order and every member's read cursor. Same tail trim as the boot seed.
-function threadLog(boardId: string, threadId: string): ThreadMsg[] {
-  let log = threadLogs.get(threadId);
-  if (!log) {
-    const repoPath = boards.get(boardId)?.repoPath;
-    log = repoPath ? readThreadLog(repoPath, threadId) : [];
-    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS);
-    threadLogs.set(threadId, log);
-  }
-  return log;
-}
-
-// Restore a board's thread logs from `.canvas/threads/*.jsonl` into the in-memory map at boot (once per
-// board, gated by startBoardFeeds, after migrateChannelLedger has moved any pre-rename dir). This is the
-// cold-restart fix: without it, a process restart emptied every thread card's conversation. Republishing
-// each restored log to its `thread:<id>` feed seeds feedValues, so a tab that connects to /api/feeds AFTER
-// the restart gets the history replayed (handleFeeds) — the thread card renders its backlog with no message
-// having to arrive first. Thread ids are globally unique, so the shared (cross-board) threadLogs map is
-// safe to seed per board; a log already in memory (a hot re-eval kept it pinned) is left alone — disk and
-// memory agree, and we don't want to clobber a live tail with a stale read.
-function seedThreadLogs(repoPath: string): void {
-  for (const meta of listThreads(repoPath)) {
-    const threadId = meta.threadId as string;
-    // Rehydrate durable membership from the marker (survives a cold restart — the in-memory index doesn't).
-    // Done before the threadLogs short-circuit: a hot re-eval keeps threadLogs but may have dropped the index.
-    const durable = threadMembersFromMeta(meta);
-    if (durable.length) {
-      const set = durableMembers.get(threadId) ?? new Set<string>();
-      for (const sid of durable) set.add(sid);
-      durableMembers.set(threadId, set);
-    }
-    if (threadLogs.has(threadId)) continue; // pinned from before a hot re-eval — keep the live one
-    let log = readThreadLog(repoPath, threadId);
-    if (log.length > MAX_THREAD_MSGS) log = log.slice(log.length - MAX_THREAD_MSGS); // keep the recent tail
-    threadLogs.set(threadId, log);
-    if (log.length) publishThreadFeed(repoPath ? boardIdentity(repoPath).boardId : "", threadId, log, false);
-  }
-  // Backfill durable membership from the persisted snapshot's live member:open EDGES — so a member that
-  // joined BEFORE this became marker-backed (its marker has no `members` yet) is still adopted as durable
-  // on boot. Without this, such a member counts only while its edge lives, and a card delete would drop it
-  // — the migration gap for memberships that predate the fix. Idempotent; writes the marker as it adopts.
-  const snap = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
-  for (const r of snap?.records ?? [])
-    if (r.typeName === "edge" && String(r.type) === "member:open") {
-      const sid = sidFromSessionNode(String(r.from));
-      if (sid) recordDurableMember(repoPath, String(r.to), sid, Date.now());
-    }
-}
-
-// The thread ids a session is an OPEN member of (the reverse of threadMemberSids), for nudge/read.
-// Memberships the SERVER has just emitted (a member:open over the bus), so wake / inbox / message logic
-// counts a new member IMMEDIATELY — before the browser's snapshot round-trips back (the ~500ms-to-seconds
-// window the CLAUDE.md "membership must be in the pushed snapshot" gotcha warns about, and what made a task
-// posted right after a spawn miss the new worker). Keyed edgeId → {thread, sid, ts}; threadMemberSids and
-// sessionThreads UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
-// human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
-const emittedMembers = (fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
-const EMITTED_MEMBER_TTL = 60_000;
-const sidFromSessionNode = (node: string): string | null =>
-  node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
-// Non-expired emitted memberships, pruning stale ones in passing.
-function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
-  const now = Date.now();
-  const out: Array<{ thread: string; sid: string }> = [];
-  for (const [edgeId, m] of emittedMembers) {
-    if (now - m.ts > EMITTED_MEMBER_TTL) emittedMembers.delete(edgeId);
-    else out.push({ thread: m.thread, sid: m.sid });
-  }
-  return out;
-}
-// Record/forget a server-emitted membership for the immediate-membership window. Called from
-// dispatchBusCommand for every member:open / removeEdge it sends (spawn, join, invite).
-function trackEmittedMembership(cmd: { type: string; payload?: Record<string, unknown> }): void {
-  const p = cmd.payload ?? {};
-  if (cmd.type === "removeEdge") {
-    if (typeof p.id === "string") emittedMembers.delete(p.id);
-    return;
-  }
-  if (cmd.type !== "addEdge" || String(p.type ?? "") !== "member:open") return;
-  const sid = typeof p.from === "string" ? sidFromSessionNode(p.from) : null;
-  if (typeof p.id === "string" && typeof p.to === "string" && sid)
-    emittedMembers.set(p.id, { thread: p.to, sid, ts: Date.now() });
-}
-
-// DURABLE membership (delete-card-keep-session): the sids that JOINED a thread and haven't LEFT, keyed by
-// threadId. The `member:open` edge is the canvas VIEW of a membership and dies with the session's card
-// (removeNode cascades its wires; core is deliberately blind to member semantics). This index is the
-// membership ITSELF — unioned into threadMemberSids / sessionThreads so a cardless session still counts as
-// a member (still logged, still wakeable by @-tag, still in the roster). Marker-backed (thread-ledger's
-// `members`): this in-memory map is the fast read side, the marker the durable tier a cold restart rehydrates
-// from (seedThreadLogs). Recorded on every member:open sighting; dropped only on a REAL leave (not card delete).
-const durableMembers = (fsState.durableMembers ??= new Map<string, Set<string>>());
-// Record sid as a durable member of a thread (in-memory + marker). Idempotent; needs the board's repoPath.
-function recordDurableMember(repoPath: string | undefined, threadId: string, sid: string, ts: number): void {
-  let set = durableMembers.get(threadId);
-  if (!set) durableMembers.set(threadId, (set = new Set<string>()));
-  set.add(sid);
-  if (repoPath) addThreadMember(repoPath, threadId, sid, ts);
-}
-// Forget a durable membership (in-memory + marker) — the REAL-leave companion, never called on a card delete.
-function forgetDurableMember(repoPath: string | undefined, threadId: string, sid: string): void {
-  const set = durableMembers.get(threadId);
-  if (set) { set.delete(sid); if (set.size === 0) durableMembers.delete(threadId); }
-  if (repoPath) removeThreadMember(repoPath, threadId, sid);
-}
-
-function sessionThreads(records: Array<Record<string, unknown>>, sid: string): string[] {
-  const out: string[] = [];
-  const node = sessionNodeForSid(records, sid);
-  if (node)
-    for (const r of records)
-      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && threadNode(records, String(r.to)))
-        out.push(String(r.to));
-  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
-  // Durable members whose card/edge is gone: still a member of these threads (the card was only a view).
-  for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
-  return out;
-}
-
-// ── operating-loop heartbeat (agent-roles.md) ────────────────────────────────────────────────────
-// A looping ROLE (the Coordinator) needs to sweep the board for STALLS — but nothing emits an event when an agent
-// goes silent, so a purely reactive session would never wake to notice. And built-in self-scheduling does
-// NOT fire in a `claude -p` child (tested), so the wake can't come from inside the agent — the SERVER has to
-// fire the timer. This USED to be a bespoke per-session loop here (a cadence timer that nudged every already-
-// live looping session). It has been RETIRED and CONVERGED onto the general STANDING-JOB machinery (R6/W6):
-// the Coordinator heartbeat is now a standing job on the Coordinator's thread (`coordinator-heartbeat.js`),
-// fired by `standingJobsTick`, which under TIMERS-NUDGE-NEVER-SPAWN only NUDGES a live+idle Coordinator
-// (cheap — context intact) and does nothing for a dormant seat (a timer can't create a session; a real
-// event — @-mention/ask/human — is what revives one). Reap-only-on-done keeps that live seat PARKED between
-// nudges, so the heartbeat keeps finding it. One driver, no fork. Enabling that job is the AUTONOMY SWITCH
-// and is human-gated (`scripts/canvas job
-// coordinator <thread>`); absent the job there is no auto-heartbeat, which is the correct gated-off state.
-// The `loops` role flag survives only as LEGIBILITY: an idle looping session reads the calm `scheduled` band
-// (sessionStatus) rather than the loud amber "waiting", since its wake comes from a scheduled job not a human.
-const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due jobs / reaps idle workers
-
-// One scheduler tick: reap idle auto-wake workers and fire due standing jobs. Both iterate their own records;
-// neither interrupts a RUNNING session (a mid-turn target is skipped and retried next tick).
-function loopTick(): void {
-  autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
-  standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
-  //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
-  reconcileSessionBands(); // mrcmofwf-10: republish any session whose live band has drifted from its last
-  //                          push — the catch-all for out-of-band transitions the instant paths don't cover.
-}
-
-// reconcileSessionBands (the band-staleness safety net) moved to server-sessions.ts (P5 sub-step 2); loopTick calls it via the import.
-
-// Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
-// one timer instead of stacking a second (mirrors boardFeedsStarted). One timer drives every board.
-function startLoopHeartbeat(): void {
-  const g = globalThis as { __canvasLoopHeartbeat?: ReturnType<typeof setInterval> };
-  if (g.__canvasLoopHeartbeat) clearInterval(g.__canvasLoopHeartbeat);
-  g.__canvasLoopHeartbeat = setInterval(loopTick, LOOP_TICK_MS);
-}
+// The operating-loop heartbeat (LOOP_TICK_MS/loopTick/startLoopHeartbeat) moved to server-orchestration.ts
+// (P5 sub-step 3). loopTick drives autoWakeReapTick + standingJobsTick + reconcileSessionBands; startBoardFeeds imports startLoopHeartbeat.
 
 // sendSessionInterrupt moved to server-sessions.ts (P5 sub-step 2).
 
-// POST /api/session/spawn  { prompt? } → { id }. Mint a new session id, spawn the process, and send the
-// first prompt if given. The client drops a session card titled <id>, which subscribes to session:<id>.
-// The host:port the browser actually reached us on (so the spawned agent's API base matches the live
-// server, not a guessed default — sidesteps the 5173/5174 footgun). Falls back to the default dev port.
-// The last request host we saw — the origin a SERVER-FIRED spawn (standingJobsTick) seeds its worker brief /
-// bus commands with, since it has no triggering request of its own. The server is strictPort-pinned to
-// 127.0.0.1:5173, so the constant fallback is correct until the first request refines it.
-let lastKnownOrigin = "127.0.0.1:5173";
-function originOf(req: IncomingMessage): string {
-  const host = req.headers.host;
-  const origin = typeof host === "string" && host ? host : "localhost:5173";
-  lastKnownOrigin = origin;
-  return origin;
-}
+// originOf (+ lastKnownOrigin, the server-fired-spawn origin seed) moved to server-orchestration.ts (P5 sub-step 3).
 
 // The spawn-cap consts (MAX_LIVE_SESSIONS) + liveSessionCount/placeWorkerCard/resolveSpawnCwd moved to server-sessions.ts (P5 sub-step 2).
 
@@ -1234,193 +779,13 @@ function originOf(req: IncomingMessage): string {
 
 // serverSpawnWorker (the server-spawn-from-a-durable-record primitive) moved to server-sessions.ts (P5 sub-step 2).
 
-// The doc worker's first-turn brief: service the doc's open-annotation queue, loop-until-dry, wind down.
-// Its own session id is baked into the collab brief (ensureLiveSession), so `<your session id>` resolves.
-function docWorkerBrief(rel: string, origin: string): string {
-  return (
-    `[canvas] You are an auto-spawned DOC WORKER for \`${rel}\`. Activity landed on this doc's annotations and needs servicing.\n` +
-    `- Read the open queue: \`scripts/canvas anno list ${rel}\` (or GET http://${origin}/api/annotations?path=${encodeURIComponent(rel)}).\n` +
-    `- For each ANSWERED question (a human decided): apply the decision by editing the doc, then RESOLVE the question (resolution belongs to the asker — you).\n` +
-    `- For each open COMMENT (note) meant for you: reply and make the change it asks for.\n` +
-    `- LEAVE questions still AWAITING a human — you can't answer those; don't touch or resolve them.\n` +
-    `- Re-read the queue after each pass so a comment that arrived mid-work is caught; LOOP until nothing actionable remains.\n` +
-    `- Then WIND DOWN: POST http://${origin}/api/session/<your session id>/done. Don't linger idle — batch this wake and exit; fresh activity will spawn a new worker.`
-  );
-}
-
-// The dormant-seat reconstitution brief: a FRESH session standing back up an addressed-but-vacant seat.
-function dormantWakeBrief(handle: string, origin: string): string {
-  return (
-    `[canvas] You've been RECONSTITUTED as the \`${handle}\` seat on this thread — a message was addressed to you while the prior session had wound down. This is a FRESH session seeded from the thread's durable history (NOT a resume): read the thread to catch up.\n` +
-    `- Read your inbox: GET http://${origin}/api/inbox?session=<your session id> — the message addressed to you is there (the full backlog replays on this first read).\n` +
-    `- Read the thread, then respond to what was asked and continue the seat's work.\n` +
-    `- Leave anything you need in the thread before you wind down — a fresh session can't recover your process state.\n` +
-    `- When your part is done: POST http://${origin}/api/session/<your session id>/done.`
-  );
-}
-
-// Trigger 1 — DOC-WAKE. Called after a qualifying annotation write (a `note` comment, or an `answer` on a
-// question). If any active watcher's level clears the event (auto-wake.js reuses W4's wakesSeat), service the
-// doc: NUDGE a live worker already on it (R1 keep-alive continuity — a comment within its idle window
-// continues it, no duplicate) or spawn a fresh one. Single-flight per doc; the worker loops-until-dry.
-function maybeWakeDocWorker(boardId: string, repoPath: string, origin: string, rel: string, eventKind: "note" | "answer" | "suggestion"): void {
-  const qualifying = qualifyingWatchers(readWatchers(repoPath, rel), eventKind);
-  if (qualifying.length === 0) return; // no watcher this activity would wake — nothing to do
-  const key = docSurfaceKey(rel);
-  const claimant = surfaceClaimant(key);
-  if (claimant) {
-    const s = liveSessions.get(claimant);
-    if (s && s.status !== "exited") {
-      // A worker is already servicing this doc — nudge it to re-check rather than spawn a duplicate.
-      sendSessionInput(
-        claimant,
-        `[canvas] new annotation activity on ${rel} — re-check the open queue (\`scripts/canvas anno list ${rel}\`) and keep servicing it; POST /api/session/<your session id>/done when the queue is dry.`,
-      );
-      return;
-    }
-    releaseSurface(key, claimant); // stale claim (worker gone) — clear it and spawn fresh below
-  }
-  // The worker runs as the first qualifying watcher whose role is a real charter'd role; else bare (the
-  // ask-armed watcher's reserved handle isn't a role, so an answer-driven wake spawns a plain doc worker).
-  let roleId: string | null = null;
-  for (const w of qualifying) if (readRole(repoPath, w.role)) { roleId = w.role; break; }
-  serverSpawnWorker({
-    boardId, repoPath, origin, roleId, threadId: null, anchorNodeId: `node:repo:${rel}`,
-    claimKey: key, firstPrompt: docWorkerBrief(rel, origin),
-  });
-}
-
-// Trigger 2 — DORMANT-SEAT RESPAWN (R1). Called from wakeThreadMembers when an @-addressed member has no
-// live session. Reconstitute the seat: read the dormant occupant's role from its marker, spawn fresh into
-// the thread, and re-occupy the SAME seat with the new sid. Single-flight per seat; a bare (unseated)
-// dormant member has no reconstitution identity, so it's left as a dropped nudge (unchanged behaviour).
-function maybeRespawnDormantSeat(boardId: string, threadId: string, dormantSid: string, origin: string, meta: ThreadMetaMarker | null): void {
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (!repoPath) return;
-  const handle = seatForSid(meta?.seats, dormantSid);
-  if (!handle) return; // a plain sid participant, not a seated role — nothing durable to stand back up
-  const key = seatSurfaceKey(threadId, handle);
-  if (isSurfaceClaimed(key)) return; // already being reconstituted — don't race a second worker onto the seat
-  const roleId = (readCanvasSession(repoPath, dormantSid)?.roleId as string | undefined) ?? null;
-  const newSid = serverSpawnWorker({
-    boardId, repoPath, origin, roleId, threadId, anchorNodeId: threadId,
-    claimKey: key, firstPrompt: dormantWakeBrief(handle, origin),
-  });
-  // Re-occupy the seat immediately with the fresh sid so the next addressed message finds it live/claimed
-  // (onboarding also fills it from the card name; fillSeat is idempotent on the same sid).
-  if (newSid) fillSeat(repoPath, threadId, handle, newSid, Date.now());
-}
+// docWorkerBrief/dormantWakeBrief + maybeWakeDocWorker (doc-wake) + maybeRespawnDormantSeat (dormant-seat
+// respawn) moved to server-orchestration.ts (P5 sub-step 3); both wake ops stay ctx ops for the routes/delivery.
 
 // autoWakeReapTick (the idle-worker keep-alive reaper) moved to server-sessions.ts (P5 sub-step 2); loopTick calls it via the import.
 
-// The standing-job NUDGE: the cheap — and now ONLY — wake a standing job can deliver. Under "timers nudge,
-// never spawn" a standing job only ever nudges an ALREADY-LIVE target (a role-seat occupant kept parked by
-// reap-only-on-done, or a live doc worker); there is no fresh-spawn brief anymore. Reuses the live session's
-// assembled context — the sendSessionInput nudge path the loop heartbeat uses. The instruction rides the
-// nudge inline (unlike a content-free wake).
-function standingJobNudge(job: { instruction: string }, origin: string): string {
-  return (
-    `[canvas] ⏱ STANDING JOB — your scheduled tick (not a human message). YOUR INSTRUCTION:\n${job.instruction}\n\n` +
-    `- Do exactly what it says. **If there's nothing to do, post NOTHING** ("skip days with nothing") — no "all clear" noise.\n` +
-    `- Then go back to sleep (stay live for the next tick). Read your inbox first if you need context: ` +
-    `GET http://${origin}/api/inbox?session=<your session id>.`
-  );
-}
-
-// Part 1 — heartbeat DEFAULT-ON. Auto-enable the Coordinator heartbeat standing job the first time a
-// Coordinator seat is staffed (coordinator-heartbeat.js): a Coordinator that doesn't proactively sweep can't
-// do its core job (peers signal completion via a `done` intent that wakes no one, so only a sweep notices),
-// and the standalone CLI enable step was routinely forgotten — so staffing a Coordinator IS the (human)
-// autonomy decision that turns it on. Idempotent: skipped when a Coordinator-role job already exists, so a
-// human who deliberately `job rm`'d it isn't overridden. Best-effort; the CLI verb remains the override path.
-function ensureCoordinatorHeartbeat(repoPath: string, threadId: string): void {
-  try {
-    if (readJobs(repoPath, threadId).some((j) => j.role === COORDINATOR_ROLE)) return;
-    upsertJob(repoPath, threadId, coordinatorHeartbeatJobSpec());
-  } catch {
-    /* best-effort — the CLI verb (`scripts/canvas job coordinator`) remains the manual fallback */
-  }
-}
-
-// Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
-// heartbeat, fire the standing jobs that have come due across every board's threads. TIMERS NUDGE, NEVER
-// SPAWN (human-locked invariant, thread mrcauz0v-f): a role-seat job whose seat is still occupied by a LIVE
-// session NUDGES that session (cheap — context intact); a DORMANT (or reaped) target is left alone — the timer
-// does NOT respawn it (see planRoleJobFire below). Reviving a dormant seat waits for a real event (@-mention/
-// ask/human); reap-only-on-done keeps a wound-down Coordinator PARKED so the nudge keeps finding it rather
-// than the old runaway of a timer respawning it in a loop. SINGLE-FLIGHT: a job whose prior fire is still running (its surface claimed, or the live occupant
-// mid-turn) is SKIPPED this tick and retried next — no double-fire, never talk over a working session.
-// FIRE-NEXT-DUE: stampFired re-bases the schedule to now only on a REAL fire, so a boot-time overdue job fires
-// once (never replaying missed fires) and a cap-skipped / busy-skipped fire retries next tick. Jobs live on
-// the thread marker, so they survive their creator and a restart.
-function standingJobsTick(): void {
-  const now = Date.now();
-  for (const [boardId, board] of boards) {
-    let threads;
-    try {
-      threads = listThreads(board.repoPath);
-    } catch {
-      continue;
-    }
-    for (const t of threads) {
-      // Read the marker once for both the due-check's intent (part 4 backoff) and the seat resolution below.
-      const tMeta = readThreadMeta(board.repoPath, t.threadId);
-      for (const job of readJobs(board.repoPath, t.threadId)) {
-        // Part 4 — intent-keyed backoff: a role-seat job's EFFECTIVE interval slows while its seat's occupant
-        // is parked on the human (blocked:human), keeps the base cadence otherwise. Derived live from the
-        // seat's declared intent — no stored backoff state (heartbeatEffectiveInterval is a no-op unless
-        // blocked:human, so a bare/undeclared job fires exactly as before).
-        const seatIntent = job.role ? tMeta?.intents?.[job.role]?.intent ?? null : null;
-        if (!jobDueWithInterval(job, now, heartbeatEffectiveInterval(job.intervalMs, seatIntent))) continue;
-        const key = jobClaimKey(t.threadId, job);
-        if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
-
-        // TIMERS NUDGE, NEVER SPAWN (human-locked invariant, thread mrcauz0v-f). A standing job may only NUDGE
-        // an already-live seat occupant; it must never create a session. So:
-        //   - a BARE (roleless) job has no seat to nudge → nothing to do (its old "spawn a fresh worker every
-        //     interval" behaviour is removed; re-add an explicit periodic-spawn primitive here if ever needed).
-        //   - a ROLE-seat job (incl. the Coordinator heartbeat): planRoleJobFire → "nudge" a live+idle occupant
-        //     (the only fire a timer may make), "skip" a mid-turn one, or "none" (dormant/absent, or a
-        //     stood-down `done` seat) — both non-nudge outcomes do nothing and do NOT stamp, so the job simply
-        //     re-evaluates next tick. A wound-down Coordinator is kept PARKED by the reaper (reap-only-on-done),
-        //     so the nudge keeps finding it; a truly-exited seat waits for a real event (@-mention/ask/human).
-        if (!job.role) continue; // bare job: no live seat to nudge, and timers don't spawn → no-op
-        const sid = tMeta?.seats?.[job.role]?.sid; // reuse the marker read once at the top of this thread
-        const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
-        if (planRoleJobFire(live?.status ?? null, seatIntent) !== "nudge") continue; // skip / none → no fire, no stamp
-        sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
-        stampFired(board.repoPath, t.threadId, job.id, now);
-      }
-    }
-
-    // Doc standing jobs (doc-jobs.js) — the SAME server-fired timer on a DOC's marker, and the SAME invariant:
-    // TIMERS NUDGE, NEVER SPAWN. A due doc job may only nudge a LIVE, idle worker already servicing the doc
-    // (single-flight per doc, docJobClaimKey = docSurfaceKey); a mid-turn worker is skipped (no stamp); a
-    // dead/absent claimant is a no-op (the old fresh-respawn is removed). A doc that needs a worker gets one
-    // reactively via maybeWakeDocWorker (an annotation event), not from this timer.
-    let docPaths: string[];
-    try {
-      docPaths = listDocsWithJobs(board.repoPath);
-    } catch {
-      docPaths = [];
-    }
-    for (const rel of docPaths) {
-      for (const job of dueJobs(readDocJobs(board.repoPath, rel), now)) {
-        const key = docJobClaimKey(rel);
-        const claimant = surfaceClaimant(key);
-        if (!claimant) continue; // no live worker on the doc — timers don't spawn → nothing to do
-        const s = liveSessions.get(claimant);
-        if (!s || s.status === "exited") {
-          releaseSurface(key, claimant); // stale claim (worker gone) — clear it; no respawn
-          continue;
-        }
-        if (s.status !== "idle") continue; // mid-turn — don't interrupt; retry next tick (no stamp)
-        sendSessionInput(claimant, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
-        stampDocFired(board.repoPath, rel, job.id, now);
-      }
-    }
-  }
-}
+// standingJobNudge + ensureCoordinatorHeartbeat + standingJobsTick (the standing-jobs firing loop) moved to
+// server-orchestration.ts (P5 sub-step 3). ensureCoordinatorHeartbeat stays a ctx op (server-delivery calls it).
 
 // handleSessionInput / handleSessionResume / handleSessionInterrupt / handleSessionTerminate /
 // handleSessionDone (POST /api/session/<id>/{input,resume,interrupt,terminate,done}) moved to
@@ -1444,120 +809,8 @@ function standingJobsTick(): void {
 
 // denySessionPermissions (teardown deny-all) moved to server-sessions.ts (P5 sub-step 2).
 
-// Feed: one true-internet source for flavour — the current Hacker News #1 story (keyless API).
-// Polled server-side so the browser stays a pure SSE consumer like every other feed.
-function startHnFeed(): void {
-  const poll = async () => {
-    try {
-      const ids = (await (await fetch("https://hacker-news.firebaseio.com/v0/topstories.json")).json()) as number[];
-      const item = (await (
-        await fetch(`https://hacker-news.firebaseio.com/v0/item/${ids[0]}.json`)
-      ).json()) as { id: number; title: string; by: string; score: number };
-      publishFeed("hn", { id: item.id, title: item.title, by: item.by, score: item.score });
-    } catch {
-      // offline / rate-limited — keep the previous value; the card just stops advancing
-    }
-  };
-  void poll();
-  setInterval(poll, 90_000);
-}
-
-// ── usage feed (the canvas mirror of Claude Code's /usage) ──────────────────────────────────────
-// The account-level plan windows (5-hour session + weekly all-models / Sonnet / Opus) the TUI's
-// /usage shows. There is NO local mirror of these, so this polls Anthropic's (undocumented) OAuth
-// usage endpoint server-side with the locally-stored OAuth token and republishes the result as the
-// off-log `usage` feed — same channel-1 seam as git HEAD / HN, never the canvas log. Two properties
-// make this safe to run unattended (the user's stated concern, "is polling ok and free"):
-//   • FREE in tokens: it's a METERING call — it reports window utilization and runs no inference, so
-//     it consumes none of the budget it measures.
-//   • BOUNDED on rate: the endpoint throttles per access-token; the community-safe cadence is 180s
-//     WITH a `claude-code/<version>` User-Agent (omitting it trips an aggressive 429 bucket). We back
-//     off on 429 and keep the last good value so a throttle never blanks the card.
-// The token stays SERVER-SIDE: it sets the Authorization header and is never published on any feed.
-
-// Read the OAuth access token the way the CLI stores it: the macOS keychain item
-// "Claude Code-credentials" (a JSON blob), falling back to ~/.claude/.credentials.json. Re-read every
-// poll (not cached) so when Claude Code refreshes the token in place we transparently pick up the new
-// one — the pragmatic alternative to reimplementing the OAuth refresh flow here. null ⇒ not logged in.
-function readClaudeOAuthToken(): Promise<string | null> {
-  const fromBlob = (raw: string): string | null => {
-    try {
-      const t = JSON.parse(raw)?.claudeAiOauth?.accessToken;
-      return typeof t === "string" && t ? t : null;
-    } catch {
-      return null;
-    }
-  };
-  const fromFile = (): string | null => {
-    try {
-      return fromBlob(fs.readFileSync(path.join(os.homedir(), ".claude", ".credentials.json"), "utf8"));
-    } catch {
-      return null;
-    }
-  };
-  return new Promise((resolve) => {
-    execFile(
-      "security",
-      ["find-generic-password", "-s", "Claude Code-credentials", "-w"],
-      (err, stdout) => resolve((!err && fromBlob(stdout.trim())) || fromFile()),
-    );
-  });
-}
-
-// The required `claude-code/<version>` User-Agent. Resolved once from `claude --version` (so it tracks
-// the installed CLI), cached, with a plain fallback if claude isn't on PATH — the prefix is what the
-// endpoint gates on, not the exact version.
-let claudeUA: string | null = null;
-function claudeUserAgent(): Promise<string> {
-  if (claudeUA) return Promise.resolve(claudeUA);
-  return new Promise((resolve) => {
-    execFile("claude", ["--version"], (err, stdout) => {
-      const v = (!err && stdout.match(/\d+\.\d+\.\d+/)?.[0]) || "2.0.0";
-      resolve((claudeUA = `claude-code/${v}`));
-    });
-  });
-}
-
-const USAGE_POLL_MS = 180_000; // 3 min — safe with the User-Agent; faster trips the 429 bucket
-function startUsageFeed(): void {
-  let backoff = 0; // extra ms added after a 429, cleared on the next success
-  const last = () => (feedValues.get("usage") as Record<string, unknown> | undefined) ?? {};
-  const poll = async () => {
-    let nextDelay = USAGE_POLL_MS;
-    try {
-      const token = await readClaudeOAuthToken();
-      if (!token) {
-        publishFeed("usage", { error: "no-credentials", fetchedAt: Date.now() });
-      } else {
-        const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
-          headers: {
-            Authorization: `Bearer ${token}`,
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": await claudeUserAgent(),
-            "Content-Type": "application/json",
-          },
-        });
-        if (res.status === 429) {
-          // Throttled — keep the last good windows, just flag it, and wait longer next time.
-          backoff = Math.min(backoff ? backoff * 2 : USAGE_POLL_MS, 15 * 60_000);
-          nextDelay = USAGE_POLL_MS + backoff;
-          publishFeed("usage", { ...last(), error: "rate-limited", fetchedAt: Date.now() });
-        } else if (!res.ok) {
-          // 401 ⇒ token expired/needs re-auth; anything else ⇒ the endpoint changed or is down.
-          publishFeed("usage", { ...last(), error: `http-${res.status}`, fetchedAt: Date.now() });
-        } else {
-          backoff = 0;
-          const data = (await res.json()) as Record<string, unknown>;
-          publishFeed("usage", { ...data, error: null, fetchedAt: Date.now() });
-        }
-      }
-    } catch {
-      publishFeed("usage", { ...last(), error: "offline", fetchedAt: Date.now() });
-    }
-    setTimeout(poll, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
-  };
-  void poll();
-}
+// The HN feed (startHnFeed) + the usage feed (startUsageFeed + readClaudeOAuthToken/claudeUserAgent/
+// USAGE_POLL_MS) moved to server-orchestration.ts (P5 sub-step 3); startFeeds imports startHnFeed/startUsageFeed.
 
 // /api/weather (Open-Meteo, keyed by a free-text location) now lives in routes/weather.ts — a fully
 // self-contained extraction (god-file split, Phase 1); its route is spread into GLOBAL_ROUTES below.
@@ -1583,120 +836,9 @@ function startWorktreesFeed(boardId: string, repoPath: string): void {
     .on("unlinkDir", ping);
 }
 
-// ── shadow-git committer (docs/shadow-git-ledger.md step 1) ───────────────────────────────────────
-// The ledger's live half: a SERVER-SIDE watcher per root (independent of browser tabs, unlike handleWatch)
-// that commits the work-tree into its shadow repo on settle, preceded by a boot-reconcile that bundles
-// whatever changed while we weren't watching into one `external` commit (doc §5). The settle commit is the
-// honest `external` floor; per-session attribution rides on the editor tool calls (see foldShadowEdits —
-// claim on tool_use, attributed path-scoped commit on tool_result). Watchers aren't pinned — the
-// boardFeedsStarted guard stops stacking on hot re-eval, as with the other feeds. Shadow DBs live centrally
-// under the canonical repo's .canvas/ (gitRoot = repoPath), so one board spans worktrees and a removed
-// worktree's history survives (we close its watcher; the DB persists). syncShadowRoots re-runs on worktree
-// add/remove so the committer set tracks boardRoots.
-const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>()); // key: boardId\0rootId — pinned:
-// an unpinned map emptied on hot re-eval while boardFeedsStarted kept syncShadowRoots from refilling it,
-// so every session spawned after a re-eval lost attribution to the `external` floor (see fsState rule).
-const SHADOW_SETTLE_MS = 800;
-// The shadow committer's watch ignore (Rule B): see `.canvas/` content so it gets versioned, but never the
-// shadow git-dirs under `.canvas/roots/` — a commit writes objects THERE, and watching them would re-commit
-// forever (docs/canvas-home.md §5). This is the load-bearing feedback-loop guard.
-const shadowIgnored = (p: string): boolean => isInternalPath(p);
-
-// Attribution (doc §6): the server already parses each session's stdout, so an editor tool CALL is our
-// honest attribution signal — it names both the session and the exact file. On the assistant `tool_use` we
-// CLAIM the target path (the `external` floor then leaves it for us); on the matching `user` tool_result the
-// write has landed, so we commit JUST that path attributed to the session. Bash/out-of-band writes name no
-// path and keep falling to the `external` floor. (Turn-boundary attribution was abandoned — a turn spans
-// many edits over minutes, and a whole-tree snapshot misattributes a concurrent agent's in-flight files.)
-const EDIT_TOOL_PATH: Record<string, string> = {
-  Edit: "file_path",
-  Write: "file_path",
-  MultiEdit: "file_path",
-  NotebookEdit: "notebook_path",
-};
-
-// Resolve an editor tool's target to a shadow committer: the board root whose work-tree CONTAINS the file
-// (longest prefix — so a worktree session attributes to ITS root, not the canonical repo), the path relative
-// to that root, and the live watcher handle. null when no active committer owns the path.
-function shadowTargetFor(s: LiveSession, filePath: string): { key: string; rel: string; handle: ReturnType<typeof watchRoot> } | null {
-  const abs = path.resolve(s.repoPath, filePath); // tools usually emit absolute paths; resolve relatives off cwd
-  const boardId = boardIdentity(s.repoPath).boardId;
-  let best: { id: string; path: string } | null = null;
-  for (const r of boardRoots(boardId)) {
-    if ((abs === r.path || abs.startsWith(r.path + path.sep)) && (!best || r.path.length > best.path.length)) best = r;
-  }
-  if (!best) return null;
-  const rel = path.relative(best.path, abs);
-  // Agent worktrees (`spawn --worktree`) live under the board's `.canvas/worktrees/` and are their OWN real
-  // git checkouts — they reach main via merge-on-green, never the shadow ledger. listWorktrees excludes them
-  // from boardRoots, so an edit inside one has no committer of its own and falls through to the canonical
-  // repo root, yielding rel = `.canvas/worktrees/<key>/…`. Staging that with `git add` in the canonical
-  // work-tree hits the nested checkout's gitlink boundary ("is in submodule"). Never shadow-attribute it.
-  const wtHome = path.join(".canvas", "worktrees");
-  if (rel === wtHome || rel.startsWith(wtHome + path.sep)) return null;
-  const key = boardId + "\0" + best.id;
-  const handle = shadowRoots.get(key);
-  return handle ? { key, rel, handle } : null;
-}
-
-function foldShadowEdits(s: LiveSession, e: { type?: string; message?: { content?: unknown } }): void {
-  const content = e.message?.content;
-  if (!Array.isArray(content)) return;
-  if (e.type === "assistant") {
-    // Claim each editor tool_use's target so the floor debounce skips it until the result commits it.
-    for (const b of content as Array<{ type?: string; id?: string; name?: string; input?: Record<string, unknown> }>) {
-      if (b?.type !== "tool_use" || !b.id || !b.name) continue;
-      const field = EDIT_TOOL_PATH[b.name];
-      const fp = field && b.input ? b.input[field] : undefined;
-      if (typeof fp !== "string" || !fp) continue;
-      const tgt = shadowTargetFor(s, fp);
-      if (!tgt) continue;
-      tgt.handle.claim([tgt.rel]);
-      s.pendingEdits.set(b.id, { key: tgt.key, rel: tgt.rel });
-    }
-  } else if (e.type === "user") {
-    // The write has landed — commit each claimed path attributed (or release it if the edit errored/no-op'd).
-    for (const b of content as Array<{ type?: string; tool_use_id?: string }>) {
-      if (b?.type !== "tool_result" || !b.tool_use_id) continue;
-      const pending = s.pendingEdits.get(b.tool_use_id);
-      if (!pending) continue;
-      s.pendingEdits.delete(b.tool_use_id);
-      const handle = shadowRoots.get(pending.key);
-      if (!handle) continue; // committer torn down (worktree vanished mid-turn) — claim is gone with it
-      const author = `session:${s.id.slice(0, 8)} <${s.id}@foolscap.session>`;
-      void handle
-        .commitClaimed([pending.rel], { author, message: `${s.id.slice(0, 8)}: edit ${pending.rel}` })
-        .catch((err: unknown) => console.error("[shadow] session commit:", err instanceof Error ? err.message : err));
-    }
-  }
-}
-
-function syncShadowRoots(boardId: string, repoPath: string): void {
-  const roots = boardRoots(boardId);
-  const live = new Set(roots.map((r) => boardId + "\0" + r.id));
-  for (const r of roots) {
-    const key = boardId + "\0" + r.id;
-    if (shadowRoots.has(key)) continue;
-    const onErr = (e: unknown): void => console.error(`[shadow] ${r.id}:`, e instanceof Error ? e.message : e);
-    // boot-reconcile: one bundled `external` commit catching offline/unobserved changes before live watching.
-    void commitRoot(r.path, { rootId: r.id, gitRoot: repoPath, message: "external: reconcile on start" }).catch(onErr);
-    const handle = watchRoot(r.path, {
-      rootId: r.id,
-      gitRoot: repoPath,
-      settleMs: SHADOW_SETTLE_MS,
-      ignored: shadowIgnored,
-      onError: onErr,
-    });
-    shadowRoots.set(key, handle);
-  }
-  // tear down watchers for roots that vanished; the shadow DB under .canvas/ stays (history survives removal).
-  for (const [key, h] of shadowRoots) {
-    if (key.startsWith(boardId + "\0") && !live.has(key)) {
-      void h.close();
-      shadowRoots.delete(key);
-    }
-  }
-}
+// ── shadow-git committer moved to server-orchestration.ts (P5 sub-step 3): shadowRoots/SHADOW_SETTLE_MS/
+// shadowIgnored/EDIT_TOOL_PATH/shadowTargetFor/foldShadowEdits/syncShadowRoots. The ShadowRootHandle type
+// stays in the shell (it types CanvasFsState.shadowRoots); startWorktreesFeed/startBoardFeeds import syncShadowRoots.
 
 function startBoardFeeds(boardId: string, repoPath: string): void {
   if (boardFeedsStarted.has(boardId)) return;
@@ -1727,22 +869,7 @@ function startFeeds(): void {
   startBoardFeeds(DEFAULT_BOARD.boardId, DEFAULT_BOARD.repoPath);
 }
 
-// ── card types (card-types-as-data.md §3/§7: type definitions are data in the folder) ──────────
-// The type-registry ROUTE handlers (/api/card-types list + the raw /card-types/* asset serve) now live in
-// routes/card-types.ts (god-file split, Phase 1), which OWNS the CARD_TYPES_DIR path and exports it. The
-// WATCH feed below stays here for now (it's stateful — rides the "cardtypes" feed bus) and imports the dir:
-// a template edit on disk pings the client, whose registry re-imports the module. CARD_TYPES_DIR is also
-// imported by the HMR guard in configureServer (keep template files out of Vite's transform pipeline).
-
-function startCardTypesFeed(): void {
-  let t: ReturnType<typeof setTimeout> | null = null;
-  let pending: string | null = null;
-  chokidar.watch(CARD_TYPES_DIR, { ignoreInitial: true }).on("all", (_ev, abs) => {
-    pending = path.relative(CARD_TYPES_DIR, abs);
-    if (t) clearTimeout(t);
-    t = setTimeout(() => publishFeed("cardtypes", { path: pending, ts: Date.now() }), 100);
-  });
-}
+// startCardTypesFeed (the template-edit watch feed) moved to server-orchestration.ts (P5 sub-step 3).
 
 // ── agent bus (demo §10 step 4: the MCP server's dress rehearsal) ───────────────────────────────
 // In-band agent interaction over plain HTTP. An agent POSTs a Command to /api/command; the server
@@ -1787,6 +914,7 @@ function tabCountFor(boardId: string): number {
 // including any join still inside the ~400ms save window (the snapshot wouldn't list those yet). Idempotent:
 // re-removing an edge the store already dropped is a no-op.
 function cascadeNodeEdges(boardId: string, nodeId: string, actor: string, origin: string): void {
+  const emittedMembers = (fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
   const records = boardSnapshotRecords(boardId) ?? [];
   const ids = new Set(connectedEdgeIds(records, nodeId));
   const sid = nodeSessionId(records, nodeId);
@@ -1904,79 +1032,9 @@ export interface SnapNode {
   text?: string; // a thread node's `text` is its (optional) task brief
 }
 
-// The records of a board's DURABLE snapshot (`.canvas/board/snapshot.json` — the same one hydrate
-// serves), or null if the board has never saved one. Used for all server-side node/edge resolution
-// (thread membership, session-card lookup, spawn positioning); it no longer needs a live tab, only a
-// board that has persisted at least once. Lags a just-committed change by the ~400ms save debounce —
-// the same window the old tab-push had.
-function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> | null {
-  const b = boards.get(boardId);
-  if (!b) return null;
-  const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
-  return snap?.records ?? null;
-}
-
-// A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /
-// node:live:<sid>, title = the full sid). Resolve a node id to its session id, or null if the node isn't
-// a session card. Reading the title (not parsing the id) keeps this robust to the id scheme.
-function nodeSessionId(records: Array<Record<string, unknown>>, nodeId: string): string | null {
-  const n = records.find((r) => r.typeName === "node" && r.id === nodeId) as SnapNode | undefined;
-  return n && n.type === "session" && typeof n.title === "string" && n.title ? n.title : null;
-}
-
-// The reverse: a session id → its card's node id (so an agent that knows only its own sid can join/leave
-// without ever handling a node id). Null if no session card on the board carries that title.
-function sessionNodeForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
-  const n = records.find(
-    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
-  ) as SnapNode | undefined;
-  return n ? String(n.id) : null;
-}
-
-// The channel card by id (or null if that id isn't a channel node).
-function threadNode(records: Array<Record<string, unknown>>, threadId: string): SnapNode | null {
-  const n = records.find((r) => r.typeName === "node" && r.id === threadId) as SnapNode | undefined;
-  // "thread" is the node type since §8 step 2; "channel" is the carried-over legacy type (existing
-  // channels live on as long-lived threads — same card, same machinery).
-  return n && (n.type === "thread" || n.type === "channel") ? n : null;
-}
-
-// A session card's display NAME (the new `name` field a role-spawned card carries, `<RoleName>.<short-sid>`),
-// or null if it has none. The renderer falls back to the short sid; tag resolution uses it so `@RoleName`
-// reaches a role by its handle. Found by the same title===sid convention as sessionNodeForSid.
-function sessionNameForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
-  const n = records.find(
-    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
-  ) as (SnapNode & { name?: unknown }) | undefined;
-  return n && typeof n.name === "string" && n.name ? n.name : null;
-}
-
-// The session ids of a channel's OPEN members (from each member:open edge session→channel).
-function threadMemberSids(records: Array<Record<string, unknown>>, threadId: string): string[] {
-  const out: string[] = [];
-  for (const r of records) {
-    if (r.typeName === "edge" && r.to === threadId && String(r.type) === "member:open") {
-      const sid = nodeSessionId(records, String(r.from));
-      if (sid && !out.includes(sid)) out.push(sid);
-    }
-  }
-  for (const m of liveEmittedMembers()) if (m.thread === threadId && !out.includes(m.sid)) out.push(m.sid);
-  // Durable members whose session card was deleted keep their membership (the card was only a view) — a
-  // surviving member here with no edge is exactly the delete-card-keep-session case.
-  for (const sid of durableMembers.get(threadId) ?? []) if (!out.includes(sid)) out.push(sid);
-  return out;
-}
-
-// How much of the backlog a not-yet-onboarded member should see, keyed `<threadId>|<sid>`. Set by an
-// invite/join (or the /history action) that names a mode; consumed + cleared when member:open onboarding
-// seeds the read cursor. ABSENT ⇒ the default, FULL history — a new member replays the whole backlog on
-// their first inbox read (Slack public-channel style). "future" is the opt-out (start at the tail).
-const pendingHistoryMode = (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
-const historyKey = (threadId: string, sid: string): string => `${threadId}|${sid}`;
-// The read cursor that gives `sid` the chosen visibility of `log`: full ⇒ 0 (everything is unread), future
-// ⇒ the current tail (only messages from here on). The single source of "how much backlog replays".
-const seedCursor = (mode: "full" | "future", log: ThreadMsg[]): number =>
-  mode === "future" && log.length ? log[log.length - 1]!.seq : 0;
+// The snapshot/log resolvers (boardSnapshotRecords, nodeSessionId, sessionNodeForSid, threadNode,
+// sessionNameForSid, threadMemberSids) + the backlog-visibility seed (seedCursor/historyKey) moved to
+// server-snapshot.ts (P5 sub-step 3). pendingHistoryMode is reached via fsState (routes/threads.ts).
 
 // clearBlockedIntents + resumeRunning (the idle→running self-freshen) moved to server-sessions.ts (P5 sub-step 2).
 

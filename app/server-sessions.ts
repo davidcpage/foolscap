@@ -5,18 +5,19 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import chokidar from "chokidar";
 import { getServerContext } from "./server-context.js";
-import { markCanvasSession, readCanvasSession, recordSessionEnd } from "./session-ledger.js";
+import { markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
 import { localProc, remoteProc, type ProcHooks } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
-import { listThreads, ownBlockedIntentKeys, readThreadMeta, sessionDeclaredDone, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
+import { listThreads, ownBlockedIntentKeys, readThreadMeta, sessionDeclaredDone, sessionIdleIntent, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { intentLine } from "./work-intent.js";
 import { claimSurface, reapKeepAliveMs, releaseSurface, shouldReapIdle } from "./auto-wake.js";
-import { shouldRepublishBand } from "./session-band-republish.js";
+import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
+import { sessionHasScheduledWake } from "./standing-jobs.js";
 import { readRole } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, worktreeOnboarding } from "./worktrees.js";
 import { settlePermission, PERMISSION_HOLD_MS } from "./routes/permissions.js";
-import type { LiveSession } from "./vite-fs-plugin.js";
+import type { LiveSession, SessionBand } from "./vite-fs-plugin.js";
 
 // ── the session / spawn / host ENGINE (P5 sub-step 2) ───────────────────────────────────────────────────
 // The second ENGINE module of the P5 god-file split (after server-delivery.ts). It owns the live-session
@@ -944,4 +945,201 @@ export function endSession(id: string, endReason: "done" | "terminated"): boolea
   publishSession(s);
   liveSessions.delete(id);
   return true;
+}
+
+// ── session-read helpers + the whole-session status band + persist/publish (P5 sub-step 3) ──────────
+// The rest of the session engine that sub-step 2 left in the shell because publishSession/sessionStatus are
+// cross-cutting (the band-reconcile loop above and routes/sessions.ts both reach them via ctx). They fold in
+// here now, their home: a board's transcripts dir + one transcript's tail read; the ONE whole-session status
+// band both the card and the thread pill render from; the cursor-persist debounce; and the session-feed
+// publish. Each is byte-identical to its former shell definition save for a getServerContext()/binding
+// preamble (liveSessions / fsState maps reached via ctx, exactly like the functions above).
+
+// A board's Claude Code transcripts dir: ~/.claude/projects/<abs path with every non-alnum → ->. Per board
+// (was a single module constant) so a canvas over another repo lists THAT repo's sessions, not the dev
+// repo's. The slug rule lives once in projectsDirForCwd (session-ledger) — a board root has no dots so it's
+// unchanged, but a worktree cwd contains `.canvas` and MUST slug the dot too (`.canvas` → `-canvas`), or its
+// transcript dir won't be found. Passing a worktree cwd here resolves that session's own dir.
+export function sessionsDir(repoPath: string): string {
+  return projectsDirForCwd(repoPath);
+}
+
+// Claude Code's transcripts live in ~/.claude/projects/<slug> — resolved PER BOARD by sessionsDir(repoPath)
+// above (the session handlers thread the board's dir), so the cards serve the right repo's history.
+export const MAX_SESSION_BYTES = 4 * 1024 * 1024; // whole sessions, bounded against a pathological one. The
+// card scrolls, so we serve the full transcript; the cap only guards an extreme outlier (and the
+// card flags it honestly when it bites — the codec marks a partial tail). In-memory spike, so a few
+// MB in node.text is fine.
+
+// Real Claude Code transcripts in the board's transcripts `dir`: `*.jsonl` minus the `*.usage.jsonl` sidecars (those
+// are a separate usage-logging stream, not conversations). Returned newest-first by mtime so a
+// caller with no id gets the most recent session.
+// GET /api/session?id=<sessionId>  → { id, content, truncated }: one transcript's raw jsonl, bounded.
+// No `id` → the most recent session. The id is an allow-listed shape (no dots/slashes) AND the
+// resolved path is re-checked to sit in the board's transcripts dir — same two guards as the file reads, since this
+// also runs with the dev server's fs privileges. Content is served raw; the jsonl → turns codec is
+// the card's (render.js), keeping the format understood in exactly one place.
+export function readSessionFile(dir: string, id: string): { content: string; truncated: boolean } | null {
+  const abs = path.resolve(dir, id + ".jsonl");
+  if (!abs.startsWith(dir + path.sep)) return null; // id re-checked to sit in the board's transcripts dir
+  try {
+    const buf = fs.readFileSync(abs);
+    // Keep the TAIL when capping, never the head: a transcript is append-only and the card reads it
+    // bottom-up (auto-scroll-to-bottom), so the bytes you want are the most RECENT — where you left off.
+    // Head-slicing here would have hidden the live end behind the old opening, the same class of bug as
+    // the card's old turn-slice. The codec tolerates the ragged first line a tail leaves. (The live feed
+    // bounds itself the same way, MAX_SESSION_FEED_BYTES.) `truncated` flags it so the card says so.
+    const over = buf.length > MAX_SESSION_BYTES;
+    return {
+      content: (over ? buf.subarray(buf.length - MAX_SESSION_BYTES) : buf).toString("utf8"),
+      truncated: over,
+    };
+  } catch {
+    return null;
+  }
+}
+
+const MAX_SESSION_FEED_BYTES = 512 * 1024; // bound the live buffer — a derived stream stays bounded
+// (§9.4). Keep the most-recent tail; older completed turns drop off (the card scrolls live output).
+
+function endReasonBand(reason: string | undefined): SessionBand {
+  return reason === "done" ? "done" : reason === "crashed" ? "crashed" : "ended";
+}
+// Is a wake ACTUALLY scheduled for this session? The `loops` role flag is static legibility ("this is a
+// looping-TYPE role") and asserts nothing about a timer — real wakes come from live standing JOBS on a thread
+// (standing-jobs.js), which are human-gated and often absent. So an idle looping session reads the calm teal
+// "scheduled" band only when some thread carries a live job whose ROLE-SEAT this session currently occupies
+// (sessionHasScheduledWake); otherwise it's genuinely "waiting", not asleep on a heartbeat. Only consulted for
+// idle looping sessions (callers gate on `loops` first), so the listThreads marker read stays off the hot path.
+function hasScheduledWake(repoPath: string, id: string): boolean {
+  try {
+    return sessionHasScheduledWake(listThreads(repoPath), id);
+  } catch {
+    return false;
+  }
+}
+// The ONE whole-session status band both surfaces render from (thread mrcmofwf-10): the session card's
+// frame band (card-types/session/render.js) AND that session's participant pill in every thread
+// (thread-state.js memberPillState) read THIS value, so they can never disagree. Process-observed bands
+// (working/scheduled/crashed/ended) are authoritative and GLOBAL; only the *idle* band takes a declared-
+// intent refinement, folded WHOLE-SESSION (across every thread the session is in — sessionIdleIntent), per
+// the v2 precedence. `null` = bandless (a never-run session that has handed you nothing yet, or an unknown
+// session): both surfaces render neutral, never a fabricated "your turn".
+export function sessionStatus(repoPath: string, id: string): SessionBand | null {
+  const { liveSessions, fsState } = getServerContext();
+  const pendingPermissions = fsState.pendingPermissions!;
+  const live = liveSessions.get(id);
+  if (live) {
+    // A held permission prompt outranks everything live: the process is technically mid-turn
+    // ("running"), but it's blocked on a HUMAN click — the one state the loud band exists for.
+    if (live.status !== "exited" && [...pendingPermissions.values()].some((p) => p.sid === id)) return "waiting";
+    if (live.status === "running") return "working";
+    if (live.status === "idle") {
+      // Never-run: idle with no output yet has handed you nothing back, so the loud amber "your turn" is
+      // wrong — stay bandless until the first turn produces output and idles again (which IS your turn).
+      if (live.lines.length === 0) return null;
+      // Idle band precedence (v3, whole-session — see idleBand): a DECLARED intent outranks a wake timer —
+      // declared blocked:human (loud orange) > declared blocked:peer (blue) > scheduled (a looping role asleep
+      // on its heartbeat — teal, no human demand; gated on an ACTUAL live wake, not the static `loops` flag) >
+      // a server-inferred @-tag peer-wait (blue `waitingOn`, free) > the default orange "your turn". Declared
+      // intent is aggregated across ALL the session's threads; `done`/`working` don't paint the idle band
+      // (done never colours a live session — it shows only once the process exits, via endReason grey). One
+      // listThreads read shared by both consults.
+      const metas = listThreads(repoPath);
+      const scheduled = !!live.loops && sessionHasScheduledWake(metas, id);
+      return idleBand(sessionIdleIntent(metas, id), scheduled, !!live.waitingOn?.length);
+    }
+    if (live.endReason) return endReasonBand(live.endReason); // exited process with a recorded reason
+  }
+  // not live (or exited with no in-memory reason) → the durable marker is the only surviving source
+  return endReasonBand(readCanvasSession(repoPath, id)?.endReason as string | undefined);
+}
+
+// Persist the live-registry state that must survive a restart — the thread read cursors and waitingOn —
+// onto the session's durable marker. Without this, a restart that keeps the SESSION alive (a --resume, or
+// the session-host sidecar) still resets its cursors to 0 and the next inbox read re-delivers every joined
+// thread's whole backlog as "unread". Debounced per session (reads/posts come in bursts); the timer reads
+// s.read at fire time, so it always writes the latest cursors. Best-effort like every marker write.
+export function persistSessionState(s: LiveSession): void {
+  const persistTimers = (getServerContext().fsState.persistTimers ??= new Map<string, ReturnType<typeof setTimeout>>());
+  if (persistTimers.has(s.id)) return;
+  persistTimers.set(
+    s.id,
+    setTimeout(() => {
+      persistTimers.delete(s.id);
+      updateCanvasSession(s.repoPath, s.id, { read: s.read, waitingOn: s.waitingOn });
+    }, 500),
+  );
+}
+
+// The pending permission prompts addressed to one session, in card-render shape (no held internals).
+// Oldest-first so the card shows them in arrival order.
+function permissionsOf(sid: string): Array<{ id: string; toolName: string; input: unknown; ts: number }> {
+  const pendingPermissions = getServerContext().fsState.pendingPermissions!;
+  return [...pendingPermissions.values()]
+    .filter((p) => p.sid === sid)
+    .sort((a, b) => a.ts - b.ts)
+    .map((p) => ({ id: p.permId, toolName: p.toolName, input: p.input, ts: p.ts }));
+}
+
+// Publish the session's buffer (completed lines + the in-flight synthetic turn) on its feed. Bounded
+// from the tail; `truncated` mirrors the codec's existing cap signal so the card flags a clipped view.
+export function publishSession(s: LiveSession): void {
+  const { publishFeed } = getServerContext();
+  const lines = [...s.lines];
+  if (s.inflight && s.inflight.length > 0) {
+    // The live tail: a synthetic assistant message the codec parses exactly like a real one. Only
+    // text/thinking accumulate visibly; a tool_use shows its name until its consolidated event lands.
+    lines.push(JSON.stringify({ type: "assistant", message: { role: "assistant", content: s.inflight } }));
+  }
+  let content = lines.join("\n");
+  let truncated = false;
+  if (Buffer.byteLength(content) > MAX_SESSION_FEED_BYTES) {
+    content = content.slice(content.length - MAX_SESSION_FEED_BYTES);
+    truncated = true;
+  }
+  // Compute the band ONCE and remember it: this pushed value is what the card renders, and the loopTick
+  // safety net compares against `lastBand` to catch it going stale on an out-of-band transition.
+  const band = sessionStatus(s.repoPath, s.id);
+  s.lastBand = band;
+  publishFeed("session:" + s.id, {
+    content,
+    truncated,
+    status: s.status,
+    // The ONE whole-session status band (sessionStatus) the card renders its frame from — the SAME value
+    // the thread participant pill reads off /api/sessions, so the two surfaces can't drift. Sent on every
+    // publish (including `null` = bandless/never-run) so the card stops recomputing the band client-side;
+    // it falls back to its own derivation only when this key is absent (a slice-1 file-tail feed).
+    band,
+    skills: s.skills ?? undefined,
+    verb: s.verb ?? undefined, // live progress label for the status pill (channel-1 chrome)
+    usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
+    endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
+    waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
+    // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:
+    // an idle looping session with no held waitingOn AND a live standing job on its seat (hasScheduledWake).
+    // Computed only for that narrow case (short-circuits on status/loops/waitingOn first) so the marker read
+    // stays off the hot path — publishSession fires on every delta burst. Replaces the old raw `loops` flag,
+    // which asserted "scheduled" for any looping role even when nothing would ever wake it.
+    scheduled: (s.status === "idle" && !s.waitingOn?.length && s.loops && hasScheduledWake(s.repoPath, s.id)) || undefined,
+    // Held permission prompts: the card renders allow/deny buttons and paints the loud waiting band —
+    // the process is mid-turn ("running") but blocked on a HUMAN, and only the server knows that.
+    permissions: (() => { const p = permissionsOf(s.id); return p.length ? p : undefined; })(),
+  });
+}
+
+// Republish every LIVE seat occupant of a thread (mrcmofwf-10 instant path). A standing job created/removed
+// on a seat flips that occupant's `scheduled` band (sessionHasScheduledWake goes true/false) with no process
+// event of its own, so push the affected occupants' feeds now rather than waiting for the loopTick safety
+// net. Cheap: a thread holds a handful of seats, publishSession recomputes the band fresh, and dead/absent
+// occupants are skipped. Best-effort — a read failure leaves the safety net to reconcile.
+export function republishThreadSeatOccupants(repoPath: string, threadId: string): void {
+  const { liveSessions } = getServerContext();
+  try {
+    const seats = readThreadMeta(repoPath, threadId)?.seats ?? {};
+    for (const seat of Object.values(seats) as Array<{ sid?: string }>) {
+      const s = seat?.sid ? liveSessions.get(seat.sid) : undefined;
+      if (s && s.status !== "exited") publishSession(s);
+    }
+  } catch { /* best-effort; loopTick reconciles */ }
 }
