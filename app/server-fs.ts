@@ -54,6 +54,7 @@ export function isInternalPath(p: string): boolean {
 export const TEXT_EXT = new Set([
   ".md", ".markdown", ".txt", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
   ".json", ".css", ".html", ".py", ".yaml", ".yml", ".toml", ".sh",
+  ".ipynb", // Jupyter notebooks are JSON; the ipynb card renders them from fileContent.
 ]);
 
 // IMAGE assets (the image card, image-cards-on-canvas). Binaries can't ride the text file endpoints
