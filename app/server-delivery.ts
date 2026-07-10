@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
 import {
@@ -211,6 +212,29 @@ export function flushNudge(s: LiveSession): void {
   if (asks) lines.push(`${asks} pending question${asks === 1 ? "" : "s"} — GET http://${s.origin}/api/asks?session=${s.id}`);
   if (lines.length === 0) return;
   sendSessionInput(s.id, `[canvas] ${lines.join("; ")}`, { keepWaitingOn: true });
+}
+
+// Bug B/C — make a headless-CREATED node/edge ADDRESSABLE. A create command's id is otherwise minted
+// TAB-side (core addNode/addEdge: `p.id ?? nodeId()`), so a headless POST /api/command that omits
+// `payload.id` can never learn the id of the node/edge it just created — the un-addressable orphan (David's
+// lost thread/session card). So mint the id SERVER-side here when it's absent, write it INTO the payload
+// we're about to broadcast (the tab then uses `p.id` verbatim instead of minting its own), and hand it back
+// so handleCommand can echo it in the HTTP response. The id is then deterministic + known to the caller for
+// EVERY create — and identical whether a live tab applies it now or the persist-gap buffer replays it later
+// (both carry this same payload). addShape delegates to addNode in core, so it takes a node id too. A
+// non-create command returns null (there is no created id to report) and its payload is left untouched.
+// `mkUuid` is injectable so the pure minting is deterministically testable.
+export function ensureCommandId(
+  cmd: { type?: string; payload?: unknown },
+  mkUuid: () => string = randomUUID,
+): string | null {
+  const isNode = cmd.type === "addNode" || cmd.type === "addShape";
+  const isEdge = cmd.type === "addEdge";
+  if (!isNode && !isEdge) return null;
+  const payload = cmd.payload && typeof cmd.payload === "object" ? (cmd.payload as Record<string, unknown>) : {};
+  if (typeof payload.id !== "string" || !payload.id) payload.id = `${isEdge ? "edge" : "node"}:${mkUuid()}`;
+  cmd.payload = payload;
+  return String(payload.id);
 }
 
 // Broadcast a command to a board's tabs (the board lives in the browser, so a mutation is an addEdge/
