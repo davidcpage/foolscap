@@ -10,6 +10,7 @@
     "dev:local": "CANVAS_SESSION_HOST=0 vite",
     "session-host": "node session-host.js",
     "session-host:stop": "node session-host.js --stop",
+    "jupyter-host:stop": "node jupyter-host.js --stop",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test --test-concurrency=4 test/*.test.mjs",

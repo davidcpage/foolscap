@@ -36,13 +36,62 @@ the use case that motivated it is browsing `.ipynb` files ahead of a possible tr
   bypasses the server, so it still sees raw base64 — an explicit agent tool-call to view image outputs is
   a possible future direction, deliberately left open by the codec's structure.
 
+## Interactive execution (Path B — server-driven kernel)
+
+The card is no longer view-only: it runs a **real per-repo Python kernel server-side** and persists the
+results back into the `.ipynb`, so the file stays the durable, agent-legible, shadow-git-versioned record
+and the card is a live view over it. This is Path B from [notebook-card.md](notebook-card.md) §2 — a
+server-owned kernel, the counterpart to the session model — chosen over a browser↔kernel bridge so the
+**gateway token never leaves the server** (the browser only ever talks same-origin to the dev-server plugin).
+
+**The pieces:**
+
+- **Sidecar** (`app/jupyter-host.js`, the cousin of `session-host.js`): launches a detached
+  `jupyter kernelgateway` on `127.0.0.1` with a random token, records it in a tmpdir **rendezvous**
+  (`canvas-jupyter-host-<appDirKey>.json`, keyed off the app checkout like the session-host socket — never
+  in the watched tree). Start-on-demand + probe + reclaim-stale; the gateway **survives a dev-server
+  restart** (detached + rendezvous), though the kernel itself need not (a dead kernel is just re-started).
+  Stop it with `npm run jupyter-host:stop`.
+- **Broker** (`routes/kernel.ts` → `server-kernel.ts`, in the fs-plugin): a **kernel-per-notebook** keyed by
+  `(board, node)` in `fsState.liveKernels`. It holds the upstream Jupyter WS, maps IOPub replies
+  (`stream` / `execute_result` / `display_data` / `error` + `execution_count`) into nbformat outputs
+  correlated by `parent_header.msg_id → cellId`, and drives it via REST: `POST /api/kernel/<nodeId>/{run,
+  run-all,interrupt,restart,shutdown}`.
+- **Write-back:** on each cell completion the broker read-modify-**merges** outputs into the `.ipynb` **by
+  nbformat cell id** (never index) under an optimistic-concurrency **CAS** (`baseVersion` content hash,
+  retry-on-conflict) so a concurrent edit can't be clobbered. It serializes through the codec's
+  **full-fidelity** projection (`transformNotebook(text, { mode: "full" })` — no elision, strips the
+  render-only `metadata.__foolscap`), never the lossy render/agent views. Notebooks predating nbformat 4.5
+  cell ids are **normalized** once (ids assigned + persisted) so the id-keyed merge is stable.
+- **Card affordances** (`card-types/ipynb/type.yaml` + `render.js`): a toolbar (Run all / Interrupt /
+  Restart + a kernel-state dot) and a per-cell **Run** button, plus a **live status** feed
+  `kernel:<nodeId>:<boardId>` (mirror `session:<id>`, board-scoped since a node id isn't unique across
+  boards). The card reads status from the feed; the **durable outputs arrive via the file watch**
+  re-rendering `fileContent` — the feed is only the live channel.
+
+### Setup — this feature requires a repo Python env
+
+The kernel runs in the repo's Python environment. The sidecar auto-detects it in order:
+**repo `.venv` → conda (`$CONDA_PREFIX`) → poetry → system `jupyter` on PATH**. For a fresh checkout,
+create the `.venv` (gitignored, disposable) and install Jupyter into it:
+
+```sh
+uv venv                                              # or: python3 -m venv .venv
+uv pip install jupyter_kernel_gateway ipykernel      # or: .venv/bin/pip install …
+```
+
+If no env is found, `run`/`run-all` fail with an actionable error naming that command. (Python 3.14 works —
+`jupyter_kernel_gateway` + `ipykernel` ship wheels; `uv venv` may select a slightly older CPython, which is
+fine.)
+
 ## Two deliberate limits
 
 - **HTML outputs are rendered RAW and UNSANITISED.** We build a real DOM node and embed it (the same
   live-node embedding the reactive notebook card uses for its output views), so DataFrames, styled tables,
   and HTML-emitting plots render faithfully. This is a **trusted-notebook assumption**: it is appropriate
-  for notebooks you already trust on disk, and is *not* safe for untrusted input. The assumption is noted
-  in `render.js`; sanitise there if it ever stops holding.
-- **No execution / REPL.** There is no kernel, no cell-run, no editing — the card only displays what is
-  already in the file's saved outputs. A REPL-style interaction mode is an interesting future direction
-  (the human raised it) but is out of scope here, parked as a future thread.
+  for notebooks you already trust on disk, and is *not* safe for untrusted input. The same assumption
+  extends to executing a notebook you trust — the kernel runs with full machine access, like the
+  `claude -p` sessions already on the board (local-trusted, kernel on `127.0.0.1`, token server-side).
+- **The card SOURCE stays read-only (P1).** You can run cells and outputs persist, but editing cell source
+  and adding/deleting/moving cells is **out of scope for P1** (parked as P2/P3), as are annotations. The
+  card runs what is on disk; edit the `.ipynb` in your editor (or via an agent) and the watch re-renders.

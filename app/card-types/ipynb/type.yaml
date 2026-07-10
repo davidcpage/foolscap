@@ -9,9 +9,18 @@
 #     card's path. render.js JSON-parses it into cells and renders markdown / code / outputs faithfully.
 #     It is byte-bounded upstream (MAX_BYTES in vite-fs-plugin.ts); a clipped notebook is invalid JSON, so
 #     the template shows a truncation notice rather than adding a second cap (CLAUDE.md size-cap rule).
+#   • the Jupyter kernel BROKER capabilities (Path B, docs/notebook-card.md §2) — the card runs a REAL
+#     per-repo Python kernel SERVER-side and outputs persist back into the `.ipynb`:
+#       - `kernelRun`       — run ONE cell now (by cell id / index)         → POST /api/kernel/<node>/run
+#       - `kernelRunAll`    — run every code cell in order                  → POST /api/kernel/<node>/run-all
+#       - `kernelInterrupt` — interrupt the running cell (KeyboardInterrupt) → POST /api/kernel/<node>/interrupt
+#       - `kernelRestart`   — restart the kernel (fresh namespace)          → POST /api/kernel/<node>/restart
+#       - `kernelStatus`    — the live status/streaming feed (kernel:<node>:<board>): running/idle/errored
+#     Outputs are NOT written from the card: the broker merges them into the file by cell id, and the file
+#     watch re-renders this card through `fileContent` — the file is the durable, agent-legible record.
 #
-# Deliberately NOT granted: no `writeFile` (read-only — no in-card editing), no execution/REPL (parked as a
-# future thread). html outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
+# The card SOURCE stays read-only for P1 (no `writeFile`; no add/delete/move cells — that is P2/P3). html
+# outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
 name: ipynb
 contract: 1
-capabilities: [fileContent]
+capabilities: [fileContent, kernelRun, kernelRunAll, kernelInterrupt, kernelRestart, kernelStatus]

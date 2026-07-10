@@ -101,6 +101,12 @@ harness leaves, not here):
 - `app/annotations.js` (+ `.canvas/annotations/`) + `app/anchors.js` — doc annotations (standoff, W3C
   quote anchors); `app/src/NodeView.tsx` + `app/src/annotations.ts` — the annotation card UI (host chrome).
 - `app/role-format.js` / `app/role-ledger.js` (+ `app/default-roles/`) — role charters (frontmatter + body).
+- `app/jupyter-host.js` (+ `jupyter-host-protocol.js`) — the Jupyter kernel-gateway sidecar (launch-on-demand,
+  tmpdir rendezvous, `--stop`); `app/server-kernel.ts` + `app/routes/kernel.ts` — the `/api/kernel/*` broker
+  (kernel-per-notebook on `fsState.liveKernels`, IOPub→nbformat, id-keyed CAS write-back through the codec's
+  `mode:"full"` projection); `app/card-types/ipynb/` runs cells + shows the `kernel:<node>:<board>` status feed.
+  The interactive `.ipynb` card needs a repo Python env (`docs/ipynb-card.md`: `uv venv && uv pip install
+  jupyter_kernel_gateway ipykernel`).
 - Design rationale: `docs/threads-as-cards.md`, `docs/agent-to-agent-messaging.md`,
   `docs/doc-annotations.md`, `docs/anchored-async-ask.md`, `docs/wakeable-substrate-plan.md`,
   `docs/harness-constitution.md`, `docs/architecture-history.md`.

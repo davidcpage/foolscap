@@ -8,8 +8,12 @@ export const DEFAULT_MAX_TEXT_CHARS: number;
 export const DEFAULT_RENDER_BUDGET: number;
 
 export interface TransformOpts {
-  /** "render" keeps images (drops whole outputs past the budget); "agent" (default) elides base64 + clamps text. */
-  mode?: "render" | "agent";
+  /**
+   * "render" keeps images (drops whole outputs past the budget); "agent" (default) elides base64 + clamps
+   * text; "full" is the full-fidelity identity projection for write-back (no elision/drop, strips the
+   * render-only `metadata.__foolscap` banner flag) — the ONLY sanctioned write projection.
+   */
+  mode?: "render" | "agent" | "full";
   maxTextChars?: number;
   renderBudget?: number;
 }
