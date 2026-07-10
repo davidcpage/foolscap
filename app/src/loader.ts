@@ -636,6 +636,61 @@ export function addChannelsCard(m: InteractionManager, at?: Pos): void {
   });
 }
 
+// The minimap — a corner-pinned HUD element (hud.ts), an ordinary node since the P3 unification (was
+// separate DOM chrome). It stores nothing but its arrangement: NodeView's `minimap` view reads the live
+// board off the store + camera signals, so this addNode is the only thing it ever logs. anchor:"screen"
+// routes it to the ScreenLayer, where HUD membership places it top-RIGHT and toggles it with the HUD group
+// (the stored x/y/w/h are seeded from the default-layout spec by seedHud). Stable singleton id (node:minimap)
+// → idempotent across reloads/StrictMode.
+export const MINIMAP_HUD_W = 240;
+export const MINIMAP_HUD_H = 180;
+export function addMinimapCard(m: InteractionManager, at?: Pos): void {
+  m.editor.commit({
+    type: "addNode",
+    actor: "system",
+    payload: {
+      id: "node:minimap" as Id<"node">,
+      type: "minimap",
+      title: "",
+      text: "",
+      color: "purple",
+      anchor: "screen",
+      ...(at ?? spawnAt(m, MINIMAP_HUD_W, MINIMAP_HUD_H)),
+      w: MINIMAP_HUD_W,
+      h: MINIMAP_HUD_H,
+    },
+  });
+}
+
+// The File Tree — a corner-pinned HUD element (hud.ts) since the P3 unification, no longer a menu-spawned
+// world card. It's the "roots" sentinel directory card (root=roots, path="") whose top level is every root
+// (canonical + git worktrees, read reactively off rootsSignal); drill in and drag a row out to pin a
+// file/folder as its own card. Its stable id node:roots: IS the deterministic (root, path) id a File-tree
+// drag-out already mints (fileNodeId), so seeding never duplicates it. anchor:"screen" routes it to the
+// ScreenLayer, where HUD membership places it in the LEFT column beneath the sessions browser, viewport-
+// height-capped so its interior tree scrolls, and toggles it with the HUD group. Stable singleton id →
+// idempotent across reloads/StrictMode. The list/tree churns off-log through the directory card's
+// capabilities, so this addNode is the only thing it logs.
+export const FILETREE_HUD_W = 240;
+export const FILETREE_HUD_H = 300;
+export function addFileTreeCard(m: InteractionManager, at?: Pos): void {
+  m.editor.commit({
+    type: "addNode",
+    actor: "system",
+    payload: {
+      id: fileNodeId("roots", ""), // node:roots: — the combined all-roots tree
+      type: "directory",
+      title: "", // the directory path relative to its root; "" = the root listing
+      text: "",
+      color: "purple",
+      anchor: "screen",
+      ...(at ?? spawnAt(m, FILETREE_HUD_W, FILETREE_HUD_H)),
+      w: FILETREE_HUD_W,
+      h: FILETREE_HUD_H,
+    },
+  });
+}
+
 // The roles browser card (card-types/roles, agent-roles.md) — the channels/sessions card's twin: a persistent
 // on-canvas list of this board's roles; LAUNCH a session under a role from a row's button, or (phase 2b) open a
 // role to edit its charter. Its body reads the off-log `rolesList` projection (content.ts, /api/roles), so this

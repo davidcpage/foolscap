@@ -1,46 +1,37 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { boxCenter, worldBounds, type Box, type InteractionManager } from "./lib";
+import { useMemo, useRef } from "react";
+import { boxCenter, worldBounds, type Box, type Id, type InteractionManager } from "./lib";
 import { useSignal } from "./reactive";
 import { sessionListSignal } from "./content";
 import { STATUS_COLOR, type SessionStatus } from "./session-status";
 
-// The minimap HUD — navigation chrome, not a card. Tapping Alt toggles it On ↔ Off (`mode` 0/1): Off is
-// hidden, On shows the plain map (card rects + the board edges between them + the viewport frustum). No
-// auto-show/fade — it's simply in the state you put it in. It lives OUTSIDE the canvas's DOM subtree (a
-// sibling of the bindDom element), so its pointer events never reach the interaction engine and it can
-// use plain React handlers (it also preventDefaults mousedown so a click on it never steals keyboard
-// focus from the canvas — otherwise the number keys, handled on the canvas, would go dead). Reuses
-// worldBounds + the camera; pressing/dragging the map recenters the camera.
+// The minimap — an ordinary HUD card since the P3 unification (was separate DOM chrome). It renders in the
+// ScreenLayer through the SAME unified ScreenCardFrame as every other HUD card (NodeView dispatches the
+// `minimap` node type here), so it toggles with the HUD group, drags/resizes in Alt-held edit mode, and takes
+// the shared `.hud-frame > .node` panel chrome. Its body shows the plain map (card rects + the board edges
+// between them + the viewport frustum) and pressing/dragging the map recenters the camera. Two behaviours the
+// DOM-parent move (out of the canvas-sibling shell, into the frame) had to preserve:
+//   • click-to-pan: the svg claims its own pointer via setPointerCapture. Outside edit mode the ScreenCardFrame
+//     is LOCKED and binds no pointerdown listener, so the svg's own onPointerDown runs and the pan works; the
+//     frame's locked mousedown-preventDefault (keeping canvas focus, as the old shell did) is a mouse event and
+//     never touches the pointer capture. In edit mode the frame's NATIVE pointerdown fires first and
+//     stopPropagation pre-empts React's root-delegated svg handler, so the frame drag wins over a pan — the two
+//     don't fight.
+//   • screen→page projection: recenter() uses getScreenCTM(), which reflects the svg's ACTUAL on-screen box, so
+//     it holds regardless of which DOM parent the svg sits under.
+// Being unmounted by the ScreenLayer when the HUD is hidden preserves the old perf win: the body subscribes to
+// the camera and rebuilds an SVG rect per card every pan/zoom frame, so it must not run while the map is off.
 
-export function MinimapHud({ m, mode }: { m: InteractionManager; mode: 0 | 1 }) {
-  // Visibility is purely the explicit cycle (no auto-show/fade). The SHELL stays mounted so the CSS
-  // opacity transition runs both ways; the BODY — which subscribes to the camera and rebuilds an SVG
-  // rect per card on every pan/zoom frame — unmounts once the fade-out completes. It used to stay
-  // mounted at opacity 0, paying that O(cards) render every camera tick with the map off.
-  const shown = mode !== 0;
-  const [renderBody, setRenderBody] = useState(shown);
-  useEffect(() => {
-    if (shown) {
-      setRenderBody(true);
-      return;
-    }
-    const t = setTimeout(() => setRenderBody(false), 220); // ~ the CSS opacity transition
-    return () => clearTimeout(t);
-  }, [shown]);
-
-  return (
-    <div
-      className={`minimap-hud${shown ? " show" : ""}`}
-      // Keep keyboard focus on the canvas (where the number keys are handled) — a mousedown on chrome
-      // would otherwise blur it and the digit shortcuts would go dead until you clicked the canvas again.
-      onMouseDown={(e) => e.preventDefault()}
-    >
-      {renderBody && <MinimapBody m={m} />}
-    </div>
-  );
-}
-
-function MinimapBody({ m }: { m: InteractionManager }) {
+export function MinimapCard({
+  m,
+  id,
+  box,
+  selected,
+}: {
+  m: InteractionManager;
+  id: Id<"node">;
+  box: React.CSSProperties;
+  selected: boolean;
+}) {
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
@@ -150,7 +141,7 @@ function MinimapBody({ m }: { m: InteractionManager }) {
   };
 
   return (
-    <div className="minimap">
+    <div data-node-id={id} className={`node minimap${selected ? " selected" : ""}`} style={box}>
       <div className="minimap-head">minimap</div>
       <svg
         ref={svgRef}

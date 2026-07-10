@@ -23,18 +23,21 @@ export const HUD_GAP = 12; // vertical gap between stacked chrome
 export const HUD_SNAP = 8;
 
 // Corner geometry the stacked cards derive from — kept here, deterministic, not DOM-measured. The minimap
-// block MIRRORS `.minimap-hud` in style.css (width/height): the right column sits flush one gap beneath the
-// minimap and both columns match its width, so change one, change both.
+// is now an ORDINARY HUD card (id node:minimap) whose size IS this data: MINIMAP_WIDTH/HEIGHT are its own
+// stored w/h, and the right column stacks flush beneath it (channels one gap down, File Tree below that),
+// both columns matching its width. No longer mirrored into `.minimap-hud` in style.css — that shell is gone;
+// this is the single source of the minimap's geometry.
 const MINIMAP_WIDTH = 240;
 const MINIMAP_HEIGHT = 180;
 const COLUMN_WIDTH = MINIMAP_WIDTH; // left + right columns both match the minimap width
 const USAGE_HEIGHT = 300; // left column: the usage card on top …
-const LIST_HEIGHT = 300; // … the sessions/channels lists below it, compact; their interiors scroll
+const LIST_HEIGHT = 300; // … the sessions/channels/files lists below it, compact; their interiors scroll
 const CLOCK_SIZE = 72; // the top-centre clock renders compact and frameless
 
 // The HUD card set + default placement, in seed/paint order. `id` is the stable singleton id (so seeding is
 // idempotent across reloads + StrictMode); `type` is the card type its seeder mints. `left`/`right`/`centreX`
-// is the one horizontal anchor resolveHudPosition resolves against the viewport.
+// is the one horizontal anchor resolveHudPosition resolves against the viewport. Two columns: the LEFT stacks
+// usage → sessions → File Tree; the RIGHT stacks minimap → Threads; the clock floats top-centre.
 export const DEFAULT_HUD = [
   { id: "node:usage", type: "usage", top: HUD_MARGIN, left: HUD_MARGIN, w: COLUMN_WIDTH, h: USAGE_HEIGHT },
   {
@@ -46,7 +49,21 @@ export const DEFAULT_HUD = [
     h: LIST_HEIGHT,
     capToViewport: true,
   },
+  {
+    // The File Tree singleton (the "roots" sentinel directory card): stable id node:roots: (root=roots,
+    // path="" — the same deterministic id a File-tree drag-out mints), so seeding never duplicates it. Left
+    // column, flush beneath the sessions browser; its interior tree scrolls inside a viewport-capped frame.
+    id: "node:roots:",
+    type: "directory",
+    top: HUD_MARGIN + USAGE_HEIGHT + HUD_GAP + LIST_HEIGHT + HUD_GAP, // beneath the sessions card
+    left: HUD_MARGIN,
+    w: COLUMN_WIDTH,
+    h: LIST_HEIGHT,
+    capToViewport: true,
+  },
   { id: "node:clock", type: "clock", top: HUD_MARGIN, centreX: true, w: CLOCK_SIZE, h: CLOCK_SIZE, frameless: true },
+  // The minimap — an ordinary HUD card now (was separate DOM chrome). Top-right, its own stored geometry.
+  { id: "node:minimap", type: "minimap", top: HUD_MARGIN, right: HUD_MARGIN, w: MINIMAP_WIDTH, h: MINIMAP_HEIGHT },
   {
     id: "node:channels",
     type: "channels",

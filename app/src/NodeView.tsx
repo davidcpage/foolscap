@@ -26,6 +26,7 @@ import {
   type AnnotationInfo,
 } from "./annotations";
 import { fileContentSignal, sessionListSignal } from "./content";
+import { MinimapCard } from "./Minimap";
 import { memberPillState, intentPillState, type PillState } from "../thread-state.js";
 
 // Human label per participant-pill state (thread-state.js PILL_STATES). The tooltip's bold status word: the
@@ -114,6 +115,12 @@ export const NodeView = memo(function NodeView({
     card = <ComputedView m={m} id={id} box={box} selected={selected} />;
   } else if (node.type === "provenance") {
     card = <ProvenanceView m={m} id={id} box={box} selected={selected} />;
+  } else if (node.type === "minimap") {
+    // The minimap HUD card (P3): a hardcoded view like the feed/thread cards — it needs full
+    // InteractionManager/camera access (recenter the camera, project the frustum) rather than a capability
+    // template. Renders through the same ScreenCardFrame; only ever a HUD card (isHudCard), so it always
+    // arrives here in the screen layer with a chrome descriptor.
+    card = <MinimapCard m={m} id={id} box={box} selected={selected} />;
   } else if (node.type === "thread" || node.type === "channel") {
     // "thread" is the node type since threads-as-cards §8 step 2; "channel" is the carried-over legacy
     // type — the same card, so old boards render unchanged.
