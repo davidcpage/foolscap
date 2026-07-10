@@ -15,10 +15,26 @@ the use case that motivated it is browsing `.ipynb` files ahead of a possible tr
   (with an `In [n]:` prompt), and **outputs** by `output_type` — `stream` and `text/plain` as `<pre>`,
   `image/png`/`image/jpeg` as an inline base64 `<img>`, `text/html` (and `image/svg+xml`) rendered raw,
   and `error` as an ANSI-stripped `<pre>`.
-- Truncation is honored, not re-capped: `fileContent` is byte-bounded upstream, so a clipped notebook is
-  invalid JSON. The card catches the parse failure and shows a clear "too large" / "couldn't parse" notice
-  (using the `\n…` sentinel to tell the two apart), per the CLAUDE.md size-cap rule — it never adds a
-  second cap.
+- Size is **notebook-aware** at the server (`app/ipynb-codec.js`, wired into `/api/file` via
+  `routes/files.ts`), because a notebook with base64 image outputs is easily megabytes and the generic
+  128 KiB file-preview cap would head-clip it into invalid JSON (a blank "too large" card, and an
+  unreadable agent read). `/api/file` reads a `.ipynb` against a generous `MAX_NOTEBOOK_BYTES` ceiling
+  (server-http.ts) and serves two shapes of the same file, one memory bound honored (CLAUDE.md size-cap
+  rule — the codec then elides at the STRUCTURE level, never a second byte cap):
+  - **RENDER** (`?notebook=render`, what the card requests via `content.ts`/`loader.ts`): keep every
+    image; only if the serialized notebook exceeds a generous render budget are WHOLE outputs dropped
+    (largest first, never a byte-clip), so the JSON stays valid and the card never blanks. A drop is
+    flagged in `metadata.__foolscap` and `render.js` shows a small "outputs elided" banner.
+  - **AGENT** (the default, a bare `/api/file`): elide each base64 raster-image payload to a
+    `<image/png output elided: N bytes>` marker and clamp oversized text/stream/traceback outputs to a
+    head + marker, keeping cell **source** intact and the JSON valid + parseable. `trimmed` is flagged in
+    the response envelope.
+- The card still keeps its own parse guard: beyond even the notebook ceiling `/api/file` falls back to
+  head-truncation (the `\n…` sentinel → "too large"), and a genuinely malformed file is served verbatim
+  → "couldn't parse". The card never guesses truncation from a parse failure.
+- **Out of scope (noted, not precluded):** a Claude Code session that Reads the `.ipynb` straight off disk
+  bypasses the server, so it still sees raw base64 — an explicit agent tool-call to view image outputs is
+  a possible future direction, deliberately left open by the codec's structure.
 
 ## Two deliberate limits
 

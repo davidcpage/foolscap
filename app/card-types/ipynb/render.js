@@ -182,8 +182,20 @@ export default {
 
     const cells = Array.isArray(nb.cells) ? nb.cells : [];
     const lang = notebookLang(nb);
+    // The server's notebook-aware RENDER codec keeps images but drops WHOLE outputs when the notebook
+    // exceeds its generous render budget (never a byte-clip — the JSON stays valid, so we still render).
+    // It flags that via metadata.__foolscap so we can tell the reader some outputs were elided, rather
+    // than silently showing a partial notebook (the "where did my content go?" failure, CLAUDE.md).
+    const fooled = nb.metadata && typeof nb.metadata === "object" ? nb.metadata.__foolscap : null;
+    const trimNotice =
+      fooled && fooled.trimmed
+        ? html`<div class="ipynb-body ipynb-notice">${fooled.droppedOutputs || "Some"} large output${
+            fooled.droppedOutputs === 1 ? "" : "s"
+          } elided to keep this notebook renderable. Open the file directly for the full outputs.</div>`
+        : "";
     return html`
       ${head}
+      ${trimNotice}
       <div class="ipynb-body">
         ${cells.length
           ? cells.map((c) => renderCell(c, lang))
