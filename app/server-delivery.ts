@@ -1,4 +1,5 @@
 import { getServerContext } from "./server-context.js";
+import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
 import {
   appendThreadLine,
   fillSeat,
@@ -14,7 +15,7 @@ import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { wakesSeat } from "./notification-levels.js";
 import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
 import type { WorkIntent } from "./work-intent.js";
-import type { LiveSession, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { LiveSession, PendingBusCommand, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 
 // ── the channel-delivery / wake engine (P5 sub-step 1) ─────────────────────────────────────────────
 // The first ENGINE module of the P5 god-file split. Where server-context.ts is the DI seam and
@@ -231,13 +232,47 @@ export function dispatchBusCommand(
   const frame = `data: ${JSON.stringify(cmd)}\n\n`;
   if (clients) for (const c of clients) c.res.write(frame);
   for (const c of sockets) c.send({ ch: "bus", cmd });
+  // Persist-gap guard (Bug A summon card/edge loss + Bug C headless-created node invisible): the bus is a
+  // broadcast relay — it never writes the durable store GET /api/canvas serves; only a tab's debounced
+  // Persistence save does. So a CREATION command (addNode/addEdge) that reached no live tab is lost forever
+  // unless we hold it for replay. A remove for the same id prunes any buffered create (even when a tab WAS
+  // live for the remove) so a create-then-delete with no persisting tab in between nets to nothing.
+  if (cmd.type === "removeNode" || cmd.type === "removeEdge") bufferOrPruneBusCommand(boardId, cmd);
+  else if (delivered === 0) bufferOrPruneBusCommand(boardId, cmd);
   // Only announce if a tab actually applied it — a command that reached no tab (delivered=0) didn't change
   // the board, so announcing a join/invite that never landed would be a phantom (and double-fire on retry).
+  // A buffered member:open edge self-heals its onboarding via the snapshot-diff path (announceNewMemberships)
+  // once the replay tab persists it — the same path a human-drawn join takes.
   if (delivered > 0) {
     trackEmittedMembership(cmd); // front-run the snapshot so a post right after a spawn/join wakes the new member
     maybeAnnounceMembership(boardId, cmd, origin);
   }
   return delivered;
+}
+
+// ── the spawn/create persist-gap buffer (Bug A + Bug C) ─────────────────────────────────────────────
+// The buffer ALGEBRA (which commands to hold, prune-on-remove, the cap) is the pure, hermetically-tested
+// module bus-replay-buffer.js (like node-cascade.js); here we own only the fsState wiring. The per-board
+// buffer Map lives on fsState so it survives a hot re-eval (THE RULE).
+function bufferOrPruneBusCommand(
+  boardId: string,
+  cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
+): void {
+  const { fsState } = getServerContext();
+  const pending = (fsState.pendingBusReplay ??= new Map<string, PendingBusCommand[]>());
+  const { dropped } = bufferBusReplay(pending, boardId, cmd);
+  if (dropped > 0)
+    console.warn(
+      `[bus] pending-replay buffer for ${boardId} exceeded ${MAX_PENDING_BUS_REPLAY}; dropped ${dropped} oldest ` +
+        `command(s) — no live tab has attached to persist them`,
+    );
+}
+
+// Drain (and CLEAR) a board's buffered creation commands — the ws-attach handler replays these to the
+// freshly-attached tab right after feedValues. First attacher wins: clearing stops a second tab re-applying
+// a duplicate addNode (it hydrates the now-persisted records instead).
+export function drainPendingBusReplay(boardId: string): PendingBusCommand[] {
+  return takeBusReplay(getServerContext().fsState.pendingBusReplay, boardId) as PendingBusCommand[];
 }
 
 // Onboarding's SECOND trigger. The first is dispatchBusCommand, which fires for an agent-initiated POST

@@ -20,7 +20,7 @@ import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
-import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
+import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
 import { boardSnapshotRecords, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
@@ -503,6 +503,14 @@ interface WsClient {
   watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
   send(msg: unknown): void;
 }
+// A bus command held for later replay: the same shape dispatchBusCommand broadcasts. Buffered per board
+// when a creation command (addNode/addEdge) reached no live tab (Bug A/C persist-gap), replayed on the
+// next ws-attach so a tab applies + PERSISTS it into the durable store (what GET /api/canvas serves).
+export interface PendingBusCommand {
+  type: string;
+  payload?: Record<string, unknown>;
+  actor?: string;
+}
 export interface CanvasFsState {
   feedClients: Set<SseClient>;
   feedValues: Map<string, unknown>;
@@ -535,6 +543,7 @@ export interface CanvasFsState {
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member
   lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
+  pendingBusReplay?: Map<string, PendingBusCommand[]>; // boardId → creation commands that reached no live tab, replayed on the next ws-attach (Bug A/C persist-gap)
 }
 type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
@@ -643,6 +652,12 @@ function attachWs(server: ViteDevServer): void {
           );
       }
       for (const [feed, value] of feedValues) client.send({ ch: "feed", feed, value }); // replay, like handleFeeds
+      // Persist-gap replay (Bug A/C): creation commands (a summon's session card + member:open edge, a
+      // headless /api/command addNode) that reached NO live tab were buffered — the bus is a broadcast
+      // relay and the durable store GET /api/canvas serves is written only by a tab's Persistence save.
+      // Hand them to THIS freshly-attached tab so it applies + persists them; first attacher drains the
+      // buffer (a second tab hydrates the now-persisted records rather than re-applying a duplicate).
+      for (const cmd of drainPendingBusReplay(b.boardId)) client.send({ ch: "bus", cmd });
       const ping = setInterval(() => {
         if (ws.readyState === ws.OPEN) ws.ping();
       }, 25000);

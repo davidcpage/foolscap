@@ -193,8 +193,10 @@ async function handleSessionSpawn(
   // reads the channel card's position from the last snapshot and places the worker beside it, vs an agent
   // guessing coordinates badly) AND robustness: dispatchBusCommand records the member:open in the
   // immediate-membership registry, so a task the Coordinator posts right after this reliably wakes the worker even
-  // before the snapshot round-trips. `carded` reports whether a live tab applied it. Browser-initiated
-  // spawns omit these params and keep placing their own card. `card:true` = a standalone card, no edge.
+  // before the snapshot round-trips. `carded` reports whether a live tab applied it NOW — `false` no longer
+  // means the card was LOST: dispatchBusCommand buffers the card+edge for replay on the next tab attach
+  // (Bug A persist-gap fix), so `carded:false` means "deferred until a tab connects", not "gone".
+  // Browser-initiated spawns omit these params and keep placing their own card. `card:true` = a standalone card.
   let carded = false;
   if (threadId || body.card === true) {
     const records = boardSnapshotRecords(boardId);

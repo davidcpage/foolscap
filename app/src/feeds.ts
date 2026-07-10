@@ -48,6 +48,13 @@ interface ServerFrame {
 const values = new Map<string, unknown>();
 const subs = new Map<string, Set<() => void>>();
 const busSubs = new Set<(cmd: BusCommand) => void>();
+// Bus commands that arrived before a consumer registered. The socket opens on the FIRST subscription of
+// ANY kind (a feed card during render), but connectAgentBus — the one bus consumer — registers later, in
+// a post-mount effect. Without this queue a command in that gap is dropped, which is exactly when the
+// server replays a no-tab board's buffered spawn cards / created nodes on attach (Bug A/C). Queue when
+// there's no consumer; drained to the first busSub. Bounded (generous) against an unbounded no-consumer run.
+const pendingBus: BusCommand[] = [];
+const MAX_PENDING_BUS = 1000;
 const watchSubs = new Map<string, Set<(ev: { type: string; path: string }) => void>>();
 let ws: WebSocket | null = null;
 let connectedOnce = false;
@@ -77,7 +84,10 @@ function ensureConnected(): void {
       values.set(frame.feed, frame.value);
       for (const fn of subs.get(frame.feed) ?? []) fn();
     } else if (frame.ch === "bus" && frame.cmd) {
-      for (const fn of busSubs) fn(frame.cmd);
+      if (busSubs.size === 0) {
+        pendingBus.push(frame.cmd); // no consumer yet — hold it (see pendingBus above)
+        if (pendingBus.length > MAX_PENDING_BUS) pendingBus.shift();
+      } else for (const fn of busSubs) fn(frame.cmd);
     } else if (frame.ch === "watch" && frame.root != null && frame.ev) {
       for (const fn of watchSubs.get(frame.root) ?? []) fn(frame.ev);
     }
@@ -100,8 +110,15 @@ function ensureConnected(): void {
 // The agent-bus command stream (agentBus.ts is the one consumer): every Command an agent POSTs to
 // /api/command for this tab's board arrives here, to be run through editor.commit.
 export function onBusCommand(fn: (cmd: BusCommand) => void): () => void {
+  const firstConsumer = busSubs.size === 0;
   busSubs.add(fn);
   ensureConnected();
+  // Drain anything that arrived before this first consumer (a server replay-on-attach, a peer's edit
+  // during boot) so it isn't lost — the raison d'être of pendingBus above.
+  if (firstConsumer && pendingBus.length) {
+    const queued = pendingBus.splice(0, pendingBus.length);
+    for (const cmd of queued) for (const g of busSubs) g(cmd);
+  }
   return () => busSubs.delete(fn);
 }
 
