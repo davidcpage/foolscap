@@ -790,6 +790,17 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // reads that live feed for its content — the transcript stays REFERENCED, never copied onto the log
   // — so we keep nothing from the body here; text:"" is a pure reference card.
   const { id: sid } = (await res.json()) as { id: string };
+  // Dedup on reopen (mirrors openChannel's fly-to): a card for this session may ALREADY be on the board —
+  // either a live-summoned worker card (`node:live:<sid>`, dropped by the server on spawn) or a prior
+  // reopen (`node:session:<sid>`). The two ids differ, so a naive re-add litters a SECOND, unconnected
+  // card (the exact "reopen produced a duplicate" bug). Fly to whichever exists instead.
+  for (const existing of [`node:live:${sid}`, `node:session:${sid}`] as Id<"node">[]) {
+    if (m.editor.store.get<"node">(existing)) {
+      m.selection.set([existing]);
+      m.fitSelection();
+      return;
+    }
+  }
   m.editor.commit({
     type: "addNode",
     actor: "system",
