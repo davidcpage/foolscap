@@ -37,8 +37,8 @@ function sessionTranscriptDir(repoPath: string, id: string): string {
   return cwd ? sessionsDir(cwd) : sessionsDir(repoPath);
 }
 
-function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string): void {
-  const { readSessionFile, ensureSessionFeed } = getServerContext();
+function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): void {
+  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionThreads } = getServerContext();
   let chosen = id;
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
@@ -55,7 +55,11 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   // to externals nobody has placed. Write-once: a real spawn already wrote a richer marker; don't clobber it.
   if (!isCanvasSession(repoPath, chosen)) markCanvasSession(repoPath, chosen, { adoptedAt: Date.now() });
   ensureSessionFeed(tdir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
-  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated });
+  // The threads this session is a DURABLE member of, so the client can redraw the `member:open` edge(s) on
+  // reopen: the card + its edge vanished on close, but the membership outlived them (delete-card-keep-session).
+  // This only REPORTS existing membership — it changes no server state, keeping card-close/reopen display-only.
+  const threads = sessionThreads(boardSnapshotRecords(boardId) ?? [], chosen);
+  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated, threads });
 }
 
 // A human-legible label + counts for the dropdown, parsed from a transcript. The label prefers the
@@ -327,7 +331,7 @@ export const sessionReadRoutes: GlobalRoute[] = [
       const ctx = getServerContext();
       const b = ctx.reqBoard(url);
       if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleSession(res, ctx.sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath);
+      return handleSession(res, ctx.sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath, b.boardId);
     },
   },
   {

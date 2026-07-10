@@ -106,8 +106,11 @@ const RECORDS = [
   { typeName: "edge", id: "e1", from: "node:live:s1", to: "node:thread:t1", type: "member:open" },
 ];
 
-test("server-snapshot sidFromSessionNode maps a live-session node id to its sid", () => {
-  assert.equal(snap.sidFromSessionNode("node:live:abc-123"), "abc-123");
+test("server-snapshot sidFromSessionNode maps BOTH session-node vintages to their sid", () => {
+  assert.equal(snap.sidFromSessionNode("node:live:abc-123"), "abc-123", "spawn/summon vintage");
+  // A card reopened from the rail is the node:session: vintage (loader.openSession) — id-based sid
+  // resolution must handle it too, else a reopened card's leave/adoption silently mis-resolves (GAP B).
+  assert.equal(snap.sidFromSessionNode("node:session:abc-123"), "abc-123", "reopen vintage");
   assert.equal(snap.sidFromSessionNode("node:thread:t1"), null);
   assert.equal(snap.sidFromSessionNode("garbage"), null);
 });

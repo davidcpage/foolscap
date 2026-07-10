@@ -853,23 +853,27 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // server-side file-tail (handleSession → ensureSessionFeed) that publishes session:<id>. The card
   // reads that live feed for its content — the transcript stays REFERENCED, never copied onto the log
   // — so we keep nothing from the body here; text:"" is a pure reference card.
-  const { id: sid } = (await res.json()) as { id: string };
+  // `threads` = the sid's durable thread memberships (server-reported). Card-close removed the card + its
+  // member:open edge (the VIEW); the membership outlived them, so on reopen we repaint the wire from these.
+  const { id: sid, threads } = (await res.json()) as { id: string; threads?: string[] };
   // Dedup on reopen (mirrors openChannel's fly-to): a card for this session may ALREADY be on the board —
   // either a live-summoned worker card (`node:live:<sid>`, dropped by the server on spawn) or a prior
   // reopen (`node:session:<sid>`). The two ids differ, so a naive re-add litters a SECOND, unconnected
   // card (the exact "reopen produced a duplicate" bug). Fly to whichever exists instead.
   for (const existing of [`node:live:${sid}`, `node:session:${sid}`] as Id<"node">[]) {
     if (m.editor.store.get<"node">(existing)) {
+      redrawMemberEdges(m, existing, sid, threads); // idempotent — heal a card opened before this fix too
       m.selection.set([existing]);
       m.fitSelection();
       return;
     }
   }
+  const nodeId = `node:session:${sid}` as Id<"node">;
   m.editor.commit({
     type: "addNode",
     actor: "system",
     payload: {
-      id: `node:session:${sid}` as Id<"node">,
+      id: nodeId,
       type: "session",
       title: sid, // the FULL session id — the template both displays (truncated) and keys its live
       // feed off (the `session` capability subscribes to session:<title>); it live-tails whatever
@@ -881,6 +885,33 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       h: SESSION_CARD_H,
     },
   });
+  // Repaint the member:open edge(s): the thread connection must be VISIBLY alive across a close/reopen, and
+  // reopen is display-only (the durable membership was never touched). The edge id matches the spawn
+  // convention so it's stable + idempotent across spawn→close→reopen; the server treats a redraw of an
+  // existing membership as a no-op (no re-onboarding, no peer wake) — see server-delivery's REOPEN GUARD.
+  redrawMemberEdges(m, nodeId, sid, threads);
+}
+
+// Repaint a reopened session card's `member:open` edge(s) from the durable memberships the server reported
+// (GET /api/session → `threads`). One edge per thread whose card is currently on the board; a thread whose
+// card is closed is skipped — the renderer would no-op a dangling edge anyway, and that wire reappears when
+// its own thread card is reopened. Idempotent: `addEdge` upserts by id, and the id is the stable spawn-time
+// `edge:member:<sid>:<thread>`, so re-running never stacks a duplicate. Display-only — it draws no state the
+// server doesn't already hold.
+function redrawMemberEdges(m: InteractionManager, nodeId: Id<"node">, sid: string, threads: string[] | undefined): void {
+  for (const threadId of threads ?? []) {
+    if (!m.editor.store.get<"node">(threadId as Id<"node">)) continue; // thread card not open → no wire to draw
+    m.editor.commit({
+      type: "addEdge",
+      actor: "system",
+      payload: {
+        id: `edge:member:${sid}:${threadId}` as Id<"edge">,
+        from: nodeId,
+        to: threadId as Id<"node">,
+        type: "member:open",
+      },
+    });
+  }
 }
 
 // Reopen a thread as a card from the rail (the sessions card's twin, card-types/channels). Unlike

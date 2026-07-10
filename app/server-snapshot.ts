@@ -94,8 +94,15 @@ export function seedThreadLogs(repoPath: string): void {
 // sessionThreads UNION these in (additive, deduped). TTL'd so a membership dropped OUTSIDE the bus (e.g. a
 // human deletes the edge in the browser) can't linger past the window the snapshot needs to agree.
 const EMITTED_MEMBER_TTL = 60_000;
+// A session card carries its sid in the node id under TWO vintages: `node:live:<sid>` (spawn/summon) and
+// `node:session:<sid>` (a reopen from the rail, loader.ts). Both resolve to the same sid — so id-based sid
+// resolution (the leave-vs-card-delete discriminator, boot-time durable-member adoption) stays correct
+// across a spawn→close→reopen, where the reopened card is the node:session: vintage. (Title-based
+// resolution — nodeSessionId — was already robust to both; this is its id-based twin catching up.)
 export const sidFromSessionNode = (node: string): string | null =>
-  node.startsWith("node:live:") ? node.slice("node:live:".length) : null;
+  node.startsWith("node:live:") ? node.slice("node:live:".length)
+  : node.startsWith("node:session:") ? node.slice("node:session:".length)
+  : null;
 // Non-expired emitted memberships, pruning stale ones in passing.
 export function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
   const emittedMembers = (getServerContext().fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
