@@ -1,6 +1,7 @@
 import type { IncomingMessage } from "node:http";
 import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, SessionBand, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 import type { WorkIntent } from "./work-intent.js";
+import type { ThreadMetaMarker } from "./thread-ledger.js";
 import type { EnsuredWorktree } from "./worktrees.js";
 
 // ── the ServerContext seam ────────────────────────────────────────────────────────────────────────
@@ -107,6 +108,24 @@ export interface ServerContext {
     origin: string,
   ) => number;
   forgetDurableMember: (repoPath: string | undefined, threadId: string, sid: string) => void;
+  // Engine ops the extracted channel-delivery/wake module (server-delivery.ts, P5 sub-step 1) reaches back
+  // into. Their DEFINITIONS still live in the shell (session/spawn = sub-step 2; heartbeat + membership
+  // registry + snapshot resolvers = sub-step 3), so — exactly like the effects above — the seam injects the
+  // operation and the moved delivery functions call it via getServerContext(); the defs move in a later
+  // sub-step and just repoint. MAX_THREAD_MSGS rides here as a value the same way MAX_LIVE_SESSIONS does.
+  maybeRespawnDormantSeat: (
+    boardId: string,
+    threadId: string,
+    dormantSid: string,
+    origin: string,
+    meta: ThreadMetaMarker | null,
+  ) => void; // reconstitute a dormant SEAT when an @-addressed member has no live process (wakeThreadMembers)
+  ensureCoordinatorHeartbeat: (repoPath: string, threadId: string) => void; // first Coordinator staffing auto-enables its sweep
+  recordDurableMember: (repoPath: string | undefined, threadId: string, sid: string, ts: number) => void; // membership survives card/edge removal
+  trackEmittedMembership: (cmd: { type: string; payload?: Record<string, unknown> }) => void; // front-run the snapshot for the immediate-membership window
+  sidFromSessionNode: (node: string) => string | null; // "node:live:<sid>" → sid
+  nodeSessionId: (records: Array<Record<string, unknown>>, nodeId: string) => string | null; // a session node's sid (its title)
+  MAX_THREAD_MSGS: number; // the bounded thread-log TAIL appendThreadMsg trims to
   republishThreadSeatOccupants: (repoPath: string, threadId: string) => void;
   serverSpawnWorker: (opts: {
     boardId: string;
