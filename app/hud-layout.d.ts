@@ -34,3 +34,12 @@ export declare function resolveHudPosition(
   card: HudCardSpec,
   viewportW: number,
 ): { x: number; y: number; w: number; h: number };
+
+/** The uniform scale (≤ 1) the HUD group should render at to fit `boxes` inside the live viewport — 1 when
+ *  it already fits, shrinking (never enlarging) so no card is pushed off the right edge or bottom. */
+export declare function hudFitScale(
+  boxes: ReadonlyArray<{ x: number; y: number; w: number; h: number }>,
+  viewportW: number,
+  viewportH: number,
+  margin?: number,
+): number;
