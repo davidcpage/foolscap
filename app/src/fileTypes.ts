@@ -27,6 +27,7 @@ const BY_EXT: Record<string, FileKind> = {
   ".toml": { kind: "toml", color: "green" },
   ".css": { kind: "css", color: "pink" },
   ".html": { kind: "html", color: "orange" },
+  ".ipynb": { kind: "ipynb", color: "orange" }, // Jupyter notebooks open as the read-only ipynb card
 };
 
 const OTHER: FileKind = { kind: "file", color: "purple" };
