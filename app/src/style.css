@@ -3644,10 +3644,10 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .floating-resize-handle.resize-sw { bottom: 0; left: 0; transform: translate(-50%, 50%); cursor: nesw-resize; }
 .floating-resize-handle.resize-se { bottom: 0; right: 0; transform: translate(50%, 50%); cursor: nwse-resize; }
 
-/* A corner-locked HUD card (usage / clock — hud.ts): anchored to the viewport's top-left corner via
-   top/left (set inline from the HUD stack), so it tracks a window resize with no JS. Unlike a floating
-   card it isn't draggable (no grab cursor, no move gesture) — it's chrome, positioned for you. The card
-   fills the frame just like a floating one. */
+/* A corner-locked HUD card (usage / sessions / clock / channels — hud.ts): the same screen-positioned box
+   as a floating card (top/left from its stored layout, set inline by ScreenCardFrame), but chrome — unlike a
+   floating card it isn't draggable (no grab cursor, no move gesture), it's positioned for you. The card fills
+   the frame just like a floating one. */
 .hud-frame {
   position: absolute;
   pointer-events: auto;
@@ -3678,8 +3678,8 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 
 /* The Threads indicator (node:channels) sits under the minimap at matching width; its frame is height-
-   capped (maxHeight in HudFrame), and .dir-body is already a scroll container, so a long thread list
-   scrolls inside the viewport rather than overflowing the bottom. A slightly smaller row type than a world
+   capped (capToViewport in ScreenCardFrame), and .dir-body is already a scroll container, so a long thread
+   list scrolls inside the viewport rather than overflowing the bottom. A slightly smaller row type than a world
    card keeps the compact HUD panel legible without crowding. */
 .hud-frame > .node.channels .file-name { font-size: 11px; }
 .hud-frame > .node.channels .ses-row-title { font-size: 11px; }

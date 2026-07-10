@@ -1,0 +1,77 @@
+// The default HUD layout (pinned-cards-and-HUD unification, P1): the seed spec that makes HUD positions
+// REAL, PERSISTED layout data instead of values derived at render from a corner switch. seedHud (App.tsx)
+// reads this same module to seat each chrome card's stored screen x/y/w/h, so the numbers the browser seeds
+// are exactly the ones asserted here.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  DEFAULT_HUD,
+  HUD_CARD_IDS,
+  HUD_MARGIN,
+  HUD_GAP,
+  isHudCard,
+  hudChromeFor,
+  resolveHudPosition,
+} from "../hud-layout.js";
+
+test("the HUD card set is the four stable singletons, in seed/paint order", () => {
+  assert.deepEqual(HUD_CARD_IDS, ["node:usage", "node:sessions", "node:clock", "node:channels"]);
+  for (const id of HUD_CARD_IDS) assert.ok(isHudCard(id), `${id} is a HUD card`);
+  // Stable ids are what make seeding idempotent across reloads + StrictMode.
+  assert.equal(isHudCard("node:roles"), false);
+  assert.equal(isHudCard("node:usageX"), false);
+});
+
+test("every card carries a type its seeder mints, and a sound placement", () => {
+  for (const c of DEFAULT_HUD) {
+    assert.ok(c.type, `${c.id} has a card type`);
+    assert.ok(c.w > 0 && c.h > 0, `${c.id} has a positive size`);
+    // Exactly ONE horizontal anchor (left | right | centreX) — the corner vocabulary resolveHudPosition reads.
+    const anchors = [c.left != null, c.right != null, !!c.centreX].filter(Boolean).length;
+    assert.equal(anchors, 1, `${c.id} has exactly one horizontal anchor`);
+  }
+});
+
+test("chrome descriptor is frame-STYLE only, and null for a non-HUD id", () => {
+  // The clock is the only frameless card; the two scrolling lists are the only viewport-capped ones.
+  assert.deepEqual(hudChromeFor("node:clock"), { frameless: true, capToViewport: false });
+  assert.deepEqual(hudChromeFor("node:usage"), { frameless: false, capToViewport: false });
+  assert.deepEqual(hudChromeFor("node:sessions"), { frameless: false, capToViewport: true });
+  assert.deepEqual(hudChromeFor("node:channels"), { frameless: false, capToViewport: true });
+  assert.equal(hudChromeFor("node:roles"), null);
+});
+
+test("resolveHudPosition: left column is viewport-independent, centre/right track the width", () => {
+  const W = 1440;
+  const byId = Object.fromEntries(DEFAULT_HUD.map((c) => [c.id, c]));
+
+  // Left column — fixed at the margin, one gap below each other, viewport-independent.
+  assert.deepEqual(resolveHudPosition(byId["node:usage"], W), { x: HUD_MARGIN, y: HUD_MARGIN, w: 240, h: 300 });
+  const sessions = resolveHudPosition(byId["node:sessions"], W);
+  assert.equal(sessions.x, HUD_MARGIN);
+  assert.equal(sessions.y, HUD_MARGIN + 300 + HUD_GAP); // flush beneath the usage card
+
+  // Clock — centred at this width.
+  const clock = resolveHudPosition(byId["node:clock"], W);
+  assert.equal(clock.x, Math.round(W / 2 - clock.w / 2));
+  assert.equal(clock.y, HUD_MARGIN);
+
+  // Channels — offset in from the right edge (flush under the minimap column).
+  const channels = resolveHudPosition(byId["node:channels"], W);
+  assert.equal(channels.x, W - HUD_MARGIN - channels.w);
+  assert.equal(channels.y, HUD_MARGIN + 180 + HUD_GAP);
+});
+
+test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {
+  const channels = DEFAULT_HUD.find((c) => c.id === "node:channels");
+  const a = resolveHudPosition(channels, 1600);
+  const b = resolveHudPosition(channels, 1600);
+  assert.deepEqual(a, b);
+  // A different width re-places the right-anchored card (the only reason a same-board reload would re-seat it).
+  assert.notDeepEqual(resolveHudPosition(channels, 1200), a);
+  // Integer coordinates everywhere (odd widths don't leak sub-pixels into the layout record).
+  const clock = DEFAULT_HUD.find((c) => c.id === "node:clock");
+  const odd = resolveHudPosition(clock, 1281);
+  assert.ok(Number.isInteger(odd.x) && Number.isInteger(odd.y));
+});
