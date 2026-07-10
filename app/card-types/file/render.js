@@ -9,6 +9,7 @@
 // pre-signal fallback (empty now), so the card still renders headlessly / before the signal resolves.
 import { html } from "/vendor/lit-html.js";
 import { renderMd } from "/vendor/markdown.js";
+import { highlightCode, langForKind } from "/vendor/highlight-lit.js";
 
 // Extension → kind label, only where the label differs from the bare extension. The colour half
 // of the old fileTypes codec stays at INGEST (the loader stamps node.color when the card is
@@ -220,13 +221,22 @@ export default {
     // and the [data-text] coordinate space annotations resolve against — holds only the body.
     const { frontmatter, body: mdBody } =
       kind === "md" ? splitFrontmatter(text) : { frontmatter: null, body: text };
+    // A non-prose kind gets syntax highlighting when its `kind` maps to a language the vendored
+    // highlight.js bundle knows (langForKind); highlightCode returns a lit tree of ESCAPED token spans
+    // (never injected HTML — same posture as the markdown codec). An unknown kind, or any highlighter
+    // failure, falls back to the plain whitespace-preserving <pre>, so an unhighlightable file is never
+    // worse off than before. `data-text` stays on the <pre> whose textContent is the verbatim source
+    // (highlight.js preserves every character), so the annotation layer's offset anchors still resolve.
+    const highlighted = kind === "md" ? null : highlightCode(text, langForKind(kind));
     const body =
       kind === "md"
         ? html`
             ${frontmatter ? renderFrontmatter(frontmatter) : ""}
             <div class="file-body file-md md-prose" data-text>${renderMd(linkifyWikilinks(mdBody))}</div>
           `
-        : html`<pre class="file-body" data-text>${text}</pre>`;
+        : highlighted
+          ? html`<pre class="file-body file-code hljs" data-text><code>${highlighted}</code></pre>`
+          : html`<pre class="file-body" data-text>${text}</pre>`;
     return html`
       <div class="file-head">
         ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
