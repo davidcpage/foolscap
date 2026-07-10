@@ -32,6 +32,8 @@ import {
   addThreadMember,
   removeThreadMember,
   threadMembersFromMeta,
+  setMemberOffset,
+  memberOffsetFromMeta,
   untaggedSeatNudgeTarget,
 } from "../thread-ledger.js";
 
@@ -429,6 +431,45 @@ test("members: the durable set survives activity/seat/pin upserts (marker coexis
   assert.equal(meta.seats.Coordinator.sid, "sid-a", "seat coexists");
   assert.equal(meta.pins.length, 1, "pins coexist");
   assert.equal(meta.title, "build");
+});
+
+// ── relative-offset layout (P2) ─────────────────────────────────────────────────────────────────────
+
+test("setMemberOffset stores {dx,dy} on a membership; memberOffsetFromMeta reads it (null when absent)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:offset";
+  assert.equal(setMemberOffset(repo, id, "sid-a", 30, -12), false, "not a member yet → no write");
+  addThreadMember(repo, id, "sid-a", 100);
+  assert.equal(memberOffsetFromMeta(readThreadMeta(repo, id), "sid-a"), null, "member but no offset → null");
+  assert.equal(setMemberOffset(repo, id, "sid-a", 30, -12), true, "first offset → wrote");
+  assert.deepEqual(memberOffsetFromMeta(readThreadMeta(repo, id), "sid-a"), { dx: 30, dy: -12 });
+  // joinedAt is preserved alongside the offset (the offset rides the same record).
+  assert.equal(readThreadMeta(repo, id).members["sid-a"].joinedAt, 100, "joinedAt untouched");
+});
+
+test("setMemberOffset is idempotent (unchanged / rounded), so a no-op save never churns the marker", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:offset-idem";
+  addThreadMember(repo, id, "sid-a", 100);
+  assert.equal(setMemberOffset(repo, id, "sid-a", 30, 40), true);
+  assert.equal(setMemberOffset(repo, id, "sid-a", 30, 40), false, "same value → no write");
+  assert.equal(setMemberOffset(repo, id, "sid-a", 30.2, 40.4), false, "rounds to the same whole pixel → no write");
+  assert.equal(setMemberOffset(repo, id, "sid-a", 31, 40), true, "a real move → writes");
+  assert.deepEqual(memberOffsetFromMeta(readThreadMeta(repo, id), "sid-a"), { dx: 31, dy: 40 });
+});
+
+test("setMemberOffset rounds to whole pixels (sub-pixel noise would defeat the unchanged-guard)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:offset-round";
+  addThreadMember(repo, id, "sid-a", 100);
+  setMemberOffset(repo, id, "sid-a", 30.6, -12.4);
+  assert.deepEqual(memberOffsetFromMeta(readThreadMeta(repo, id), "sid-a"), { dx: 31, dy: -12 });
+});
+
+test("memberOffsetFromMeta: null for a missing member / empty meta / partial record", () => {
+  assert.equal(memberOffsetFromMeta(null, "sid-x"), null);
+  assert.equal(memberOffsetFromMeta({}, "sid-x"), null);
+  assert.equal(memberOffsetFromMeta({ members: { "sid-x": { joinedAt: 1, dx: 5 } } }, "sid-x"), null, "dy missing → null");
 });
 
 // ── notification levels (P1, wakeable-substrate-plan W4) ─────────────────────────────────────────────

@@ -83,6 +83,14 @@ export interface ServerContext {
   sessionNameForSid: (records: Array<Record<string, unknown>>, sid: string) => string | null;
   threadMemberSids: (records: Array<Record<string, unknown>>, threadId: string) => string[];
   sessionThreads: (records: Array<Record<string, unknown>>, sid: string) => string[];
+  // P2 relative-offset layout: the session's primary thread + stored offset (for reopen-at-offset placement),
+  // and the debounced snapshot-save capture that recomputes each member's offset from its primary thread card.
+  sessionAnchor: (
+    repoPath: string,
+    records: Array<Record<string, unknown>>,
+    sid: string,
+  ) => { primaryThread: string | null; offset: { dx: number; dy: number } | null };
+  captureMemberOffsets: (boardId: string, records: Array<Record<string, unknown>> | null) => void;
   threadLog: (boardId: string, threadId: string) => ThreadMsg[];
   seedCursor: (mode: "full" | "future", log: ThreadMsg[]) => number;
   historyKey: (threadId: string, sid: string) => string;

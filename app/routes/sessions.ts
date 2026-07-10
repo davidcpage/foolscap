@@ -38,7 +38,7 @@ function sessionTranscriptDir(repoPath: string, id: string): string {
 }
 
 function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): void {
-  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionThreads } = getServerContext();
+  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionThreads, sessionAnchor } = getServerContext();
   let chosen = id;
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
@@ -58,8 +58,13 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   // The threads this session is a DURABLE member of, so the client can redraw the `member:open` edge(s) on
   // reopen: the card + its edge vanished on close, but the membership outlived them (delete-card-keep-session).
   // This only REPORTS existing membership — it changes no server state, keeping card-close/reopen display-only.
-  const threads = sessionThreads(boardSnapshotRecords(boardId) ?? [], chosen);
-  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated, threads });
+  const records = boardSnapshotRecords(boardId) ?? [];
+  const threads = sessionThreads(records, chosen);
+  // P2 relative-offset layout: the session's PRIMARY thread (earliest joined) + its stored offset, so the
+  // client places the reopened card at primaryThreadCardPos + offset instead of a fresh cascade spot. Null
+  // primaryThread / offset → the client falls back to spawnAt. A pure read (changes no server state).
+  const { primaryThread, offset } = sessionAnchor(repoPath, records, chosen);
+  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated, threads, primaryThread, offset });
 }
 
 // A human-legible label + counts for the dropdown, parsed from a transcript. The label prefers the

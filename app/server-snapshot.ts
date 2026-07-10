@@ -2,8 +2,11 @@ import { getServerContext } from "./server-context.js";
 import {
   addThreadMember,
   listThreads,
+  memberOffsetFromMeta,
   readThreadLog,
+  readThreadMeta,
   removeThreadMember,
+  setMemberOffset,
   threadMembersFromMeta,
 } from "./thread-ledger.js";
 import { readBoardSnapshot } from "./board-persist.js";
@@ -164,6 +167,108 @@ export function sessionThreads(records: Array<Record<string, unknown>>, sid: str
   // Durable members whose card/edge is gone: still a member of these threads (the card was only a view).
   for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
   return out;
+}
+
+// ── relative-offset layout (P2) ─────────────────────────────────────────────────────────────────────
+// The PRIMARY thread of a session is the one it joined EARLIEST (min joinedAt across its memberships) — a
+// session's card is anchored to (moves with / reopens relative to) this thread only; a secondary thread
+// moving must NOT move it. Ties (equal joinedAt) break on the smaller threadId so the choice is stable. The
+// joinedAt lives on each thread's marker (`members[sid].joinedAt`), so this reads one marker per membership;
+// callers keep it off hot paths (used on reopen + the debounced offset capture). Returns null when the
+// session has no durable memberships. `repoPath` is the board's canonical home; `records` the snapshot.
+export function primaryThreadForSession(
+  repoPath: string,
+  records: Array<Record<string, unknown>>,
+  sid: string,
+): string | null {
+  let best: string | null = null;
+  let bestJoinedAt = Infinity;
+  for (const threadId of sessionThreads(records, sid)) {
+    const rec = (readThreadMeta(repoPath, threadId)?.members ?? {})[sid] as { joinedAt?: number } | undefined;
+    const joinedAt = typeof rec?.joinedAt === "number" ? rec.joinedAt : Infinity;
+    if (joinedAt < bestJoinedAt || (joinedAt === bestJoinedAt && (best === null || threadId < best))) {
+      best = threadId;
+      bestJoinedAt = joinedAt;
+    }
+  }
+  return best;
+}
+
+// The PRIMARY thread of EVERY durable member, board-wide: { [sid]: primaryThreadId }. Computed purely from
+// the thread markers' `members[sid].joinedAt` (no snapshot needed — durable membership is the authority for
+// primacy), with the same min-joinedAt / smaller-threadId tie-break as primaryThreadForSession. The client's
+// move-with-thread reactor reads this to move a multi-thread session ONLY with its primary; it rides the
+// /api/threads response (refreshed on the threads feed, i.e. whenever a membership changes). Best-effort.
+export function allSessionAnchors(repoPath: string): Record<string, string> {
+  const best = new Map<string, { threadId: string; joinedAt: number }>();
+  for (const meta of listThreads(repoPath)) {
+    const members = (meta.members ?? {}) as Record<string, { joinedAt?: number }>;
+    for (const [sid, rec] of Object.entries(members)) {
+      const joinedAt = typeof rec?.joinedAt === "number" ? rec.joinedAt : Infinity;
+      const cur = best.get(sid);
+      if (!cur || joinedAt < cur.joinedAt || (joinedAt === cur.joinedAt && meta.threadId < cur.threadId))
+        best.set(sid, { threadId: meta.threadId, joinedAt });
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const [sid, { threadId }] of best) out[sid] = threadId;
+  return out;
+}
+
+// The session's PRIMARY thread id + its stored relative offset {dx,dy}, for the reopen-at-offset placement
+// (loader.ts openSession). `offset` is null when the primary membership carries no offset yet (a never-moved
+// card whose spawn placement hasn't been captured, or a session with no memberships) — the client then falls
+// back to its cascade/spawn spot. Pure read: touches no server state, keeping reopen display-only.
+export function sessionAnchor(
+  repoPath: string,
+  records: Array<Record<string, unknown>>,
+  sid: string,
+): { primaryThread: string | null; offset: { dx: number; dy: number } | null } {
+  const primaryThread = primaryThreadForSession(repoPath, records, sid);
+  const offset = primaryThread ? memberOffsetFromMeta(readThreadMeta(repoPath, primaryThread), sid) : null;
+  return { primaryThread, offset };
+}
+
+// The x,y of a node's layout record in a snapshot, or null (a node with no layout / off-canvas). Pure.
+function nodeLayoutPos(records: Array<Record<string, unknown>>, nodeId: string): { x: number; y: number } | null {
+  const l = records.find(
+    (r) => r.typeName === "layout" && (r as { nodeId?: unknown }).nodeId === nodeId,
+  ) as { x?: unknown; y?: unknown } | undefined;
+  return l && typeof l.x === "number" && typeof l.y === "number" ? { x: l.x, y: l.y } : null;
+}
+
+// Capture each durable member's relative offset from its PRIMARY thread card — called from the board-persist
+// SNAPSHOT-save hook (beside announceNewMemberships), so it runs on the debounced save that follows a
+// drag-end, NOT the per-frame drag (the brief's "persist on drag-end, not every pointermove"). For every
+// session that has a card on the board AND whose primary thread card is on the board, recompute
+// dx = sessionCardX - primaryThreadCardX (dy likewise) and store it on the primary membership. setMemberOffset
+// is idempotent (skips the write when unchanged), so a save where nothing moved — and, crucially, a
+// move-with-thread where the session card AND its thread card shifted by the SAME delta (offset preserved) —
+// writes nothing. This is also what SEEDS a freshly-spawned card's offset: the first save after a spawn
+// captures the server's placeWorkerCard placement. Best-effort; never throws (a bad marker just skips a sid).
+export function captureMemberOffsets(boardId: string, records: Array<Record<string, unknown>> | null): void {
+  const { boards } = getServerContext();
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath || !records) return;
+  // Every session card currently on the board, by sid (a session card carries its full sid as the title).
+  const seen = new Set<string>();
+  for (const r of records) {
+    if (r.typeName !== "node" || r.type !== "session" || typeof r.title !== "string" || !r.title) continue;
+    const sid = r.title;
+    if (seen.has(sid)) continue;
+    seen.add(sid);
+    const cardPos = nodeLayoutPos(records, String(r.id));
+    if (!cardPos) continue;
+    const primaryThread = primaryThreadForSession(repoPath, records, sid);
+    if (!primaryThread) continue; // no membership → nothing to anchor to
+    const threadPos = nodeLayoutPos(records, primaryThread);
+    if (!threadPos) continue; // primary thread card closed → keep the last-known offset
+    try {
+      setMemberOffset(repoPath, primaryThread, sid, cardPos.x - threadPos.x, cardPos.y - threadPos.y);
+    } catch {
+      /* best-effort — a single bad marker must not abort the whole capture pass */
+    }
+  }
 }
 
 // The records of a board's DURABLE snapshot (`.canvas/board/snapshot.json` — the same one hydrate

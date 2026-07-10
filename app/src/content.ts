@@ -418,14 +418,21 @@ let channelListValue: ChannelMeta[] | undefined;
 const channelListSubs = new Set<() => void>();
 let channelListInflight = false;
 
+// P2 relative-offset layout: the board-wide sid→primaryThread map, captured from the SAME /api/threads pull
+// (it rides that response) so it stays fresh on every threads-feed ping — exactly when a membership, and thus
+// a session's primacy, can change. The move-with-thread reactor reads primaryThreadOf(sid) to move a
+// multi-thread session only with its PRIMARY thread. Undefined until the first fetch lands.
+let sessionAnchorsValue: Record<string, string> | undefined;
+
 async function fetchChannelList(force = false): Promise<void> {
   if (channelListInflight && !force) return; // a normal lazy fetch de-dupes; a forced refresh always runs
   channelListInflight = true;
   try {
     const r = await fetch(`/api/threads?board=${activeBoardId()}`);
     if (r.ok) {
-      const d = (await r.json()) as { threads?: ChannelMeta[] };
+      const d = (await r.json()) as { threads?: ChannelMeta[]; anchors?: Record<string, string> };
       channelListValue = d.threads ?? [];
+      sessionAnchorsValue = d.anchors ?? {};
       for (const fn of channelListSubs) fn();
     }
   } catch {
@@ -433,6 +440,17 @@ async function fetchChannelList(force = false): Promise<void> {
   } finally {
     channelListInflight = false;
   }
+}
+
+// The PRIMARY thread id of a session (its earliest-joined thread), or undefined when unknown (anchors not
+// yet fetched, or the session isn't a durable member of any thread). The move-with-thread reactor uses this
+// to disambiguate a multi-thread session; a single-membership session doesn't need it. Reading it also ARMS
+// the threads feed + a first pull (idempotent), so the reactor gets a live-refreshed map without a rail card
+// being open.
+export function primaryThreadOf(sid: string): string | undefined {
+  hookThreadsFeed();
+  if (sessionAnchorsValue === undefined) void fetchChannelList();
+  return sessionAnchorsValue?.[sid];
 }
 
 // The rail card's ⟳ refresh button — re-pull and notify. A live push covers the common case
