@@ -91,6 +91,13 @@ test("POST /api/command with no tab on the board is 503 {delivered:0}", { skip: 
   assert.equal((await res.json()).delivered, 0);
 });
 
+// NOTE: the end-to-end contract for the Bug B/C id-echo (POST /api/command addNode without an id returns
+// the SERVER-minted node id) is exercised in a self-standing runner (npm run — see the branch handoff),
+// NOT here: this file targets the ALWAYS-ON 5173 server, which serves the main checkout's plugin code and
+// won't carry the fix until it's merged AND the dev server is manually restarted (the documented
+// dev-server-serves-stale-plugin-code footgun). Adding it here would red-fail the merge-on-green gate
+// against the still-stale shared server. The minting LOGIC is covered hermetically in middleware-hermetic.
+
 test("thread append lazy-seeds from the on-disk ledger — never mints seq 1 onto a real tail", { skip: !up && "no dev server on 5173" }, async () => {
   // Per-run id: the server's in-memory thread log is pinned for the process, so re-using one id
   // across runs would serve the previous run's in-memory tail instead of exercising the lazy seed.

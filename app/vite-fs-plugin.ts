@@ -20,7 +20,7 @@ import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { getWsClients, setServerContext } from "./server-context.js";
-import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
+import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
 import { boardSnapshotRecords, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
@@ -960,10 +960,15 @@ async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId:
     const nodeId = typeof (cmd.payload as { id?: unknown } | undefined)?.id === "string" ? String((cmd.payload as { id: string }).id) : null;
     if (nodeId) cascadeNodeEdges(boardId, nodeId, typeof cmd.actor === "string" ? cmd.actor : "system", origin);
   }
+  // Bug B/C: mint the created node/edge id SERVER-side when the caller omits it, so a headless caller can
+  // ADDRESS what it just created. ensureCommandId writes the id into `cmd.payload` (so the tab we broadcast
+  // to uses it rather than minting its own) and returns it to echo in the response. null for non-create
+  // commands, which carry no created id.
+  const createdId = ensureCommandId(cmd as { type?: string; payload?: unknown });
   // Broadcast to the board's tabs (+ fire the membership announce if it's a member:* edge). delivered=0
   // tells the agent no tab for THIS board is listening — the command went nowhere.
   const delivered = dispatchBusCommand(boardId, cmd as { type: string; payload?: Record<string, unknown>; actor?: string }, origin);
-  sendJson(res, delivered > 0 ? 200 : 503, { ok: delivered > 0, delivered, board: boardId });
+  sendJson(res, delivered > 0 ? 200 : 503, { ok: delivered > 0, delivered, board: boardId, ...(createdId ? { id: createdId } : {}) });
 }
 
 // The agents' board read, served from the DURABLE store (unification: the browser used to push a

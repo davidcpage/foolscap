@@ -35,6 +35,7 @@ const snap = await import("../server-snapshot.ts");
 const ctx = await import("../server-context.ts");
 const orch = await import("../server-orchestration.ts");
 const sess = await import("../server-sessions.ts");
+const delivery = await import("../server-delivery.ts");
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -193,6 +194,49 @@ test("threadMemberSids unions edge members with cardless durable members over a 
     ["ghost", "s1"],
     "edge member s1 and cardless durable member ghost are both members",
   );
+});
+
+// ── ensureCommandId: server-side id minting so a headless-created node/edge is ADDRESSABLE (Bug B/C) ──
+test("ensureCommandId mints a node id for an idless addNode, writes it into the payload, and returns it", () => {
+  let n = 0;
+  const cmd = { type: "addNode", actor: "user", payload: { type: "thread", title: "t" } };
+  const id = delivery.ensureCommandId(cmd, () => `uuid${++n}`);
+  assert.equal(id, "node:uuid1", "returns the minted node id");
+  assert.equal(cmd.payload.id, "node:uuid1", "and injects it into the broadcast payload so the tab uses it");
+  assert.equal(cmd.payload.type, "thread", "other payload fields are preserved");
+});
+
+test("ensureCommandId mints an edge id for an idless addEdge", () => {
+  const cmd = { type: "addEdge", payload: { from: "node:a", to: "node:b", type: "member:open" } };
+  const id = delivery.ensureCommandId(cmd, () => "abcd");
+  assert.equal(id, "edge:abcd");
+  assert.equal(cmd.payload.id, "edge:abcd");
+});
+
+test("ensureCommandId takes a node id for addShape too (it delegates to addNode in core)", () => {
+  const cmd = { type: "addShape", payload: {} };
+  assert.equal(delivery.ensureCommandId(cmd, () => "s1"), "node:s1");
+});
+
+test("ensureCommandId echoes a caller-supplied id unchanged and never re-mints", () => {
+  const cmd = { type: "addNode", payload: { id: "node:mine", type: "note" } };
+  const id = delivery.ensureCommandId(cmd, () => "SHOULD-NOT-BE-USED");
+  assert.equal(id, "node:mine");
+  assert.equal(cmd.payload.id, "node:mine");
+});
+
+test("ensureCommandId synthesizes a payload when a create command omits one entirely", () => {
+  const cmd = { type: "addNode" };
+  const id = delivery.ensureCommandId(cmd, () => "x1");
+  assert.equal(id, "node:x1");
+  assert.equal(cmd.payload.id, "node:x1");
+});
+
+test("ensureCommandId returns null and leaves the payload untouched for a non-create command", () => {
+  const cmd = { type: "removeNode", payload: { id: "node:gone" } };
+  assert.equal(delivery.ensureCommandId(cmd, () => "nope"), null, "removeNode has no created id");
+  assert.equal(cmd.payload.id, "node:gone", "its payload is not rewritten");
+  assert.equal(delivery.ensureCommandId({ type: "moveNode", payload: { id: "node:x" } }, () => "nope"), null);
 });
 
 test("sessionStatus resolves a running session with a fsState that has NO pendingPermissions (former ! site)", () => {
