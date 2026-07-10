@@ -558,6 +558,10 @@ const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
 const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
 const pendingPermissions = (fsState.pendingPermissions ??= new Map<string, PendingPermission>());
 const wsClients = (fsState.wsClients ??= new Set<WsClient>());
+// No local reader since P5 sub-step 3 moved the seed/spawn code out, but the extracted modules
+// (server-sessions, server-delivery, routes/threads, routes/sessions) all read it via `!` — this
+// init is what makes those assertions true.
+fsState.pendingHistoryMode ??= new Map<string, "full" | "future">();
 
 // One-time shape migration for a HOT RE-EVAL over a pre-SessionProc registry: entries pinned by the old
 // module carry a raw `child` (its stdout/exit handlers — old closures — still publish fine); wrap it so
