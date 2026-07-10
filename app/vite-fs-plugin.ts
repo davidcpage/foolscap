@@ -19,7 +19,7 @@ import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./boar
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
-import { setServerContext } from "./server-context.js";
+import { getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
 import { boardSnapshotRecords, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
@@ -498,7 +498,7 @@ export interface PendingPermission {
 // per-host HTTP/1.1 connection slots: ~3 tabs starved the pool and every further request (the document
 // itself, the template registry's fetches) queued forever with no error. A WebSocket lives in a separate,
 // much larger browser budget, so tabs no longer compete with real request/response traffic.
-interface WsClient {
+export interface WsClient {
   boardId: string; // fixed at connect (?board=) — bus commands fan out per board
   watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
   send(msg: unknown): void;
@@ -520,9 +520,9 @@ export interface CanvasFsState {
   sessionCleanupHooked: boolean;
   shuttingDown?: boolean; // set by killAll so the exit handler tells a clean server shutdown from a real crash
   threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
-  pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (added via ??= for old pinned state)
-  pendingPermissions?: Map<string, PendingPermission>; // permId → held permission prompt (??= likewise)
-  wsClients?: Set<WsClient>; // connected /api/ws tabs (added via ??= for old pinned state)
+  pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (lazy-init via getPendingAsks in server-context.ts)
+  pendingPermissions?: Map<string, PendingPermission>; // permId → held permission prompt (lazy-init via getPendingPermissions)
+  wsClients?: Set<WsClient>; // connected /api/ws tabs (lazy-init via getWsClients)
   // CANVAS_SESSION_HOST mode: the one client to the session-host sidecar. Pinned so an in-process re-eval
   // reuses the attached socket instead of a second `hello` bouncing off its own busy guard. `null` after a
   // busy rejection (another dev server holds the slot) → spawns fall back to in-process ownership.
@@ -541,7 +541,7 @@ export interface CanvasFsState {
   busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
-  pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member
+  pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
   lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
   pendingBusReplay?: Map<string, PendingBusCommand[]>; // boardId → creation commands that reached no live tab, replayed on the next ws-attach (Bug A/C persist-gap)
 }
@@ -564,13 +564,10 @@ const sessionWatchers = fsState.sessionWatchers;
 // `??=` so a fsState pinned BEFORE this field existed (a hot re-eval) gets the map added in place rather
 // than reading `undefined` and crashing — the object initializer above only runs when fsState is absent.
 const threadLogs = (fsState.threadLogs ??= new Map<string, ThreadMsg[]>());
-const pendingAsks = (fsState.pendingAsks ??= new Map<string, PendingAsk>());
-const pendingPermissions = (fsState.pendingPermissions ??= new Map<string, PendingPermission>());
-const wsClients = (fsState.wsClients ??= new Set<WsClient>());
-// No local reader since P5 sub-step 3 moved the seed/spawn code out, but the extracted modules
-// (server-sessions, server-delivery, routes/threads, routes/sessions) all read it via `!` — this
-// init is what makes those assertions true.
-fsState.pendingHistoryMode ??= new Map<string, "full" | "future">();
+// pendingAsks / pendingPermissions / wsClients / pendingHistoryMode are NOT aliased or `??=`-inited here:
+// each reaches its map through its lazy accessor in server-context.ts (getPendingAsks / getPendingPermissions
+// / getWsClients / getPendingHistoryMode), so no consumer — shell, engine module, route, or test fake —
+// depends on a shell load-order side effect. The shell's own wsClients readers below use getWsClients(fsState).
 
 // One-time shape migration for a HOT RE-EVAL over a pre-SessionProc registry: entries pinned by the old
 // module carry a raw `child` (its stdout/exit handlers — old closures — still publish fine); wrap it so
@@ -638,7 +635,7 @@ function attachWs(server: ViteDevServer): void {
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
         },
       };
-      wsClients.add(client);
+      getWsClients(fsState).add(client);
       {
         // The durable store assumes ONE writer tab per board (tabs mint their own event seq and race
         // the debounced snapshot save). A second connection is an ordinary event now (picker, probes),
@@ -685,7 +682,7 @@ function attachWs(server: ViteDevServer): void {
       ws.on("close", () => {
         clearInterval(ping);
         for (const close of client.watches.values()) close();
-        wsClients.delete(client);
+        getWsClients(fsState).delete(client);
       });
     });
   });
@@ -924,7 +921,7 @@ function busClientsFor(boardId: string): Set<SseClient> {
 // judged against (the app's tabs ride /api/ws; the SSE set is the compat path). The `tabs` liveness
 // signal on GET /api/canvas.
 function tabCountFor(boardId: string): number {
-  return (busClients.get(boardId)?.size ?? 0) + [...wsClients].filter((c) => c.boardId === boardId).length;
+  return (busClients.get(boardId)?.size ?? 0) + [...getWsClients(fsState)].filter((c) => c.boardId === boardId).length;
 }
 
 // T3c helper: tear down every edge touching `nodeId` before its removeNode lands. Emits a removeEdge over

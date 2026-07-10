@@ -1,5 +1,5 @@
 import type { IncomingMessage } from "node:http";
-import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, SessionBand, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, PendingAsk, PendingPermission, RootInfo, SessionBand, SnapNode, ThreadMsg, WsClient } from "./vite-fs-plugin.js";
 import type { WorkIntent } from "./work-intent.js";
 import type { ThreadMetaMarker } from "./thread-ledger.js";
 import type { EnsuredWorktree } from "./worktrees.js";
@@ -190,4 +190,26 @@ export function setServerContext(ctx: ServerContext): void {
 export function getServerContext(): ServerContext {
   if (!holder.ctx) throw new Error("ServerContext not initialized — setServerContext must run at plugin load");
   return holder.ctx;
+}
+
+// ── lazy fsState-map accessors ────────────────────────────────────────────────────────────────────
+// These four maps are declared OPTIONAL on CanvasFsState. They were historically initialized by a `??=`
+// block in vite-fs-plugin.ts's module body, so every consumer that reached them via a `!` non-null
+// assertion (`fsState.pendingAsks!`) silently depended on that shell init having run first — a load-order
+// coupling that a hermetic fake ServerContext, built without the shell, would crash against (undefined map).
+// Each accessor below initializes its map IN PLACE on first read, so any caller — the shell, an extracted
+// engine/route module, or a test fake — gets a live map with no ordering dependency. ONE accessor per map;
+// nothing else `??=`-inits these. (Pure functions of their fsState arg, so a test can call them on a bare
+// fake state without wiring the global context.)
+export function getPendingAsks(fsState: CanvasFsState): Map<string, PendingAsk> {
+  return (fsState.pendingAsks ??= new Map<string, PendingAsk>());
+}
+export function getPendingPermissions(fsState: CanvasFsState): Map<string, PendingPermission> {
+  return (fsState.pendingPermissions ??= new Map<string, PendingPermission>());
+}
+export function getWsClients(fsState: CanvasFsState): Set<WsClient> {
+  return (fsState.wsClients ??= new Set<WsClient>());
+}
+export function getPendingHistoryMode(fsState: CanvasFsState): Map<string, "full" | "future"> {
+  return (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
 }

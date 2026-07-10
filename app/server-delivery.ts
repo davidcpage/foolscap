@@ -1,4 +1,4 @@
-import { getServerContext } from "./server-context.js";
+import { getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
 import {
   appendThreadLine,
@@ -193,7 +193,7 @@ export function wakeThreadMembers(
 export function flushNudge(s: LiveSession): void {
   const { fsState, boardIdentity, boardSnapshotRecords, sessionThreads, threadNode, sendSessionInput } = getServerContext();
   const threadLogs = fsState.threadLogs;
-  const pendingAsks = fsState.pendingAsks!;
+  const pendingAsks = getPendingAsks(fsState);
   s.nudge = false;
   const boardId = boardIdentity(s.repoPath).boardId;
   const records = boardSnapshotRecords(boardId);
@@ -225,7 +225,7 @@ export function dispatchBusCommand(
 ): number {
   const { fsState, trackEmittedMembership } = getServerContext();
   const busClients = fsState.busClients!;
-  const wsClients = fsState.wsClients!;
+  const wsClients = getWsClients(fsState);
   const clients = busClients.get(boardId); // SSE compat path — the app's tabs ride /api/ws now
   const sockets = [...wsClients].filter((c) => c.boardId === boardId);
   const delivered = (clients?.size ?? 0) + sockets.length;
@@ -349,7 +349,7 @@ function maybeAnnounceMembership(
     ensureCoordinatorHeartbeat,
   } = getServerContext();
   const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
-  const pendingHistoryMode = fsState.pendingHistoryMode!;
+  const pendingHistoryMode = getPendingHistoryMode(fsState);
   const p = cmd.payload ?? {};
   if (cmd.type === "removeEdge") {
     if (typeof p.id === "string") {

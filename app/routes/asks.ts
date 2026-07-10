@@ -1,15 +1,15 @@
 import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
-import { getServerContext } from "../server-context.js";
+import { getPendingAsks, getServerContext } from "../server-context.js";
 import { exact, type GlobalRoute } from "./router.js";
 
 // ── §16 ask/reply + the pending-ask queue — god-file split, Phase 3 ─────────────────────────────────
 // A synchronous binary consultation over channel membership: /ask parks the asker's connection and nudges
 // ONLY the answerer; /reply (addressee only) resolves it and echoes a card-only Q→A summary; /api/asks is
 // the answerer's pending-consultation queue (parallel to /api/inbox). The held asks live in the shared
-// `fsState.pendingAsks` registry (reached via ServerContext — pinned + ??=-initialized at god-file load, so
-// always present by request time; the pendingPermissions precedent). settleAsk (resolve-once) is concern-
+// `fsState.pendingAsks` registry, reached via the getPendingAsks(fsState) lazy accessor (server-context.ts) —
+// initialized in place on first read, so no load-order dependency on the shell. settleAsk (resolve-once) is concern-
 // owned and moved here with the handlers. The ask/reply handlers are exported so the thread-action route
 // (routes/threads.ts) dispatches them from the shared `/api/thread/<id>/<action>` arm.
 
@@ -18,7 +18,7 @@ const ASK_TIMEOUT_MAX = 60_000; // capped under the agent's Bash tool timeout so
 
 // Resolve a parked /ask connection exactly once (reply or timeout), clearing its timer and registry entry.
 export function settleAsk(askId: string, payload: Record<string, unknown>): void {
-  const pendingAsks = getServerContext().fsState.pendingAsks!;
+  const pendingAsks = getPendingAsks(getServerContext().fsState);
   const ask = pendingAsks.get(askId);
   if (!ask) return;
   clearTimeout(ask.timer);
@@ -40,7 +40,7 @@ export async function handleThreadAsk(
   threadId: string,
 ): Promise<void> {
   const { boardSnapshotRecords, threadNode, threadMemberSids, liveSessions, flushNudge } = getServerContext();
-  const pendingAsks = getServerContext().fsState.pendingAsks!;
+  const pendingAsks = getPendingAsks(getServerContext().fsState);
   let body: { from?: unknown; to?: unknown; text?: unknown; timeoutMs?: unknown };
   try {
     body = JSON.parse(await readBody(req));
@@ -75,7 +75,7 @@ export async function handleThreadAsk(
 // GET /api/asks?session=<sid> — the answerer's pending-consultation queue (parallel to /api/inbox). The
 // HELD asks addressed to this session; read-only, resolves nothing.
 function handleAsksRead(res: ServerResponse, sid: string | null): void {
-  const pendingAsks = getServerContext().fsState.pendingAsks!;
+  const pendingAsks = getPendingAsks(getServerContext().fsState);
   if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
   const asks = [...pendingAsks.values()]
     .filter((a) => a.to === sid)
@@ -93,7 +93,7 @@ export async function handleThreadReply(
   threadId: string,
 ): Promise<void> {
   const { appendThreadMsg } = getServerContext();
-  const pendingAsks = getServerContext().fsState.pendingAsks!;
+  const pendingAsks = getPendingAsks(getServerContext().fsState);
   let body: { from?: unknown; askId?: unknown; text?: unknown };
   try {
     body = JSON.parse(await readBody(req));
