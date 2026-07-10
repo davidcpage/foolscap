@@ -35,15 +35,9 @@ import {
   defaultDocPath,
   addProvenanceCard,
   addSessionsCard,
-  SESSIONS_HUD_W,
-  SESSIONS_HUD_H,
   addChannelsCard,
-  CHANNELS_HUD_W,
-  CHANNELS_HUD_H,
   addStickyNote,
   addUsageCard,
-  USAGE_HUD_W,
-  USAGE_HUD_H,
   addWeatherCard,
   clearBoard,
   exportBoard,
@@ -65,6 +59,7 @@ import {
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
+import { DEFAULT_HUD, resolveHudPosition } from "../hud-layout.js";
 import { applyScrollKey, noteCameraMoved, notePointerAim, observeWheelGesture, scrollableIn } from "./interior";
 import { bindPeek } from "./peek";
 import { preserveViewState } from "./viewstate";
@@ -157,37 +152,45 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
   return { m, undo, persistence };
 }
 
-// Ensure the HUD chrome exists on this board. Usage + sessions + clock + the Threads indicator (channels)
-// are HUD-only elements now (hud.ts) — removed from the Add menu — so a board that never had them (a fresh
-// one, or one cleared) still gets the corner chrome. Idempotent: the seeders use stable singleton ids, and
-// we skip them if the node is already present, so a returning board neither duplicates nor re-logs. Seeded
-// hidden — the HUD group is off until the Alt tap, exactly like the minimap; the cards' stored x/y are a
-// headless fallback the corner geometry overrides at render.
-//
-// The sessions card (like the Threads card before it) was a WORLD card before this change, so a returning
-// board can carry a pinned-to-canvas node:sessions. Migrate it into the HUD in place: flip its anchor to
-// "screen" (HUD membership then corner-locks it) and reset it to the compact HUD box, so the old canvas card
-// doesn't linger as a duplicate. The usage card was already screen-anchored but at the old 300×320 world
-// size — reset it to the trimmed left-column box so its stored record matches the derived HUD placement.
-function migrateHudCard(m: InteractionManager, id: Id<"node">, w: number, h: number): void {
+// The seeders for the HUD chrome cards, keyed by the default-layout spec's `type`. Each mints its stable
+// singleton node (idempotent — a re-add on an existing id is skipped by the guard in seedHud).
+const HUD_SEEDERS: Record<string, (m: InteractionManager) => void> = {
+  usage: addUsageCard,
+  sessions: addSessionsCard,
+  clock: addClock,
+  channels: addChannelsCard,
+};
+
+// Seat one HUD card at its default screen position/size (compare-then-commit): only logs a setAnchor when
+// the stored layout actually differs, so a returning board that already matches is a NO-OP. This is what
+// makes HUD positions REAL, PERSISTED data (records.ts anchor:"screen") rather than values derived at render,
+// and it migrates a legacy card in place: a pre-unification world card (anchor !== "screen") or one left at a
+// stale/bogus x/y (positions were derived-not-stored before, so they were never meaningful) is normalized to
+// its default slot. Idempotent across a same-viewport reload; the two viewport-relative cards (clock centre,
+// channels right) re-seat only if the window width changed since last load. (A later phase adds drag/resize
+// of HUD cards; that phase must stop re-asserting a moved card's position here — today nothing moves them.)
+function seatHudCard(m: InteractionManager, id: Id<"node">, pos: { x: number; y: number; w: number; h: number }): void {
   const l = m.editor.store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
-  if (l && (l.anchor !== "screen" || l.w !== w || l.h !== h)) {
-    m.editor.commit({
-      type: "setAnchor",
-      actor: "system",
-      payload: { id, anchor: "screen", x: 16, y: 16, w, h },
-    });
+  if (!l) return;
+  if (l.anchor !== "screen" || l.x !== pos.x || l.y !== pos.y || l.w !== pos.w || l.h !== pos.h) {
+    m.editor.commit({ type: "setAnchor", actor: "system", payload: { id, anchor: "screen", ...pos } });
   }
 }
+
+// Ensure the HUD chrome exists and sits at its default layout on this board. Usage + sessions + clock + the
+// Threads indicator (channels) are HUD-only elements (hud.ts) — not in the Add menu — so a board that never
+// had them (a fresh one, or one cleared) still gets the corner chrome. The card SET and its default
+// positions/sizes come from the seed spec (hud-layout.js); seatHudCard makes each card's stored screen
+// x/y/w/h match, seeding a fresh card and migrating a legacy one alike. Idempotent: stable singleton ids mean
+// no duplicate nodes, and the compare-then-commit seat re-logs nothing when the board already matches.
 function seedHud(m: InteractionManager): void {
   const store = m.editor.store;
-  if (!store.get<"node">("node:usage" as Id<"node">)) addUsageCard(m);
-  else migrateHudCard(m, "node:usage" as Id<"node">, USAGE_HUD_W, USAGE_HUD_H);
-  if (!store.get<"node">("node:clock" as Id<"node">)) addClock(m);
-  if (!store.get<"node">("node:sessions" as Id<"node">)) addSessionsCard(m);
-  else migrateHudCard(m, "node:sessions" as Id<"node">, SESSIONS_HUD_W, SESSIONS_HUD_H);
-  if (!store.get<"node">("node:channels" as Id<"node">)) addChannelsCard(m);
-  else migrateHudCard(m, "node:channels" as Id<"node">, CHANNELS_HUD_W, CHANNELS_HUD_H);
+  const viewportW = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1440;
+  for (const card of DEFAULT_HUD) {
+    const id = card.id as Id<"node">;
+    if (!store.get<"node">(id)) HUD_SEEDERS[card.type]?.(m); // create the missing chrome card (stable id)
+    seatHudCard(m, id, resolveHudPosition(card, viewportW));
+  }
 }
 
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.

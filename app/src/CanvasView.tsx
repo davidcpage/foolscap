@@ -4,7 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
-import { HUD_CARDS, hudPlacementFor, isHudCard } from "./hud";
+import { HUD_CARDS, hudChrome, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -87,12 +87,14 @@ function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
   const floating = layouts.filter((l) => l.anchor === "screen");
-  // Two kinds of screen-anchored card share this layer: HUD chrome (usage/clock — hud.ts), which is
-  // corner-locked and toggled as a group with the minimap, and ordinary user-PINNED cards (the `p` key),
-  // which are draggable and always shown. Split them so the HUD toggle only touches the former.
+  // Two kinds of screen-anchored card share this layer AND the same frame (NodeView's ScreenCardFrame): HUD
+  // chrome (usage/sessions/clock/channels — hud.ts), corner-locked and toggled as a group with the minimap,
+  // and ordinary user-PINNED cards (the `p` key), draggable and always shown. Split them so the HUD toggle
+  // only touches the former; both position from their own stored layout x/y/w/h now.
   const free = floating.filter((l) => !isHudCard(l.nodeId));
-  // HUD cards, each corner-anchored by its own derived placement (hud.ts): usage top-left, clock
-  // top-centre, threads top-right under the minimap.
+  // HUD cards render through the same frame with a chrome descriptor (frame style only); position comes from
+  // the card's stored layout, seeded from the default-layout spec (hud-layout.js). Iterated in HUD_CARDS
+  // order for a deterministic DOM order among equal z.
   const hud = hudShown
     ? HUD_CARDS.map((id) => floating.find((l) => l.nodeId === id)).filter((l): l is NonNullable<typeof l> => !!l)
     : [];
@@ -103,9 +105,9 @@ function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean
         <NodeView key={l.nodeId} m={m} id={l.nodeId} screen />
       ))}
       {hud.map((l) => {
-        const placement = hudPlacementFor(l.nodeId);
-        if (!placement) return null;
-        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={placement} />;
+        const chrome = hudChrome(l.nodeId);
+        if (!chrome) return null;
+        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} />;
       })}
     </div>
   );

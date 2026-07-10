@@ -11,7 +11,7 @@ import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
 import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
-import { type HudPlacement } from "./hud";
+import { HUD_GAP, type HudChrome } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
@@ -59,10 +59,11 @@ export const NodeView = memo(function NodeView({
   m: InteractionManager;
   id: Id<"node">;
   screen?: boolean;
-  // When set (only in the screen layer), the card is corner-LOCKED HUD chrome (hud.ts) instead of a
-  // free-floating pinned card: rendered in HudFrame at this derived screen placement rather than the
-  // draggable FloatingFrame. The placement (a viewport corner + optional size/frameless) tracks a resize.
-  hud?: HudPlacement;
+  // When set (only in the screen layer), the card is corner-LOCKED HUD chrome (hud.ts): the SAME
+  // ScreenCardFrame as a free pinned card, but locked (not draggable) and drawn as the neutral HUD panel.
+  // The descriptor is frame STYLE only (frameless / viewport-height-capped) — position/size come from the
+  // card's own stored layout record now, exactly like a pinned card (no more derived corner placement).
+  hud?: HudChrome;
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -129,94 +130,55 @@ export const NodeView = memo(function NodeView({
   }
 
   if (!screen) return card;
-  // A HUD card is corner-locked chrome (HudFrame); every other screen card is a draggable pinned card
-  // (FloatingFrame). Both wrap the SAME card render above — the frame only owns placement + drag.
-  return hud ? (
-    <HudFrame id={id} layout={layout} placement={hud}>{card}</HudFrame>
-  ) : (
-    <FloatingFrame m={m} id={id} layout={layout} selected={selected}>{card}</FloatingFrame>
+  // Every screen-anchored card — user-pinned or HUD chrome — renders through the ONE ScreenCardFrame,
+  // positioned from its own stored layout x/y/w/h. The `hud` descriptor (present only for chrome) locks it
+  // and picks the HUD panel styling; absent, it's a draggable pinned card. Same card render above either way.
+  return (
+    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud}>
+      {card}
+    </ScreenCardFrame>
   );
 });
 
-// The wrapper for a corner-locked HUD card (usage / clock / threads — see hud.ts). Unlike FloatingFrame it
-// is NOT draggable and NOT selectable: it's heads-up chrome, so its position is DERIVED (a viewport corner,
-// passed in as `placement`), not a logged x/y the user can move. Anchoring via CSS on the full-viewport
-// .screen-layer means a window resize re-lays it out with no JS. Like the
-// minimap, a mousedown preventDefaults so a press on the card doesn't blur the canvas (keeping the
-// number-key / Alt-tap shortcuts live) — but ONLY off an interactive interior: the Threads indicator's rows
-// are focusable (tabindex) and drag-out-able (draggable="true"), and preventDefault on mousedown would
-// suppress focus and native drag start. So skip it when the press lands on an interactive descendant (the
-// same data-interactive seam FloatingFrame/TemplateCard use), leaving click/dblclick/drag-out intact. The
-// card fills the frame exactly as a floating card does.
-function HudFrame({
-  id,
-  layout,
-  placement,
-  children,
-}: {
-  id: Id<"node">;
-  layout: LayoutRecord;
-  placement: HudPlacement;
-  children: React.ReactNode;
-}) {
-  // Build the anchored style from the placement: `top` plus ONE horizontal anchor (centreX → centred with a
-  // translate; else right; else left). Size falls back to the logged w/h but a placement may override it
-  // (the clock renders compact; the Threads card matches the minimap width). `maxHeight` caps the frame so
-  // a long interior scrolls inside the viewport instead of overflowing the bottom.
-  const style: React.CSSProperties = {
-    top: placement.top,
-    width: placement.width ?? layout.w,
-    height: placement.height ?? layout.h,
-    zIndex: layout.z,
-  };
-  if (placement.centreX) {
-    style.left = "50%";
-    style.transform = "translateX(-50%)";
-  } else if (placement.right !== undefined) {
-    style.right = placement.right;
-  } else {
-    style.left = placement.left ?? 0;
-  }
-  if (placement.maxHeight) style.maxHeight = placement.maxHeight;
-  return (
-    <div
-      data-node-id={id}
-      className={`hud-frame${placement.frameless ? " frameless" : ""}`}
-      style={style}
-      onMouseDown={(e) => {
-        if (e.target instanceof Element && e.target.closest("input, textarea, button, [data-interactive]")) return;
-        e.preventDefault();
-      }}
-    >
-      {children}
-    </div>
-  );
-}
-
-// The wrapper for a floating (screen-anchored) card: a screen-positioned box that the card fills. It
-// owns the things the engine does for a WORLD card but won't for chrome — moving it, and keeping the
-// press off the canvas. Per the interior-seam note, React's synthetic stopPropagation can't stop the
-// canvas's NATIVE bindDom listener, so the drag is wired with native listeners: a pointerdown on the
-// frame stops the canvas seeing it (no marquee behind the card), selects the card (so Delete / the
-// pin-toggle key apply), and — once the pointer actually moves — opens ONE move gesture that coalesces
-// every frame into a single diff / IntentEvent / undo step, exactly like a world drag. A press that
-// lands on an interactive interior (an input, a button, the minimap's own map surface, which stops the
-// event itself) never reaches this listener, so those keep their own behaviour.
-function FloatingFrame({
+// The ONE wrapper for a screen-anchored (anchor "screen") card — the pinned-cards-and-HUD unification (P1).
+// Position and size come from the card's stored layout x/y/w/h for BOTH kinds: a HUD card no longer derives a
+// viewport corner from a switch, its position is seeded as real data (hud-layout.js / seedHud). The two kinds
+// differ only in the frame:
+//   • A free PINNED card (hud absent) is draggable + resizable. It owns the things the engine does for a
+//     WORLD card but won't for chrome — moving it, and keeping the press off the canvas. Per the interior-seam
+//     note, React's synthetic stopPropagation can't stop the canvas's NATIVE bindDom listener, so the drag is
+//     wired with native listeners: a pointerdown stops the canvas seeing it (no marquee behind the card),
+//     selects the card (so Delete / the pin-toggle key apply), and — once the pointer actually moves — opens
+//     ONE move gesture that coalesces every frame into a single diff / IntentEvent / undo step, like a world
+//     drag. A press on an interactive interior (an input, a button, the minimap surface — which stops the
+//     event itself) never reaches this listener, so those keep their own behaviour.
+//   • A HUD card (hud present) is corner-locked chrome: NOT draggable and NOT selectable (drag/resize of HUD
+//     cards is a later phase), drawn as the neutral translucent HUD panel (optionally frameless, or height-
+//     capped so a long list scrolls inside the viewport). Like the minimap, a mousedown preventDefaults so a
+//     press doesn't blur the canvas (keeping the number-key / Alt-tap shortcuts live) — but ONLY off an
+//     interactive interior: the Threads/sessions rows are focusable (tabindex) and drag-out-able
+//     (draggable="true"), and preventDefault would suppress focus and native drag start, so skip it when the
+//     press lands on an interactive descendant (the same data-interactive seam TemplateCard uses).
+// The card fills the frame in both cases.
+function ScreenCardFrame({
   m,
   id,
   layout,
   selected,
+  hud,
   children,
 }: {
   m: InteractionManager;
   id: Id<"node">;
   layout: LayoutRecord;
   selected: boolean;
+  hud?: HudChrome;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const locked = !!hud;
   useEffect(() => {
+    if (locked) return; // HUD chrome is locked — no move gesture (drag/resize is a later phase)
     const el = ref.current;
     if (!el) return;
     const store = m.editor.store;
@@ -245,16 +207,35 @@ function FloatingFrame({
     };
     el.addEventListener("pointerdown", onDown);
     return () => el.removeEventListener("pointerdown", onDown);
-  }, [m, id]);
+  }, [m, id, locked]);
+  const style: React.CSSProperties = {
+    left: layout.x,
+    top: layout.y,
+    width: layout.w,
+    height: layout.h,
+    zIndex: layout.z,
+  };
+  // A height-capped HUD card leaves a HUD_GAP margin at the viewport bottom; its interior is already a scroll
+  // container, so a capped frame height makes a long list scroll (the old HudFrame maxHeight, derived here
+  // from the stored top instead of a per-card calc string).
+  if (hud?.capToViewport) style.maxHeight = `calc(100vh - ${layout.y + HUD_GAP}px)`;
   return (
     <div
       ref={ref}
       data-node-id={id}
-      className="floating-frame"
-      style={{ left: layout.x, top: layout.y, width: layout.w, height: layout.h, zIndex: layout.z }}
+      className={hud ? `hud-frame${hud.frameless ? " frameless" : ""}` : "floating-frame"}
+      style={style}
+      onMouseDown={
+        locked
+          ? (e) => {
+              if (e.target instanceof Element && e.target.closest("input, textarea, button, [data-interactive]")) return;
+              e.preventDefault();
+            }
+          : undefined
+      }
     >
       {children}
-      {selected && <FloatingResizeHandles m={m} id={id} />}
+      {!locked && selected && <FloatingResizeHandles m={m} id={id} />}
     </div>
   );
 }
@@ -262,11 +243,11 @@ function FloatingFrame({
 // Screen-space resize handles for a floating (pinned) card. A pinned card lives in the screen layer,
 // where its layout x/y/w/h are SCREEN pixels — so SelectionOverlay (which works in PAGE space) drops it
 // and its world-card handles never render (that was Bug B: a pinned card could move but not resize). These
-// handles live INSIDE the FloatingFrame instead and own their own resize gesture the way the frame owns
-// its move gesture: they drive the SAME clamped resizeBox corner math world cards use, but with a straight
-// screen-px delta (the screen layer has no camera transform, so no screenToPage). Wired with NATIVE
+// handles live INSIDE the ScreenCardFrame (pinned cards only) and own their own resize gesture the way the
+// frame owns its move gesture: they drive the SAME clamped resizeBox corner math world cards use, but with a
+// straight screen-px delta (the screen layer has no camera transform, so no screenToPage). Wired with NATIVE
 // pointerdown (not React synthetic) and a stopPropagation, so the press pre-empts the frame's own move
-// listener AND the canvas's native listener before either fires — the same reason FloatingFrame's move is
+// listener AND the canvas's native listener before either fires — the same reason the frame's move is
 // native. Only mounted when the card is selected, mirroring the world SelectionOverlay's lone-selection
 // handles; the container is pointer-transparent so only the four dots take the press.
 const FLOAT_CORNERS: readonly Corner[] = ["nw", "ne", "sw", "se"];
