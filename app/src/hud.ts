@@ -10,9 +10,9 @@
 // yet; drag/resize is a later phase), toggled as a group, and drawn as the neutral translucent HUD panel
 // (optionally frameless, or viewport-height-capped so a long list scrolls). A user-PINNED card (the `p` key)
 // is NOT a HUD card, so it stays draggable and always visible, unaffected by the HUD toggle.
-import { DEFAULT_HUD, HUD_GAP, hudChromeFor, isHudCard as _isHudCard } from "../hud-layout.js";
+import { DEFAULT_HUD, HUD_GAP, HUD_SNAP, hudChromeFor, isHudCard as _isHudCard } from "../hud-layout.js";
 
-export { HUD_GAP };
+export { HUD_GAP, HUD_SNAP };
 export const HUD_CARDS: string[] = DEFAULT_HUD.map((c) => c.id);
 export function isHudCard(id: string): boolean {
   return _isHudCard(id);

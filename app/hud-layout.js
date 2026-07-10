@@ -16,6 +16,12 @@
 export const HUD_MARGIN = 16; // viewport inset shared by the corner cards (mirrors .minimap-hud top/right)
 export const HUD_GAP = 12; // vertical gap between stacked chrome
 
+// The fine grid step drag/resize snap to while a HUD card is being edited (Alt-held edit mode). Deliberately
+// FINER than the 24px visual dot grid (CanvasView BASE) so the human gets pixel-level alignment control with
+// no granularity UI — an 8px lattice divides the 24px grid evenly (every third snap lands on a grid line) and
+// divides HUD_MARGIN (16) and the column width (240), so the default cards already sit on the lattice.
+export const HUD_SNAP = 8;
+
 // Corner geometry the stacked cards derive from — kept here, deterministic, not DOM-measured. The minimap
 // block MIRRORS `.minimap-hud` in style.css (width/height): the right column sits flush one gap beneath the
 // minimap and both columns match its width, so change one, change both.

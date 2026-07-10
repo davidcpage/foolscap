@@ -152,6 +152,19 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
   return { m, undo, persistence };
 }
 
+// How long Alt must be held before it means "edit the HUD" rather than "tap to toggle visibility". Short
+// enough that a deliberate hold engages promptly, long enough that a quick show/hide tap never trips it.
+const HUD_HOLD_MS = 250;
+
+// Readable menu labels for the HUD singletons, keyed by the seed spec's card `type` (hud-layout.js). Used by
+// the right-click menu's HUD section; the ids + set come from DEFAULT_HUD so this stays a pure display map.
+const HUD_LABELS: Record<string, string> = {
+  usage: "Usage",
+  sessions: "Sessions",
+  clock: "Clock",
+  channels: "Threads",
+};
+
 // The seeders for the HUD chrome cards, keyed by the default-layout spec's `type`. Each mints its stable
 // singleton node (idempotent — a re-add on an existing id is skipped by the guard in seedHud).
 const HUD_SEEDERS: Record<string, (m: InteractionManager) => void> = {
@@ -161,36 +174,65 @@ const HUD_SEEDERS: Record<string, (m: InteractionManager) => void> = {
   channels: addChannelsCard,
 };
 
-// Seat one HUD card at its default screen position/size (compare-then-commit): only logs a setAnchor when
-// the stored layout actually differs, so a returning board that already matches is a NO-OP. This is what
-// makes HUD positions REAL, PERSISTED data (records.ts anchor:"screen") rather than values derived at render,
-// and it migrates a legacy card in place: a pre-unification world card (anchor !== "screen") or one left at a
-// stale/bogus x/y (positions were derived-not-stored before, so they were never meaningful) is normalized to
-// its default slot. Idempotent across a same-viewport reload; the two viewport-relative cards (clock centre,
-// channels right) re-seat only if the window width changed since last load. (A later phase adds drag/resize
-// of HUD cards; that phase must stop re-asserting a moved card's position here — today nothing moves them.)
-function seatHudCard(m: InteractionManager, id: Id<"node">, pos: { x: number; y: number; w: number; h: number }): void {
+// Seat one HUD card at its default screen position/size — but ONLY when it isn't already an authoritative
+// screen card. This is the P2 carry-over the P1 worker flagged: once drag/resize can move a HUD card, seedHud
+// must SEED and MIGRATE, never OVERWRITE a user-set position (or the card snaps back to default on every
+// reload — a move that doesn't stick). So:
+//   • `fresh` (we just minted the node this load) → place it at the spec default (the seeder drops it at a
+//     generic fallback spot + its own w/h; this normalizes it to the HUD slot).
+//   • a LEGACY non-screen card (anchor !== "screen": a pre-unification world card) → migrate it into the
+//     unified model at its default slot.
+//   • a card ALREADY anchored to the screen → AUTHORITATIVE: its stored x/y/w/h is either the default we
+//     seeded or a spot the user dragged/resized it to. Leave it exactly as-is — this is what makes a moved
+//     HUD card persist across reload. (The one-time pre-unification migration of stale screen positions was
+//     P1's job and is already done on any board that has loaded the P1 build.)
+// Compare-then-commit within the seed/migrate branch so a board that already matches the default re-logs
+// nothing (idempotent across reload + StrictMode).
+function seatHudCard(
+  m: InteractionManager,
+  id: Id<"node">,
+  pos: { x: number; y: number; w: number; h: number },
+  fresh: boolean,
+): void {
   const l = m.editor.store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
   if (!l) return;
+  if (!fresh && l.anchor === "screen") return; // authoritative screen card — never overwrite (persist moves)
   if (l.anchor !== "screen" || l.x !== pos.x || l.y !== pos.y || l.w !== pos.w || l.h !== pos.h) {
     m.editor.commit({ type: "setAnchor", actor: "system", payload: { id, anchor: "screen", ...pos } });
   }
 }
 
 // Ensure the HUD chrome exists and sits at its default layout on this board. Usage + sessions + clock + the
-// Threads indicator (channels) are HUD-only elements (hud.ts) — not in the Add menu — so a board that never
-// had them (a fresh one, or one cleared) still gets the corner chrome. The card SET and its default
-// positions/sizes come from the seed spec (hud-layout.js); seatHudCard makes each card's stored screen
-// x/y/w/h match, seeding a fresh card and migrating a legacy one alike. Idempotent: stable singleton ids mean
-// no duplicate nodes, and the compare-then-commit seat re-logs nothing when the board already matches.
+// Threads indicator (channels) are HUD elements (hud.ts) — so a board that never had them (a fresh one, or one
+// cleared) still gets the corner chrome. The card SET and its default positions/sizes come from the seed spec
+// (hud-layout.js); seatHudCard seeds a fresh card and migrates a legacy one but leaves a user-moved screen
+// card alone. Idempotent: stable singleton ids mean no duplicate nodes, and the seat re-logs nothing once the
+// board matches.
 function seedHud(m: InteractionManager): void {
   const store = m.editor.store;
   const viewportW = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1440;
   for (const card of DEFAULT_HUD) {
     const id = card.id as Id<"node">;
-    if (!store.get<"node">(id)) HUD_SEEDERS[card.type]?.(m); // create the missing chrome card (stable id)
-    seatHudCard(m, id, resolveHudPosition(card, viewportW));
+    const fresh = !store.get<"node">(id);
+    if (fresh) HUD_SEEDERS[card.type]?.(m); // create the missing chrome card (stable id)
+    seatHudCard(m, id, resolveHudPosition(card, viewportW), fresh);
   }
+}
+
+// Ensure ONE HUD singleton exists — the right-click menu's "reveal the singleton" action. A HUD singleton
+// is normally always present (seedHud runs on every board load), but a user can delete its card; this
+// re-mints it at its default slot on demand, reusing the same seed/seat path as seedHud so it's identical to
+// a fresh board's. A NO-OP when the card is already present (stable id + compare-then-commit seat), so it
+// never duplicates — the true-singleton guarantee. Making it VISIBLE (revealing a hidden HUD group) is the
+// caller's job (it flips hudMode); this only guarantees existence at the right place.
+function ensureHudCard(m: InteractionManager, id: string): void {
+  const spec = DEFAULT_HUD.find((c) => c.id === id);
+  if (!spec) return;
+  const fresh = !m.editor.store.get<"node">(id as Id<"node">);
+  if (fresh) HUD_SEEDERS[spec.type]?.(m);
+  const viewportW = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1440;
+  // fresh → place at default; an existing (possibly user-moved) card is left where it is — reveal never re-seats.
+  seatHudCard(m, id as Id<"node">, resolveHudPosition(spec, viewportW), fresh);
 }
 
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.
@@ -234,44 +276,91 @@ function Board({ m, undo, persistence }: Engine) {
   const views = useMemo(() => new ViewStore(), []);
   const [toast, setToast] = useState<{ text: string; seq: number } | null>(null);
   const toastSeq = useRef(0);
-  // TAP Alt/Option to toggle the whole HUD GROUP On ↔ Off: the minimap plus the corner-pinned usage +
-  // clock cards (hud.ts) show/hide as one. A simple explicit toggle, no auto-show/fade — the HUD is just
-  // in the state you put it in. "Tap" = Alt pressed and released ALONE — if another key OR a pointer press
-  // happens while Alt is down it's a combo (an alt-drag wire, …) and must not toggle. Tracked window-wide;
-  // a click or blur clears the pending tap so it never fires spuriously.
+  // Alt/Option drives the HUD, split by gesture (seq 20/22 interaction model):
+  //  • TAP (press + release ALONE, quickly) → toggle the whole HUD GROUP On ↔ Off: the minimap plus the
+  //    corner-pinned usage/sessions/clock/channels cards (hud.ts) show/hide as one. A simple explicit
+  //    persistent toggle, no auto-show/fade — visibility is just where you left it. A tap is only a tap if
+  //    nothing else happened while Alt was down (another key → a combo like an alt-drag wire) and it was
+  //    released before the hold threshold.
+  //  • HOLD (Alt down past HUD_HOLD_MS) → HUD EDIT MODE: while held, HUD cards drag/resize with fine grid
+  //    snap (NodeView) and `p` toggles a card in/out of the HUD (onKeyDown). Outside the hold the HUD is
+  //    fully inert. Editing needs the cards visible, so entering edit force-shows a hidden HUD and restores
+  //    it on release — keeping the TAP the sole PERSISTENT visibility control (a hold never leaves the HUD
+  //    in a new visibility state on its own).
   const [hudMode, setHudMode] = useState<0 | 1>(0);
+  const [hudEdit, setHudEdit] = useState(false);
+  const hudModeRef = useRef<0 | 1>(0);
+  hudModeRef.current = hudMode;
   useEffect(() => {
-    let pristine = false; // Alt is down with nothing else since → still a tap candidate
+    let altDown = false; // Alt physically held right now
+    let tap = false; // Alt down with nothing else since → still a tap candidate
+    let entered = false; // this Alt press crossed the hold threshold → edit mode engaged
+    let forcedShow = false; // edit mode force-showed a hidden HUD → hide it again on release
+    let holdTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearHold = () => { if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; } };
+    const enterEdit = () => {
+      entered = true;
+      tap = false; // a hold is not a tap — releasing must not toggle visibility
+      setHudEdit(true);
+      if (!hudModeRef.current) { forcedShow = true; setHudMode(1); } // reveal the cards to edit them
+    };
     const down = (e: KeyboardEvent) => {
       if (e.key === "Alt") {
-        if (!e.repeat) pristine = true;
-      } else if (e.code !== "KeyZ") {
-        // Any other key → the Alt press is a combo, not a tap. The peek key (z, peek.ts) is EXEMPT so
-        // the HUD can still be toggled mid-peek: holding z auto-repeats keydown, and each repeat
-        // would otherwise reset pristine and swallow the Alt-tap. Match e.CODE (the physical key), not
-        // e.key — while Alt/Option is held the repeating z arrives as an Option-MODIFIED character
-        // (e.key "Ω" on macOS), not "z"/"Z", so an e.key check misses it and the toggle stays broken.
-        // z carries no modifier as a real gesture (peek bails on any altKey), so exempting it is safe.
-        pristine = false;
+        if (e.repeat || altDown) return; // auto-repeat while held is not a fresh press
+        altDown = true;
+        entered = false;
+        tap = true;
+        clearHold();
+        holdTimer = setTimeout(() => { if (altDown) enterEdit(); }, HUD_HOLD_MS);
+      } else if (e.code === "KeyZ") {
+        // The peek key (z, peek.ts) is EXEMPT — the HUD can still be toggled mid-peek: holding z auto-repeats
+        // keydown, and each repeat would otherwise cancel the tap. Match e.CODE not e.key: while Alt is held
+        // the repeating z arrives as an Option-MODIFIED char (e.key "Ω" on macOS), so an e.key check misses it.
+      } else {
+        // Any other key while Alt is down → the Alt press is a CHORD, not a tap: releasing Alt must not then
+        // toggle visibility. This includes `p` (the in/out-of-HUD action, handled in onKeyDown): using the
+        // Alt+p chord to pin a card leaves the HUD visibility exactly as it was.
+        tap = false;
       }
     };
     const up = (e: KeyboardEvent) => {
       if (e.key !== "Alt") return;
-      if (pristine) setHudMode((v) => (v ? 0 : 1));
-      pristine = false;
+      altDown = false;
+      clearHold();
+      if (entered) {
+        setHudEdit(false); // hold released → leave edit mode
+        if (forcedShow) { setHudMode(0); forcedShow = false; } // restore the pre-edit hidden state
+      } else if (tap) {
+        setHudMode((v) => (v ? 0 : 1)); // a clean quick tap → toggle visibility
+      }
+      entered = false;
+      tap = false;
     };
     const cancel = () => {
-      pristine = false; // a click/drag (e.g. alt-drag wiring) or losing focus ends the tap candidacy
+      // A pointer press (e.g. alt-drag wiring, or dragging a HUD card in edit mode) ends TAP candidacy only —
+      // it must NOT end an engaged edit hold (dragging a card is the whole point of edit mode).
+      tap = false;
+    };
+    const onBlur = () => {
+      // Losing focus can swallow the Alt keyup, so reset everything: end the hold, edit mode, and restore a
+      // force-shown HUD, so a blur mid-hold can't strand the HUD in edit mode or a surprise visible state.
+      altDown = false;
+      tap = false;
+      entered = false;
+      clearHold();
+      setHudEdit(false);
+      if (forcedShow) { setHudMode(0); forcedShow = false; }
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     window.addEventListener("pointerdown", cancel);
-    window.addEventListener("blur", cancel);
+    window.addEventListener("blur", onBlur);
     return () => {
+      clearHold();
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
       window.removeEventListener("pointerdown", cancel);
-      window.removeEventListener("blur", cancel);
+      window.removeEventListener("blur", onBlur);
     };
   }, []);
   const flash = useCallback((text: string) => setToast({ text, seq: ++toastSeq.current }), []);
@@ -505,8 +594,12 @@ function Board({ m, undo, persistence }: Engine) {
           if (n === 1) navigate(() => m.fitAll(isFloating));
           else if (n === 2) navigate(() => m.fitSelection(isFloating));
         }
-      } else if ((e.key === "p" || e.key === "P") && !meta) {
-        // Pin / unpin the single selected card (float it in the viewport ⇄ drop it on the canvas).
+      } else if (e.code === "KeyP" && e.altKey && !meta) {
+        // Toggle the single selected card in/out of the HUD — pin it into the viewport ⇄ drop it back on the
+        // canvas (togglePin flips its anchor). Gated behind Alt-HELD (seq 22): the HUD's every mutation lives
+        // behind one affordance, so a stray `p` while the HUD sits open can't accidentally pin a card. Matched
+        // on e.CODE (the physical P), not e.key — while Alt is held e.key is an Option-modified char (π on
+        // macOS), so an e.key check would miss it and the toggle would never fire.
         const ids = m.selection.ids();
         if (ids.length === 1) {
           e.preventDefault();
@@ -708,7 +801,7 @@ function Board({ m, undo, persistence }: Engine) {
         onDragEnd={onDragEnd}
         onContextMenu={onContextMenu}
       >
-        <CanvasView m={m} hudShown={!!hudMode} />
+        <CanvasView m={m} hudShown={!!hudMode} hudEditing={hudEdit} />
       </div>
 
       {/* The minimap HUD — a sibling of the canvas (so its pointer events never reach the interaction
@@ -766,6 +859,7 @@ function Board({ m, undo, persistence }: Engine) {
           screen={menu.screen}
           at={menu.at}
           onImport={() => importRef.current?.click()}
+          onRevealHud={() => setHudMode(1)}
           onClose={() => setMenu(null)}
         />
       )}
@@ -992,12 +1086,14 @@ function CanvasMenu({
   screen,
   at,
   onImport,
+  onRevealHud,
   onClose,
 }: {
   m: InteractionManager;
   screen: Pos;
   at: Pos;
   onImport: () => void;
+  onRevealHud: () => void;
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -1052,16 +1148,33 @@ function CanvasMenu({
         <NewSessionItem m={m} at={at} run={run} />
         <button onClick={() => run(() => addRolesCard(m, at))}>Roles</button>
         <button onClick={() => run(() => void createThread(m.editor, at))}>New thread</button>
-        {/* The sessions browser and the Threads indicator are HUD-only chrome now (hud.ts) — seeded at boot
-            (seedHud) and toggled with the minimap by the Alt tap, not spawnable world cards. */}
+        {/* The HUD singletons (usage / sessions / clock / Threads) — true singletons: one instance, stable id.
+            Each row is CHECKED when its card already exists (seedHud seeds them on every board load, so that's
+            the normal state); a user who deleted one gets it re-minted at its default slot on click. Clicking
+            never duplicates (ensureHudCard is a no-op when present) — it just guarantees the card exists and
+            REVEALS the HUD group (onRevealHud) so a hidden HUD pops into view with the card in it. */}
+        <div className="menu-section">HUD</div>
+        {DEFAULT_HUD.map((spec) => {
+          const exists = !!m.editor.store.get<"node">(spec.id as Id<"node">);
+          return (
+            <button
+              key={spec.id}
+              className="menu-singleton"
+              onClick={() => run(() => { ensureHudCard(m, spec.id); onRevealHud(); })}
+            >
+              <span className="menu-check" aria-hidden="true">{exists ? "✓" : " "}</span>
+              {HUD_LABELS[spec.type] ?? spec.type}
+            </button>
+          );
+        })}
         <div className="menu-section">Files</div>
         <NewFileItem m={m} at={at} onClose={onClose} />
         <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>
         <div className="menu-section">Notes &amp; widgets</div>
         <button onClick={() => run(() => addStickyNote(m, at))}>Sticky note</button>
-        {/* Clock + Usage are HUD-only elements now (hud.ts) — corner-pinned chrome seeded at boot
-            (seedHud) and toggled with the minimap by the Alt tap, not spawnable world cards. */}
+        {/* Clock + Usage live under the HUD section above (true singletons), not here — they're corner chrome,
+            not duplicable world widgets. */}
         <button onClick={() => run(() => addGitHeadCard(m, at))}>Git HEAD</button>
         <button onClick={() => run(() => addHnCard(m, at))}>Hacker News</button>
         <button onClick={() => run(() => addWeatherCard(m, at))}>Weather</button>
