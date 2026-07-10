@@ -10,6 +10,7 @@ import {
   HUD_CARD_IDS,
   HUD_MARGIN,
   HUD_GAP,
+  HUD_SNAP,
   isHudCard,
   hudChromeFor,
   resolveHudPosition,
@@ -61,6 +62,21 @@ test("resolveHudPosition: left column is viewport-independent, centre/right trac
   const channels = resolveHudPosition(byId["node:channels"], W);
   assert.equal(channels.x, W - HUD_MARGIN - channels.w);
   assert.equal(channels.y, HUD_MARGIN + 180 + HUD_GAP);
+});
+
+test("HUD_SNAP is a fine step (P2 edit-mode grid) that the default layout already sits on", () => {
+  // Finer than the 24px visual dot grid (CanvasView BASE) so a drag/resize gives pixel-level control, yet a
+  // divisor of it (every third snap lands on a grid line) — so 8 is the sweet spot the human validated by feel.
+  assert.equal(HUD_SNAP, 8);
+  assert.equal(24 % HUD_SNAP, 0, "an even divisor of the 24px visual grid");
+  // The shared corner constants land on the lattice, so the seeded default cards start perfectly aligned and a
+  // snapped drag keeps them there — dragging one card to another's edge lines them up to the pixel.
+  assert.equal(HUD_MARGIN % HUD_SNAP, 0, "the viewport inset is on the lattice");
+  for (const c of DEFAULT_HUD) {
+    // A snapped drag quantizes x/y to the lattice; a left-anchored card already starts there.
+    if (c.left != null) assert.equal(c.left % HUD_SNAP, 0, `${c.id} left edge is on the lattice`);
+    assert.equal(c.w % HUD_SNAP, 0, `${c.id} width is on the lattice`);
+  }
 });
 
 test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {

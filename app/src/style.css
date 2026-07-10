@@ -3505,6 +3505,21 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   font-variant-numeric: tabular-nums;
 }
+/* A HUD-singleton menu row: a leading check column marks whether that single instance already exists. Unlike
+   the default space-between rows, the check + label read as one left-aligned unit (a checklist), so override
+   the justification and drop the fixed-width check into its own gutter so labels line up whether checked or not. */
+.menu-list button.menu-singleton {
+  justify-content: flex-start;
+  gap: 6px;
+}
+.menu-singleton .menu-check {
+  display: inline-block;
+  width: 12px;
+  flex: 0 0 auto;
+  text-align: center;
+  color: #6366f1;
+  font-weight: 600;
+}
 
 /* The "New session" role picker (agent-roles.md). The parent row is an ordinary menu button with a caret;
    expanding it reveals an indented list of roles to spawn under. */
@@ -3718,6 +3733,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .hud-frame {
   position: absolute;
   pointer-events: auto;
+}
+/* HUD EDIT MODE (Alt-held): the card unlocks to drag/resize, so it wears the grab cursor and a faint dashed
+   indigo ring — a deliberate, unmistakable "you can move this now" affordance that the inert HUD never shows.
+   The ring sits just outside the box (offset) so it doesn't shift the panel or fight its own border. */
+.hud-frame.editing {
+  cursor: grab;
+  outline: 1.5px dashed #6366f1aa;
+  outline-offset: 2px;
+  border-radius: 8px;
 }
 /* HUD chrome reads as ONE FAMILY with the minimap: the box, border, blur and shadow below MIRROR
    `.minimap` exactly, and — being a later rule at equal specificity — override each card's per-kind

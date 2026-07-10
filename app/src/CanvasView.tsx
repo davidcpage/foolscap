@@ -33,7 +33,7 @@ const camZ = (c: CameraState) => c.z;
 // O(cards) pass per pan frame that changed nothing but the transform. The camera subscription lives
 // in the leaf `Page` below instead: when only Page re-renders, its `children` prop is the SAME element
 // array from CanvasView's last render, so React bails out of the whole subtree by identity.
-export function CanvasView({ m, hudShown }: { m: InteractionManager; hudShown: boolean }) {
+export function CanvasView({ m, hudShown, hudEditing }: { m: InteractionManager; hudShown: boolean; hudEditing: boolean }) {
   const nodeQuery = useMemo(() => m.editor.store.query({ typeName: "node" }), [m]);
   const nodes = useSignal(nodeQuery);
   // Which agent attention-edge is selected for actions (accept / sever / send). App-local state, not the
@@ -51,7 +51,7 @@ export function CanvasView({ m, hudShown }: { m: InteractionManager; hudShown: b
         <SelectionOverlay m={m} />
         <MarqueeOverlay m={m} />
       </Page>
-      <ScreenLayer m={m} hudShown={hudShown} />
+      <ScreenLayer m={m} hudShown={hudShown} hudEditing={hudEditing} />
       <EdgeActions m={m} edgeId={selectedEdge} onClose={() => setSelectedEdge(null)} />
     </>
   );
@@ -82,7 +82,7 @@ function Page({ m, onPointerDown, children }: { m: InteractionManager; onPointer
 // the layout query so a card that gets pinned/unpinned hops layers, and so a floating card it owns
 // re-renders live as it's dragged. The layer itself is pointer-transparent (empty space falls through
 // to the canvas); each floating card re-enables pointer events on itself.
-function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean }) {
+function ScreenLayer({ m, hudShown, hudEditing }: { m: InteractionManager; hudShown: boolean; hudEditing: boolean }) {
   const store = m.editor.store;
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   const layouts = useSignal(layoutQuery);
@@ -107,7 +107,7 @@ function ScreenLayer({ m, hudShown }: { m: InteractionManager; hudShown: boolean
       {hud.map((l) => {
         const chrome = hudChrome(l.nodeId);
         if (!chrome) return null;
-        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} />;
+        return <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hud={chrome} hudEditing={hudEditing} />;
       })}
     </div>
   );

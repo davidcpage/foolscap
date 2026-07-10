@@ -18,6 +18,7 @@ export interface HudCardSpec {
 
 export declare const HUD_MARGIN: number;
 export declare const HUD_GAP: number;
+export declare const HUD_SNAP: number;
 export declare const DEFAULT_HUD: readonly HudCardSpec[];
 export declare const HUD_CARD_IDS: readonly string[];
 

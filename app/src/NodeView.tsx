@@ -11,7 +11,7 @@ import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
 import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
-import { HUD_GAP, type HudChrome } from "./hud";
+import { HUD_GAP, HUD_SNAP, type HudChrome } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
 import {
@@ -55,6 +55,7 @@ export const NodeView = memo(function NodeView({
   id,
   screen,
   hud,
+  hudEditing,
 }: {
   m: InteractionManager;
   id: Id<"node">;
@@ -64,6 +65,10 @@ export const NodeView = memo(function NodeView({
   // The descriptor is frame STYLE only (frameless / viewport-height-capped) — position/size come from the
   // card's own stored layout record now, exactly like a pinned card (no more derived corner placement).
   hud?: HudChrome;
+  // HUD edit mode is engaged (Alt-held, App.tsx). Only meaningful for a HUD card: while true the card is
+  // UNLOCKED — draggable + resizable with grid snap, exactly like a free pinned card — and reverts to inert
+  // chrome the moment it clears. Ignored for a free pinned card (never locked to begin with).
+  hudEditing?: boolean;
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -134,7 +139,7 @@ export const NodeView = memo(function NodeView({
   // positioned from its own stored layout x/y/w/h. The `hud` descriptor (present only for chrome) locks it
   // and picks the HUD panel styling; absent, it's a draggable pinned card. Same card render above either way.
   return (
-    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud}>
+    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud} hudEditing={hudEditing}>
       {card}
     </ScreenCardFrame>
   );
@@ -152,20 +157,25 @@ export const NodeView = memo(function NodeView({
 //     ONE move gesture that coalesces every frame into a single diff / IntentEvent / undo step, like a world
 //     drag. A press on an interactive interior (an input, a button, the minimap surface — which stops the
 //     event itself) never reaches this listener, so those keep their own behaviour.
-//   • A HUD card (hud present) is corner-locked chrome: NOT draggable and NOT selectable (drag/resize of HUD
-//     cards is a later phase), drawn as the neutral translucent HUD panel (optionally frameless, or height-
-//     capped so a long list scrolls inside the viewport). Like the minimap, a mousedown preventDefaults so a
-//     press doesn't blur the canvas (keeping the number-key / Alt-tap shortcuts live) — but ONLY off an
-//     interactive interior: the Threads/sessions rows are focusable (tabindex) and drag-out-able
-//     (draggable="true"), and preventDefault would suppress focus and native drag start, so skip it when the
-//     press lands on an interactive descendant (the same data-interactive seam TemplateCard uses).
-// The card fills the frame in both cases.
+//   • A HUD card (hud present) is corner chrome: LOCKED by default — NOT draggable and NOT selectable, drawn
+//     as the neutral translucent HUD panel (optionally frameless, or height-capped so a long list scrolls
+//     inside the viewport). Like the minimap, a mousedown preventDefaults so a press doesn't blur the canvas
+//     (keeping the number-key / Alt-tap shortcuts live) — but ONLY off an interactive interior: the
+//     Threads/sessions rows are focusable (tabindex) and drag-out-able (draggable="true"), and preventDefault
+//     would suppress focus and native drag start, so skip it when the press lands on an interactive descendant
+//     (the same data-interactive seam TemplateCard uses). While HUD EDIT MODE is engaged (Alt-held, App.tsx →
+//     `hudEditing`) a HUD card UNLOCKS and behaves exactly like a free pinned card — draggable + resizable —
+//     except its drag/resize SNAPS to a fine grid (HUD_SNAP) so the human can align the chrome pixel-perfectly.
+//     It re-locks the instant Alt is released. So the same frame serves three states: free pinned (always
+//     movable, no snap), HUD locked (inert), HUD editing (movable + snapped).
+// The card fills the frame in all cases.
 function ScreenCardFrame({
   m,
   id,
   layout,
   selected,
   hud,
+  hudEditing,
   children,
 }: {
   m: InteractionManager;
@@ -173,12 +183,18 @@ function ScreenCardFrame({
   layout: LayoutRecord;
   selected: boolean;
   hud?: HudChrome;
+  hudEditing?: boolean;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  const locked = !!hud;
+  // A HUD card is locked (inert chrome) UNLESS edit mode is engaged; a free pinned card (no hud) is never
+  // locked. `snap` is the grid step the move/resize gesture quantizes to — only a HUD card being edited
+  // snaps; a free pinned card drags pixel-continuously as before (snap 0 = off).
+  const editing = !!hud && !!hudEditing;
+  const locked = !!hud && !editing;
+  const snap = editing ? HUD_SNAP : 0;
   useEffect(() => {
-    if (locked) return; // HUD chrome is locked — no move gesture (drag/resize is a later phase)
+    if (locked) return; // locked HUD chrome — no move gesture
     const el = ref.current;
     if (!el) return;
     const store = m.editor.store;
@@ -192,8 +208,13 @@ function ScreenCardFrame({
       const py = e.clientY;
       let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
       const onMove = (ev: PointerEvent) => {
-        const nx = Math.round(l0.x + (ev.clientX - px));
-        const ny = Math.round(l0.y + (ev.clientY - py));
+        // Snap the ABSOLUTE position to the grid lattice (not the delta) so every snapped card lands on the
+        // same global 8px grid — that's what makes two cards line up edge-to-edge. Free pinned cards (snap 0)
+        // stay pixel-continuous.
+        const rawX = l0.x + (ev.clientX - px);
+        const rawY = l0.y + (ev.clientY - py);
+        const nx = snap ? Math.round(rawX / snap) * snap : Math.round(rawX);
+        const ny = snap ? Math.round(rawY / snap) * snap : Math.round(rawY);
         gesture ??= m.editor.beginGesture("moveNode", "user"); // open lazily: a click with no move logs nothing
         gesture.update(() => store.update<LayoutRecord>(layoutId(id), { x: nx, y: ny }));
       };
@@ -207,7 +228,7 @@ function ScreenCardFrame({
     };
     el.addEventListener("pointerdown", onDown);
     return () => el.removeEventListener("pointerdown", onDown);
-  }, [m, id, locked]);
+  }, [m, id, locked, snap]);
   const style: React.CSSProperties = {
     left: layout.x,
     top: layout.y,
@@ -223,7 +244,7 @@ function ScreenCardFrame({
     <div
       ref={ref}
       data-node-id={id}
-      className={hud ? `hud-frame${hud.frameless ? " frameless" : ""}` : "floating-frame"}
+      className={hud ? `hud-frame${hud.frameless ? " frameless" : ""}${editing ? " editing" : ""}` : "floating-frame"}
       style={style}
       onMouseDown={
         locked
@@ -235,7 +256,7 @@ function ScreenCardFrame({
       }
     >
       {children}
-      {!locked && selected && <FloatingResizeHandles m={m} id={id} />}
+      {!locked && selected && <FloatingResizeHandles m={m} id={id} snap={snap} />}
     </div>
   );
 }
@@ -251,7 +272,7 @@ function ScreenCardFrame({
 // native. Only mounted when the card is selected, mirroring the world SelectionOverlay's lone-selection
 // handles; the container is pointer-transparent so only the four dots take the press.
 const FLOAT_CORNERS: readonly Corner[] = ["nw", "ne", "sw", "se"];
-function FloatingResizeHandles({ m, id }: { m: InteractionManager; id: Id<"node"> }) {
+function FloatingResizeHandles({ m, id, snap = 0 }: { m: InteractionManager; id: Id<"node">; snap?: number }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const host = ref.current;
@@ -275,7 +296,12 @@ function FloatingResizeHandles({ m, id }: { m: InteractionManager; id: Id<"node"
         let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
         const onMove = (ev: PointerEvent) => {
           gesture ??= m.editor.beginGesture("resizeNode", "user"); // open lazily: a click with no move logs nothing
-          const box = resizeBox(startBox, corner, ev.clientX - px, ev.clientY - py, MIN_SIZE, aspect);
+          // Snap the pointer DELTA to the grid step (HUD edit mode only; snap 0 = continuous). Snapping the
+          // delta rather than the box edges keeps resizeBox's aspect math intact — the round clock stays
+          // square because its derived dimension is computed from the already-snapped driving delta.
+          const dx = snap ? Math.round((ev.clientX - px) / snap) * snap : ev.clientX - px;
+          const dy = snap ? Math.round((ev.clientY - py) / snap) * snap : ev.clientY - py;
+          const box = resizeBox(startBox, corner, dx, dy, MIN_SIZE, aspect);
           gesture.update(() => store.update<LayoutRecord>(layoutId(id), box));
         };
         const onUp = () => {
@@ -290,7 +316,7 @@ function FloatingResizeHandles({ m, id }: { m: InteractionManager; id: Id<"node"
       cleanups.push(() => el.removeEventListener("pointerdown", onDown));
     });
     return () => cleanups.forEach((fn) => fn());
-  }, [m, id]);
+  }, [m, id, snap]);
   return (
     <div ref={ref} className="floating-resize" aria-hidden="true">
       {FLOAT_CORNERS.map((c) => (
