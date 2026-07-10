@@ -1,92 +1,29 @@
 import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { execFile, execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { commitRoot, watchRoot } from "./shadow-git.js";
-import { canvasSessionsDir, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
+import { watchRoot } from "./shadow-git.js";
+import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
 import { type SessionHostClient } from "./session-host-client.js";
-import { addThreadMember, appendThreadLine, canvasThreadsDir, fillSeat, listThreads, migrateChannelLedger, readPins, readSeenMentions, readThreadLog, readThreadMeta, removeThreadMember, seatForSid, sessionIdleIntent, threadLevelForSid, threadMembersFromMeta, untaggedSeatNudgeTarget, upsertThreadMeta, type PinnedMsg, type ThreadMetaMarker } from "./thread-ledger.js";
+import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, type ThreadMetaMarker } from "./thread-ledger.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { intentLine, type WorkIntent } from "./work-intent.js";
-import { wakesSeat } from "./notification-levels.js";
 import { deriveThreadState } from "./thread-state.js";
-import { readWatchers } from "./doc-watch.js";
-import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, surfaceClaimant } from "./auto-wake.js";
-import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, sessionHasScheduledWake, stampFired, upsertJob } from "./standing-jobs.js";
-import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
-import { idleBand } from "./session-band-republish.js";
-import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
-import { canvasRolesDir, listRoles, readRole } from "./role-ledger.js";
 import { parseWorktreePorcelain } from "./worktrees.js";
-import { boardPersistMtime, describeBoardEvents, readBoardPersist, readBoardSnapshot } from "./board-persist.js";
+import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import {
-  attachSessionHost,
-  autoWakeReapTick,
-  endSession,
-  ensureLiveSession,
-  ensureSessionFeed,
-  liveSessionCount,
-  MAX_LIVE_SESSIONS,
-  MAX_SESSION_BYTES,
-  persistSessionState,
-  placeWorkerCard,
-  publishSession,
-  readSessionFile,
-  reconcileSessionBands,
-  republishThreadSeatOccupants,
-  resolveSpawnCwd,
-  sendSessionInput,
-  sendSessionInterrupt,
-  serverSpawnWorker,
-  sessionsDir,
-  sessionStatus,
-} from "./server-sessions.js";
-import {
-  boardSnapshotRecords,
-  forgetDurableMember,
-  historyKey,
-  MAX_THREAD_MSGS,
-  nodeSessionId,
-  recordDurableMember,
-  seedCursor,
-  seedThreadLogs,
-  sessionNameForSid,
-  sessionNodeForSid,
-  sessionThreads,
-  sidFromSessionNode,
-  threadLog,
-  threadMemberSids,
-  threadNode,
-  trackEmittedMembership,
-} from "./server-snapshot.js";
-import {
-  ensureCoordinatorHeartbeat,
-  foldShadowEdits,
-  maybeRespawnDormantSeat,
-  maybeWakeDocWorker,
-  originOf,
-  publishFeed,
-  startCardTypesFeed,
-  startGitHeadFeed,
-  startHnFeed,
-  startLoopHeartbeat,
-  startRolesFeed,
-  startSessionsFeed,
-  startThreadsFeed,
-  startUsageFeed,
-  syncShadowRoots,
-} from "./server-orchestration.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
+import { boardSnapshotRecords, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
+import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
