@@ -412,7 +412,20 @@ function maybeAnnounceMembership(
     // the single funnel every join path reaches — a bus addEdge (spawn/join/invite-accept) AND a human-drawn
     // join replayed here from the snapshot diff. The membership now outlives the card/edge (deleting the card
     // removes the view, not this record); it's dropped only by a real leave (announceNewMemberships / /leave).
-    recordDurableMember(boards.get(boardId)?.repoPath, thread.id, sid, Date.now());
+    // REOPEN GUARD (card-close/reopen is display-only, P1): if `sid` is ALREADY a durable member, this
+    // member:open is a REDRAW of an existing membership — a reopened session card repainting its wire — NOT
+    // a fresh join. Onboarding here would re-push the welcome text, re-wake peers, reseed the read cursor,
+    // and re-fill the seat: all forbidden on a display-only reopen. So record (idempotent) + mark announced,
+    // then stop. Checked BEFORE recordDurableMember so a genuine first join reads false. A real RE-join after
+    // a leave still onboards (leave dropped the membership → wasMember is false). The dedup Set alone can't
+    // stand in for this test: a card delete's removeEdge clears the key, so a reopen would slip through.
+    const repoPath = boards.get(boardId)?.repoPath;
+    const wasMember = !!(repoPath && readThreadMeta(repoPath, thread.id)?.members?.[sid]);
+    recordDurableMember(repoPath, thread.id, sid, Date.now());
+    if (wasMember) {
+      announcedMemberships.add(announceKey(String(p.id), type));
+      return;
+    }
     if (announcedMemberships.has(announceKey(String(p.id), type))) return;
     announcedMemberships.add(announceKey(String(p.id), type));
     const others = threadMemberSids(records, thread.id).filter((m) => m !== sid);
@@ -454,7 +467,6 @@ function maybeAnnounceMembership(
     const name = sessionNameForSid(records, sid);
     if (name) {
       const role = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
-      const repoPath = boards.get(boardId)?.repoPath;
       if (role && repoPath) {
         const r = fillSeat(repoPath, thread.id, role, sid, Date.now(), isSidLive);
         if (r.blocked)
