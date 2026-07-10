@@ -21,7 +21,6 @@ import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
 import { connectToThread, createThread, isThreadNode, isSessionNode } from "./threads";
 import { CanvasView } from "./CanvasView";
-import { MinimapHud } from "./Minimap";
 import { useSignal } from "./reactive";
 import { templatesSignal } from "./templates";
 import {
@@ -29,7 +28,8 @@ import {
   addComputedCard,
   addGitHeadCard,
   addHnCard,
-  addFolderCard,
+  addFileTreeCard,
+  addMinimapCard,
   addNotebookCard,
   addTextFileCard,
   defaultDocPath,
@@ -163,6 +163,8 @@ const HUD_LABELS: Record<string, string> = {
   sessions: "Sessions",
   clock: "Clock",
   channels: "Threads",
+  minimap: "Minimap",
+  directory: "File Tree",
 };
 
 // The seeders for the HUD chrome cards, keyed by the default-layout spec's `type`. Each mints its stable
@@ -172,6 +174,8 @@ const HUD_SEEDERS: Record<string, (m: InteractionManager) => void> = {
   sessions: addSessionsCard,
   clock: addClock,
   channels: addChannelsCard,
+  minimap: addMinimapCard,
+  directory: addFileTreeCard,
 };
 
 // Seat one HUD card at its default screen position/size — but ONLY when it isn't already an authoritative
@@ -804,10 +808,8 @@ function Board({ m, undo, persistence }: Engine) {
         <CanvasView m={m} hudShown={!!hudMode} hudEditing={hudEdit} />
       </div>
 
-      {/* The minimap HUD — a sibling of the canvas (so its pointer events never reach the interaction
-          engine). Tap Alt to toggle the whole HUD group (minimap + the corner-pinned usage/clock cards,
-          which render in the ScreenLayer inside CanvasView) On ↔ Off together. */}
-      <MinimapHud m={m} mode={hudMode} />
+      {/* The minimap is a HUD card now (node:minimap) — it renders in the ScreenLayer inside CanvasView with
+          the rest of the HUD group and toggles with it (Alt tap), no longer a separate canvas sibling. */}
 
       {/* The only standing chrome: a faint cue on an empty board, since right-click is otherwise invisible. */}
       {nodes.length === 0 && (
@@ -1169,7 +1171,8 @@ function CanvasMenu({
         })}
         <div className="menu-section">Files</div>
         <NewFileItem m={m} at={at} onClose={onClose} />
-        <button onClick={() => run(() => addFolderCard(m, "", at))}>File tree</button>
+        {/* The root "File tree" is a HUD singleton now (listed under the HUD section above, checked/reveal);
+            it's no longer a duplicable world card. Sub-folders are still pinned by dragging a row out. */}
         <button onClick={() => run(() => void addNotebookCard(m, at))}>Notebook</button>
         <div className="menu-section">Notes &amp; widgets</div>
         <button onClick={() => run(() => addStickyNote(m, at))}>Sticky note</button>

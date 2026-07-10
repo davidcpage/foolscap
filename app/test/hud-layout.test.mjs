@@ -16,12 +16,23 @@ import {
   resolveHudPosition,
 } from "../hud-layout.js";
 
-test("the HUD card set is the four stable singletons, in seed/paint order", () => {
-  assert.deepEqual(HUD_CARD_IDS, ["node:usage", "node:sessions", "node:clock", "node:channels"]);
+test("the HUD card set is the stable singletons, in seed/paint order", () => {
+  // Left column (usage → sessions → File Tree), then the centred clock, then the right column
+  // (minimap → Threads). File Tree (the roots sentinel) and the minimap joined the set in P3.
+  assert.deepEqual(HUD_CARD_IDS, [
+    "node:usage",
+    "node:sessions",
+    "node:roots:",
+    "node:clock",
+    "node:minimap",
+    "node:channels",
+  ]);
   for (const id of HUD_CARD_IDS) assert.ok(isHudCard(id), `${id} is a HUD card`);
   // Stable ids are what make seeding idempotent across reloads + StrictMode.
   assert.equal(isHudCard("node:roles"), false);
   assert.equal(isHudCard("node:usageX"), false);
+  // A NON-root directory card (a dragged-out sub-folder) is an ordinary world card, never HUD chrome.
+  assert.equal(isHudCard("node:repo:src"), false);
 });
 
 test("every card carries a type its seeder mints, and a sound placement", () => {
@@ -35,11 +46,14 @@ test("every card carries a type its seeder mints, and a sound placement", () => 
 });
 
 test("chrome descriptor is frame-STYLE only, and null for a non-HUD id", () => {
-  // The clock is the only frameless card; the two scrolling lists are the only viewport-capped ones.
+  // The clock is the only frameless card; the scrolling lists (sessions, Threads, File Tree) are the
+  // viewport-capped ones. The minimap takes the plain panel frame — neither frameless nor capped.
   assert.deepEqual(hudChromeFor("node:clock"), { frameless: true, capToViewport: false });
   assert.deepEqual(hudChromeFor("node:usage"), { frameless: false, capToViewport: false });
   assert.deepEqual(hudChromeFor("node:sessions"), { frameless: false, capToViewport: true });
   assert.deepEqual(hudChromeFor("node:channels"), { frameless: false, capToViewport: true });
+  assert.deepEqual(hudChromeFor("node:roots:"), { frameless: false, capToViewport: true });
+  assert.deepEqual(hudChromeFor("node:minimap"), { frameless: false, capToViewport: false });
   assert.equal(hudChromeFor("node:roles"), null);
 });
 
@@ -53,12 +67,22 @@ test("resolveHudPosition: left column is viewport-independent, centre/right trac
   assert.equal(sessions.x, HUD_MARGIN);
   assert.equal(sessions.y, HUD_MARGIN + 300 + HUD_GAP); // flush beneath the usage card
 
+  // File Tree — left column, flush beneath the sessions browser (usage + sessions + a gap each).
+  const filetree = resolveHudPosition(byId["node:roots:"], W);
+  assert.equal(filetree.x, HUD_MARGIN);
+  assert.equal(filetree.y, HUD_MARGIN + 300 + HUD_GAP + 300 + HUD_GAP);
+
   // Clock — centred at this width.
   const clock = resolveHudPosition(byId["node:clock"], W);
   assert.equal(clock.x, Math.round(W / 2 - clock.w / 2));
   assert.equal(clock.y, HUD_MARGIN);
 
-  // Channels — offset in from the right edge (flush under the minimap column).
+  // Minimap — top-right, offset in from the right edge.
+  const minimap = resolveHudPosition(byId["node:minimap"], W);
+  assert.equal(minimap.x, W - HUD_MARGIN - minimap.w);
+  assert.equal(minimap.y, HUD_MARGIN);
+
+  // Channels — offset in from the right edge (flush under the minimap).
   const channels = resolveHudPosition(byId["node:channels"], W);
   assert.equal(channels.x, W - HUD_MARGIN - channels.w);
   assert.equal(channels.y, HUD_MARGIN + 180 + HUD_GAP);
