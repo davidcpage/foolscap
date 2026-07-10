@@ -284,6 +284,15 @@ export async function materializeAt(
       actor: "user",
       payload: { id, type: "notebook", title: path, text: "", color: "green", x, y, w: NOTEBOOK_CARD_W, h: NOTEBOOK_CARD_H },
     });
+  } else if (path.toLowerCase().endsWith(".ipynb")) {
+    // A Jupyter `.ipynb` opens as the READ-ONLY `ipynb` card — rendered cells (markdown / code / outputs),
+    // no execution. Unlike the reactive `.html` notebook this needs no content sniff: the extension is the
+    // format. It reads a tall reading footprint like a prose card since a notebook is a scrolling document.
+    m.editor.commit({
+      type: "addNode",
+      actor: "user",
+      payload: { id, type: "ipynb", title: path, text: "", color: "orange", x, y, w: PROSE_CARD_W, h: PROSE_CARD_H },
+    });
   } else {
     const kindInfo = fileKind(path);
     // Markdown renders as prose (not a <pre>), so it opens at the larger reading footprint; code/data/etc.

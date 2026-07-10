@@ -1,0 +1,17 @@
+# The ipynb card type — a READ-ONLY Jupyter notebook viewer (docs/doc-annotations.md's sibling: a file
+# card specialised for `.ipynb`). Like the file card, its title carries the file's path relative to the
+# dataset root, and its body is the notebook's content read OFF-LOG through the `fileContent` capability
+# (content.ts) — never node.text — so a disk change re-renders just this body. The path → basename/dir
+# mapping is the v1 codec, real JS in render.js.
+#
+# GRANT:
+#   • `fileContent` — the `.ipynb` file's content as an off-log signal projected from disk, keyed by this
+#     card's path. render.js JSON-parses it into cells and renders markdown / code / outputs faithfully.
+#     It is byte-bounded upstream (MAX_BYTES in vite-fs-plugin.ts); a clipped notebook is invalid JSON, so
+#     the template shows a truncation notice rather than adding a second cap (CLAUDE.md size-cap rule).
+#
+# Deliberately NOT granted: no `writeFile` (read-only — no in-card editing), no execution/REPL (parked as a
+# future thread). html outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
+name: ipynb
+contract: 1
+capabilities: [fileContent]

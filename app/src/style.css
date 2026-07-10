@@ -436,6 +436,136 @@ textarea.file-source {
   background: #f4f4f5;
 }
 
+/* ── The read-only Jupyter (.ipynb) card (card-types/ipynb/render.js) ─────────────────────────────────
+   A scrolling notebook document: markdown cells as prose (.md-prose, shared), code cells as a highlighted
+   source box with an `In [n]:` prompt, and outputs below. Reuses .file-head / .file-name / .file-ext /
+   .file-dir for the header (same chrome as the file card). html outputs are rendered raw (see render.js). */
+.ipynb-body {
+  margin: 6px 0 0;
+  padding: 6px 10px 10px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  border-top: 1px solid #00000008;
+  background: #00000003;
+}
+.ipynb-body::-webkit-scrollbar {
+  width: 8px;
+}
+.ipynb-body::-webkit-scrollbar-thumb {
+  background: #00000022;
+  border-radius: 4px;
+}
+.ipynb-cell {
+  margin: 0 0 12px;
+}
+.ipynb-cell:last-child {
+  margin-bottom: 0;
+}
+/* A markdown cell is prose (.md-prose supplies the block spacing); a shade of extra left room sets it
+   apart from the code gutter. */
+.ipynb-md {
+  font-size: 12px;
+  color: #27272a;
+}
+/* Code cell: an `In [n]:` gutter prompt beside the highlighted source, Jupyter-style. */
+.ipynb-in {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+}
+.ipynb-prompt {
+  flex: none;
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a1a1aa;
+  padding-top: 6px;
+  white-space: nowrap;
+  user-select: none;
+}
+.ipynb-source {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 8px;
+  border-radius: 5px;
+  border: 1px solid #0000000f;
+  background: #fbfbfa;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #27272a;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+/* Outputs sit indented under their code cell, so an output reads as belonging to the cell above it. */
+.ipynb-outputs {
+  margin: 4px 0 0 10px;
+  padding-left: 8px;
+  border-left: 2px solid #0000000d;
+}
+.ipynb-out-stream,
+.ipynb-out-text,
+.ipynb-out-error {
+  margin: 4px 0 0;
+  padding: 4px 6px;
+  font: 10px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #52525b;
+}
+.ipynb-out-stderr {
+  background: #fff7ed;
+  color: #9a3412;
+  border-radius: 4px;
+}
+.ipynb-out-error {
+  background: #fef2f2;
+  color: #b91c1c;
+  border-radius: 4px;
+}
+.ipynb-out-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 6px 0 0;
+  border-radius: 4px;
+}
+/* A raw (UNSANITISED) text/html or svg output — its own scroll box so a wide DataFrame table doesn't blow
+   out the card width. See the security note in render.js: trusted-notebook assumption. */
+.ipynb-out-html {
+  margin: 6px 0 0;
+  overflow-x: auto;
+  font-size: 11px;
+  color: #27272a;
+}
+.ipynb-out-html table {
+  border-collapse: collapse;
+  font-size: 10px;
+}
+.ipynb-out-html th,
+.ipynb-out-html td {
+  border: 1px solid #e4e4e7;
+  padding: 2px 6px;
+  text-align: right;
+}
+.ipynb-notice {
+  padding: 14px 10px;
+  color: #a1a1aa;
+  font-size: 11px;
+  text-align: center;
+}
+.ipynb-notice-warn {
+  color: #52525b;
+  text-align: left;
+  line-height: 1.5;
+}
+.ipynb-notice-warn strong {
+  display: block;
+  margin-bottom: 3px;
+  color: #b45309;
+}
+
 /* Frontmatter "properties" strip (card-types/file/render.js): a compact key/value panel above the prose
    for markdown files that open with YAML frontmatter (memory files, role.md, …), instead of the raw
    `---` fence rendering as an <hr> + run-on paragraph. Muted, monospace keys — reads as metadata, not body. */

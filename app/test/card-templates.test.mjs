@@ -271,6 +271,114 @@ test("file template: in-card raw-source EDIT toggle (writeFile + treeState), tru
   assert.ok(!clipped.includes("textarea"), "a truncated file never enters the raw-source editor");
 });
 
+test("ipynb template renders a notebook read-only: header, markdown + code cells, outputs by type", async () => {
+  const mod = await loadTemplate("ipynb");
+  assert.equal(mod.contract, 1);
+
+  // A realistic nbformat-v4 notebook: a markdown cell, a code cell with a stream + an execute_result
+  // (text/plain), an image output, an html output, and an error cell. `source`/`text` come as arrays of
+  // line-strings (the common on-disk shape) — the codec joins them verbatim.
+  const notebook = {
+    nbformat: 4,
+    metadata: { language_info: { name: "python" } },
+    cells: [
+      { cell_type: "markdown", source: ["# Analysis\n", "\n", "Some **bold** intro."] },
+      {
+        cell_type: "code",
+        execution_count: 1,
+        source: ["import pandas as pd\n", "df.head()"],
+        outputs: [
+          { output_type: "stream", name: "stdout", text: ["loading...\n", "done\n"] },
+          { output_type: "execute_result", execution_count: 1, data: { "text/plain": ["   a  b\n", "0  1  2"] } },
+        ],
+      },
+      {
+        cell_type: "code",
+        execution_count: 2,
+        source: ["plot()"],
+        outputs: [
+          { output_type: "display_data", data: { "image/png": "iVBORw0KGgoAAAANS\nUhEUg==" } },
+        ],
+      },
+      {
+        cell_type: "code",
+        execution_count: 3,
+        source: ["df.style"],
+        outputs: [
+          { output_type: "execute_result", data: { "text/html": "<table><tr><td>1</td></tr></table>" } },
+        ],
+      },
+      {
+        cell_type: "code",
+        execution_count: 4,
+        source: ["1/0"],
+        outputs: [
+          { output_type: "error", ename: "ZeroDivisionError", evalue: "division by zero",
+            traceback: ["[0;31mZeroDivisionError[0m: division by zero"] },
+        ],
+      },
+    ],
+  };
+  const card = {
+    fields: { title: "notebooks/explore.ipynb", text: "", color: "orange" },
+    signals: { fileContent: JSON.stringify(notebook) },
+  };
+  const out = flatten(mod.render(card));
+
+  // Header: basename + the ipynb ext badge + the dir line (reusing the file-card chrome).
+  assert.ok(out.includes('file-name">explore.ipynb<'), "basename in the head");
+  assert.ok(out.includes('file-ext">ipynb<'), "ipynb ext badge");
+  assert.ok(out.includes("notebooks/"), "directory meta line");
+
+  // A markdown cell is PROSE (shared /vendor/markdown.js codec), not a raw dump.
+  assert.ok(out.includes("ipynb-md") && out.includes("md-prose"), "markdown cell wears the prose classes");
+  assert.ok(out.includes('class="md-h md-h1"') && out.includes(">Analysis<"), "# renders as a heading");
+  assert.ok(out.includes("<strong>bold</strong>"), "inline markdown renders");
+
+  // A code cell is a highlighted source box with an `In [n]:` prompt.
+  assert.ok(out.includes("ipynb-source") && out.includes("hljs"), "code cell is a highlighted source box");
+  assert.ok(out.includes("In [1]:"), "the execution-count prompt shows");
+  assert.ok(out.includes("hljs-keyword") && out.includes(">import<"), "python is syntax-highlighted");
+
+  // Outputs by type: stream → <pre>, execute_result text/plain → <pre>, image/png → inline base64 <img>
+  // (whitespace stripped from the payload), text/html → the raw-html wrapper, error → an ANSI-stripped <pre>.
+  assert.ok(out.includes("ipynb-out-stream") && out.includes("loading...") && out.includes("done"), "stream output as pre");
+  assert.ok(out.includes("ipynb-out-text") && out.includes("a  b"), "execute_result text/plain as pre");
+  assert.ok(out.includes("ipynb-out-img") && out.includes("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="), "image output as inline base64 img, whitespace stripped");
+  assert.ok(out.includes("ipynb-out-html"), "html output routes to the raw-html wrapper (unsanitised, browser-rendered)");
+  assert.ok(out.includes("ipynb-out-error") && out.includes("ZeroDivisionError: division by zero"), "error traceback rendered with ANSI stripped");
+  assert.ok(!out.includes("["), "no raw ANSI escape codes leak through");
+});
+
+test("ipynb template honors truncation + parse failure, and the empty/pre-signal beat, without throwing", async () => {
+  const mod = await loadTemplate("ipynb");
+
+  // TRUNCATION GUARD (CLAUDE.md size-cap rule): fileContent is byte-bounded upstream; content.ts marks a
+  // clipped body with a trailing `\n…`. A clipped notebook is invalid JSON, so we show a clear "too large"
+  // notice — NOT a second cap, NOT a blank card.
+  const clipped = flatten(
+    mod.render({ fields: { title: "big.ipynb", text: "", color: "orange" }, signals: { fileContent: '{"cells": [{"cell_type": "cod\n…' } }),
+  );
+  assert.ok(clipped.includes("ipynb-notice-warn") && clipped.includes("too large"), "a truncated notebook shows the too-large notice");
+  assert.ok(clipped.includes('file-name">big.ipynb<'), "…while still showing the header, not a blank card");
+
+  // A genuinely malformed (non-truncated) file gets the parse-failure notice, distinct wording.
+  const broken = flatten(
+    mod.render({ fields: { title: "bad.ipynb", text: "", color: "orange" }, signals: { fileContent: "not json at all" } }),
+  );
+  assert.ok(broken.includes("Could not parse") && !broken.includes("too large"), "malformed JSON → parse notice, not the truncation one");
+
+  // The pre-signal / empty beat: a calm loading placeholder, never a throw.
+  const loading = flatten(mod.render({ fields: { title: "x.ipynb", text: "", color: "orange" }, signals: {} }));
+  assert.ok(loading.includes("loading…"), "no content yet → loading placeholder");
+
+  // An empty-but-valid notebook (no cells) renders its own marker.
+  const empty = flatten(
+    mod.render({ fields: { title: "x.ipynb", text: "", color: "orange" }, signals: { fileContent: '{"cells": [], "metadata": {}}' } }),
+  );
+  assert.ok(empty.includes("Empty notebook"), "a cell-less notebook shows the empty marker");
+});
+
 test("directory template is an in-card tree: dirListing(path) per level, treeState expands, every row drags / folders also expand", async () => {
   const mod = await loadTemplate("directory");
   assert.equal(mod.contract, 1);
