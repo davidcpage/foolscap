@@ -86,6 +86,13 @@ async function handleBoardPersistWrite(
       } catch (err) {
         console.warn("[threads] membership announce from snapshot diff failed:", err);
       }
+      // P2: capture each durable member's offset from its primary thread card off this debounced save (the
+      // "persist on drag-end, not per-frame" point). Idempotent — a save that moved nothing writes nothing.
+      try {
+        ctx.captureMemberOffsets(boardId, snap.records ?? []);
+      } catch (err) {
+        console.warn("[threads] member-offset capture from snapshot save failed:", err);
+      }
       return;
     }
     // import: the one-time IndexedDB adoption. Refused (imported:false) once any server state exists.

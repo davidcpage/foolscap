@@ -36,6 +36,7 @@ const ctx = await import("../server-context.ts");
 const orch = await import("../server-orchestration.ts");
 const sess = await import("../server-sessions.ts");
 const delivery = await import("../server-delivery.ts");
+const ledger = await import("../thread-ledger.js");
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -253,4 +254,106 @@ test("sessionStatus resolves a running session with a fsState that has NO pendin
   assert.ok(fake.fsState.pendingPermissions instanceof Map, "getPendingPermissions lazily created the map");
   // An unknown session with no durable marker resolves to the neutral "ended" band, still no crash.
   assert.equal(sess.sessionStatus("/no/such/repo", "ghost"), "ended");
+});
+
+// ── Group D: P2 relative-offset layout (primary thread / anchors / offset capture) ──────────────────
+const tmpRepo = () => fs.mkdtempSync(path.join(os.tmpdir(), "p2-offset-"));
+// Records for a session `sid` that is a member of the given thread ids (session card + member:open edges).
+const membershipRecords = (sid, threadIds, extra = []) => [
+  { typeName: "node", id: `node:live:${sid}`, type: "session", title: sid },
+  ...threadIds.map((t) => ({ typeName: "node", id: t, type: "thread", title: t })),
+  ...threadIds.map((t, i) => ({ typeName: "edge", id: `e${i}`, from: `node:live:${sid}`, to: t, type: "member:open" })),
+  ...extra,
+];
+
+test("primaryThreadForSession picks the EARLIEST-joined thread (min joinedAt), across memberships", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {} });
+  ledger.addThreadMember(repo, "node:thread:late", "sid-a", 300);
+  ledger.addThreadMember(repo, "node:thread:early", "sid-a", 100);
+  const records = membershipRecords("sid-a", ["node:thread:late", "node:thread:early"]);
+  assert.equal(snap.primaryThreadForSession(repo, records, "sid-a"), "node:thread:early");
+  // No memberships → null (nothing to anchor to).
+  assert.equal(snap.primaryThreadForSession(repo, membershipRecords("sid-none", []), "sid-none"), null);
+});
+
+test("primaryThreadForSession breaks a joinedAt tie on the smaller threadId (stable choice)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {} });
+  ledger.addThreadMember(repo, "node:thread:bbb", "sid-a", 100);
+  ledger.addThreadMember(repo, "node:thread:aaa", "sid-a", 100); // same joinedAt
+  const records = membershipRecords("sid-a", ["node:thread:bbb", "node:thread:aaa"]);
+  assert.equal(snap.primaryThreadForSession(repo, records, "sid-a"), "node:thread:aaa", "smaller id wins the tie");
+});
+
+test("allSessionAnchors maps every durable member to its primary thread, board-wide (marker-only)", () => {
+  const repo = tmpRepo();
+  ledger.addThreadMember(repo, "node:thread:t1", "sid-a", 100); // sid-a primary
+  ledger.addThreadMember(repo, "node:thread:t2", "sid-a", 200); // sid-a secondary
+  ledger.addThreadMember(repo, "node:thread:t2", "sid-b", 50); // sid-b only here
+  const anchors = snap.allSessionAnchors(repo);
+  assert.equal(anchors["sid-a"], "node:thread:t1", "earliest join is primary");
+  assert.equal(anchors["sid-b"], "node:thread:t2");
+});
+
+test("sessionAnchor returns the primary thread + its stored offset (null offset until captured)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {} });
+  ledger.addThreadMember(repo, "node:thread:t1", "sid-a", 100);
+  const records = membershipRecords("sid-a", ["node:thread:t1"]);
+  assert.deepEqual(snap.sessionAnchor(repo, records, "sid-a"), { primaryThread: "node:thread:t1", offset: null });
+  ledger.setMemberOffset(repo, "node:thread:t1", "sid-a", 40, -20);
+  assert.deepEqual(snap.sessionAnchor(repo, records, "sid-a"), {
+    primaryThread: "node:thread:t1",
+    offset: { dx: 40, dy: -20 },
+  });
+});
+
+test("captureMemberOffsets stores each member's offset from its PRIMARY thread card (from the snapshot)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  ledger.addThreadMember(repo, "node:thread:t1", "sid-a", 100);
+  const records = membershipRecords("sid-a", ["node:thread:t1"], [
+    { typeName: "layout", nodeId: "node:thread:t1", x: 1000, y: 500 },
+    { typeName: "layout", nodeId: "node:live:sid-a", x: 1120, y: 556 }, // 120 right, 56 down
+  ]);
+  snap.captureMemberOffsets("b1", records);
+  assert.deepEqual(ledger.memberOffsetFromMeta(ledger.readThreadMeta(repo, "node:thread:t1"), "sid-a"), {
+    dx: 120,
+    dy: 56,
+  });
+});
+
+test("captureMemberOffsets: SECONDARY thread card position never sets the offset (primary only)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  ledger.addThreadMember(repo, "node:thread:primary", "sid-a", 100);
+  ledger.addThreadMember(repo, "node:thread:secondary", "sid-a", 200);
+  // Only the SECONDARY thread card is on the board (primary is closed) — with no primary card to measure
+  // against, the offset must stay uncaptured rather than being taken relative to the secondary.
+  const records = membershipRecords("sid-a", ["node:thread:secondary"], [
+    { typeName: "layout", nodeId: "node:thread:secondary", x: 0, y: 0 },
+    { typeName: "layout", nodeId: "node:live:sid-a", x: 300, y: 300 },
+  ]);
+  snap.captureMemberOffsets("b1", records);
+  assert.equal(
+    ledger.memberOffsetFromMeta(ledger.readThreadMeta(repo, "node:thread:primary"), "sid-a"),
+    null,
+    "primary membership keeps no offset — the secondary card must not seed it",
+  );
+});
+
+test("captureMemberOffsets is idempotent — a save that moved nothing writes nothing", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  ledger.addThreadMember(repo, "node:thread:t1", "sid-a", 100);
+  const records = membershipRecords("sid-a", ["node:thread:t1"], [
+    { typeName: "layout", nodeId: "node:thread:t1", x: 100, y: 100 },
+    { typeName: "layout", nodeId: "node:live:sid-a", x: 150, y: 130 },
+  ]);
+  snap.captureMemberOffsets("b1", records);
+  const marker1 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
+  snap.captureMemberOffsets("b1", records); // same positions again
+  const marker2 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
+  assert.equal(marker1, marker2, "unchanged offset → marker byte-identical (no churn)");
 });

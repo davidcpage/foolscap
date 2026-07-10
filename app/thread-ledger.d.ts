@@ -53,7 +53,16 @@ export interface ThreadMetaMarker {
   levels?: Record<string, NotificationLevel>; // sid-keyed wake preference for seatless members (P1/W4)
   pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
   seenMentions?: number[]; // @human mention seqs the human has VIEWED (user waiting-state), sorted
-  members?: Record<string, { joinedAt: number }>; // durable membership — survives the card/edge (delete-card-keep-session)
+  members?: Record<string, MemberRecord>; // durable membership — survives the card/edge (delete-card-keep-session)
+}
+
+// A durable membership record (delete-card-keep-session). `joinedAt` is the join time (min across a session's
+// memberships picks its PRIMARY thread); `dx,dy` (P2) is the session card's offset from its PRIMARY thread
+// card, written only on the primary membership (absent until captured from a placement/move).
+export interface MemberRecord {
+  joinedAt: number;
+  dx?: number;
+  dy?: number;
 }
 
 // A pinned message (R-PIN, W7): a SNAPSHOT of a thread message flagged as head context — re-read on every
@@ -124,10 +133,24 @@ export function addThreadMember(
   threadId: string,
   sid: string,
   ts: number,
-): Record<string, { joinedAt: number }>;
+): Record<string, MemberRecord>;
 export function removeThreadMember(
   repoPath: string,
   threadId: string,
   sid: string,
-): Record<string, { joinedAt: number }>;
+): Record<string, MemberRecord>;
 export function threadMembersFromMeta(meta: ThreadMetaMarker | null | undefined): string[];
+// P2 relative-offset layout: set/read the session card's offset from its PRIMARY thread card, stored on the
+// primary membership. setMemberOffset is idempotent (returns false when not a member or the offset is
+// unchanged, so a no-op save never churns the marker); memberOffsetFromMeta reads it (null when absent).
+export function setMemberOffset(
+  repoPath: string,
+  threadId: string,
+  sid: string,
+  dx: number,
+  dy: number,
+): boolean;
+export function memberOffsetFromMeta(
+  meta: ThreadMetaMarker | null | undefined,
+  sid: string,
+): { dx: number; dy: number } | null;

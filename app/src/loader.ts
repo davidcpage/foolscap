@@ -855,7 +855,12 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // — so we keep nothing from the body here; text:"" is a pure reference card.
   // `threads` = the sid's durable thread memberships (server-reported). Card-close removed the card + its
   // member:open edge (the VIEW); the membership outlived them, so on reopen we repaint the wire from these.
-  const { id: sid, threads } = (await res.json()) as { id: string; threads?: string[] };
+  const { id: sid, threads, primaryThread, offset } = (await res.json()) as {
+    id: string;
+    threads?: string[];
+    primaryThread?: string | null;
+    offset?: { dx: number; dy: number } | null;
+  };
   // Dedup on reopen (mirrors openChannel's fly-to): a card for this session may ALREADY be on the board —
   // either a live-summoned worker card (`node:live:<sid>`, dropped by the server on spawn) or a prior
   // reopen (`node:session:<sid>`). The two ids differ, so a naive re-add litters a SECOND, unconnected
@@ -869,6 +874,12 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
     }
   }
   const nodeId = `node:session:${sid}` as Id<"node">;
+  // Placement (P2 reopen-at-offset): an explicit drop point (`at`) always wins. Otherwise, if the session
+  // has a stored offset relative to its PRIMARY thread AND that thread's card is currently on the board,
+  // reopen the card at primaryThreadCardPos + offset — so a closed session comes back exactly where it sat
+  // relative to its thread, not at a fresh cascade spot. Falls back to the viewport-centre cascade (spawnAt)
+  // when there's no offset yet or the primary thread card is closed (nothing to anchor to).
+  const pos = at ?? reopenAtOffset(m, primaryThread, offset) ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H);
   m.editor.commit({
     type: "addNode",
     actor: "system",
@@ -880,7 +891,7 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       // that session is (slice 1), and resumes in place if you recommence it.
       text: "",
       color: "blue",
-      ...(at ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H)),
+      ...pos,
       w: SESSION_CARD_W,
       h: SESSION_CARD_H,
     },
@@ -890,6 +901,24 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // convention so it's stable + idempotent across spawn→close→reopen; the server treats a redraw of an
   // existing membership as a no-op (no re-onboarding, no peer wake) — see server-delivery's REOPEN GUARD.
   redrawMemberEdges(m, nodeId, sid, threads);
+}
+
+// The reopen position for a session card (P2): its PRIMARY thread card's current on-board position PLUS the
+// stored offset, or null when there's nothing to anchor to — no primary thread / no stored offset / the
+// primary thread card isn't currently on the board (its layout is gone). Reading the LIVE thread-card layout
+// (not a server-cached one) means the card lands relative to wherever the thread sits right now, even if the
+// human moved the thread while this session was closed. Null → openSession falls back to the cascade spawn.
+function reopenAtOffset(
+  m: InteractionManager,
+  primaryThread: string | null | undefined,
+  offset: { dx: number; dy: number } | null | undefined,
+): Pos | null {
+  if (!primaryThread || !offset) return null;
+  const layout = m.editor.store.get<"layout">(layoutId(primaryThread as Id<"node">)) as
+    | { x: number; y: number }
+    | undefined;
+  if (!layout) return null; // primary thread card is closed → no anchor
+  return { x: Math.round(layout.x + offset.dx), y: Math.round(layout.y + offset.dy) };
 }
 
 // Repaint a reopened session card's `member:open` edge(s) from the durable memberships the server reported

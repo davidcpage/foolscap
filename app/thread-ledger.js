@@ -360,6 +360,44 @@ export function threadMembersFromMeta(meta) {
   return meta && meta.members && typeof meta.members === "object" ? Object.keys(meta.members) : [];
 }
 
+// ── relative-offset layout (P2) ─────────────────────────────────────────────────────────────────────
+// A session card's on-canvas position is stored RELATIVE to its PRIMARY thread card, so (a) moving the
+// thread moves its open member cards preserving the layout, and (b) a closed session reopens at its stored
+// relative offset (not a fresh cascade spot). The offset lives on the membership record beside `joinedAt`
+// (`members[sid] = { joinedAt, dx, dy }`) — the human's explicit call to store it on the thread — and is
+// written ONLY on the session's PRIMARY membership (its earliest-joined thread; see primaryThreadForSession).
+// dx,dy are the session card's layout (x,y) MINUS the primary thread card's layout (x,y). Written on the
+// debounced snapshot save (captureMemberOffsets), never the per-frame drag — the offset is a settled fact,
+// not a hot value.
+
+/**
+ * Set the relative offset {dx,dy} on `sid`'s membership of a thread — idempotent: a no-op (returns false)
+ * when `sid` isn't a member, or when the stored offset already equals dx,dy (so a snapshot save that moved
+ * nothing, or a move-with-thread that preserved the offset, never churns the marker). Returns true iff it
+ * wrote. Best-effort (upsertThreadMeta swallows write errors). dx,dy are rounded to whole pixels — sub-pixel
+ * offsets are noise that would defeat the unchanged-guard.
+ */
+export function setMemberOffset(repoPath, threadId, sid, dx, dy) {
+  const members = readThreadMeta(repoPath, threadId)?.members ?? {};
+  const rec = members[sid];
+  if (!rec) return false; // not a member — nothing to anchor
+  const rx = Math.round(dx);
+  const ry = Math.round(dy);
+  if (rec.dx === rx && rec.dy === ry) return false; // unchanged — don't churn the marker
+  const next = { ...members, [sid]: { ...rec, dx: rx, dy: ry } };
+  upsertThreadMeta(repoPath, threadId, { members: next });
+  return true;
+}
+
+/**
+ * The stored offset {dx,dy} for `sid`'s membership of a thread, or null when there is no membership or no
+ * offset recorded yet. Pure — callers pass `meta` (readThreadMeta).
+ */
+export function memberOffsetFromMeta(meta, sid) {
+  const rec = meta && meta.members && typeof meta.members === "object" ? meta.members[sid] : undefined;
+  return rec && typeof rec.dx === "number" && typeof rec.dy === "number" ? { dx: rec.dx, dy: rec.dy } : null;
+}
+
 // ── notification levels (P1, wakeable-substrate-plan W4; claude-tag R2 recast) ──────────────────────
 // A thread member's SEAT carries a notification LEVEL — the same wake preference a doc watcher carries
 // (notification-levels.js), one surface up. Default `all` (any room broadcast wakes it, the R2 default);

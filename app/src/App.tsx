@@ -20,6 +20,7 @@ import { onFeedsReconnect } from "./feeds";
 import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
 import { connectToThread, createThread, isThreadNode, isSessionNode } from "./threads";
+import { installMoveWithThread } from "./move-with-thread";
 import { CanvasView } from "./CanvasView";
 import { useSignal } from "./reactive";
 import { templatesSignal } from "./templates";
@@ -545,6 +546,11 @@ function Board({ m, undo, persistence }: Engine) {
   // The agent bus: inbound commands (POST /api/command → SSE → editor.commit) and the debounced
   // outbound snapshot push that makes GET /api/canvas the agent's read side.
   useEffect(() => connectAgentBus(m), [m]);
+
+  // Move-with-thread (P2): dragging a thread card carries its open member session cards along, preserving
+  // the cluster's relative layout. Reactive to layout changes (the store's layout query), so it tracks a
+  // live drag frame-by-frame; a session moves only with its PRIMARY thread.
+  useEffect(() => installMoveWithThread(m), [m]);
 
   // Delete the selected cards (actor "user", so it's undoable). Edges touching a removed node go first,
   // so no wire ever dangles — the same edges-before-nodes order clearBoard uses.
