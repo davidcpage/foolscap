@@ -10,7 +10,7 @@ import {
   type AnyRecord,
 } from "./lib";
 import { fileKind } from "./fileTypes";
-import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce } from "./content";
+import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce, fileApiUrl } from "./content";
 import { annotationsWatchEvent } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
@@ -1301,9 +1301,7 @@ async function onWatchEvent(
     setGone(root, msg.path, true);
   } else {
     setGone(root, msg.path, false); // re-created on disk → clear any tombstone
-    const r = await fetch(
-      `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(msg.path)}`,
-    );
+    const r = await fetch(fileApiUrl(root, msg.path));
     if (!r.ok) return; // a directory event (no file body) or transient — its listing refreshes on re-subscribe
     setFileContent(root, msg.path, filePreview((await r.json()) as TreeFile));
   }

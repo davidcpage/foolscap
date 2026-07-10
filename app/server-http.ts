@@ -76,13 +76,21 @@ export function openSse(req: IncomingMessage, res: ServerResponse, clients: Set<
 // routes — one source, imported, never re-declared.
 export const MAX_BYTES = 128 * 1024;
 
-// Read a file as utf8, head-truncated at MAX_BYTES with a `truncated` flag, or null if it can't be read.
-// The stateless read primitive the file-card / card-type / bundled-role reads share (all preview-bounded);
-// callers needing the FULL bytes (a template module, a CAS hash) read the file directly instead.
-export function readText(abs: string): { content: string; truncated: boolean } | null {
+// A `.ipynb` is JSON that must PARSE intact to render (the ipynb card) or be legibly transformed (an
+// agent read) — a 128 KiB head-clip yields invalid JSON, so notebooks read against this generous ceiling
+// instead. This is the ONE byte bound for the notebook path (CLAUDE.md's size-cap rule): the notebook-aware
+// codec (ipynb-codec.js) then elides/drops at the STRUCTURE level, never adding a second byte cap. A file
+// beyond even this is genuinely pathological and falls back to head-truncation (card shows "too large").
+export const MAX_NOTEBOOK_BYTES = 32 * 1024 * 1024;
+
+// Read a file as utf8, head-truncated at `maxBytes` (default MAX_BYTES) with a `truncated` flag, or null if
+// it can't be read. The stateless read primitive the file-card / card-type / bundled-role reads share (all
+// preview-bounded); the notebook route passes MAX_NOTEBOOK_BYTES. Callers needing the FULL bytes (a template
+// module, a CAS hash) read the file directly instead.
+export function readText(abs: string, maxBytes: number = MAX_BYTES): { content: string; truncated: boolean } | null {
   try {
     const buf = fs.readFileSync(abs);
-    return { content: buf.subarray(0, MAX_BYTES).toString("utf8"), truncated: buf.length > MAX_BYTES };
+    return { content: buf.subarray(0, maxBytes).toString("utf8"), truncated: buf.length > maxBytes };
   } catch {
     return null;
   }

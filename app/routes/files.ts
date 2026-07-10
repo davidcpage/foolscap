@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { sendJson, readBody, readBodyBuffer, readText, MAX_BYTES } from "../server-http.js";
+import { sendJson, readBody, readBodyBuffer, readText, MAX_BYTES, MAX_NOTEBOOK_BYTES } from "../server-http.js";
+import { transformNotebook } from "../ipynb-codec.js";
 import {
   safeResolve,
   isInternalPath,
@@ -51,7 +52,26 @@ function handleLs(res: ServerResponse, root: string, sub: string): void {
   sendJson(res, 200, { path: sub, dirs, files });
 }
 
-function handleFile(res: ServerResponse, root: string, rel: string): void {
+// NOTEBOOK-AWARE read (.ipynb) — the file card's generic 128 KiB preview head-clips a notebook with base64
+// image outputs into invalid JSON (blank card; unreadable agent read). Read against the generous
+// MAX_NOTEBOOK_BYTES ceiling instead, then hand to the notebook codec, which serves two shapes of the same
+// file: `notebook=render` (the card) keeps images and only drops WHOLE outputs past its budget; the default
+// (a bare agent read) elides base64 images to markers and clamps huge text — both stay valid, parseable JSON.
+// Beyond even the ceiling we fall back to head-truncation (truncated flag → card's existing "too large"
+// notice); we never guess truncation from a parse failure — a malformed file is served verbatim.
+function handleNotebookFile(res: ServerResponse, abs: string, rel: string, mode: "render" | "agent"): void {
+  const raw = readText(abs, MAX_NOTEBOOK_BYTES);
+  if (!raw) return sendJson(res, 404, { error: "not found" });
+  if (raw.truncated) {
+    // File exceeds even the notebook ceiling — the bytes are already clipped, so we can't parse/transform.
+    // Serve the head-truncated content with the flag; the card shows "too large", an agent sees the flag.
+    return sendJson(res, 200, { path: rel, content: raw.content, truncated: true, version: fileVersion(abs) });
+  }
+  const { content, trimmed } = transformNotebook(raw.content, { mode });
+  sendJson(res, 200, { path: rel, content, truncated: false, trimmed, version: fileVersion(abs) });
+}
+
+function handleFile(res: ServerResponse, root: string, rel: string, notebook: string | null): void {
   const abs = safeResolve(root, rel);
   // Apply the SAME gates handleLs uses, so a card can only read what the listing would have shown:
   // inside the root (safeResolve), not under an excluded dir (.git, node_modules, …), and only a
@@ -60,6 +80,8 @@ function handleFile(res: ServerResponse, root: string, rel: string): void {
   // the endpoint never confirms a blocked file exists.
   const allowed =
     !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
+  if (allowed && path.extname(rel).toLowerCase() === ".ipynb")
+    return handleNotebookFile(res, abs!, rel, notebook === "render" ? "render" : "agent");
   const r = allowed ? readText(abs!) : null;
   if (!r) {
     // Role cards read `.canvas/roles/<id>/role.md` through this endpoint. On a board with no override the
@@ -310,7 +332,7 @@ export const fileRootRoutes: RootRoute[] = [
     match: exact("/api/file"),
     run: (req, res, url, _g, _boardId, board, root) => {
       if (req.method === "POST") return void handleFileWrite(req, res, root, url.searchParams.get("path") ?? "", board.repoPath);
-      return handleFile(res, root, url.searchParams.get("path") ?? "");
+      return handleFile(res, root, url.searchParams.get("path") ?? "", url.searchParams.get("notebook"));
     },
   },
   {

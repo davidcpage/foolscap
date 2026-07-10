@@ -1,0 +1,27 @@
+// Types for ipynb-codec.js (plain ESM, runs under node --test). Hand-written so routes/files.ts can import
+// the transform without allowJs. Keep in sync with the exports in ipynb-codec.js.
+
+/** Per-output text-clamp budget (chars) for the agent path. */
+export const DEFAULT_MAX_TEXT_CHARS: number;
+
+/** Serialized-size budget (chars ≈ bytes) for the render path before whole outputs are dropped. */
+export const DEFAULT_RENDER_BUDGET: number;
+
+export interface TransformOpts {
+  /** "render" keeps images (drops whole outputs past the budget); "agent" (default) elides base64 + clamps text. */
+  mode?: "render" | "agent";
+  maxTextChars?: number;
+  renderBudget?: number;
+}
+
+export interface TransformResult {
+  /** Valid notebook JSON (transformed) when parsed; the ORIGINAL text unchanged when parsed=false. */
+  content: string;
+  /** Whether any image was elided / text clamped / output dropped. */
+  trimmed: boolean;
+  /** False when `text` wasn't valid notebook JSON (malformed or byte-clipped upstream). */
+  parsed: boolean;
+}
+
+/** Transform a `.ipynb`'s raw JSON text for the card (render) or an agent read (agent, default). */
+export function transformNotebook(text: string, opts?: TransformOpts): TransformResult;

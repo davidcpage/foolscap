@@ -78,14 +78,21 @@ export function goneSignal(root: string, path: string): Subscribable<boolean> {
   };
 }
 
+// The /api/file URL a CARD reads a file's content from. A `.ipynb` opts into the notebook-aware RENDER
+// shape (`notebook=render`) — keep the images, drop only whole outputs past a generous budget — vs the
+// endpoint's default (a bare agent read, which elides base64 to markers for legibility). Shared with the
+// loader's watch-refetch so both card fetch sites request the identical shape.
+export function fileApiUrl(root: string, path: string): string {
+  const nb = path.toLowerCase().endsWith(".ipynb") ? "&notebook=render" : "";
+  return `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}${nb}`;
+}
+
 async function fetchContent(root: string, path: string): Promise<void> {
   const k = key(root, path);
   if (inflight.has(k)) return;
   inflight.add(k);
   try {
-    const r = await fetch(
-      `/api/file?board=${activeBoardId()}&root=${encodeURIComponent(root)}&path=${encodeURIComponent(path)}`,
-    );
+    const r = await fetch(fileApiUrl(root, path));
     if (r.ok) {
       setGone(root, path, false);
       setFileContent(root, path, filePreview((await r.json()) as { content: string; truncated: boolean }));
