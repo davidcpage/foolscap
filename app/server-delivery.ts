@@ -71,7 +71,7 @@ function memberEdgesOf(records: Array<Record<string, unknown>> | null | undefine
 // state rides the same feed the log does, no second subscription. Pins live on the durable marker (read
 // best-effort; [] when there's no repo/marker). Used by appendThreadMsg, seedThreadLogs, and the pin handler.
 export function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean): void {
-  const { boards, publishFeed, boardSnapshotRecords } = getServerContext();
+  const { boards, publishFeed, boardSnapshotRecords, sessionStatus } = getServerContext();
   const repoPath = boards.get(boardId)?.repoPath;
   const pins: PinnedMsg[] = repoPath ? readPins(repoPath, threadId) : [];
   // The board owner's unseen-mention signal (user waiting-state + you-pill): an @you/@human mention the human
@@ -86,15 +86,23 @@ export function publishThreadFeed(boardId: string, threadId: string, messages: T
   // whose session card was deleted — the edge (and its edge-derived pill) vanished, but the membership and
   // seat outlived them (server-snapshot's threadMemberSids folds those cardless durable members in). The
   // card unions this with its edge-derived members: a durable sid with no member:open edge → a CLOSED,
-  // clickable pill that reopens the session (the P4 pill-open path). Kept lean — sid + name only — so this
-  // per-frame feed payload stays small (the name is formatted like a live card's node.name so both pills
-  // render the same handle through displayHandle). `[]` when there's no repo/marker.
+  // clickable pill that reopens the session (the P4 pill-open path). Each entry also carries the member's
+  // live STATUS — the SAME canonical sessionStatus() band the session card's frame and the open-member pill
+  // (via /api/sessions) derive from, NOT a second derivation — so a CLOSED-but-running session's pill still
+  // paints its live colour instead of a misleading neutral (a closed card ≠ an inactive session). Kept lean
+  // — sid + name + status only — so this per-frame feed payload stays small (the name is formatted like a
+  // live card's node.name so both pills render the same handle through displayHandle). `[]` when there's no
+  // repo/marker.
   const seats = (repoPath ? readThreadMeta(repoPath, threadId) : null)?.seats;
   const records = boardSnapshotRecords(boardId) ?? [];
   const members = threadMemberSids(records, threadId).map((sid) => {
     const seat = seatForSid(seats, sid);
     const role = seat ? (seats?.[seat]?.role ?? seat) : null;
-    return { sid, name: role ? `${role}.${sid.slice(0, 8)}` : null };
+    return {
+      sid,
+      name: role ? `${role}.${sid.slice(0, 8)}` : null,
+      status: repoPath ? sessionStatus(repoPath, sid) : null,
+    };
   });
   publishFeed("thread:" + threadId, {
     messages,

@@ -595,7 +595,7 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[]; members?: { sid: string; name: string | null }[] }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[]; members?: { sid: string; name: string | null; status?: string | null }[] }>("thread:" + id));
   const msgs = feed?.messages ?? [];
   // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you/@human
   // mention seqs the human has not yet VIEWED (thread-waiting.js × the durable seenMentions set). This no
@@ -619,6 +619,16 @@ function ThreadView({
     for (const s of sessions ?? []) if (s.status) map[s.id] = s.status;
     return map;
   }, [sessions]);
+  // The server roster's per-member status (server-delivery.ts publishThreadFeed) — the SAME canonical
+  // sessionStatus() band as bandBySid, delivered through the thread feed so a CLOSED member (its session
+  // card deleted → absent from the local snapshot AND often from /api/sessions, e.g. a worktree session in
+  // another projects dir) still has a live band to paint. bandBySid (fresher, per session-feed frame) wins
+  // when present; this is the fallback for members it doesn't cover. Same source, so the two can't disagree.
+  const rosterStatusBySid = useMemo(() => {
+    const map: Record<string, string> = {};
+    for (const r of feed?.members ?? []) if (r.status) map[r.sid] = r.status;
+    return map;
+  }, [feed?.members]);
   // Work-intent is CURRENT state, not transcript history, so it no longer renders as inline log lines
   // (Thread card UI). Instead each member's *latest* declared intent colours their participant pill. The
   // feed is ordered, so the last intent act per sid wins. `visible` is the log with intent acts filtered
@@ -1061,12 +1071,17 @@ function ThreadView({
             // blue = blocked:peer/waiting-agent, teal = scheduled, red = crashed, grey = done/ended). The band
             // already carries the whole-session intent refinement (folded server-side), so memberPillState is a
             // pure band→slot map; a running turn is green, a permission-hold/crash/scheduled all reach the pill.
+            // This is the STATUS axis (the pill's FILL) and it runs for CLOSED members too, not just open ones:
+            // a closed card doesn't mean an inactive session, so the fill tracks live status regardless — the
+            // band comes from bandBySid (open members, live in /api/sessions) OR the server roster's status
+            // (closed members, absent from the list). Only OPEN/CLOSED-vs-open is the BORDER axis below. A
+            // PENDING invite has no session yet, so it gets no status fill (pillState null → the dashed style).
             // The declared intent is passed only for the no-live-row fallback (a durable exited seat). A member
-            // with no row and nothing declared falls back to the open/pending styling.
-            const ci = mem.open ? currentIntent[mem.sid] : undefined;
-            const pillState: PillState | null = mem.open
-              ? memberPillState(bandBySid[mem.sid] ?? null, ci?.intent ?? null)
-              : null;
+            // with no row and nothing declared falls back to the closed/pending styling.
+            const ci = currentIntent[mem.sid];
+            const pillState: PillState | null = mem.invited
+              ? null
+              : memberPillState(bandBySid[mem.sid] ?? rosterStatusBySid[mem.sid] ?? null, ci?.intent ?? null);
             // Keep the declared note ONLY when the shown slot actually came FROM the declaration; when the
             // server band drove the slot (e.g. running → working, or waiting-agent → blue with nothing
             // declared) a stale note ("blocked on X") would be misleading — drop it.

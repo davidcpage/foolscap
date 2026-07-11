@@ -3466,13 +3466,19 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   font: inherit;
   color: inherit;
 }
-/* An OPEN member reads as a quiet neutral pill; a PENDING (invited) one is dimmer with a dashed border to
-   mark "not yet joined" — the distinction carried by weight/border, not by competing saturated colours.
-   (Right-click inserts the @-tag; that's surfaced in the hover tooltip, not via a cursor change.) */
+/* TWO INDEPENDENT AXES on a member pill (Thread card UI). FILL/colour = the session's live STATUS (the
+   `.i-*` rules below), painted for every JOINED member — open OR closed — because a closed card does NOT
+   mean an inactive session. BORDER = whether that session's CARD is currently OPEN on the canvas: an open
+   card gets a box-shadow RING, a closed one gets none. So .open/.closed here carry ONLY the ring (and a
+   neutral fallback fill for the rare status-less member); the status fill comes from `.i-*` and overrides
+   the neutral. A PENDING (invited) member has no session yet — no status — so it keeps its own dimmer
+   dashed style and never takes a status fill. (Right-click inserts the @-tag; surfaced in the hover
+   tooltip, not via a cursor change.) */
 .chan-member.open {
   background: #f4f4f5;
   color: #52525b;
   border-color: #e4e4e7;
+  box-shadow: 0 0 0 1.5px #c4c4cc; /* RING = this member's session card is OPEN on the canvas */
 }
 .chan-member.pending {
   background: transparent;
@@ -3480,19 +3486,21 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border: 1px dashed #d4d4d8;
 }
 /* A CLOSED durable member — joined server-side, but its session card was select-deleted (a display-only
-   close: membership + seat survive). Reads as a REAL member (neutral fill like .open, not the dimmer
-   dashed "invited" styling) with a dotted border hinting it's reopenable — a click runs openSession to
-   bring its card back. Distinct from .pending, which is a not-yet-joined invite. */
+   close: membership + seat survive). Same neutral FALLBACK fill as .open (a REAL member, not the dimmer
+   dashed "invited" style) but NO ring — the ring is the open/closed cue. Its live status fill comes from
+   `.i-*` below just like an open member, so a closed-but-running session is coloured, not neutral-white. A
+   click runs openSession to bring its card back. Distinct from .pending (a not-yet-joined invite). */
 .chan-member.closed {
-  background: #fafafa;
-  color: #71717a;
-  border: 1px dotted #d4d4d8;
+  background: #f4f4f5;
+  color: #52525b;
+  border-color: #e4e4e7;
 }
-/* The pill coloured by the member's CURRENT work-intent (Thread card UI) — status where it belongs, on the
+/* The pill's FILL, coloured by the member's live STATUS (Thread card UI) — status where it belongs, on the
    roster, instead of as inline transcript history. The note rides the pill's hover title. These follow the
-   session-status vocabulary and sit AFTER `.open` so they win at equal specificity: amber = blocked:human
-   (your turn), blue = blocked:peer (in flight elsewhere), green = working, grey = done. A member with no
-   declared intent keeps the neutral open/pending styling above. */
+   session-status vocabulary and sit AFTER `.open`/`.closed` so they win the FILL at equal specificity: amber
+   = blocked:human (your turn), blue = blocked:peer (in flight elsewhere), green = working, grey = done. They
+   set background/colour/border-colour only — NOT box-shadow — so the open-card RING survives on top of any
+   status fill. A member with no known status keeps the neutral open/closed fallback fill above. */
 .chan-member.i-working { background: #eaf7ec; color: #3f7a4c; border-color: #cfe9d3; }
 .chan-member.i-blocked-human { background: #fdf0e0; color: #b45309; border-color: #f3d7b0; }
 .chan-member.i-blocked-peer { background: #e9eefb; color: #3d5bb0; border-color: #cdd9f4; }
