@@ -130,6 +130,9 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleId: (marker?.roleId as string | undefined) ?? null,
       roleName: (marker?.roleName as string | undefined) ?? null,
       roleColour: (marker?.roleColour as string | undefined) ?? null,
+      // The serving model, known only for a session the registry holds live (folded from its stream /
+      // seeded transcript). Dead rows read null — the list renders no chip rather than a stale guess.
+      model: liveSessions.get(s.id)?.model ?? null,
     };
   });
   // Union in LIVE sessions the disk walk missed: a session that hasn't completed a single turn has a
@@ -154,6 +157,7 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleId: (marker?.roleId as string | undefined) ?? null,
       roleName: (marker?.roleName as string | undefined) ?? null,
       roleColour: (marker?.roleColour as string | undefined) ?? null,
+      model: l.model ?? null,
     } as (typeof sessions)[number]);
   }
   sessions.sort((a, b) => b.mtime - a.mtime); // keep the newest-first contract across both sources

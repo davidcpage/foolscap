@@ -264,8 +264,11 @@ function foldSessionEvent(s: LiveSession, e: any): void {
   // stdout stream does NOT emit that attachment — the init event is the only live source. We take
   // `skills` (the curated Skill-tool set) rather than the wider `slash_commands` (which also carries
   // TUI-only built-ins like /clear,/config that are meaningless to pipe into a headless session).
-  if (e?.type === "system" && e?.subtype === "init" && Array.isArray(e.skills)) {
-    s.skills = (e.skills as unknown[]).filter((n): n is string => typeof n === "string");
+  if (e?.type === "system" && e?.subtype === "init") {
+    // The init frame names the REQUESTED model; each assistant message below then carries the model that
+    // actually SERVED it (which differs after a refusal fallback, e.g. fable-5 → opus-4-8) and overwrites.
+    if (typeof e.model === "string" && e.model) s.model = e.model;
+    if (Array.isArray(e.skills)) s.skills = (e.skills as unknown[]).filter((n): n is string => typeof n === "string");
     return;
   }
 
@@ -286,6 +289,9 @@ function foldSessionEvent(s: LiveSession, e: any): void {
         s.turnOut += Number(e.message.usage.output_tokens) || 0;
         s.usage = { input: ctxOf(e.message.usage), output: s.turnOut };
       }
+      // The serving model, authoritative per message — tracks a mid-session refusal fallback the moment
+      // the first fallen-back message lands (the requested model from init is only the opening claim).
+      if (e.type === "assistant" && typeof e.message?.model === "string" && e.message.model) s.model = e.message.model;
       break;
     case "result":
       s.inflight = null;
@@ -299,6 +305,7 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       if (ev?.type === "message_start") {
         s.inflight = [];
         s.usage = { input: ctxOf(ev.message?.usage), output: s.turnOut };
+        if (typeof ev.message?.model === "string" && ev.message.model) s.model = ev.message.model; // serving model, live
         s.verb = "Thinking"; // a neutral default until the first content_block_start names the activity
       } else if (ev?.type === "content_block_start" && s.inflight) {
         const cb = ev.content_block;
@@ -337,8 +344,12 @@ function seedFromTranscript(s: LiveSession): void {
     if (!line.trim()) continue;
     try {
       const e = JSON.parse(line);
-      if ((e?.type === "user" || e?.type === "assistant") && e.message)
+      if ((e?.type === "user" || e?.type === "assistant") && e.message) {
         s.lines.push(JSON.stringify({ type: e.type, message: e.message }));
+        // Recover the serving model from history too (last assistant message wins), so an adopted or
+        // resumed session shows its model chip before its first new turn.
+        if (e.type === "assistant" && typeof e.message.model === "string" && e.message.model) s.model = e.message.model;
+      }
     } catch {
       // a non-JSON framing line or a ragged tail — skip, same tolerance as the codec
     }
@@ -541,7 +552,7 @@ export function ensureLiveSession(
     // a `result`, until it's first prompted), so "running" would be a turn that never ends — and the inbox,
     // which flushes idle-immediately / at a turn boundary, would queue forever with no boundary to drain at.
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
-    id, repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, turnOut: 0,
+    id, repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, model: null, turnOut: 0,
     // Cursors revive from the marker (persistSessionState) so a --resume / sidecar adoption doesn't reset
     // them to 0 and re-deliver every joined thread's backlog as unread.
     read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
@@ -642,7 +653,7 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
   const s: LiveSession = {
     id: info.id, repoPath: boardRoot, cwd: info.cwd, proc, lines: [], inflight: null,
     status: info.busy ? "running" : "idle", skills: null, verb: info.busy ? "Working" : null,
-    usage: null, turnOut: 0,
+    usage: null, model: null, turnOut: 0,
     read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
     nudge: false,
     waitingOn: Array.isArray(marker.waitingOn) ? (marker.waitingOn as string[]) : null,
@@ -1160,6 +1171,7 @@ export function publishSession(s: LiveSession): void {
     skills: s.skills ?? undefined,
     verb: s.verb ?? undefined, // live progress label for the status pill (channel-1 chrome)
     usage: s.usage ?? undefined, // {input, output} token counts for the current/last turn
+    model: s.model ?? undefined, // the model actually serving the session (tracks refusal fallbacks)
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
     // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:

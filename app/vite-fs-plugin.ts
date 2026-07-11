@@ -745,6 +745,11 @@ export interface LiveSession {
   skills: string[] | null; // slash-invocable skills the harness advertised this session (for /-completion)
   verb: string | null; // what the live turn is doing now ("Thinking"/"Running"/…) — channel-1 chrome, null when idle
   usage: { input: number; output: number } | null; // this turn's tokens: input = latest context size, output = accrued
+  // The model actually SERVING this session — folded from the stream (init's requested model, then each
+  // assistant message's authoritative `message.model`, which tracks a server-side refusal fallback, e.g.
+  // fable-5 → opus-4-8; see canvas-workers-fable-fallback-opus memory). Rendered as a chip on the session
+  // card and the sessions list so a silent model demotion is VISIBLE. null until the first frame names it.
+  model: string | null;
   turnOut: number; // output tokens from this turn's COMPLETED messages; the live output adds the streaming delta on top
   // Channel delivery (4e): message CONTENT is never injected as user text — it lives in the off-log channel
   // log and the agent READS it by tool call (GET /api/inbox). The session only tracks, per channel, the

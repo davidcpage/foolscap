@@ -694,6 +694,14 @@ export default {
           >`
         : "";
 
+    // The model actually serving the session, server-folded from the stream (it tracks a refusal
+    // fallback, e.g. a fable-5 spawn silently served by opus-4-8 — the chip is how you SEE that).
+    // Shown whenever the feed names one, exited included: which model did the work stays informative.
+    const model = live && typeof live.model === "string" ? live.model : null;
+    const modelPill = model
+      ? html`<span class="ses-model" title=${`model: ${model}`}>${model.replace(/^claude-/, "")}</span>`
+      : "";
+
     // The INPUT half (agent-sessions §3; session-timelines §4): send a prompt into the live session
     // through the granted `sessionInput` capability — a session-internal POST, never the canvas log.
     // keydown stopPropagation keeps typing off the canvas shortcuts (v/h/arrows/⌘Z); the host contains
@@ -991,7 +999,7 @@ export default {
         <button class="ses-name" type="button" title="Copy session id" @click=${copyId}>
           ${displayName}
         </button>
-        ${pill}${usagePill}
+        ${pill}${usagePill}${modelPill}
         <span class="ses-meta">
           ${turns.length} turns · ${tools} tools${truncated ? html`<span class="ses-trunc"> · ⚠ truncated</span>` : ""}
         </span>

@@ -2243,6 +2243,19 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
+/* The serving-model chip (session card head + sessions-list row meta): same muted monospace register as
+   the token counts, boxed so it reads as an identifier. It shows the model that ACTUALLY answered —
+   after a refusal fallback this is the fallback model, which is the whole point of surfacing it. */
+.ses-model {
+  font-size: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #a1a1aa;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  border: 1px solid #e4e4e7;
+  border-radius: 4px;
+  padding: 0 4px;
+}
 /* Touched-files activity strip (worktree-activity slice A): a subtle, collapsed disclosure beneath the
    head — recency-decaying dots + a count; click to expand the path list. Monochrome for now; the dots
    split into per-worktree hues once multi-root discovery lands (slice C). */

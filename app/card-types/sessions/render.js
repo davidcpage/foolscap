@@ -111,7 +111,9 @@ export default {
                 <span class="ses-row-title ${s.title ? "" : "ses-row-mono"}">${s.title || s.id.slice(0, 8)}</span>
               </span>
               <span class="ses-row-meta">
-                ${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${fmtSize(s.bytes)}
+                ${s.model /* serving model, known for live sessions only — tracks a refusal fallback */
+                  ? html`<span class="ses-model" title=${`model: ${s.model}`}>${s.model.replace(/^claude-/, "")}</span> · `
+                  : ""}${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${fmtSize(s.bytes)}
               </span>
             </div>
           `,
