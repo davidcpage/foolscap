@@ -13,14 +13,9 @@ import {
   HUD_SNAP,
   isHudCard,
   hudChromeFor,
-  hudFitScale,
+  hudCardScale,
   resolveHudPosition,
 } from "../hud-layout.js";
-
-// The default HUD boxes as seeded against a reference width, for the viewport-fit tests below.
-function seedBoxes(viewportW) {
-  return DEFAULT_HUD.map((c) => resolveHudPosition(c, viewportW));
-}
 
 test("the HUD card set is the stable singletons, in seed/paint order", () => {
   // Left column (usage → sessions → File Tree), then the centred clock, then the right column
@@ -109,43 +104,37 @@ test("HUD_SNAP is a fine step (P2 edit-mode grid) that the default layout alread
   }
 });
 
-test("hudFitScale: never enlarges — a viewport at/above the seed size gives scale 1", () => {
-  const boxes = seedBoxes(1440);
-  // At the seed viewport (or larger) the layout already fits: no scaling, cards untouched.
-  assert.equal(hudFitScale(boxes, 1440, 1080), 1);
-  assert.equal(hudFitScale(boxes, 2560, 1440), 1);
-  // Empty / degenerate input is a no-op (nothing to fit).
-  assert.equal(hudFitScale([], 400, 300), 1);
-  assert.equal(hudFitScale(boxes, 0, 0), 1);
+test("hudCardScale: reference == current viewport renders native (scale 1)", () => {
+  // The consistency invariant: a card whose reference IS the current screen renders at full content size,
+  // exactly like an ordinary/world card and a freshly-pinned card. This is what the per-card model buys.
+  assert.equal(hudCardScale(1440, 900, 1440, 900), 1);
+  assert.equal(hudCardScale(1024, 768, 1024, 768), 1);
 });
 
-test("hudFitScale: shrinks to fit a narrower viewport so the right column stays on-screen", () => {
-  // A layout seeded on a 1440 screen, opened on a 1024-wide one: the right column (minimap/channels) sits at
-  // x = 1440 - 16 - 240 = 1184, so its right edge is 1424 — off a 1024 viewport. The fit scale must bring it in.
-  const boxes = seedBoxes(1440);
-  const maxRight = Math.max(...boxes.map((b) => b.x + b.w)); // 1424
-  const s = hudFitScale(boxes, 1024, 2000, HUD_MARGIN); // tall enough that width binds
-  assert.ok(s < 1, "narrower viewport shrinks the HUD");
-  // The scaled right edge lands within the viewport (at the margin-inset available width).
-  assert.ok(maxRight * s <= 1024 - HUD_MARGIN + 0.5, "right column pulled fully on-screen");
-  assert.equal(s, (1024 - HUD_MARGIN) / maxRight);
+test("hudCardScale: never enlarges — a viewport larger than the reference stays native (≤1 ceiling)", () => {
+  // The grow-side ceiling is what keeps a small-reference card consistent with ordinary cards (and a fresh
+  // pin) on a bigger screen: native, not ballooned past its font size. Both-axes-larger and one-axis-larger.
+  assert.equal(hudCardScale(1280, 800, 2560, 1440), 1);
+  assert.equal(hudCardScale(1280, 800, 2560, 800), 1); // wider only
+  assert.equal(hudCardScale(1280, 800, 1280, 1600), 1); // taller only
 });
 
-test("hudFitScale: shrinks to fit a shorter viewport so the columns don't overflow the bottom", () => {
-  const boxes = seedBoxes(1440);
-  const maxBottom = Math.max(...boxes.map((b) => b.y + b.h)); // left column: 16+300+12+300+12+300 = 940
-  const s = hudFitScale(boxes, 4000, 700, HUD_MARGIN); // wide enough that height binds
-  assert.ok(s < 1, "shorter viewport shrinks the HUD");
-  assert.ok(maxBottom * s <= 700 - HUD_MARGIN + 0.5, "bottom of the columns pulled on-screen");
-  assert.equal(s, (700 - HUD_MARGIN) / maxBottom);
+test("hudCardScale: shrinks on a viewport smaller than the reference, by the binding axis", () => {
+  // A card referenced on a 1440×900 screen, viewed narrower/shorter, scales down — and takes the SMALLER
+  // (binding) of the two axis ratios so it never overflows the reference footprint on either axis.
+  assert.equal(hudCardScale(1440, 900, 720, 900), 0.5); // half width, full height → width binds
+  assert.equal(hudCardScale(1440, 900, 1440, 450), 0.5); // full width, half height → height binds
+  assert.equal(hudCardScale(1440, 900, 720, 450), 0.5); // both halved → 0.5
+  assert.equal(hudCardScale(1000, 1000, 800, 900), 0.8); // width binds (0.8 < 0.9)
 });
 
-test("hudFitScale: takes the binding (smaller) of the width and height fits", () => {
-  const boxes = seedBoxes(1440);
-  const both = hudFitScale(boxes, 1024, 700, HUD_MARGIN);
-  const widthOnly = hudFitScale(boxes, 1024, 4000, HUD_MARGIN);
-  const heightOnly = hudFitScale(boxes, 4000, 700, HUD_MARGIN);
-  assert.equal(both, Math.min(widthOnly, heightOnly));
+test("hudCardScale: absent or degenerate reference is native (safe default for a legacy screen card)", () => {
+  // A legacy screen card seeded before per-card scaling (no refW/refH) renders native until backfilled — and
+  // a degenerate reference or viewport never yields a divide-by-zero / non-positive scale.
+  assert.equal(hudCardScale(undefined, undefined, 1024, 768), 1);
+  assert.equal(hudCardScale(1440, undefined, 1024, 768), 1);
+  assert.equal(hudCardScale(0, 0, 1024, 768), 1);
+  assert.equal(hudCardScale(1440, 900, 0, 0), 1);
 });
 
 test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {
