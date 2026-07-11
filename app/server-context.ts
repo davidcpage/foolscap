@@ -91,6 +91,7 @@ export interface ServerContext {
     sid: string,
   ) => { primaryThread: string | null; offset: { dx: number; dy: number } | null };
   captureMemberOffsets: (boardId: string, records: Array<Record<string, unknown>> | null) => void;
+  captureReopenSets: (boardId: string, records: Array<Record<string, unknown>> | null) => void;
   threadLog: (boardId: string, threadId: string) => ThreadMsg[];
   seedCursor: (mode: "full" | "future", log: ThreadMsg[]) => number;
   historyKey: (threadId: string, sid: string) => string;

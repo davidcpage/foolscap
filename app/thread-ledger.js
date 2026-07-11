@@ -398,6 +398,40 @@ export function memberOffsetFromMeta(meta, sid) {
   return rec && typeof rec.dx === "number" && typeof rec.dy === "number" ? { dx: rec.dx, dy: rec.dy } : null;
 }
 
+// ── reopen-set (P4) ─────────────────────────────────────────────────────────────────────────────────
+// The set of member SIDs whose session card was OPEN the last time this thread's card was on the canvas.
+// Reopening the thread card restores exactly that set (each at its P2 offset, edges redrawn) — so a
+// select-deleted cluster comes back as it was, not as a lone thread card. Captured the SAME way P2 offsets
+// are: on the debounced board-persist snapshot save (captureReopenSets), for threads whose card is present.
+// It is therefore FROZEN when the thread card closes (the capture pass skips an absent thread), leaving the
+// last-open set = exactly the set open at close. A thread with no recorded set (never had a member card
+// open, e.g. a first-ever open) restores to the thread card alone. Lives on the meta marker beside
+// `members`, display-only (a VIEW fact — durable membership is untouched by open/close).
+
+/**
+ * Set the reopen-set (member sids open now) on a thread — idempotent: a no-op (returns false) when the
+ * stored set already equals `sids` (order-insensitive), so a snapshot save where the open-set didn't change
+ * never churns the marker. `sids` is deduped + sorted before storing so the unchanged-guard is stable.
+ * Returns true iff it wrote. Best-effort (upsertThreadMeta swallows write errors).
+ */
+export function setReopenSet(repoPath, threadId, sids) {
+  const next = [...new Set(sids)].filter((s) => typeof s === "string" && s).sort();
+  const prior = readReopenSet(readThreadMeta(repoPath, threadId));
+  if (prior.length === next.length && prior.every((s, i) => s === next[i])) return false; // unchanged
+  upsertThreadMeta(repoPath, threadId, { reopenSet: next });
+  return true;
+}
+
+/**
+ * The recorded reopen-set (member sids) for a thread, or [] when none recorded. Pure — callers pass `meta`
+ * (readThreadMeta). [] covers both "never recorded" and "recorded empty" — both restore to the thread card
+ * alone, so the two need no distinguishing.
+ */
+export function readReopenSet(meta) {
+  const set = meta && Array.isArray(meta.reopenSet) ? meta.reopenSet : null;
+  return set ? set.filter((s) => typeof s === "string" && s) : [];
+}
+
 // ── notification levels (P1, wakeable-substrate-plan W4; claude-tag R2 recast) ──────────────────────
 // A thread member's SEAT carries a notification LEVEL — the same wake preference a doc watcher carries
 // (notification-levels.js), one surface up. Default `all` (any room broadcast wakes it, the R2 default);

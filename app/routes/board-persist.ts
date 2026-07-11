@@ -93,6 +93,13 @@ async function handleBoardPersistWrite(
       } catch (err) {
         console.warn("[threads] member-offset capture from snapshot save failed:", err);
       }
+      // P4: capture each open thread card's reopen-set (member cards open right now) off the same save.
+      // Frozen when the thread card closes, so reopen restores the set that was open at close. Idempotent.
+      try {
+        ctx.captureReopenSets(boardId, snap.records ?? []);
+      } catch (err) {
+        console.warn("[threads] reopen-set capture from snapshot save failed:", err);
+      }
       return;
     }
     // import: the one-time IndexedDB adoption. Refused (imported:false) once any server state exists.

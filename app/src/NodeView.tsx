@@ -10,7 +10,7 @@ import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./
 import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
-import { consumePendingJump, openCanvasLink, openDocLink, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
+import { consumePendingJump, openCanvasLink, openDocLink, openSession, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
 import { HUD_GAP, HUD_SNAP, type HudChrome } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
@@ -1044,12 +1044,19 @@ function ThreadView({
               </>
             ) : mem.open ? "no status declared" : "invited — not yet joined";
             const tipNodes: React.ReactNode[] = [statusNode];
+            tipNodes.push("click: open card");
             if (tag) tipNodes.push("right-click: insert @tag");
             return (
               <span
                 key={mem.edgeId}
                 className={`chan-member${mem.open ? " open" : " pending"}${intentClass}`}
                 data-interactive
+                // LEFT-CLICK reopens (or flies to) this member's session card via the P1 openSession path —
+                // it redraws the member:open edge and lands the card at its stored P2 offset. Display-only:
+                // openSession never touches durable membership/process/wakeability. stopPropagation so the
+                // click stays off the canvas select/drag (belt-and-suspenders atop data-interactive).
+                onClick={(e) => { e.stopPropagation(); void openSession(m, mem.sid); }}
+                // RIGHT-CLICK still inserts the @tag into the post box — the rarer, deliberate act, kept intact.
                 onContextMenu={tag ? (e) => { e.preventDefault(); e.stopPropagation(); insertTag(tag); } : undefined}
               >
                 <span className="chan-member-name">

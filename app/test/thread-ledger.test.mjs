@@ -34,6 +34,8 @@ import {
   threadMembersFromMeta,
   setMemberOffset,
   memberOffsetFromMeta,
+  setReopenSet,
+  readReopenSet,
   untaggedSeatNudgeTarget,
 } from "../thread-ledger.js";
 
@@ -470,6 +472,45 @@ test("memberOffsetFromMeta: null for a missing member / empty meta / partial rec
   assert.equal(memberOffsetFromMeta(null, "sid-x"), null);
   assert.equal(memberOffsetFromMeta({}, "sid-x"), null);
   assert.equal(memberOffsetFromMeta({ members: { "sid-x": { joinedAt: 1, dx: 5 } } }, "sid-x"), null, "dy missing → null");
+});
+
+// ── reopen-set (P4) ─────────────────────────────────────────────────────────────────────────────────
+
+test("setReopenSet stores the open-member sids; readReopenSet reads them (dedup + sorted, order-insensitive)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:reopen";
+  assert.deepEqual(readReopenSet(readThreadMeta(repo, id)), [], "nothing recorded → []");
+  assert.equal(setReopenSet(repo, id, ["sid-b", "sid-a", "sid-b"]), true, "first set → wrote");
+  assert.deepEqual(readReopenSet(readThreadMeta(repo, id)), ["sid-a", "sid-b"], "deduped + sorted");
+});
+
+test("setReopenSet is idempotent (order-insensitive), so a save whose open-set didn't change never churns", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:reopen-idem";
+  assert.equal(setReopenSet(repo, id, ["sid-a", "sid-b"]), true);
+  assert.equal(setReopenSet(repo, id, ["sid-b", "sid-a"]), false, "same set, different order → no write");
+  assert.equal(setReopenSet(repo, id, ["sid-a"]), true, "a member closed → shrinks, writes");
+  assert.deepEqual(readReopenSet(readThreadMeta(repo, id)), ["sid-a"]);
+  assert.equal(setReopenSet(repo, id, []), true, "all closed → empty set, writes");
+  assert.deepEqual(readReopenSet(readThreadMeta(repo, id)), []);
+});
+
+test("setReopenSet drops non-string / empty entries and rides the marker beside members without clobbering", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:reopen-coexist";
+  addThreadMember(repo, id, "sid-a", 100);
+  setMemberOffset(repo, id, "sid-a", 10, 20);
+  setReopenSet(repo, id, ["sid-a", "", null, undefined, "sid-c"]);
+  const meta = readThreadMeta(repo, id);
+  assert.deepEqual(readReopenSet(meta), ["sid-a", "sid-c"], "junk entries dropped");
+  assert.equal(meta.members["sid-a"].joinedAt, 100, "membership untouched");
+  assert.deepEqual(memberOffsetFromMeta(meta, "sid-a"), { dx: 10, dy: 20 }, "offset untouched");
+});
+
+test("readReopenSet: [] for empty / absent / non-array meta (never a throw)", () => {
+  assert.deepEqual(readReopenSet(null), []);
+  assert.deepEqual(readReopenSet({}), []);
+  assert.deepEqual(readReopenSet({ reopenSet: "nope" }), []);
 });
 
 // ── notification levels (P1, wakeable-substrate-plan W4) ─────────────────────────────────────────────

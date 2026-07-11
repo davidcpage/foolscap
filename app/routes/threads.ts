@@ -14,6 +14,7 @@ import { listWorktrees as listThreadWorktrees, mergeWorktree, removeWorktree, wo
 import {
   markSeenMentions,
   pinMessage,
+  readReopenSet,
   readThreadLog,
   readThreadMeta,
   releaseSeat,
@@ -711,6 +712,19 @@ export const threadRoutes: GlobalRoute[] = [
       if (!b) return sendJson(res, 400, { error: "unknown board" });
       const threadId = decodeURIComponent(g[0]!);
       return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(b.repoPath, threadId) });
+    },
+  },
+  // GET /api/thread/<id>/reopen-set — the member sids whose card was open when this thread's card last
+  // closed (P4). The client reads it on reopen (openChannel) to restore that exact set of session cards.
+  // [] ⇒ restore the thread card alone (never recorded, or closed with no members open — incl. first open).
+  {
+    method: "GET",
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/reopen-set$/),
+    run: (_req, res, url, g) => {
+      const b = getServerContext().reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const threadId = decodeURIComponent(g[0]!);
+      return sendJson(res, 200, { thread: threadId, sids: readReopenSet(readThreadMeta(b.repoPath, threadId)) });
     },
   },
 ];
