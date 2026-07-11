@@ -1003,6 +1003,27 @@ export function openChannel(m: InteractionManager, threadId: string, title: stri
     },
   });
   m.selection.set([id]);
+  // P4 reopen-set: this thread card was just re-added (the fresh-add branch — the fly-to above returns early),
+  // so restore the member cards that were open when it last closed. Fire-and-forget: the thread card is
+  // already on the board, so each restored session card can anchor at its P2 offset. Display-only throughout.
+  void restoreReopenSet(m, threadId);
+}
+
+// Restore a reopened thread's open-member set (P4): fetch the sids that were open when the thread card last
+// closed (server-frozen in the thread marker) and openSession each — the same P1/P2 path a pill-click or a
+// Sessions-row reopen takes, so cards land at their stored offsets with edges redrawn. An empty set (never
+// recorded, or closed with no members open — a first-ever open included) opens the thread card alone.
+// Non-fatal: a failed fetch just leaves the thread card by itself.
+async function restoreReopenSet(m: InteractionManager, threadId: string): Promise<void> {
+  let sids: string[] = [];
+  try {
+    const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/reopen-set?board=${activeBoardId()}`);
+    if (!res.ok) return;
+    sids = ((await res.json()) as { sids?: string[] }).sids ?? [];
+  } catch {
+    return; // offline / bad board — leave the lone thread card
+  }
+  for (const sid of sids) await openSession(m, sid);
 }
 
 // An IN-CANVAS link target, resolved from a markdown link's href (Channel UI: clickable charter links). The

@@ -357,3 +357,62 @@ test("captureMemberOffsets is idempotent — a save that moved nothing writes no
   const marker2 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
   assert.equal(marker1, marker2, "unchanged offset → marker byte-identical (no churn)");
 });
+
+// ── P4 reopen-set capture (the twin of offset capture: freeze-on-close from the snapshot) ────────────
+// Records for a thread card `tid` with the given open-member sids (thread node + a session card + a
+// member:open edge per sid). A member whose sid is NOT listed has no card/edge — display-only closed.
+const threadWithOpenMembers = (tid, sids, includeThread = true) => [
+  ...(includeThread ? [{ typeName: "node", id: tid, type: "thread", title: tid }] : []),
+  ...sids.flatMap((sid, i) => [
+    { typeName: "node", id: `node:live:${sid}`, type: "session", title: sid },
+    { typeName: "edge", id: `e-${tid}-${i}`, from: `node:live:${sid}`, to: tid, type: "member:open" },
+  ]),
+];
+
+test("captureReopenSets records the OPEN member set of each present thread card (from the snapshot)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  snap.captureReopenSets("b1", threadWithOpenMembers("node:thread:t1", ["sid-b", "sid-a"]));
+  assert.deepEqual(ledger.readReopenSet(ledger.readThreadMeta(repo, "node:thread:t1")), ["sid-a", "sid-b"]);
+});
+
+test("captureReopenSets FREEZES the set when the thread card is absent from the snapshot (close preserves it)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  // Thread open with two members → set recorded.
+  snap.captureReopenSets("b1", threadWithOpenMembers("node:thread:t1", ["sid-a", "sid-b"]));
+  // A later save where the thread card (and its cluster) is GONE — the capture pass must not touch the set.
+  snap.captureReopenSets("b1", []);
+  assert.deepEqual(
+    ledger.readReopenSet(ledger.readThreadMeta(repo, "node:thread:t1")),
+    ["sid-a", "sid-b"],
+    "closed thread keeps the last-open set = the set to restore on reopen",
+  );
+});
+
+test("captureReopenSets shrinks the set when a member card is closed while the thread stays open", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  snap.captureReopenSets("b1", threadWithOpenMembers("node:thread:t1", ["sid-a", "sid-b"]));
+  // sid-b's card was display-only closed (its node + edge removed); thread + sid-a remain.
+  snap.captureReopenSets("b1", threadWithOpenMembers("node:thread:t1", ["sid-a"]));
+  assert.deepEqual(ledger.readReopenSet(ledger.readThreadMeta(repo, "node:thread:t1")), ["sid-a"]);
+});
+
+test("captureReopenSets: a present thread card with no open members records the empty set (reopen = thread alone)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  snap.captureReopenSets("b1", threadWithOpenMembers("node:thread:t1", []));
+  assert.deepEqual(ledger.readReopenSet(ledger.readThreadMeta(repo, "node:thread:t1")), []);
+});
+
+test("captureReopenSets is idempotent — an unchanged open-set writes nothing (no marker churn)", () => {
+  const repo = tmpRepo();
+  ctx.setServerContext({ fsState: {}, boards: new Map([["b1", { repoPath: repo }]]) });
+  const records = threadWithOpenMembers("node:thread:t1", ["sid-a", "sid-b"]);
+  snap.captureReopenSets("b1", records);
+  const marker1 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
+  snap.captureReopenSets("b1", records); // same open-set again
+  const marker2 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
+  assert.equal(marker1, marker2, "unchanged reopen-set → marker byte-identical");
+});

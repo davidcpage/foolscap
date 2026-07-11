@@ -7,6 +7,7 @@ import {
   readThreadMeta,
   removeThreadMember,
   setMemberOffset,
+  setReopenSet,
   threadMembersFromMeta,
 } from "./thread-ledger.js";
 import { readBoardSnapshot } from "./board-persist.js";
@@ -265,6 +266,41 @@ export function captureMemberOffsets(boardId: string, records: Array<Record<stri
     if (!threadPos) continue; // primary thread card closed → keep the last-known offset
     try {
       setMemberOffset(repoPath, primaryThread, sid, cardPos.x - threadPos.x, cardPos.y - threadPos.y);
+    } catch {
+      /* best-effort — a single bad marker must not abort the whole capture pass */
+    }
+  }
+}
+
+// Capture each OPEN thread card's reopen-set (P4) — the twin of captureMemberOffsets, called from the same
+// board-persist SNAPSHOT-save hook. For every THREAD card currently on the board, record the set of member
+// sids whose session card is ALSO on the board (an open member:open edge → a present session card). Stored
+// idempotently on the thread marker (setReopenSet skips the write when unchanged). Only threads PRESENT in
+// the snapshot are touched, so a closed thread's set is FROZEN at its last-open state — which is exactly the
+// set that was open at the moment of close, the thing reopen must restore. Display-only: it reads the
+// snapshot and writes a VIEW fact; durable membership is never touched. Best-effort; never throws.
+export function captureReopenSets(boardId: string, records: Array<Record<string, unknown>> | null): void {
+  const { boards } = getServerContext();
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath || !records) return;
+  // Every thread card currently on the board, by id.
+  const threadIds = new Set<string>();
+  for (const r of records) {
+    if (r.typeName === "node" && (r.type === "thread" || r.type === "channel")) threadIds.add(String(r.id));
+  }
+  for (const threadId of threadIds) {
+    // Open members: the source session card of each member:open edge pointing at this thread that is itself
+    // present in the snapshot (a closed card's edge was removed by display-only close, so this is precisely
+    // the open set). nodeSessionId resolves the card node → its sid, returning null for a non-session/absent
+    // node, so a dangling edge contributes nothing.
+    const open: string[] = [];
+    for (const r of records) {
+      if (r.typeName !== "edge" || r.to !== threadId || String(r.type) !== "member:open") continue;
+      const sid = nodeSessionId(records, String(r.from));
+      if (sid && !open.includes(sid)) open.push(sid);
+    }
+    try {
+      setReopenSet(repoPath, threadId, open);
     } catch {
       /* best-effort — a single bad marker must not abort the whole capture pass */
     }

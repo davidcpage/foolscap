@@ -54,6 +54,7 @@ export interface ThreadMetaMarker {
   pins?: PinnedMsg[]; // R-PIN head context, chronological (seq) order
   seenMentions?: number[]; // @human mention seqs the human has VIEWED (user waiting-state), sorted
   members?: Record<string, MemberRecord>; // durable membership — survives the card/edge (delete-card-keep-session)
+  reopenSet?: string[]; // P4: member sids whose card was open when this thread's card last closed; restored on reopen
 }
 
 // A durable membership record (delete-card-keep-session). `joinedAt` is the join time (min across a session's
@@ -154,3 +155,7 @@ export function memberOffsetFromMeta(
   meta: ThreadMetaMarker | null | undefined,
   sid: string,
 ): { dx: number; dy: number } | null;
+// P4 reopen-set: setReopenSet stores the member sids open now (idempotent — false when the set is unchanged,
+// order-insensitive); readReopenSet reads it ([] when none recorded, covering first-ever open).
+export function setReopenSet(repoPath: string, threadId: string, sids: string[]): boolean;
+export function readReopenSet(meta: ThreadMetaMarker | null | undefined): string[];
