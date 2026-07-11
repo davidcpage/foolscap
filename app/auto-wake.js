@@ -119,6 +119,29 @@ export function shouldReapIdle(session, now, keepAliveMs) {
 }
 
 /**
+ * The P5 done-member DETACH decision: should a thread's durable member `sid` be dropped from the thread now?
+ * Pure/unit-testable — the sweep (server-orchestration.detachDoneMembersTick) maps it over every board's
+ * thread members, passing the session's marker (session-ledger.readCanvasSession), the delay window, and a
+ * liveness predicate. Detach iff ALL of:
+ *   - the session FINISHED cleanly: `endReason === "done"` (a `terminated`/`crashed`/still-open member is left
+ *     alone — a lingering crashed pill is signal, not clutter; only a clean done detaches).
+ *   - it finished AT LEAST `delayMs` ago (a valid finite `endedAt` stamp; the grace window so a just-done card
+ *     doesn't vanish out from under a human still looking at it).
+ *   - it is NOT currently live (belt-and-suspenders: a `done` marker can't co-exist with a live process, since
+ *     endSession deletes from liveSessions before stamping — but the guard makes the blast radius provably
+ *     done-only, so a re-used sid or a racing state can never detach a working session).
+ * `marker` is the session-ledger marker (or null when there's none → never detach). `isLive(sid)` returns true
+ * when a non-exited live session holds this sid.
+ */
+export function shouldDetachDoneMember(sid, marker, now, delayMs, isLive) {
+  if (!marker || marker.endReason !== "done") return false; // not a cleanly-finished session → leave it
+  if (typeof marker.endedAt !== "number" || !Number.isFinite(marker.endedAt)) return false; // no honest end stamp
+  if (now - marker.endedAt < delayMs) return false; // still inside the grace window
+  if (isLive && isLive(sid)) return false; // never detach a live session
+  return true;
+}
+
+/**
  * Which of a doc's `watchers` does an annotation event of `eventKind` wake? Filters the watcher roster
  * through `wakesSeat(watcherEffectiveLevel(w), class)` — the exact W4 gate a thread nudge uses, one surface
  * over. Empty when the event wakes no one (a non-triggering kind, or every watcher opted below its class).

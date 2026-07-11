@@ -20,6 +20,7 @@ import {
   releaseSeat,
   seatForSid,
   setThreadLevel,
+  threadMembersFromMeta,
   unpinMessage,
   upsertThreadMeta,
   type PinnedMsg,
@@ -724,7 +725,16 @@ export const threadRoutes: GlobalRoute[] = [
       const b = getServerContext().reqBoard(url);
       if (!b) return sendJson(res, 400, { error: "unknown board" });
       const threadId = decodeURIComponent(g[0]!);
-      return sendJson(res, 200, { thread: threadId, sids: readReopenSet(readThreadMeta(b.repoPath, threadId)) });
+      // Filter the frozen reopen-set to sids that are STILL durable members (P5): a member DETACHED (done →
+      // dropped from the roster) after this thread card closed is in the frozen set but must NOT be restored —
+      // reopening the thread would otherwise resurrect a card the detach auto-closed. When the thread card was
+      // open at detach the set self-heals (the reconciler removed the card → next capture drops it); this
+      // covers the closed-at-detach case where the set was frozen with the now-gone member.
+      const meta = readThreadMeta(b.repoPath, threadId);
+      const members = new Set<string>(threadMembersFromMeta(meta));
+      for (const s of Object.values(meta?.seats ?? {})) if (s?.sid) members.add(s.sid); // seat-only members count too
+      const sids = readReopenSet(meta).filter((sid) => members.has(sid));
+      return sendJson(res, 200, { thread: threadId, sids });
     },
   },
 ];

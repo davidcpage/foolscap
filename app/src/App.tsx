@@ -17,7 +17,7 @@ import { activeBoard, activeBoardId, boardHref, listBoards, resolveBoard, type B
 import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
-import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
+import { channelListSignal, refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
 import { connectToThread, createThread, isThreadNode, isSessionNode, MEMBER_OPEN } from "./threads";
 import { CanvasView } from "./CanvasView";
@@ -48,6 +48,7 @@ import {
   openSession,
   openChannel,
   openRole,
+  reconcileDetachedMemberCards,
   registerFileCommands,
   reprojectContent,
   spawnLiveSession,
@@ -511,6 +512,19 @@ function Board({ m, undo, persistence }: Engine) {
       void reprojectContent(m);
       refreshSessionList();
     });
+  }, [m]);
+
+  // P5 — auto-close cards the server has DETACHED. The threads list rides the threads:<board> feed
+  // (channelListSignal re-pulls on every ping and after boot), and its `members` field is the durable roster;
+  // reconcileDetachedMemberCards removes any session card whose member:open edge points at a thread it's no
+  // longer a member of. Subscribing here also ARMS the threads feed board-wide (no rail card needed), so a
+  // done session's card auto-closes ~2min after it ends even on a board showing only the canvas. The initial
+  // run() cleans a lingering orphaned card the persisted snapshot carried in before this tab opened.
+  useEffect(() => {
+    const run = () => reconcileDetachedMemberCards(m, channelListSignal.get());
+    const off = channelListSignal.subscribe(run);
+    run();
+    return off;
   }, [m]);
 
   // Best-effort flush of the snapshot cache on close. Events are already durable per-commit, so even if

@@ -8,13 +8,13 @@ import { getServerContext, getWsClients } from "./server-context.js";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
-import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, seatForSid, type ThreadMetaMarker } from "./thread-ledger.js";
+import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { readWatchers } from "./doc-watch.js";
-import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, surfaceClaimant } from "./auto-wake.js";
+import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./routes/card-types.js";
 import type { LiveSession } from "./vite-fs-plugin.js";
@@ -274,14 +274,64 @@ export function startCardTypesFeed(): void {
 // AUTONOMY SWITCH. The `loops` role flag survives only as legibility (the calm `scheduled` band).
 const LOOP_TICK_MS = 15_000; // scheduler granularity — how often loopTick evaluates due jobs / reaps idle workers
 
+// P5 done-member detach grace window: how long after a session ends cleanly (endReason:"done") before it is
+// dropped from its threads' durable rosters and its card auto-closes. A tunable constant, kept generous so a
+// just-finished card doesn't vanish out from under a human still reading it. Composes AFTER the reaper's
+// IDLE_KEEPALIVE_MS (server-sessions): a worker declares done → parks → reaper ends it (endReason:"done")
+// after 15m → this sweep detaches it 2m later.
+const DETACH_DELAY_MS = 2 * 60_000;
+
 // One scheduler tick: reap idle auto-wake workers and fire due standing jobs. Both iterate their own records;
 // neither interrupts a RUNNING session (a mid-turn target is skipped and retried next tick).
 function loopTick(): void {
   autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
+  detachDoneMembersTick(); // P5: drop done sessions from their threads' durable rosters (+ release seat) after
+  //                          the grace window — pills clear; the client reconciler best-effort closes the card
   standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
   //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
   reconcileSessionBands(); // mrcmofwf-10: republish any session whose live band has drifted from its last
   //                          push — the catch-all for out-of-band transitions the instant paths don't cover.
+}
+
+// P5 — the done-member DETACH sweep. Board-wide over every thread's DURABLE member roster: a member whose
+// session ended cleanly (endReason:"done") more than DETACH_DELAY_MS ago and is not currently live gets its
+// membership dropped (removeThreadMember) and any seat released (releaseSeat). Both are marker writes on the
+// thread ledger — TAB-INDEPENDENT and AUTHORITATIVE: the write fires the threads:<board> feed, the pill
+// (now durable-membership-driven) clears with or without a live tab. The on-canvas session card is NOT
+// removed here — that's a canvas mutation that 503s without a tab (canvas-mutations-need-live-tab); a live
+// tab's client reconciler closes it best-effort (and cleans a lingering node on next load). Guarded to
+// endReason:"done" ONLY (shouldDetachDoneMember) so terminated/crashed pills — signal, not clutter — are
+// left, and a live session is never touched. Because it's board-wide, a done session detaches from EVERY
+// thread it belonged to (finished globally), and the one-time cleanup of the stale done-members already on a
+// thread falls out for free on the first tick — no separate codepath. Reads markers only for durable
+// members (a handful), so it's cheap; runs on loopTick beside the reaper.
+function detachDoneMembersTick(): void {
+  const { boards, liveSessions } = getServerContext();
+  const now = Date.now();
+  const isLive = (sid: string) => {
+    const s = liveSessions.get(sid);
+    return !!s && s.status !== "exited";
+  };
+  let detached = 0;
+  for (const [, board] of boards) {
+    let threads: ThreadMetaMarker[];
+    try {
+      threads = listThreads(board.repoPath);
+    } catch {
+      continue;
+    }
+    for (const t of threads) {
+      const meta = readThreadMeta(board.repoPath, t.threadId);
+      for (const sid of threadMembersFromMeta(meta)) {
+        const marker = readCanvasSession(board.repoPath, sid);
+        if (!shouldDetachDoneMember(sid, marker, now, DETACH_DELAY_MS, isLive)) continue;
+        removeThreadMember(board.repoPath, t.threadId, sid); // authoritative: drops durable membership → pill clears
+        releaseSeat(board.repoPath, t.threadId, sid); // no-op unless this sid still holds a seat here
+        detached++;
+      }
+    }
+  }
+  if (detached) console.warn(`[detach-done] dropped ${detached} done member(s) from their thread(s) (grace ${DETACH_DELAY_MS / 1000}s elapsed)`);
 }
 
 // Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the
