@@ -49,6 +49,29 @@ export function publishFeed(feed: string, value: unknown): void {
   for (const c of wsClients) c.send({ ch: "feed", feed, value });
 }
 
+// A cheap "something in this directory changed" ping via NATIVE fs.watch — deliberately NOT chokidar.
+// chokidar v4 (no fsevents) holds one kqueue fd per watched FILE on macOS, so pointing it at an ever-
+// growing dir (`~/.claude/projects/<slug>/` gains a transcript per session ever run) held one fd per
+// HISTORICAL file forever (~460 when fd exhaustion crashed the server, 2026-07-10). Native fs.watch is
+// O(1) fds per dir (FSEvents on macOS, inotify on Linux), and its famously-unreliable event DETAIL (an
+// append can report as "rename", filenames may be absent) is irrelevant here: every consumer below is a
+// debounced refetch ping that ignores the arguments. Don't reach for this where a watcher must NAME the
+// changed path or classify add/change/unlink — that's what chokidar's per-file fds buy (see CLAUDE.md's
+// pointer at shadow-git.js / openRootWatcher).
+// mkdir-first because fs.watch throws on a missing dir (markers/threads/roles are lazily created); the
+// "error" listener is LOAD-BEARING — an FSWatcher error (e.g. the dir deleted under it) with no listener
+// is an uncaught exception, and this process has already died once to an uncaught throw in a feed.
+function watchDirPing(dir: string, onEvent: () => void, opts: { recursive?: boolean } = {}): void {
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.watch(dir, { recursive: opts.recursive === true }, onEvent).on("error", (err) => {
+      console.warn(`[feeds] dir watch lost on ${dir} (feed goes quiet until restart): ${String(err)}`);
+    });
+  } catch (err) {
+    console.warn(`[feeds] dir watch failed for ${dir} (feed will not push): ${String(err)}`);
+  }
+}
+
 // ── sessions-list feed (the sessions browser card's live push) — pings on transcript + marker churn ──
 export function startSessionsFeed(boardId: string, dir: string, markersDir: string): void {
   let t: ReturnType<typeof setTimeout> | null = null;
@@ -56,17 +79,14 @@ export function startSessionsFeed(boardId: string, dir: string, markersDir: stri
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("sessions:" + boardId, { ts: Date.now() }), 200);
   };
-  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", ping);
-  // ignorePermissionErrors + a lazy create: the marker dir may not exist until the first spawn/adoption.
-  chokidar.watch(markersDir, { ignoreInitial: true, depth: 0, ignorePermissionErrors: true }).on("all", ping);
+  watchDirPing(dir, ping);
+  watchDirPing(markersDir, ping);
 }
 
 // ── threads-list feed (the threads browser card's live push) ─────────────────────────────────────
 export function startThreadsFeed(boardId: string, repoPath: string): void {
-  const dir = canvasThreadsDir(repoPath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
   let t: ReturnType<typeof setTimeout> | null = null;
-  chokidar.watch(dir, { ignoreInitial: true, depth: 0 }).on("all", () => {
+  watchDirPing(canvasThreadsDir(repoPath), () => {
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("threads:" + boardId, { ts: Date.now() }), 200);
   });
@@ -74,13 +94,13 @@ export function startThreadsFeed(boardId: string, repoPath: string): void {
 
 // ── roles-list feed (the roles browser card's live push) ─────────────────────────────────────────
 export function startRolesFeed(boardId: string, repoPath: string): void {
-  const dir = canvasRolesDir(repoPath);
-  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* best-effort — the watch tolerates a missing dir */ }
   let t: ReturnType<typeof setTimeout> | null = null;
-  chokidar.watch(dir, { ignoreInitial: true, depth: 1 }).on("all", () => {
+  // recursive: a role's charter lives one level down (`.canvas/roles/<id>/role.md`), and a charter edit
+  // must ping the list (the old chokidar watch was depth: 1 for the same reason).
+  watchDirPing(canvasRolesDir(repoPath), () => {
     if (t) clearTimeout(t);
     t = setTimeout(() => publishFeed("roles:" + boardId, { ts: Date.now() }), 200);
-  });
+  }, { recursive: true });
 }
 
 // Feed: the repo's HEAD commit. chokidar on .git/HEAD (branch switches) + .git/logs/HEAD (every
