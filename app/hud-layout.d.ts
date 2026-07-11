@@ -44,3 +44,22 @@ export declare function hudFitScale(
   viewportH: number,
   margin?: number,
 ): number;
+
+/** The floor a pin's group scale is clamped to — guards a pathological centre-in-the-margin pin. */
+export declare const MIN_HUD_SCALE: number;
+
+/** Placement for a card being PINNED (world → screen) that keeps its on-screen CENTRE fixed as it joins the
+ *  HUD group. `existingBoxes` are the OTHER shown screen cards (the new card excluded); (cx,cy) its on-screen
+ *  centre now; (w,h) its intended on-screen (stored/unscaled) size. Returns the stored top-left {x,y} to commit
+ *  and the resulting group scale `s` the card will render under (== hudFitScale at render — a stable fixed
+ *  point, no iteration). */
+export declare function pinPlacement(
+  existingBoxes: ReadonlyArray<{ x: number; y: number; w: number; h: number }>,
+  cx: number,
+  cy: number,
+  w: number,
+  h: number,
+  viewportW: number,
+  viewportH: number,
+  margin?: number,
+): { x: number; y: number; s: number };

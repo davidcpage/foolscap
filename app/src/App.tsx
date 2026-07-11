@@ -59,7 +59,7 @@ import {
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
-import { DEFAULT_HUD, resolveHudPosition } from "../hud-layout.js";
+import { DEFAULT_HUD, resolveHudPosition, pinPlacement, hudFitScale } from "../hud-layout.js";
 import { applyScrollKey, noteCameraMoved, notePointerAim, observeWheelGesture, scrollableIn } from "./interior";
 import { bindPeek } from "./peek";
 import { preserveViewState } from "./viewstate";
@@ -417,30 +417,51 @@ function Board({ m, undo, persistence }: Engine) {
     [views, m],
   );
 
-  // Pin a card to the viewport / drop it back onto the canvas (the `p` key). Converts the box through
-  // the camera so the card doesn't visibly jump on the toggle: pinning maps page→screen and scales the
-  // size by the zoom; unpinning does the inverse. setAnchor is one undoable layout edit.
+  // Pin a card to the viewport / drop it back onto the canvas (the `p` key). Converts the box through the
+  // camera AND the HUD group scale so the card's CENTRE stays on the same screen point across the toggle — it
+  // may shrink to the group scale, but it must not jump. The pinned card renders inside the `.hud-fit` group
+  // under `transform: scale(s)` from (0,0) (CanvasView), so a stored box (x,y) paints at (x·s, y·s): neither
+  // branch may ignore s. Pin (world→screen) places against the POST-pin scale (adding the card can change the
+  // group bbox → change s), computed in closed form by pinPlacement. Unpin (screen→world) inverts through the
+  // CURRENT group scale — the card's true on-screen box is (x·s, y·s, w·s, h·s), not its stored box. setAnchor
+  // is one undoable layout edit.
   const togglePin = useCallback(
     (id: Id<"node">) => {
       const l = m.editor.store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
       if (!l) return;
       const z = m.camera.state.z;
+      const vw = typeof window !== "undefined" && window.innerWidth ? window.innerWidth : 1440;
+      const vh = typeof window !== "undefined" && window.innerHeight ? window.innerHeight : 900;
+      // The screen cards making up the HUD group (singletons + already-pinned free cards): their stored boxes
+      // are what the group fit is computed over. One-shot read (not reactive) — this runs inside a gesture.
+      const screenBoxes = m.editor.store
+        .getSnapshot()
+        .records.filter((r): r is LayoutRecord => r.typeName === "layout" && (r as LayoutRecord).anchor === "screen");
       if (l.anchor === "screen") {
-        const p = m.camera.screenToPage({ x: l.x, y: l.y });
+        // UNPIN. The card renders at (l.x·s, l.y·s) size (l.w·s, l.h·s) under the current group scale s, so map
+        // that REAL on-screen box back through the camera (screenToPage, size ÷ zoom) — not the stored box,
+        // which would leave the card jumping toward the top-left and growing by 1/s.
+        const s = hudFitScale(screenBoxes, vw, vh); // this card is still in screenBoxes — the live group scale
+        const p = m.camera.screenToPage({ x: l.x * s, y: l.y * s });
         m.editor.commit({
           type: "setAnchor",
           actor: "user",
-          payload: { id, anchor: "world", x: Math.round(p.x), y: Math.round(p.y), w: Math.round(l.w / z), h: Math.round(l.h / z) },
+          payload: { id, anchor: "world", x: Math.round(p.x), y: Math.round(p.y), w: Math.round((l.w * s) / z), h: Math.round((l.h * s) / z) },
         });
       } else {
-        const s = m.camera.pageToScreen({ x: l.x, y: l.y });
-        // The pinned card joins the HUD group and scales with it (hud-layout.js hudFitScale): native when the
-        // HUD fits, shrinking as one unit with the HUD cards beside it when it overflows — so it stays mutually
-        // consistent with them, no per-card reference needed.
+        // PIN. The card's on-screen box now is (screen top-left, world size × zoom); keep its centre fixed.
+        const tl = m.camera.pageToScreen({ x: l.x, y: l.y });
+        const w = l.w * z;
+        const h = l.h * z; // the card's intended on-screen (stored/unscaled) size
+        const cx = tl.x + w / 2;
+        const cy = tl.y + h / 2;
+        // screenBoxes excludes this card (it's still world-anchored), so it IS the "existing group" pinPlacement
+        // needs to derive the post-pin scale. The pinned card then joins the group and scales with it.
+        const { x, y } = pinPlacement(screenBoxes, cx, cy, w, h, vw, vh);
         m.editor.commit({
           type: "setAnchor",
           actor: "user",
-          payload: { id, anchor: "screen", x: Math.round(s.x), y: Math.round(s.y), w: Math.round(l.w * z), h: Math.round(l.h * z) },
+          payload: { id, anchor: "screen", x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) },
         });
         // Pinning is subsumed by the HUD now (pinned cards render in the HUD group and toggle with it). If the
         // HUD is hidden, a freshly-pinned card would vanish on commit — so reveal the HUD, mirroring the way

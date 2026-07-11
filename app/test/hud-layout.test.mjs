@@ -11,9 +11,11 @@ import {
   HUD_MARGIN,
   HUD_GAP,
   HUD_SNAP,
+  MIN_HUD_SCALE,
   isHudCard,
   hudChromeFor,
   hudFitScale,
+  pinPlacement,
   resolveHudPosition,
 } from "../hud-layout.js";
 
@@ -140,6 +142,66 @@ test("hudFitScale: empty group or a degenerate box/viewport is native (safe defa
   assert.equal(hudFitScale(undefined, 1024, 768), 1);
   assert.equal(hudFitScale([{ x: 0, y: 0, w: 0, h: 0 }], 1024, 768), 1); // zero bbox
   assert.equal(hudFitScale([{ x: 0, y: 0, w: 100, h: 100 }], 0, 0), 1); // zero viewport
+});
+
+// The invariant every pinPlacement case must hold: after the group scale it returns is applied around (0,0),
+// the placed card's centre lands back on the requested on-screen centre (cx,cy). And — the fixed-point claim —
+// that scale equals what hudFitScale actually returns at render for the resulting box set, so there is no
+// second correction pass and no oscillation.
+function centreOf(box, s) {
+  return { cx: (box.x + box.w / 2) * s, cy: (box.y + box.h / 2) * s };
+}
+
+test("pinPlacement: keeps the card's on-screen centre fixed (the primary ask)", () => {
+  // A modest card pinned in the central area of a wide viewport that the HUD already fits natively.
+  const existing = [{ x: 16, y: 16, w: 240, h: 300 }]; // one left-column card, fits at scale 1
+  const [cx, cy, w, h] = [700, 400, 300, 200];
+  const { x, y, s } = pinPlacement(existing, cx, cy, w, h, 1440, 900);
+  // Central pin on a fitting HUD → the group is NOT rescaled (s stays 1) and nothing else shrinks.
+  assert.equal(s, 1);
+  const c = centreOf({ x, y, w, h }, s);
+  assert.ok(Math.abs(c.cx - cx) < 1e-9 && Math.abs(c.cy - cy) < 1e-9, "centre preserved");
+});
+
+test("pinPlacement: the returned scale IS the render scale (fixed point, no oscillation)", () => {
+  // Whatever s pinPlacement chose, feeding the placed box back through hudFitScale (with the existing group)
+  // must return the SAME s — i.e. the card renders at exactly the scale it was placed against. This is the
+  // property that makes the placement stable: no re-measure would move it.
+  const cases = [
+    { existing: [{ x: 16, y: 16, w: 240, h: 300 }], cx: 700, cy: 400, w: 300, h: 200, vw: 1440, vh: 900 },
+    // HUD already overflows a narrow viewport → existing scale < 1; a central pin should ride that same scale.
+    { existing: [{ x: 0, y: 0, w: 1424, h: 200 }], cx: 300, cy: 300, w: 200, h: 150, vw: 728, vh: 900 },
+    // Card pinned near the right edge → its own bound binds and drops s below the existing scale.
+    { existing: [{ x: 16, y: 16, w: 240, h: 300 }], cx: 1300, cy: 300, w: 400, h: 200, vw: 1440, vh: 900 },
+  ];
+  for (const t of cases) {
+    const { x, y, s } = pinPlacement(t.existing, t.cx, t.cy, t.w, t.h, t.vw, t.vh);
+    const rendered = hudFitScale([...t.existing, { x, y, w: t.w, h: t.h }], t.vw, t.vh);
+    assert.ok(Math.abs(rendered - s) < 1e-9, `render scale ${rendered} == placed scale ${s}`);
+    const c = centreOf({ x, y, w: t.w, h: t.h }, s);
+    assert.ok(Math.abs(c.cx - t.cx) < 1e-6 && Math.abs(c.cy - t.cy) < 1e-6, "centre preserved under render scale");
+  }
+});
+
+test("pinPlacement: a central pin never rescales the rest of the HUD; an edge pin does (flagged behaviour)", () => {
+  const existing = [{ x: 16, y: 16, w: 240, h: 300 }];
+  const sExisting = hudFitScale(existing, 1440, 900); // 1 here (fits)
+  // Centre well inside → group scale unchanged.
+  const central = pinPlacement(existing, 700, 400, 300, 200, 1440, 900);
+  assert.equal(central.s, sExisting);
+  // Centre close to the right edge → keeping it fixed forces the whole group to shrink (the second-jump case).
+  const edge = pinPlacement(existing, 1400, 400, 300, 200, 1440, 900);
+  assert.ok(edge.s < sExisting, "edge pin shrinks the group");
+});
+
+test("pinPlacement: a degenerate centre in the margin band is floored, never zero/negative, centre still held", () => {
+  // cx beyond availW (centre inside the right margin) would make the raw bound negative; the floor guards it.
+  const { x, y, s } = pinPlacement([], 1438, 400, 300, 200, 1440, 900);
+  assert.equal(s, MIN_HUD_SCALE);
+  assert.ok(Number.isFinite(x) && Number.isFinite(y));
+  // Even clamped, x = cx/s − w/2 uses the SAME s, so the centre still lands on cx (only the size collapses).
+  const c = centreOf({ x, y, w: 300, h: 200 }, s);
+  assert.ok(Math.abs(c.cx - 1438) < 1e-6, "centre held even when scale is floored");
 });
 
 test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {
