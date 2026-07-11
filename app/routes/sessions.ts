@@ -64,7 +64,20 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   // client places the reopened card at primaryThreadCardPos + offset instead of a fresh cascade spot. Null
   // primaryThread / offset → the client falls back to spawnAt. A pure read (changes no server state).
   const { primaryThread, offset } = sessionAnchor(repoPath, records, chosen);
-  sendJson(res, 200, { id: chosen, content: r.content, truncated: r.truncated, threads, primaryThread, offset });
+  // The role this session instantiates (from its marker, as handleSessions ~117-118 already reads for the
+  // list): so reopen can restamp the card's friendly `name` ("<Role>.<short-sid>", the spawn convention) and
+  // the card title + member pill read the role label instead of the bare sid. null for a plain session.
+  const marker = readCanvasSession(repoPath, chosen);
+  sendJson(res, 200, {
+    id: chosen,
+    content: r.content,
+    truncated: r.truncated,
+    threads,
+    primaryThread,
+    offset,
+    roleName: (marker?.roleName as string | undefined) ?? null,
+    roleId: (marker?.roleId as string | undefined) ?? null,
+  });
 }
 
 // A human-legible label + counts for the dropdown, parsed from a transcript. The label prefers the

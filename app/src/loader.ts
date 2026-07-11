@@ -855,11 +855,12 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // — so we keep nothing from the body here; text:"" is a pure reference card.
   // `threads` = the sid's durable thread memberships (server-reported). Card-close removed the card + its
   // member:open edge (the VIEW); the membership outlived them, so on reopen we repaint the wire from these.
-  const { id: sid, threads, primaryThread, offset } = (await res.json()) as {
+  const { id: sid, threads, primaryThread, offset, roleName } = (await res.json()) as {
     id: string;
     threads?: string[];
     primaryThread?: string | null;
     offset?: { dx: number; dy: number } | null;
+    roleName?: string | null;
   };
   // Dedup on reopen (mirrors openChannel's fly-to): a card for this session may ALREADY be on the board —
   // either a live-summoned worker card (`node:live:<sid>`, dropped by the server on spawn) or a prior
@@ -889,6 +890,10 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       title: sid, // the FULL session id — the template both displays (truncated) and keys its live
       // feed off (the `session` capability subscribes to session:<title>); it live-tails whatever
       // that session is (slice 1), and resumes in place if you recommence it.
+      // A role-spawned session carries a friendly display `name` ("<Role>.<short-sid>", the spawn
+      // convention at routes/sessions.ts) so the reopened card's head + its member pill read the role
+      // label, not the bare sid. `title` stays the raw sid (the live-feed key) — only `name` is display.
+      name: roleName ? `${roleName}.${sid.slice(0, 8)}` : undefined,
       text: "",
       color: "blue",
       ...pos,

@@ -3479,6 +3479,15 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #a1a1aa;
   border: 1px dashed #d4d4d8;
 }
+/* A CLOSED durable member — joined server-side, but its session card was select-deleted (a display-only
+   close: membership + seat survive). Reads as a REAL member (neutral fill like .open, not the dimmer
+   dashed "invited" styling) with a dotted border hinting it's reopenable — a click runs openSession to
+   bring its card back. Distinct from .pending, which is a not-yet-joined invite. */
+.chan-member.closed {
+  background: #fafafa;
+  color: #71717a;
+  border: 1px dotted #d4d4d8;
+}
 /* The pill coloured by the member's CURRENT work-intent (Thread card UI) — status where it belongs, on the
    roster, instead of as inline transcript history. The note rides the pill's hover title. These follow the
    session-status vocabulary and sit AFTER `.open` so they win at equal specificity: amber = blocked:human

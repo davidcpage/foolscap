@@ -7,11 +7,13 @@ import {
   readPins,
   readSeenMentions,
   readThreadMeta,
+  seatForSid,
   threadLevelForSid,
   untaggedSeatNudgeTarget,
   upsertThreadMeta,
   type PinnedMsg,
 } from "./thread-ledger.js";
+import { threadMemberSids } from "./server-snapshot.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { wakesSeat } from "./notification-levels.js";
 import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
@@ -69,7 +71,7 @@ function memberEdgesOf(records: Array<Record<string, unknown>> | null | undefine
 // state rides the same feed the log does, no second subscription. Pins live on the durable marker (read
 // best-effort; [] when there's no repo/marker). Used by appendThreadMsg, seedThreadLogs, and the pin handler.
 export function publishThreadFeed(boardId: string, threadId: string, messages: ThreadMsg[], truncated: boolean): void {
-  const { boards, publishFeed } = getServerContext();
+  const { boards, publishFeed, boardSnapshotRecords } = getServerContext();
   const repoPath = boards.get(boardId)?.repoPath;
   const pins: PinnedMsg[] = repoPath ? readPins(repoPath, threadId) : [];
   // The board owner's unseen-mention signal (user waiting-state + you-pill): an @you/@human mention the human
@@ -80,6 +82,20 @@ export function publishThreadFeed(boardId: string, threadId: string, messages: T
   // with the rail. The rail popover's preview/more ride /api/threads (handleThreads), not this feed.
   const seen = repoPath ? readSeenMentions(repoPath, threadId) : [];
   const { waiting: youWaiting, count: youWaitingCount, seqs: youWaitingSeqs } = humanWaiting(messages, seen);
+  // The DURABLE member roster (sid + role/seat display name), so the card can paint a pill for a member
+  // whose session card was deleted — the edge (and its edge-derived pill) vanished, but the membership and
+  // seat outlived them (server-snapshot's threadMemberSids folds those cardless durable members in). The
+  // card unions this with its edge-derived members: a durable sid with no member:open edge → a CLOSED,
+  // clickable pill that reopens the session (the P4 pill-open path). Kept lean — sid + name only — so this
+  // per-frame feed payload stays small (the name is formatted like a live card's node.name so both pills
+  // render the same handle through displayHandle). `[]` when there's no repo/marker.
+  const seats = (repoPath ? readThreadMeta(repoPath, threadId) : null)?.seats;
+  const records = boardSnapshotRecords(boardId) ?? [];
+  const members = threadMemberSids(records, threadId).map((sid) => {
+    const seat = seatForSid(seats, sid);
+    const role = seat ? (seats?.[seat]?.role ?? seat) : null;
+    return { sid, name: role ? `${role}.${sid.slice(0, 8)}` : null };
+  });
   publishFeed("thread:" + threadId, {
     messages,
     truncated,
@@ -87,6 +103,7 @@ export function publishThreadFeed(boardId: string, threadId: string, messages: T
     youWaiting,
     youWaitingCount,
     youWaitingSeqs,
+    members,
   });
 }
 

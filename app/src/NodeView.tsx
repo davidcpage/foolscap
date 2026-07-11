@@ -569,7 +569,7 @@ function ThreadView({
   useSignal(useMemo(() => store.query({ typeName: "node" }), [store])); // member titles can change
   // The conversation lives off-log in the server's thread log, streamed on the thread:<id> feed (the same
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
-  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[] }>("thread:" + id));
+  const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[]; members?: { sid: string; name: string | null }[] }>("thread:" + id));
   const msgs = feed?.messages ?? [];
   // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you/@human
   // mention seqs the human has not yet VIEWED (thread-waiting.js × the durable seenMentions set). This no
@@ -691,12 +691,26 @@ function ThreadView({
     };
   }, []);
 
-  const members = edges
-    .map((e) => {
-      const n = store.get<"node">(e.from);
-      return { edgeId: e.id, sid: n?.title ?? "?", name: n?.name ?? null, open: e.type === MEMBER_OPEN };
-    })
-    .sort((a, b) => Number(b.open) - Number(a.open));
+  // Pills come from TWO sources unioned by sid. (1) The local member:* EDGES — a member with an open
+  // session card on this board; `open` reflects the edge type. (2) The server's DURABLE roster off the feed
+  // — members whose membership + seat survive server-side even after their session card (and its edge) was
+  // select-deleted (a display-only close). A durable member with NO edge here is exactly that deleted-card
+  // case: it gets a CLOSED pill (open:false, no edgeId) that stays clickable → openSession reopens it (P4
+  // pill-open). Without this union the pill would vanish on delete and P4's reopen-by-pill would be dead.
+  // `invited` splits the two open:false cases apart: a non-`member:open` EDGE is a pending invite (not yet
+  // joined server-side), whereas a cardless roster member is a CLOSED member (joined, its card deleted) —
+  // reopenable, not invited. The render keys "(invited)"/styling off this so a deleted-card pill doesn't
+  // masquerade as an un-joined invite.
+  const edgeMembers = edges.map((e) => {
+    const n = store.get<"node">(e.from);
+    const open = e.type === MEMBER_OPEN;
+    return { edgeId: e.id as string | null, sid: n?.title ?? "?", name: n?.name ?? null, open, invited: !open };
+  });
+  const edgeSids = new Set(edgeMembers.map((mm) => mm.sid));
+  const cardlessMembers = (feed?.members ?? [])
+    .filter((r) => !edgeSids.has(r.sid))
+    .map((r) => ({ edgeId: null as string | null, sid: r.sid, name: r.name, open: false, invited: false }));
+  const members = [...edgeMembers, ...cardlessMembers].sort((a, b) => Number(b.open) - Number(a.open));
   // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve and
   // highlight against these entries — by sid OR role name, exactly the set the server (thread-tags.js) wakes.
   const openMembers = members.filter((mem) => mem.open);
@@ -1042,14 +1056,14 @@ function ThreadView({
                 <b className={`chan-tip-intent i-${pillState}`}>{PILL_LABEL[pillState]}</b>
                 {displayNote && ` — ${displayNote}`}
               </>
-            ) : mem.open ? "no status declared" : "invited — not yet joined";
+            ) : mem.open ? "no status declared" : mem.invited ? "invited — not yet joined" : "card closed — click to reopen";
             const tipNodes: React.ReactNode[] = [statusNode];
             tipNodes.push("click: open card");
             if (tag) tipNodes.push("right-click: insert @tag");
             return (
               <span
-                key={mem.edgeId}
-                className={`chan-member${mem.open ? " open" : " pending"}${intentClass}`}
+                key={mem.edgeId ?? mem.sid}
+                className={`chan-member${mem.open ? " open" : mem.invited ? " pending" : " closed"}${intentClass}`}
                 data-interactive
                 // LEFT-CLICK reopens (or flies to) this member's session card via the P1 openSession path —
                 // it redraws the member:open edge and lands the card at its stored P2 offset. Display-only:
@@ -1060,7 +1074,7 @@ function ThreadView({
                 onContextMenu={tag ? (e) => { e.preventDefault(); e.stopPropagation(); insertTag(tag); } : undefined}
               >
                 <span className="chan-member-name">
-                  {displayHandle(mem.name, mem.sid)}{!mem.open && " (invited)"}
+                  {displayHandle(mem.name, mem.sid)}{mem.invited && " (invited)"}
                 </span>
                 <span className="chan-tip chan-tip-up" role="tooltip">
                   {tipNodes.map((n, i) => (
