@@ -23,6 +23,8 @@ export interface InteractionOptions {
   connectable?: (nodeId: string) => boolean;
   /** The user wired `from`→`to` with a connect-drag; the host makes the edge. See InteractionContext.connect. */
   connect?: (from: string, to: string) => void;
+  /** Directed selection-expansion (e.g. a thread → its open member cards). See InteractionContext.expandSelection. */
+  expandSelection?: (nodeId: string) => string[];
 }
 
 // Edge auto-scroll ("infinite canvas" pan-while-dragging): when a drag's pointer comes within
@@ -61,6 +63,8 @@ export class InteractionManager implements InteractionContext {
   readonly connectable?: (nodeId: string) => boolean;
   /** Connect-drag completion handler supplied by the host; see InteractionContext.connect. */
   readonly connect?: (from: string, to: string) => void;
+  /** Directed selection-expansion supplied by the host; see InteractionContext.expandSelection. */
+  readonly expandSelection?: (nodeId: string) => string[];
 
   private tools = new Map<string, Tool>();
   private active: Tool;
@@ -92,6 +96,7 @@ export class InteractionManager implements InteractionContext {
     this.aspectLock = opts.aspectLock;
     this.connectable = opts.connectable;
     this.connect = opts.connect;
+    this.expandSelection = opts.expandSelection;
 
     // Open the channel-2 index subscription via the idempotent start() so a plain (non-React) host
     // and the Node tests get a live index immediately. The lifecycle is also re-entrant: a host can

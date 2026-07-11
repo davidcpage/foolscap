@@ -55,6 +55,14 @@ export interface InteractionContext {
    * decides what edge to create (or to ignore it) — the engine carries the gesture, not the meaning.
    */
   readonly connect?: (from: string, to: string) => void;
+  /**
+   * Optional: given a node the user just selected, return EXTRA node ids that should join the
+   * selection — a DIRECTED, one-way expansion the host defines (e.g. selecting a thread card also
+   * selects its open member session cards, so the whole cluster group-drags as one; selecting a
+   * member does NOT pull in the thread). Same card-type-blind shape as aspectLock/connectable: the
+   * host supplies the graph rule, the select tool just asks. Absent / [] ⇒ no expansion.
+   */
+  readonly expandSelection?: (nodeId: string) => string[];
   /** Switch the active tool by name (e.g. a tool that finishes returns to "select"). */
   setTool(name: string): void;
 }

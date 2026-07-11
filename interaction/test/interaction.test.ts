@@ -440,3 +440,85 @@ test("fitSelection frames the selected node, falling back to fitAll when empty",
   const c2 = m.camera.pageToScreen({ x: 150, y: 50 });
   assert.ok(Math.hypot(c2.x - 400, c2.y - 300) < 1e-6);
 });
+
+// ── directed-edge selection rule (P3 cluster-selection, replaces the move-with-thread reactor) ──
+// A thread T with two open member cards A, B and an unrelated card X. The host resolver expands a
+// thread to its members and NOTHING else (one-way): selecting T grabs its cluster, selecting a member
+// never grabs T. Geometry: T 0..100, A 200..300, B 400..500, X 600..700 — all on the x axis, z=1.
+function clusterSetup() {
+  const editor = new Editor();
+  editor.commit({ type: "addNode", payload: { id: "node:thread:T", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
+  editor.commit({ type: "addNode", payload: { id: "node:live:A", x: 200, y: 0, w: 100, h: 100 }, actor: "human" });
+  editor.commit({ type: "addNode", payload: { id: "node:live:B", x: 400, y: 0, w: 100, h: 100 }, actor: "human" });
+  editor.commit({ type: "addNode", payload: { id: "node:x", x: 600, y: 0, w: 100, h: 100 }, actor: "human" });
+  const m = new InteractionManager({
+    editor,
+    expandSelection: (id) => (id === "node:thread:T" ? ["node:live:A", "node:live:B"] : []),
+  });
+  return { editor, m };
+}
+const sel = (m: InteractionManager) => new Set(m.selection.ids());
+
+test("selecting a thread auto-selects its open member cards (directed expansion)", () => {
+  const { m } = clusterSetup();
+  m.dispatch(down(vec(50, 50))); // press the thread
+  m.dispatch(up(vec(50, 50)));
+  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+});
+
+test("selecting a member is one-way — it never pulls in the thread", () => {
+  const { m } = clusterSetup();
+  m.dispatch(down(vec(250, 50))); // press member A
+  m.dispatch(up(vec(250, 50)));
+  assert.deepEqual(sel(m), new Set(["node:live:A"]), "just the member, no thread, no sibling");
+});
+
+test("plain click on the thread keeps the whole cluster (narrowOnUp carve-out)", () => {
+  const { m } = clusterSetup();
+  m.dispatch(down(vec(50, 50)));
+  m.dispatch(up(vec(50, 50))); // a plain click must NOT collapse to just the thread
+  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+  // clicking it again (cluster already selected) still keeps the cluster, not the thread alone
+  m.dispatch(down(vec(50, 50)));
+  m.dispatch(up(vec(50, 50)));
+  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+});
+
+test("plain click on ONE member of a selected cluster narrows to just that member", () => {
+  const { m } = clusterSetup();
+  m.dispatch(down(vec(50, 50)));
+  m.dispatch(up(vec(50, 50))); // cluster selected
+  m.dispatch(down(vec(250, 50))); // press member A (already in the multi-selection)
+  m.dispatch(up(vec(250, 50))); // plain click → narrow to A (rename / scroll-one)
+  assert.deepEqual(sel(m), new Set(["node:live:A"]));
+});
+
+test("group-drag: pressing the thread and dragging moves the whole cluster by one delta", () => {
+  const { editor, m } = clusterSetup();
+  m.dispatch(down(vec(50, 50))); // press thread → cluster selected + gesture opens
+  m.dispatch(move(vec(90, 50))); // +40 crosses threshold → drag the group
+  m.dispatch(up(vec(90, 50)));
+  assert.equal(x(editor, "node:thread:T"), 40, "thread moved +40");
+  assert.equal(x(editor, "node:live:A"), 240, "member A moved +40 (offset preserved)");
+  assert.equal(x(editor, "node:live:B"), 440, "member B moved +40");
+  assert.equal(x(editor, "node:x"), 600, "the unrelated card did not move");
+});
+
+test("marquee sweeping over a thread pulls in its members even if off-marquee", () => {
+  const { m } = clusterSetup();
+  // Rubber-band a box that covers ONLY the thread (0..100), not A/B (>=200).
+  m.dispatch(down(vec(-10, -10)));
+  m.dispatch(move(vec(110, 110)));
+  m.dispatch(up(vec(110, 110)));
+  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+});
+
+test("no expandSelection resolver → selection behaves exactly as before (thread selects alone)", () => {
+  const editor = new Editor();
+  editor.commit({ type: "addNode", payload: { id: "node:thread:T", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
+  editor.commit({ type: "addNode", payload: { id: "node:live:A", x: 200, y: 0, w: 100, h: 100 }, actor: "human" });
+  const m = new InteractionManager({ editor }); // no resolver wired
+  m.dispatch(down(vec(50, 50)));
+  m.dispatch(up(vec(50, 50)));
+  assert.deepEqual(sel(m), new Set(["node:thread:T"]), "unwired host = plain single-select");
+});
