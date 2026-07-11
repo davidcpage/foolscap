@@ -35,12 +35,12 @@ export declare function resolveHudPosition(
   viewportW: number,
 ): { x: number; y: number; w: number; h: number };
 
-/** The per-card render scale for a screen card given the reference screen size it was placed on and the live
- *  viewport: min(1, currentW/refW, currentH/refH) — native (1) on a screen at/above its reference, shrinking
- *  only when the viewport is smaller. Absent/degenerate reference → 1. */
-export declare function hudCardScale(
-  refW: number | undefined,
-  refH: number | undefined,
+/** The GROUP fit-to-screen scale for the whole HUD: min(1, (viewportW-margin)/maxX, (viewportH-margin)/maxY)
+ *  over the bounding box of `boxes` (all screen cards' stored x/y/w/h). Native (1) when the HUD already fits,
+ *  shrinking the group as a unit only on overflow. Empty/degenerate → 1. */
+export declare function hudFitScale(
+  boxes: ReadonlyArray<{ x: number; y: number; w: number; h: number }>,
   viewportW: number,
   viewportH: number,
+  margin?: number,
 ): number;

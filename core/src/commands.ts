@@ -26,17 +26,12 @@ export const defaultCommands: Record<string, CommandHandler> = {
   // ("world"), carrying the converted box so the toggle is visually seamless — the caller (which knows
   // the camera) computes the screen↔page coordinates. Layout-only, like moveNode; the engine stays
   // blind to anchoring (it just stops indexing a "screen" card — see syncIndexFromStore).
-  setAnchor(store, p: { id: Id<"node">; anchor: "screen" | "world"; x?: number; y?: number; w?: number; h?: number; refW?: number; refH?: number }) {
+  setAnchor(store, p: { id: Id<"node">; anchor: "screen" | "world"; x?: number; y?: number; w?: number; h?: number }) {
     const patch: Partial<import("./records.js").LayoutRecord> = { anchor: p.anchor };
     if (p.x != null) patch.x = p.x;
     if (p.y != null) patch.y = p.y;
     if (p.w != null) patch.w = p.w;
     if (p.h != null) patch.h = p.h;
-    // The reference SCREEN size for a screen card's per-card render scale (records.ts). Captured at pin /
-    // seed time by the caller (it knows the live viewport); only stamped when supplied, so a plain move /
-    // resize (which passes neither) leaves an existing reference untouched.
-    if (p.refW != null) patch.refW = p.refW;
-    if (p.refH != null) patch.refH = p.refH;
     store.update<import("./records.js").LayoutRecord>(layoutId(p.id), patch);
   },
 

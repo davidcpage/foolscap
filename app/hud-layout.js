@@ -109,25 +109,29 @@ export function resolveHudPosition(card, viewportW) {
   return { x, y: card.top, w: card.w, h: card.h };
 }
 
-// PER-CARD render scale from a card's reference screen size. Each screen card (HUD singleton or user-pinned)
-// records the viewport size it was added / pinned on (records.ts refW/refH); at render it draws under a
-// `transform: scale(s)` with `transform-origin: top left`. This replaces the retired group-wide viewport-fit
-// (a single scale() over the whole HUD group), which shrank HUD content uniformly and so made HUD cards
-// inconsistent with ordinary/world cards — a card pinned beside them kept full font size. The per-card model
-// is consistent by construction: on the screen a card was placed on (reference == current) it renders native
-// (scale 1), exactly like an ordinary card and a freshly-pinned one.
+// GROUP fit-to-screen scale. HUD card positions are frozen at seed-time viewport width and don't reflow, so a
+// layout seeded on a wide screen falls off the right/bottom edge of a narrower one — and scaling each card
+// around its OWN corner (the retired per-card model) can't fix that, because scaling in place never moves a
+// card's position. So the whole HUD renders inside ONE wrapper under `transform: scale(s)` with
+// `transform-origin: top left` (CanvasView), and `s` shrinks the group as a unit — every card's POSITION and
+// SIZE together — until the entire HUD lands on-screen. All screen cards go through this one scale: the HUD
+// singletons AND the user-pinned (`free`) cards, so a pinned card stays mutually consistent with the HUD
+// cards beside it (they scale by the same factor).
 //
-// s = min(1, currentW/refW, currentH/refH): the binding (smaller) of the two axis ratios, capped at 1 so a
-// card never renders LARGER than native — that ceiling is what keeps every card on a screen ≥ its reference
-// at scale 1, matching ordinary cards regardless of where it was pinned (a bigger screen doesn't balloon it).
-// It only ever shrinks, and only when the live viewport is smaller than the reference in some axis (a smaller
-// window / device). Absent or degenerate reference (a legacy screen card, refW/refH ≤ 0) → 1 (native).
-//
-// NOTE (step 1 scope): this scales a card's CONTENT in place around its own top-left; it does NOT reflow a
-// card's POSITION, so a right-anchored card seeded on a wide screen can sit partly off a narrower viewport.
-// Pulling it back on-screen (partial reflow, a shrink floor, a manual zoom) is the deferred step 2.
-export function hudCardScale(refW, refH, viewportW, viewportH) {
-  if (!refW || !refH || refW <= 0 || refH <= 0) return 1;
-  if (!(viewportW > 0) || !(viewportH > 0)) return 1;
-  return Math.min(1, viewportW / refW, viewportH / refH);
+// s = min(1, availW/maxX, availH/maxY) over the group's bounding box (maxX/maxY = the far edge of the
+// furthest card) against the viewport less a margin: the binding (smaller) axis ratio, capped at 1 so the HUD
+// renders NATIVE (scale 1) whenever it already fits — it only ever shrinks, and only on overflow. Empty group
+// or a degenerate box/viewport → 1 (native). `boxes` are the cards' stored (unscaled) screen x/y/w/h.
+export function hudFitScale(boxes, viewportW, viewportH, margin = HUD_MARGIN) {
+  if (!boxes || boxes.length === 0) return 1;
+  let maxX = 0;
+  let maxY = 0;
+  for (const b of boxes) {
+    if (b.x + b.w > maxX) maxX = b.x + b.w;
+    if (b.y + b.h > maxY) maxY = b.y + b.h;
+  }
+  const availW = viewportW - margin;
+  const availH = viewportH - margin;
+  if (maxX <= 0 || maxY <= 0 || availW <= 0 || availH <= 0) return 1;
+  return Math.min(1, availW / maxX, availH / maxY);
 }

@@ -65,10 +65,6 @@ export interface LayoutRecord extends BaseRecord {
   // SCREEN pixels and it stays put under pan/zoom (a pinned minimap, legend, scratch note). A floating
   // card is renderer chrome: excluded from the spatial index / hit-test / marquee / zoom-to-fit bounds,
   // and moved by its own drag, not the engine's. Flip back to "world" to drop it onto the canvas.
-  refW?: number; // the REFERENCE screen size (viewport w/h) captured when this card was added / pinned to
-  refH?: number; // the HUD. A screen card renders scaled by min(1, currentW/refW, currentH/refH): on the
-  // screen it was placed on it's native (scale 1, matching an ordinary card), and it only shrinks when the
-  // live viewport is smaller than its reference. Absent (a legacy screen card, or any world card) ≡ scale 1.
 }
 
 export type AnyRecord = NodeRecord | EdgeRecord | LayoutRecord;

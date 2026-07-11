@@ -13,7 +13,7 @@ import {
   HUD_SNAP,
   isHudCard,
   hudChromeFor,
-  hudCardScale,
+  hudFitScale,
   resolveHudPosition,
 } from "../hud-layout.js";
 
@@ -104,37 +104,42 @@ test("HUD_SNAP is a fine step (P2 edit-mode grid) that the default layout alread
   }
 });
 
-test("hudCardScale: reference == current viewport renders native (scale 1)", () => {
-  // The consistency invariant: a card whose reference IS the current screen renders at full content size,
-  // exactly like an ordinary/world card and a freshly-pinned card. This is what the per-card model buys.
-  assert.equal(hudCardScale(1440, 900, 1440, 900), 1);
-  assert.equal(hudCardScale(1024, 768, 1024, 768), 1);
+test("hudFitScale: a HUD that already fits the viewport renders native (scale 1)", () => {
+  // "Native when it fits": the group only shrinks on overflow — a bbox within the viewport (less the margin)
+  // is scale 1, so an un-overflowing HUD renders at full/native size exactly as before.
+  const boxes = [{ x: 16, y: 16, w: 240, h: 300 }]; // far edge 256×316, comfortably inside 1440×900
+  assert.equal(hudFitScale(boxes, 1440, 900), 1);
+  // Right at the edge (far edge + margin == viewport) is still native.
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 1424, h: 884 }], 1440, 900), 1); // 1424+16=1440, 884+16=900
 });
 
-test("hudCardScale: never enlarges — a viewport larger than the reference stays native (≤1 ceiling)", () => {
-  // The grow-side ceiling is what keeps a small-reference card consistent with ordinary cards (and a fresh
-  // pin) on a bigger screen: native, not ballooned past its font size. Both-axes-larger and one-axis-larger.
-  assert.equal(hudCardScale(1280, 800, 2560, 1440), 1);
-  assert.equal(hudCardScale(1280, 800, 2560, 800), 1); // wider only
-  assert.equal(hudCardScale(1280, 800, 1280, 1600), 1); // taller only
+test("hudFitScale: shrinks the whole group to fit when the bbox overflows, by the binding axis", () => {
+  // A card seeded off the right/bottom edge of a narrower viewport drives the group scale below 1 — the
+  // SMALLER (binding) of the two axis ratios, so nothing overflows on either axis.
+  // bbox far edge 1424 wide; viewport 728 → availW 712 → 712/1424 = 0.5 (width binds).
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 1424, h: 200 }], 728, 900), 0.5);
+  // bbox far edge 1784 tall; viewport height 908 → availH 892 → 892/1784 = 0.5 (height binds).
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 200, h: 1784 }], 1440, 908), 0.5);
+  // Both axes overflow: the more-binding one wins.
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 1424, h: 1784 }], 728, 908), 0.5);
 });
 
-test("hudCardScale: shrinks on a viewport smaller than the reference, by the binding axis", () => {
-  // A card referenced on a 1440×900 screen, viewed narrower/shorter, scales down — and takes the SMALLER
-  // (binding) of the two axis ratios so it never overflows the reference footprint on either axis.
-  assert.equal(hudCardScale(1440, 900, 720, 900), 0.5); // half width, full height → width binds
-  assert.equal(hudCardScale(1440, 900, 1440, 450), 0.5); // full width, half height → height binds
-  assert.equal(hudCardScale(1440, 900, 720, 450), 0.5); // both halved → 0.5
-  assert.equal(hudCardScale(1000, 1000, 800, 900), 0.8); // width binds (0.8 < 0.9)
+test("hudFitScale: the bbox spans ALL boxes — a single off-screen card pulls the whole group in", () => {
+  // The group fit is over the union of every card, so one right-anchored card frozen from a wide seed shrinks
+  // the whole HUD to bring it back on-screen (the overflow bug this fixes).
+  const boxes = [
+    { x: 16, y: 16, w: 240, h: 300 }, // left column, on-screen
+    { x: 1184, y: 16, w: 240, h: 180 }, // right-anchored on a 1440 seed → far edge 1424
+  ];
+  // On a 728-wide viewport: availW 712 / maxX 1424 = 0.5.
+  assert.equal(hudFitScale(boxes, 728, 900), 0.5);
 });
 
-test("hudCardScale: absent or degenerate reference is native (safe default for a legacy screen card)", () => {
-  // A legacy screen card seeded before per-card scaling (no refW/refH) renders native until backfilled — and
-  // a degenerate reference or viewport never yields a divide-by-zero / non-positive scale.
-  assert.equal(hudCardScale(undefined, undefined, 1024, 768), 1);
-  assert.equal(hudCardScale(1440, undefined, 1024, 768), 1);
-  assert.equal(hudCardScale(0, 0, 1024, 768), 1);
-  assert.equal(hudCardScale(1440, 900, 0, 0), 1);
+test("hudFitScale: empty group or a degenerate box/viewport is native (safe default)", () => {
+  assert.equal(hudFitScale([], 1024, 768), 1);
+  assert.equal(hudFitScale(undefined, 1024, 768), 1);
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 0, h: 0 }], 1024, 768), 1); // zero bbox
+  assert.equal(hudFitScale([{ x: 0, y: 0, w: 100, h: 100 }], 0, 0), 1); // zero viewport
 });
 
 test("resolveHudPosition is deterministic per width — same width in, same box out (seed idempotency)", () => {
