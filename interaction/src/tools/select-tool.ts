@@ -81,7 +81,23 @@ export class SelectTool implements Tool {
       // Pressed on a (now-)selected node → wait to see if this becomes a drag or a click. If it was
       // already part of a multi-selection (non-shift), keep the group so a drag moves all of it, but
       // remember to narrow to just this node if the press turns out to be a plain click (pointer-up).
-      const narrowOnUp = !e.shiftKey && this.ctx.selection.has(hit) && this.ctx.selection.size > 1;
+      // Decided BEFORE the cluster expansion below: narrow only for a card that was ALREADY part of a
+      // hand-assembled group (click one member → select just it, so rename / scroll-one works), never
+      // for a card that is about to auto-expand a cluster underfoot.
+      let narrowOnUp = !e.shiftKey && this.ctx.selection.has(hit) && this.ctx.selection.size > 1;
+      // Directed selection-expansion: selecting a card pulls in the cards the host says travel with it
+      // (a thread grabs its OPEN member session cards). One-way — a member never grabs its thread — so
+      // the seed group-drags the whole cluster with no bespoke follow reactor. Non-shift only: shift is
+      // for hand-assembling a set, where an expansion underfoot would surprise. A seed that expands IS
+      // the cluster's anchor, so keep the whole cluster on a plain click (don't narrow), so selecting
+      // the thread and then dragging moves the group rather than collapsing to the thread alone.
+      if (!e.shiftKey) {
+        const cluster = this.ctx.expandSelection?.(hit) ?? [];
+        if (cluster.length) {
+          this.ctx.selection.add(cluster);
+          narrowOnUp = false;
+        }
+      }
       // Lift the selection to the front on the press itself (non-shift only — shift is for assembling a
       // set, where a restack underfoot would surprise). The open gesture is held in the pointing state:
       // a drag reuses it, a plain click ends it (see onPointerUp). null when already on top.
@@ -99,6 +115,18 @@ export class SelectTool implements Tool {
       if (!e.shiftKey) this.ctx.selection.clear();
       this.state = { kind: "marquee", originScreen: e.point, base };
     }
+  }
+
+  // Pull in every card the host says travels with an already-selected one (directed, one-way). Applied
+  // after a marquee union so sweeping over a thread grabs its open member cards too, matching a plain
+  // thread click. Idempotent — the expansions are additive and re-derived from the live selection each
+  // frame (a marquee rewrites the base∪hits set per move, so no stale members accumulate).
+  private expandClusterSelection(): void {
+    const fn = this.ctx.expandSelection;
+    if (!fn) return;
+    const extra: string[] = [];
+    for (const id of this.ctx.selection.ids()) extra.push(...fn(id));
+    if (extra.length) this.ctx.selection.add(extra);
   }
 
   // True when `page` lands inside the bounding box of a MULTI-selection (≥2). For a single selection
@@ -163,6 +191,7 @@ export class SelectTool implements Tool {
         this.ctx.marquee.set(box);
         const hits = this.ctx.index.hitTest(box);
         this.ctx.selection.set([...s.base, ...hits]); // base (shift) ∪ rubber-banded
+        this.expandClusterSelection(); // a swept-in thread brings its open member cards, as a click would
         break;
       }
     }

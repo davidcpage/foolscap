@@ -19,8 +19,7 @@ import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
 import { refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
-import { connectToThread, createThread, isThreadNode, isSessionNode } from "./threads";
-import { installMoveWithThread } from "./move-with-thread";
+import { connectToThread, createThread, isThreadNode, isSessionNode, MEMBER_OPEN } from "./threads";
 import { CanvasView } from "./CanvasView";
 import { useSignal } from "./reactive";
 import { templatesSignal } from "./templates";
@@ -144,6 +143,20 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
     // that session (member:open) — the human drawing it is the consent for their own agent (§8).
     connectable: (nodeId) => isSessionNode(editor, nodeId) || isThreadNode(editor, nodeId),
     connect: (from, to) => connectToThread(editor, from, to),
+    // Directed-edge selection rule (replaces the old move-with-thread reactor): selecting a THREAD card
+    // also selects its OPEN member session cards, so the whole cluster group-drags as one ordinary
+    // selection. `member:open` edges run session→thread, so a thread's members are the edge SOURCES whose
+    // target is this node. ONE-WAY: only threads expand — a session returns nothing, so selecting a member
+    // never pulls in its thread. Closed members have no canvas edge (display-only close removed it), so
+    // they're naturally excluded here and instead follow via the relative-offset reopen (P2).
+    expandSelection: (nodeId) => {
+      if (!isThreadNode(editor, nodeId)) return [];
+      const members: string[] = [];
+      for (const r of editor.store.getSnapshot().records) {
+        if (r.typeName === "edge" && r.type === MEMBER_OPEN && r.to === nodeId) members.push(r.from);
+      }
+      return members;
+    },
   });
   restoreAndPersistCamera(m.camera, boardId);
   seedHud(m); // the HUD chrome (usage + sessions + clock + threads) isn't menu-spawnable, so ensure it exists on every board
@@ -546,11 +559,6 @@ function Board({ m, undo, persistence }: Engine) {
   // The agent bus: inbound commands (POST /api/command → SSE → editor.commit) and the debounced
   // outbound snapshot push that makes GET /api/canvas the agent's read side.
   useEffect(() => connectAgentBus(m), [m]);
-
-  // Move-with-thread (P2): dragging a thread card carries its open member session cards along, preserving
-  // the cluster's relative layout. Reactive to layout changes (the store's layout query), so it tracks a
-  // live drag frame-by-frame; a session moves only with its PRIMARY thread.
-  useEffect(() => installMoveWithThread(m), [m]);
 
   // Delete the selected cards (actor "user", so it's undoable). Edges touching a removed node go first,
   // so no wire ever dangles — the same edges-before-nodes order clearBoard uses.
