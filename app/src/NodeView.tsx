@@ -58,6 +58,7 @@ export const NodeView = memo(function NodeView({
   hud,
   hudEditing,
   hudScale,
+  onGestureActive,
 }: {
   m: InteractionManager;
   id: Id<"node">;
@@ -71,10 +72,15 @@ export const NodeView = memo(function NodeView({
   // UNLOCKED — draggable + resizable with grid snap, exactly like a free pinned card — and reverts to inert
   // chrome the moment it clears. Ignored for a free pinned card (never locked to begin with).
   hudEditing?: boolean;
-  // The live viewport-fit scale the HUD group is rendered under (CanvasView `.hud-fit`, frozen during edit).
-  // The move/resize gestures divide their screen-px pointer delta by it so the handle tracks the pointer 1:1
-  // inside the scaled container. Only passed for HUD cards; a free pinned card renders unscaled (defaults 1).
+  // The group fit-to-screen scale the whole HUD is rendered under (CanvasView `.hud-fit`, frozen during a
+  // gesture). The move/resize gestures divide their screen-px pointer delta by it so the handle tracks the
+  // pointer 1:1 inside the scaled group. Passed for every screen card (HUD singleton AND free pinned); the
+  // group renders at 1 when it fits, so an un-shrunk HUD is unscaled.
   hudScale?: number;
+  // Signal the group-scale freeze: called with true when a drag/resize gesture STARTS on this card and false
+  // when it ENDS (CanvasView holds the scale snapshot for the duration). Covers both an Alt-edit of a HUD card
+  // and a plain free-card drag — either would otherwise move the live group-fit under the handle.
+  onGestureActive?: (active: boolean) => void;
 }) {
   const store = m.editor.store;
   const layoutSub = useMemo(() => store.getSignal<"layout">(layoutId(id)), [store, id]);
@@ -151,7 +157,16 @@ export const NodeView = memo(function NodeView({
   // positioned from its own stored layout x/y/w/h. The `hud` descriptor (present only for chrome) locks it
   // and picks the HUD panel styling; absent, it's a draggable pinned card. Same card render above either way.
   return (
-    <ScreenCardFrame m={m} id={id} layout={layout} selected={selected} hud={hud} hudEditing={hudEditing} hudScale={hudScale}>
+    <ScreenCardFrame
+      m={m}
+      id={id}
+      layout={layout}
+      selected={selected}
+      hud={hud}
+      hudEditing={hudEditing}
+      hudScale={hudScale}
+      onGestureActive={onGestureActive}
+    >
       {card}
     </ScreenCardFrame>
   );
@@ -189,6 +204,7 @@ function ScreenCardFrame({
   hud,
   hudEditing,
   hudScale,
+  onGestureActive,
   children,
 }: {
   m: InteractionManager;
@@ -198,6 +214,7 @@ function ScreenCardFrame({
   hud?: HudChrome;
   hudEditing?: boolean;
   hudScale?: number;
+  onGestureActive?: (active: boolean) => void;
   children: React.ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -207,12 +224,16 @@ function ScreenCardFrame({
   const editing = !!hud && !!hudEditing;
   const locked = !!hud && !editing;
   const snap = editing ? HUD_SNAP : 0;
-  // The HUD renders under a `transform: scale(hudScale)` (CanvasView `.hud-fit`), so a screen-px pointer delta
-  // maps to delta/scale in the stored (unscaled) layout space. Read through a ref so the pointermove closure
-  // always sees the current scale without re-attaching the listener; frozen during edit, so it's stable across
-  // a gesture. Absent (free pinned card, rendered unscaled) → 1.
+  // The HUD renders under a group `transform: scale(hudScale)` (CanvasView `.hud-fit`), so a screen-px pointer
+  // delta maps to delta/scale in the stored (unscaled) layout space. Read through a ref so the pointermove
+  // closure always sees the current scale without re-attaching the listener; the group scale is frozen for the
+  // duration of the gesture (onGestureActive), so it's stable while we drag. Absent → 1.
   const scaleRef = useRef(hudScale ?? 1);
   scaleRef.current = hudScale ?? 1;
+  // Signal the group-scale freeze at gesture start/end (read through a ref so the pointermove closure sees the
+  // latest callback without re-attaching the listener each render).
+  const gestureCbRef = useRef(onGestureActive);
+  gestureCbRef.current = onGestureActive;
   useEffect(() => {
     if (locked) return; // locked HUD chrome — no move gesture
     const el = ref.current;
@@ -237,12 +258,14 @@ function ScreenCardFrame({
         const rawY = l0.y + (ev.clientY - py) / s;
         const nx = snap ? Math.round(rawX / snap) * snap : Math.round(rawX);
         const ny = snap ? Math.round(rawY / snap) * snap : Math.round(rawY);
+        if (!gesture) gestureCbRef.current?.(true); // first move — freeze the group scale for the drag
         gesture ??= m.editor.beginGesture("moveNode", "user"); // open lazily: a click with no move logs nothing
         gesture.update(() => store.update<LayoutRecord>(layoutId(id), { x: nx, y: ny }));
       };
       const onUp = () => {
         window.removeEventListener("pointermove", onMove);
         window.removeEventListener("pointerup", onUp);
+        if (gesture) gestureCbRef.current?.(false); // released — unfreeze (re-fit to the new position)
         gesture?.end({ ids: [id] }, "moveNode");
       };
       window.addEventListener("pointermove", onMove);
@@ -258,21 +281,15 @@ function ScreenCardFrame({
     height: layout.h,
     zIndex: layout.z,
   };
-  // Per-card render scale (CanvasView `hudScale`, from the card's stored reference screen size): draw under
-  // `transform: scale(s)` around the card's own top-left, so the box stays anchored at its stored screen
-  // position while its content + size scale. Replaces the old group-wide `.hud-fit` transform — each screen
-  // card now owns its own scale (native at s=1, so a card on a screen ≥ its reference renders identical to
-  // before). Skipped at s=1 (no transform node). The move/resize gestures divide their pointer delta by the
-  // same s (below) so the handle tracks 1:1 under the transform.
-  const s = hudScale ?? 1;
-  if (s !== 1) {
-    style.transform = `scale(${s})`;
-    style.transformOrigin = "top left";
-  }
+  // No per-card transform: the whole HUD renders inside ONE `transform: scale()` wrapper (CanvasView
+  // `.hud-fit`) that scales every card's position + size as a group, so each frame just carries its stored
+  // (unscaled) box. The gesture math still divides pointer deltas by the group scale (hudScale, above) to
+  // track 1:1 under the wrapper's transform.
+  //
   // A height-capped HUD card leaves a HUD_GAP margin at the viewport bottom; its interior is already a scroll
   // container, so a capped frame height makes a long list scroll (the old HudFrame maxHeight, derived here
   // from the stored top instead of a per-card calc string). Capped in the card's own (pre-scale) space; the
-  // transform then keeps the scaled bottom within the viewport too.
+  // group transform then keeps the scaled bottom within the viewport too.
   if (hud?.capToViewport) style.maxHeight = `calc(100vh - ${layout.y + HUD_GAP}px)`;
   return (
     <div
@@ -290,7 +307,9 @@ function ScreenCardFrame({
       }
     >
       {children}
-      {!locked && selected && <FloatingResizeHandles m={m} id={id} snap={snap} scale={hudScale} />}
+      {!locked && selected && (
+        <FloatingResizeHandles m={m} id={id} snap={snap} scale={hudScale} onGestureActive={onGestureActive} />
+      )}
     </div>
   );
 }
@@ -311,18 +330,23 @@ function FloatingResizeHandles({
   id,
   snap = 0,
   scale,
+  onGestureActive,
 }: {
   m: InteractionManager;
   id: Id<"node">;
   snap?: number;
   scale?: number;
+  onGestureActive?: (active: boolean) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
-  // The HUD renders under `transform: scale(scale)` (CanvasView `.hud-fit`); a screen-px handle delta maps to
-  // delta/scale in the stored (unscaled) layout box. Read through a ref so the pointermove closure sees the
-  // current (frozen-during-edit) scale without re-attaching listeners. Absent (unscaled card) → 1.
+  // The HUD renders under a group `transform: scale(scale)` (CanvasView `.hud-fit`); a screen-px handle delta
+  // maps to delta/scale in the stored (unscaled) layout box. Read through a ref so the pointermove closure sees
+  // the current (frozen-during-gesture) scale without re-attaching listeners. Absent (unscaled group) → 1.
   const scaleRef = useRef(scale ?? 1);
   scaleRef.current = scale ?? 1;
+  // Signal the group-scale freeze at gesture start/end (read via ref so the closure sees the latest callback).
+  const gestureCbRef = useRef(onGestureActive);
+  gestureCbRef.current = onGestureActive;
   useEffect(() => {
     const host = ref.current;
     if (!host) return;
@@ -344,6 +368,7 @@ function FloatingResizeHandles({
         const aspect = m.aspectLock?.(id) ?? undefined;
         let gesture: ReturnType<typeof m.editor.beginGesture> | null = null;
         const onMove = (ev: PointerEvent) => {
+          if (!gesture) gestureCbRef.current?.(true); // first move — freeze the group scale for the resize
           gesture ??= m.editor.beginGesture("resizeNode", "user"); // open lazily: a click with no move logs nothing
           // The screen-px delta is divided by the HUD fit scale first, so the handle tracks the pointer 1:1
           // inside the scaled `.hud-fit` container (the stored box is unscaled). THEN snap the resulting layout
@@ -361,6 +386,7 @@ function FloatingResizeHandles({
         const onUp = () => {
           window.removeEventListener("pointermove", onMove);
           window.removeEventListener("pointerup", onUp);
+          if (gesture) gestureCbRef.current?.(false); // released — unfreeze (re-fit to the new size)
           gesture?.end({ ids: [id] }, "resizeNode");
         };
         window.addEventListener("pointermove", onMove);

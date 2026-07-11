@@ -211,25 +211,15 @@ function seatHudCard(
   id: Id<"node">,
   pos: { x: number; y: number; w: number; h: number },
   fresh: boolean,
-  ref: { w: number; h: number },
 ): void {
   const l = m.editor.store.get<"layout">(layoutId(id)) as LayoutRecord | undefined;
   if (!l) return;
-  if (!fresh && l.anchor === "screen") {
-    // Authoritative screen card — never overwrite its (possibly user-moved) position. But BACKFILL the
-    // reference screen size ONCE for a legacy card seeded before per-card scaling existed (records.ts
-    // refW/refH): it makes the card render native on this screen and the reference then persists like the
-    // position does. A card that already has a reference is left entirely alone.
-    if (l.refW == null || l.refH == null) {
-      m.editor.commit({ type: "setAnchor", actor: "system", payload: { id, anchor: "screen", refW: ref.w, refH: ref.h } });
-    }
-    return;
-  }
-  // A fresh card (or a legacy non-screen card being migrated in) captures the current viewport as its
-  // reference, so it seeds at scale 1 on this screen and shrinks only on a smaller one.
-  const refMissing = l.refW == null || l.refH == null;
-  if (l.anchor !== "screen" || l.x !== pos.x || l.y !== pos.y || l.w !== pos.w || l.h !== pos.h || refMissing) {
-    m.editor.commit({ type: "setAnchor", actor: "system", payload: { id, anchor: "screen", ...pos, refW: ref.w, refH: ref.h } });
+  // Authoritative screen card — never overwrite its (possibly user-moved) position. This is what makes a moved
+  // HUD card persist across reload.
+  if (!fresh && l.anchor === "screen") return;
+  // A fresh card (or a legacy non-screen card being migrated in) is seated at its default slot.
+  if (l.anchor !== "screen" || l.x !== pos.x || l.y !== pos.y || l.w !== pos.w || l.h !== pos.h) {
+    m.editor.commit({ type: "setAnchor", actor: "system", payload: { id, anchor: "screen", ...pos } });
   }
 }
 
@@ -241,25 +231,22 @@ function seatHudCard(
 // board matches.
 function seedHud(m: InteractionManager): void {
   const store = m.editor.store;
-  const { w: viewportW, h: viewportH } = seedViewport();
-  const ref = { w: viewportW, h: viewportH };
+  const viewportW = seedViewportW();
   for (const card of DEFAULT_HUD) {
     const id = card.id as Id<"node">;
     const fresh = !store.get<"node">(id);
     if (fresh) HUD_SEEDERS[card.type]?.(m); // create the missing chrome card (stable id)
-    seatHudCard(m, id, resolveHudPosition(card, viewportW), fresh, ref);
+    seatHudCard(m, id, resolveHudPosition(card, viewportW), fresh);
   }
 }
 
-// The live viewport size (w/h) used both to place the width-relative HUD cards and to capture each seeded
-// card's reference screen size (hud-layout.js hudCardScale). SSR/degenerate fallback mirrors the old
-// seed-time width default so a headless seed stays deterministic.
-function seedViewport(): { w: number; h: number } {
+// The live viewport WIDTH used to place the width-relative HUD cards (the right/centre columns). SSR/degenerate
+// fallback mirrors the old seed-time width default so a headless seed stays deterministic. (The HUD no longer
+// captures a per-card reference size — it fits the whole group to the live viewport at render, hud-layout.js
+// hudFitScale — so only the placement width is needed here.)
+function seedViewportW(): number {
   const hasWindow = typeof window !== "undefined";
-  return {
-    w: hasWindow && window.innerWidth ? window.innerWidth : 1440,
-    h: hasWindow && window.innerHeight ? window.innerHeight : 900,
-  };
+  return hasWindow && window.innerWidth ? window.innerWidth : 1440;
 }
 
 // Ensure ONE HUD singleton exists — the right-click menu's "reveal the singleton" action. A HUD singleton
@@ -273,9 +260,9 @@ function ensureHudCard(m: InteractionManager, id: string): void {
   if (!spec) return;
   const fresh = !m.editor.store.get<"node">(id as Id<"node">);
   if (fresh) HUD_SEEDERS[spec.type]?.(m);
-  const { w: viewportW, h: viewportH } = seedViewport();
+  const viewportW = seedViewportW();
   // fresh → place at default; an existing (possibly user-moved) card is left where it is — reveal never re-seats.
-  seatHudCard(m, id as Id<"node">, resolveHudPosition(spec, viewportW), fresh, { w: viewportW, h: viewportH });
+  seatHudCard(m, id as Id<"node">, resolveHudPosition(spec, viewportW), fresh);
 }
 
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.
@@ -447,14 +434,13 @@ function Board({ m, undo, persistence }: Engine) {
         });
       } else {
         const s = m.camera.pageToScreen({ x: l.x, y: l.y });
-        // Capture the current viewport as this card's reference screen size (records.ts refW/refH), so it
-        // joins the HUD at scale 1 — native, consistent with the other current-reference cards and with the
-        // ordinary card it just was. It only shrinks later if the window gets smaller than now (hud-layout.js).
-        const { w: refW, h: refH } = seedViewport();
+        // The pinned card joins the HUD group and scales with it (hud-layout.js hudFitScale): native when the
+        // HUD fits, shrinking as one unit with the HUD cards beside it when it overflows — so it stays mutually
+        // consistent with them, no per-card reference needed.
         m.editor.commit({
           type: "setAnchor",
           actor: "user",
-          payload: { id, anchor: "screen", x: Math.round(s.x), y: Math.round(s.y), w: Math.round(l.w * z), h: Math.round(l.h * z), refW, refH },
+          payload: { id, anchor: "screen", x: Math.round(s.x), y: Math.round(s.y), w: Math.round(l.w * z), h: Math.round(l.h * z) },
         });
         // Pinning is subsumed by the HUD now (pinned cards render in the HUD group and toggle with it). If the
         // HUD is hidden, a freshly-pinned card would vanish on commit — so reveal the HUD, mirroring the way

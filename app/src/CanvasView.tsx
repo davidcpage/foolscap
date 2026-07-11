@@ -4,7 +4,7 @@ import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
-import { HUD_CARDS, hudCardScale, hudChrome, isHudCard } from "./hud";
+import { HUD_CARDS, hudChrome, hudFitScale, isHudCard } from "./hud";
 
 // Per-type connector colour (driven inline; see EdgeLayer for why visuals aren't a CSS class). Amber =
 // pending invite, green = open membership, blue = watch; the lilac fallback matches the system wires
@@ -99,41 +99,57 @@ function ScreenLayer({ m, hudShown, hudEditing }: { m: InteractionManager; hudSh
   const hud = hudShown
     ? HUD_CARDS.map((id) => floating.find((l) => l.nodeId === id)).filter((l): l is NonNullable<typeof l> => !!l)
     : [];
-  // PER-CARD render scale: each screen card draws under its own `transform: scale(s)` where s =
-  // hudCardScale(card.refW, card.refH, viewport) — native (1) on a screen at/above the reference it was
-  // pinned on, shrinking only when the live viewport is smaller. This replaces the retired group-wide
-  // viewport-fit (one scale() over the `.hud-fit` group), which shrank HUD content uniformly and so made HUD
-  // cards inconsistent with an ordinary/pinned card beside them (hud-layout.js). Both kinds go through the
-  // same per-card path now (free pinned AND HUD singleton); the frame (NodeView ScreenCardFrame) applies the
-  // transform around its own top-left. Positions are never mutated (a user's Alt-drag + the undo log stay
-  // clean); reflowing an off-screen card back in is the deferred step 2.
+  // GROUP fit-to-screen: HUD positions are frozen at seed-time width and don't reflow, so a layout seeded on a
+  // wide screen falls off the right/bottom edge of a narrower one — and scaling each card around its own
+  // corner can't pull it back (scaling in place never moves a position). So the whole HUD renders inside ONE
+  // wrapper under `transform: scale(scale)` from the top-left corner (hudFitScale over the group bbox), which
+  // shrinks the group as a unit — every card's POSITION and SIZE together — until the entire HUD fits. Native
+  // (scale 1) whenever it already fits; it only shrinks on overflow. Positions are never mutated (a user's
+  // Alt-drag + the undo log stay clean).
   //
-  // No edit-start freeze anymore: the old group fit changed with the group bbox, so growing a card mid-edit
-  // moved the scale (a chasing handle) and had to be frozen. A per-card scale is a pure fn of (refW, refH,
-  // viewport) — none of which a drag/resize touches — so it's stable across a gesture by construction, and
-  // the drag/resize math (NodeView, `hudScale` prop) still divides pointer deltas by it to track 1:1.
+  // BOTH kinds go in the group: the HUD singletons AND the user-pinned (`free`) cards, so a pinned card scales
+  // by the same factor as the HUD cards beside it and stays mutually consistent with them.
+  //
+  // FREEZE during a gesture: a card being dragged/resized is inside the scaled group, so recomputing the fit
+  // live would move the scale under the pointer — a chasing handle. This bites for an Alt-edit of a HUD card
+  // AND for a plain free-card drag (free cards drag without Alt, and now live inside the group). So we snapshot
+  // the scale at gesture START (onGestureActive(true) from the frame/handles) and hold it until the gesture
+  // ENDS — not tied to Alt-edit. The scale stays live otherwise (window resize, a card added/pinned). The
+  // drag/resize math (NodeView, `hudScale` prop) divides pointer deltas by this scale to track the pointer 1:1.
   const { w: vw, h: vh } = useViewportSize();
+  const boxes = [...hud, ...free];
+  const liveScale = hudFitScale(boxes, vw, vh);
+  const [gesturing, setGesturing] = useState(false);
+  const frozenScaleRef = useRef(liveScale);
+  if (!gesturing) frozenScaleRef.current = liveScale; // keep the snapshot fresh while idle
+  const scale = gesturing ? frozenScaleRef.current : liveScale;
   if (free.length === 0 && hud.length === 0) return null;
+  const onGestureActive = (active: boolean) => setGesturing(active);
+  const groupStyle: React.CSSProperties =
+    scale < 1 ? { position: "absolute", inset: 0, transformOrigin: "top left", transform: `scale(${scale})` } : {};
   return (
     <div className="screen-layer">
-      {free.map((l) => (
-        <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hudScale={hudCardScale(l.refW, l.refH, vw, vh)} />
-      ))}
-      {hud.map((l) => {
-        const chrome = hudChrome(l.nodeId);
-        if (!chrome) return null;
-        return (
-          <NodeView
-            key={l.nodeId}
-            m={m}
-            id={l.nodeId}
-            screen
-            hud={chrome}
-            hudEditing={hudEditing}
-            hudScale={hudCardScale(l.refW, l.refH, vw, vh)}
-          />
-        );
-      })}
+      <div className="hud-fit" style={groupStyle}>
+        {free.map((l) => (
+          <NodeView key={l.nodeId} m={m} id={l.nodeId} screen hudScale={scale} onGestureActive={onGestureActive} />
+        ))}
+        {hud.map((l) => {
+          const chrome = hudChrome(l.nodeId);
+          if (!chrome) return null;
+          return (
+            <NodeView
+              key={l.nodeId}
+              m={m}
+              id={l.nodeId}
+              screen
+              hud={chrome}
+              hudEditing={hudEditing}
+              hudScale={scale}
+              onGestureActive={onGestureActive}
+            />
+          );
+        })}
+      </div>
     </div>
   );
 }
