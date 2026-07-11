@@ -46,7 +46,10 @@ const j = (body) => ({
 });
 
 test("mount: POST /api/boards is idempotent and mints a stable boardId", { skip: !up && "no dev server on 5173" }, async () => {
-  const res = await fetch(`${HOST}/api/boards`, j({ repoPath: scratch }));
+  // noSessions: this suite's annotation/thread writes fire the SAME wake paths a human's do, and they used
+  // to auto-spawn a REAL doc worker (a live `claude` process, real token spend) once per run. The flag
+  // marks the scratch board spawn-refusing — belt to the tmpdir backstop's braces (sessionSpawnRefusal).
+  const res = await fetch(`${HOST}/api/boards`, j({ repoPath: scratch, noSessions: true }));
   assert.equal(res.status, 200);
   const first = await res.json();
   assert.match(first.boardId, /^[a-z0-9-]+-[0-9a-f]{8}$/);
@@ -56,6 +59,14 @@ test("mount: POST /api/boards is idempotent and mints a stable boardId", { skip:
   // Start from a clean store — a previous run that died before its cleanup must not skew the
   // watermark assertions below.
   assert.equal((await fetch(`${HOST}/api/board/persist?board=${boardId}`, { method: "DELETE" })).status, 200);
+});
+
+test("no real sessions on a scratch board: explicit spawn is 403", { skip: !up && "no dev server on 5173" }, async () => {
+  // The tmpdir backstop alone must refuse (the sticky noSessions flag is belt on top): a board whose repo
+  // lives under os.tmpdir() never runs a live `claude`. If this 200s, a test run just cost real tokens.
+  const res = await fetch(`${HOST}/api/session/spawn?board=${boardId}`, j({ prompt: "should never run" }));
+  assert.equal(res.status, 403);
+  assert.match((await res.json()).error, /never spawn/);
 });
 
 test("unknown ?board= is 400 on persist, 503-not-404 never leaks", { skip: !up && "no dev server on 5173" }, async () => {

@@ -43,6 +43,13 @@ export function isInternalPath(p: string): boolean {
       // TRIGGER a shadow commit per gesture. They still ride ALONG in shadow commits fired by real
       // content edits (commitRoot force-adds `.canvas` minus only `roots`) — versioned, not churning.
       if (segs[i + 1] === "board") return true;
+      // Agent worktrees (`spawn --worktree`) are full nested checkouts — hundreds of files each, plus any
+      // node_modules/.venv a worker installs. They are NOT board roots (listWorktrees excludes them) and the
+      // shadow floor never stages them (shadow-git.js), so the canonical watchers descending into them bought
+      // nothing — and on chokidar v4 (no fsevents) every watched file holds an open kqueue fd, which is what
+      // exhausted the process fd table and crashed the dev server (spawn EBADF, 2026-07-10). Never watch or
+      // serve them from the canonical root; a worktree session addresses its own tree by cwd, not these paths.
+      if (segs[i + 1] === "worktrees") return true;
       continue; // every other `.canvas/<content>` is reachable
     }
     if (EXCLUDE_DIRS.has(s)) return true;

@@ -48,7 +48,7 @@ export interface ServerContext {
   publishSession: (s: LiveSession) => void; // re-render a live session's card feed (band, permissions, tail)
   boardIdentity: (repoPath: string) => { boardId: string; name: string; repoPath: string }; // realpath→stable id
   readBoardRegistry: () => BoardRegistryEntry[]; // the durable mounted-board registry (lastOpened recency)
-  recordBoardOpened: (boardId: string, name: string, repoPath: string) => void; // upsert a mount into the registry
+  recordBoardOpened: (boardId: string, name: string, repoPath: string, noSessions?: boolean) => void; // upsert a mount into the registry
   ensureCanvasExcluded: (repoPath: string) => void; // keep a mounted repo's git status clean of .canvas/
   startBoardFeeds: (boardId: string, repoPath: string) => void; // git-HEAD + sessions-list feeds for a board
   announceNewMemberships: (
@@ -155,6 +155,7 @@ export interface ServerContext {
   readSessionFile: (dir: string, id: string) => { content: string; truncated: boolean } | null; // one transcript, tail-capped
   sessionStatus: (repoPath: string, id: string) => SessionBand | null; // the ONE whole-session status band
   liveSessionCount: () => number; // live (status !== "exited") sessions across every board — the spawn cap input
+  sessionSpawnRefusal: (boardId: string) => string | null; // why NO real session may spawn on this board (noSessions mount flag / tmpdir scratch board), or null
   MAX_LIVE_SESSIONS: number; // the concurrent-live-session ceiling the spawn guard 429s against
   resolveSpawnCwd: (
     repoPath: string,

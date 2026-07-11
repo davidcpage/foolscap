@@ -36,7 +36,7 @@ function handleBoards(res: ServerResponse): void {
 // a directory before adding it — the canvas serves a real folder, not an arbitrary string.
 async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const ctx = getServerContext();
-  let body: { repoPath?: unknown };
+  let body: { repoPath?: unknown; noSessions?: unknown };
   try {
     body = JSON.parse(await readBody(req));
   } catch {
@@ -52,13 +52,19 @@ async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Prom
   }
   if (!fs.statSync(real).isDirectory()) return sendJson(res, 400, { error: "not a directory" });
   const id = ctx.boardIdentity(real);
+  // { noSessions: true } marks a scratch/test board on which real sessions never spawn (explicit or
+  // auto-wake — sessionSpawnRefusal enforces it). STICKY: a later mount without the flag never clears it,
+  // so a suite that flags its board once can't be un-flagged by a plain tab re-open.
+  const noSessions = body.noSessions === true;
   if (!ctx.boards.has(id.boardId)) {
-    ctx.boards.set(id.boardId, { root: real, name: id.name, repoPath: id.repoPath });
-    console.log(`[boards] mounted ${id.boardId} → ${real}`);
+    ctx.boards.set(id.boardId, { root: real, name: id.name, repoPath: id.repoPath, ...(noSessions ? { noSessions: true } : {}) });
+    console.log(`[boards] mounted ${id.boardId} → ${real}${noSessions ? " (noSessions)" : ""}`);
+  } else if (noSessions) {
+    ctx.boards.get(id.boardId)!.noSessions = true;
   }
   // Every mount POST (a tab opening ?repo=, including a re-open) bumps the registry's lastOpened; the
   // default board is implicit and stays out of the file.
-  if (id.boardId !== ctx.defaultBoardId) ctx.recordBoardOpened(id.boardId, id.name, id.repoPath);
+  if (id.boardId !== ctx.defaultBoardId) ctx.recordBoardOpened(id.boardId, id.name, id.repoPath, noSessions);
   ctx.ensureCanvasExcluded(id.repoPath); // keep the target repo's git status clean of `.canvas/`
   ctx.startBoardFeeds(id.boardId, id.repoPath); // git HEAD + sessions-list feeds for this repo
   sendJson(res, 200, boardJson(id.boardId, ctx.boards.get(id.boardId)!));

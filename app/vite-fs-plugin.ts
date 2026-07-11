@@ -21,7 +21,7 @@ import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionStatus } from "./server-sessions.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus } from "./server-sessions.js";
 import { allSessionAnchors, boardSnapshotRecords, captureMemberOffsets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
@@ -96,6 +96,10 @@ export interface BoardInfo {
   root: string;
   name: string;
   repoPath: string;
+  // Mounted with { noSessions: true } (or repo under the OS tmpdir): a scratch/test board on which NO real
+  // `claude` session may ever spawn — explicit or server-fired. The http-contract suite's annotation writes
+  // used to auto-wake a REAL doc worker per test run (real token spend); this is the board-level refusal.
+  noSessions?: boolean;
 }
 const boards: Map<string, BoardInfo> = ((globalThis as { __canvasBoards?: Map<string, BoardInfo> })
   .__canvasBoards ??= new Map());
@@ -121,6 +125,7 @@ export interface BoardRegistryEntry {
   name: string;
   repoPath: string;
   lastOpened: number; // ms epoch of the latest mount POST
+  noSessions?: boolean; // sticky no-real-sessions flag (BoardInfo.noSessions) — survives a restart
 }
 function readBoardRegistry(): BoardRegistryEntry[] {
   try {
@@ -132,9 +137,13 @@ function readBoardRegistry(): BoardRegistryEntry[] {
 }
 // Upsert on every mount POST — read-modify-write against the FILE, not a cached copy (the module hot
 // re-evals; cheap correctness beats a stale mirror at this call rate).
-function recordBoardOpened(boardId: string, name: string, repoPath: string): void {
-  const entries = readBoardRegistry().filter((e) => e.boardId !== boardId);
-  entries.push({ boardId, name, repoPath, lastOpened: Date.now() });
+function recordBoardOpened(boardId: string, name: string, repoPath: string, noSessions?: boolean): void {
+  const all = readBoardRegistry();
+  const prev = all.find((e) => e.boardId === boardId);
+  const entries = all.filter((e) => e.boardId !== boardId);
+  // noSessions is STICKY: once a board is flagged, a later mount POST without the flag must not quietly
+  // re-arm real spawns on it (the flagging mount was the deliberate act; unflag by editing the registry).
+  entries.push({ boardId, name, repoPath, lastOpened: Date.now(), ...(noSessions || prev?.noSessions ? { noSessions: true } : {}) });
   try {
     fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
     fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: entries }, null, 2) + "\n");
@@ -151,7 +160,7 @@ for (const e of readBoardRegistry()) {
   } catch {
     continue;
   }
-  boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath });
+  boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath, ...(e.noSessions ? { noSessions: true } : {}) });
 }
 // …and the reverse: PRUNE pinned entries the registry no longer records (the file is the durable
 // truth — deleting an entry there is how a scratch/test board is retired without bouncing the whole
@@ -1128,6 +1137,7 @@ setServerContext({
   readSessionFile,
   sessionStatus,
   liveSessionCount,
+  sessionSpawnRefusal,
   MAX_LIVE_SESSIONS,
   resolveSpawnCwd,
   placeWorkerCard,

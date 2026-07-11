@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -433,6 +434,12 @@ export function ensureLiveSession(
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
 
+  // Backstop for EVERY new-process path (spawn / auto-wake / resume — adoption doesn't come through here):
+  // a noSessions/tmpdir scratch board never runs a real `claude`. The route/worker guards refuse earlier
+  // with nicer errors; this throw is the last line so no future call site can spawn around the predicate.
+  const refusal = sessionSpawnRefusal(boardIdentity(repoPath).boardId);
+  if (refusal) throw new Error(refusal);
+
   // The role this session instantiates (agent-roles.md): an explicit roleId on a fresh spawn, else the one
   // recorded on a prior marker so a --resume keeps its role. Its charter is appended to the system prompt
   // and its identity stamped on the marker (below), so the role survives a restart and names the card.
@@ -748,6 +755,26 @@ export const liveSessionCount = (): number => {
   return [...liveSessions.values()].filter((s) => s.status !== "exited").length;
 };
 
+// Board-level spawn refusal: the reason NO real `claude` session — explicit spawn or server-fired wake —
+// may run on this board, or null when spawning is allowed. Two triggers: the explicit `noSessions` mount
+// flag (sticky, registry-persisted), and a backstop for any board whose repo lives under the OS tmpdir —
+// tmpdir repos are scratch/test boards by construction (the http-contract suite's board lives there), and
+// its annotation writes once auto-woke a REAL doc worker per test run. Every refusal is LOUD (403 on the
+// spawn route, a warn on the auto-wake path) — never a silent drop.
+export function sessionSpawnRefusal(boardId: string): string | null {
+  const b = getServerContext().boards.get(boardId);
+  if (!b) return null; // unknown board — the spawn path's own board resolution surfaces that error
+  if (b.noSessions) return `board ${boardId} is mounted noSessions — real sessions never spawn on a test/scratch board`;
+  try {
+    const tmp = fs.realpathSync(os.tmpdir());
+    if (fs.realpathSync(b.repoPath).startsWith(tmp + path.sep))
+      return `board ${boardId} lives under the OS tmpdir (${b.repoPath}) — treated as a scratch/test board, real sessions never spawn here`;
+  } catch {
+    /* repo path vanished — let the spawn path surface its own error */
+  }
+  return null;
+}
+
 // Footprint of a SERVER-created worker card (matches the client's session-card default size).
 const WORKER_CARD_W = 800;
 const WORKER_CARD_H = 520;
@@ -827,6 +854,13 @@ export function serverSpawnWorker(opts: {
   // Replicate handleSessionSpawn's cap guard — a server-fired spawn must not blow past MAX_LIVE_SESSIONS.
   // No silent drop (repo principle): LOG the skip so a doc/seat that should've been serviced isn't left
   // invisibly waiting. It re-fires on the next qualifying activity (a deferred-wake queue is a follow-up).
+  // Board-level refusal FIRST (test/scratch boards): a wake on a noSessions/tmpdir board must never burn a
+  // real session, however it was triggered — the http-contract suite's annotation answers used to.
+  const refusal = sessionSpawnRefusal(opts.boardId);
+  if (refusal) {
+    console.warn(`[auto-wake] REFUSED server-fired spawn for ${opts.claimKey}: ${refusal}`);
+    return null;
+  }
   if (liveSessionCount() >= MAX_LIVE_SESSIONS) {
     console.warn(
       `[auto-wake] live-session cap (${MAX_LIVE_SESSIONS}) reached — SKIPPING spawn for ${opts.claimKey}; ` +

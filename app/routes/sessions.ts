@@ -131,7 +131,7 @@ async function handleSessionSpawn(
   origin: string,
 ): Promise<void> {
   const {
-    liveSessionCount, MAX_LIVE_SESSIONS, resolveSpawnCwd, ensureLiveSession, liveSessions,
+    liveSessionCount, sessionSpawnRefusal, MAX_LIVE_SESSIONS, resolveSpawnCwd, ensureLiveSession, liveSessions,
     boardSnapshotRecords, placeWorkerCard, dispatchBusCommand, sendSessionInput,
     persistSessionState, historyKey, seedCursor, threadLog, fsState,
   } = getServerContext();
@@ -146,6 +146,10 @@ async function handleSessionSpawn(
   } catch {
     return sendJson(res, 400, { error: "body must be JSON" });
   }
+  // A noSessions/tmpdir scratch board never runs a real session — a test hitting this route must get a
+  // loud 403, not a live `claude` process (the auto-wake path refuses with the same predicate).
+  const refusal = sessionSpawnRefusal(boardId);
+  if (refusal) return sendJson(res, 403, { error: refusal });
   if (liveSessionCount() >= MAX_LIVE_SESSIONS)
     return sendJson(res, 429, { error: `live-session cap reached (${MAX_LIVE_SESSIONS}); terminate one first` });
   // Optional: spawn this session AS a role — its charter is appended to the system prompt and its identity
