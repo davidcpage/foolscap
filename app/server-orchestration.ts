@@ -109,17 +109,34 @@ export function startRolesFeed(boardId: string, repoPath: string): void {
 // file-card pipeline and the commit feed stay separate ingest paths.
 export function startGitHeadFeed(boardId: string, repo: string): void {
   const feed = "githead:" + boardId;
-  const read = () =>
-    execFile(
-      "git",
-      ["log", "-1", "--format=%H%x1f%an%x1f%ct%x1f%s"],
-      { cwd: repo },
-      (err, stdout) => {
-        if (err) return; // e.g. empty repo — keep the previous value
-        const [sha, author, ct, message] = stdout.trim().split("\x1f");
-        if (sha) publishFeed(feed, { sha, author, message, ts: Number(ct) * 1000 });
-      },
-    );
+  const read = () => {
+    try {
+      execFile(
+        "git",
+        ["log", "-1", "--format=%H%x1f%an%x1f%ct%x1f%s"],
+        { cwd: repo },
+        (err, stdout) => {
+          if (err) return; // e.g. empty repo — keep the previous value
+          const [sha, author, ct, message] = stdout.trim().split("\x1f");
+          if (sha) publishFeed(feed, { sha, author, message, ts: Number(ct) * 1000 });
+        },
+      );
+    } catch (err) {
+      // execFile throws SYNCHRONOUSLY (not via the callback) when the child can't even be forked — pipe
+      // creation fails once the process fd table is full (EBADF/EMFILE). Uncaught in this timer it killed
+      // the whole dev server (2026-07-10). This catch is deliberately NARROW and NOISY, not defensive
+      // padding: the feed degrades to a stale HEAD chip, but a firing here means the process is almost
+      // certainly leaking fds — the count below is the first diagnostic. Investigate; don't ignore.
+      let fds = "?";
+      try {
+        fds = String(fs.readdirSync("/dev/fd").length); // itself needs an fd — may fail at true exhaustion
+      } catch { /* leave "?" */ }
+      console.error(
+        `[githead] git spawn threw (${String(err)}) — likely fd exhaustion (process holds ${fds} fds); ` +
+          `HEAD feed for ${repo} goes stale. This crashed the server once — find the leak.`,
+      );
+    }
+  };
 
   let t: ReturnType<typeof setTimeout> | null = null;
   const debounced = () => {
