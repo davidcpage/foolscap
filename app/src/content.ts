@@ -412,6 +412,11 @@ export interface ChannelMeta {
   // re-derivation. Optional: an older server/board that predates the field simply omits it (no highlight).
   youWaiting?: boolean;
   youWaitingCount?: number; // how many mentions await (for the count badge); 0 when not waiting
+  // The raw durable member sids on the thread's marker (P5). Source of truth for the client card-reconciler:
+  // a session card whose member:open edge points at a thread NOT in this set has been detached, so the card is
+  // orphaned and gets auto-closed. Optional — an older server that predates the field simply omits it (the
+  // reconciler then treats every thread as "unknown" and removes nothing, i.e. safely no-ops).
+  members?: string[];
 }
 
 let channelListValue: ChannelMeta[] | undefined;

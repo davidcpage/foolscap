@@ -18,6 +18,7 @@ import {
   qualifyingWatchers,
   shouldReapIdle,
   reapKeepAliveMs,
+  shouldDetachDoneMember,
 } from "../auto-wake.js";
 
 // ── surface keys ────────────────────────────────────────────────────────────────────────────────────
@@ -160,4 +161,46 @@ test("reapKeepAliveMs + shouldReapIdle: a not-done session is PARKED however lon
   const kaDone = reapKeepAliveMs(true, DEFAULT);
   assert.equal(shouldReapIdle(s(DEFAULT - 1), NOW, kaDone), false, "done but still inside the grace window — kept");
   assert.equal(shouldReapIdle(s(DEFAULT + 1), NOW, kaDone), true, "done and past the grace window — reaped");
+});
+
+// ── P5: done-member DETACH decision (shouldDetachDoneMember) ─────────────────────────────────────────────
+const DELAY = 2 * 60_000;
+const doneMarker = (endedAgo) => ({ endReason: "done", endedAt: NOW - endedAgo });
+
+test("shouldDetachDoneMember: a cleanly-done member past the grace window is detached", () => {
+  assert.equal(shouldDetachDoneMember("sid", doneMarker(DELAY), NOW, DELAY), true); // exactly at the window
+  assert.equal(shouldDetachDoneMember("sid", doneMarker(DELAY + 1), NOW, DELAY), true); // well past it
+});
+
+test("shouldDetachDoneMember: NOT detached while still inside the grace window (a just-done card is left up)", () => {
+  assert.equal(shouldDetachDoneMember("sid", doneMarker(DELAY - 1), NOW, DELAY), false);
+  assert.equal(shouldDetachDoneMember("sid", doneMarker(0), NOW, DELAY), false); // just ended this instant
+});
+
+test("shouldDetachDoneMember: only endReason 'done' detaches — terminated/crashed/open are left as signal", () => {
+  for (const endReason of ["terminated", "crashed", undefined])
+    assert.equal(
+      shouldDetachDoneMember("sid", { endReason, endedAt: NOW - DELAY * 10 }, NOW, DELAY),
+      false,
+      `endReason=${endReason} → not swept`,
+    );
+  // a still-open member (no marker end) is never detached
+  assert.equal(shouldDetachDoneMember("sid", null, NOW, DELAY), false);
+  assert.equal(shouldDetachDoneMember("sid", undefined, NOW, DELAY), false);
+});
+
+test("shouldDetachDoneMember: a done marker with no honest endedAt stamp is not detached", () => {
+  assert.equal(shouldDetachDoneMember("sid", { endReason: "done" }, NOW, DELAY), false); // missing
+  assert.equal(shouldDetachDoneMember("sid", { endReason: "done", endedAt: "nope" }, NOW, DELAY), false); // non-number
+  assert.equal(shouldDetachDoneMember("sid", { endReason: "done", endedAt: NaN }, NOW, DELAY), false); // non-finite
+});
+
+test("shouldDetachDoneMember: a LIVE session is NEVER detached, even with a stale done marker (belt-and-suspenders)", () => {
+  const isLive = (sid) => sid === "live-sid";
+  // a would-be-detachable marker, but the sid is currently live → spared
+  assert.equal(shouldDetachDoneMember("live-sid", doneMarker(DELAY * 10), NOW, DELAY, isLive), false);
+  // a different, not-live sid with the same marker → detached
+  assert.equal(shouldDetachDoneMember("dead-sid", doneMarker(DELAY * 10), NOW, DELAY, isLive), true);
+  // no predicate supplied → the guard is simply skipped (a done+aged marker detaches)
+  assert.equal(shouldDetachDoneMember("any", doneMarker(DELAY * 10), NOW, DELAY), true);
 });

@@ -10,10 +10,11 @@ import {
   type AnyRecord,
 } from "./lib";
 import { fileKind } from "./fileTypes";
-import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce, fileApiUrl } from "./content";
+import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce, fileApiUrl, type ChannelMeta } from "./content";
 import { annotationsWatchEvent } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
+import { MEMBER_OPEN } from "./threads";
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
@@ -945,6 +946,48 @@ function redrawMemberEdges(m: InteractionManager, nodeId: Id<"node">, sid: strin
         type: "member:open",
       },
     });
+  }
+}
+
+// P5 — the client half of done-member detach: auto-close a session card the server has DETACHED. The server
+// sweep (server-orchestration.detachDoneMembersTick) drops a done session from a thread's DURABLE roster after
+// the grace window; that detach is authoritative and clears the pill, but the on-canvas session card + its
+// member:open edge are a VIEW the server can't remove without a live tab (canvas mutations 503 tabless — see
+// canvas-mutations-need-live-tab). So in a live tab we reconcile: a session card whose member:open edge points
+// at a thread it is NO LONGER a durable member of has been orphaned → remove the card (removeNode cascades its
+// edges). Runs on the threads-feed ping (live auto-close, ~2min after a session goes done) AND at board load
+// (cleans a lingering orphaned card the persisted snapshot still carries from before the tab was open).
+//
+// The predicate is deliberately conservative (Coordinator-confirmed). It removes a card only when it is a
+// member of NONE of the threads its member:open edges point at, which spares:
+//   (a) standalone cards — no member:open edge, so never in the grouping at all.
+//   (b) display-only-closed members (P1/P4) — still durable members, so `members` still lists them.
+// A thread MISSING from the roster map (not in the fetched list, or an older server that omits `members`) is
+// treated as "still a member" — we never remove a card on the word of a thread we couldn't confirm, so a
+// partial/failed fetch or a legacy server can only under-remove, never wrongly nuke a valid card.
+export function reconcileDetachedMemberCards(m: InteractionManager, threads: ChannelMeta[] | undefined): void {
+  if (!threads) return;
+  const roster = new Map<string, Set<string>>();
+  for (const t of threads) if (t.chanId) roster.set(t.chanId, new Set(t.members ?? []));
+  // Group this board's member:open edges by their session card node (a card may belong to several threads).
+  const edgedThreadsByNode = new Map<string, string[]>();
+  for (const r of m.editor.store.getSnapshot().records) {
+    if (r.typeName !== "edge" || r.type !== MEMBER_OPEN) continue;
+    const list = edgedThreadsByNode.get(r.from) ?? [];
+    list.push(r.to);
+    edgedThreadsByNode.set(r.from, list);
+  }
+  for (const [node, edgedThreads] of edgedThreadsByNode) {
+    const sid = node.replace(/^node:(?:live|session):/, "");
+    if (sid === node) continue; // not a session-shaped node id (no live/session prefix) → leave it
+    // Keep the card if it is STILL a durable member of ANY edged thread, or ANY of those threads is unconfirmed.
+    const keep = edgedThreads.some((tid) => {
+      const members = roster.get(tid);
+      return !members || members.has(sid);
+    });
+    if (keep) continue;
+    if (m.editor.store.get<"node">(node as Id<"node">))
+      m.editor.commit({ type: "removeNode", actor: "system", payload: { id: node as Id<"node"> } });
   }
 }
 

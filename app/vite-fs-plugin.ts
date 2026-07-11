@@ -9,7 +9,7 @@ import { watchRoot } from "./shadow-git.js";
 import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
 import { type SessionHostClient } from "./session-host-client.js";
-import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, type ThreadMetaMarker } from "./thread-ledger.js";
+import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { intentLine, type WorkIntent } from "./work-intent.js";
@@ -425,6 +425,12 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       intents: m.intents ?? {},
       // The §5 seat records: the durable per-thread participants (role posts), 1:1 with roles until labels.
       seats: m.seats ?? {},
+      // The RAW durable member roster (sids on the marker) — the P5 client card-reconciler's source of truth.
+      // Distinct from `participants` (derived from the snapshot's member:open EDGES ∪ seats): when the P5 sweep
+      // detaches a done member it drops `members` here, but the on-canvas edge (and its card) linger, so the
+      // client needs the marker's own list to know a card is now orphaned. Also folds in seat occupants (a
+      // seated member always counts) so a seat-only membership isn't misread as detached.
+      members: [...new Set([...threadMembersFromMeta(m), ...Object.values(m.seats ?? {}).map((s) => s.sid).filter((x): x is string => !!x)])],
       state: deriveThreadState(participants),
       participants,
     };

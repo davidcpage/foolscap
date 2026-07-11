@@ -18,5 +18,12 @@ export function shouldReapIdle(
   now: number,
   keepAliveMs: number | null,
 ): boolean;
+export function shouldDetachDoneMember(
+  sid: string,
+  marker: { endReason?: string; endedAt?: number } | null | undefined,
+  now: number,
+  delayMs: number,
+  isLive?: (sid: string) => boolean,
+): boolean;
 export function annotationWakeClass(eventKind: string): { mentioned: boolean; broadcast: boolean };
 export function qualifyingWatchers(watchers: WatchRecord[] | null | undefined, eventKind: string): WatchRecord[];
