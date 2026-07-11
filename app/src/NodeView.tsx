@@ -258,9 +258,21 @@ function ScreenCardFrame({
     height: layout.h,
     zIndex: layout.z,
   };
+  // Per-card render scale (CanvasView `hudScale`, from the card's stored reference screen size): draw under
+  // `transform: scale(s)` around the card's own top-left, so the box stays anchored at its stored screen
+  // position while its content + size scale. Replaces the old group-wide `.hud-fit` transform — each screen
+  // card now owns its own scale (native at s=1, so a card on a screen ≥ its reference renders identical to
+  // before). Skipped at s=1 (no transform node). The move/resize gestures divide their pointer delta by the
+  // same s (below) so the handle tracks 1:1 under the transform.
+  const s = hudScale ?? 1;
+  if (s !== 1) {
+    style.transform = `scale(${s})`;
+    style.transformOrigin = "top left";
+  }
   // A height-capped HUD card leaves a HUD_GAP margin at the viewport bottom; its interior is already a scroll
   // container, so a capped frame height makes a long list scroll (the old HudFrame maxHeight, derived here
-  // from the stored top instead of a per-card calc string).
+  // from the stored top instead of a per-card calc string). Capped in the card's own (pre-scale) space; the
+  // transform then keeps the scaled bottom within the viewport too.
   if (hud?.capToViewport) style.maxHeight = `calc(100vh - ${layout.y + HUD_GAP}px)`;
   return (
     <div
