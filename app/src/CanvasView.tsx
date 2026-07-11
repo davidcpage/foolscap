@@ -353,9 +353,10 @@ function SelectionOverlay({ m }: { m: InteractionManager }) {
   // drop them from the box/handles entirely.
   const worldIds = [...ids].filter((id) => store.get<"layout">(layoutId(id as Id<"node">))?.anchor !== "screen");
   if (worldIds.length === 0) return null;
+  // Multi-select shows each card's own .node.selected frame; no surrounding group bounding-box overlay.
+  if (worldIds.length >= 2) return null;
   const bounds = selectionBounds(store, worldIds);
   if (!bounds) return null;
-  if (worldIds.length >= 2) return <div className="selection-box" style={rectStyle(bounds)} />;
   return <ResizeHandles box={bounds} z={z} />;
 }
 
