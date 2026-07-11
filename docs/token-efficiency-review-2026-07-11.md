@@ -102,8 +102,10 @@ What drives it:
   *is*, but it prices every unnecessary sweep.
 
 The load-bearing pricing fact: this is tolerable **only because** cache-read is ~0.1× and the
-4-minute heartbeat cadence sits *under* the ~5-minute prompt-cache TTL, so consecutive sweeps
-cache-hit. The parked-seat design silently depends on that alignment (§6.2).
+sweeps stay inside the prompt-cache TTL. Measured from the usage records' cache buckets, spawned
+sessions write exclusively to the **1-hour TTL** cache (`ephemeral_1h`, priced ~2× base input on
+write), and the TTL refreshes on each use — so the 4-minute heartbeat keeps a parked context
+permanently warm. That is precisely what makes gating safe (§6.2).
 
 ## 5. The macro-level concern, measured small
 
@@ -140,14 +142,34 @@ intent markers, open asks} suffices). Would have avoided the 101 no-op sweeps �
 cache-read + 185k writes** for zero lost function; stall detection survives because a stall *is*
 a state (staleness crossing a threshold), which the predicate can express in code, timer-cheap.
 
-### 6.2 Do NOT slow the heartbeat instead — that's a trap
+### 6.2 Gating forfeits cache warmth — checked, and still a strict win at the measured 1h TTL
 
-The 4-min cadence sits under the ~5-min prompt-cache TTL, so each sweep pays 0.1× cache-read.
-Backing off to 10 minutes would push every sweep past the TTL into full **1.25× re-creation** of
-the parked context — ~12× more expensive per token. (The existing `blocked:human` 30-min backoff
-already lives in this regime; acceptable because rare, but worth knowing.) Gate on state change
-(6.1); keep the cadence for whatever still fires. Document the TTL dependency next to
-`COORDINATOR_HEARTBEAT_INTERVAL_MS` so a future cadence tweak doesn't silently 12× the bill.
+The obvious objection to 6.1: a sweep is also a cache keep-alive. Skip it, and the next real wake
+may land on a cold cache and pay full re-creation of the parked context instead of 0.1× reads. Is
+gating still worth it?
+
+**Measured TTL first**: every cache write in the transcript usage records lands in the
+`ephemeral_1h` bucket — spawned sessions use the **1-hour** cache TTL (write ~2× base input),
+refreshed on each use. So a skipped 4-minute sweep leaves ~56 minutes of slack; the cache goes
+cold only after a **full hour of total silence**.
+
+The arithmetic at observed sizes (C ≈ 200k parked context; a no-op sweep ≈ 41k input-equiv;
+a cold 1h-TTL rewrite ≈ 2×C = 400k eq vs ~20k warm → one-time penalty ≈ 380k eq):
+
+- **Quiet stretch < 1h**: gating skips n sweeps (n × 41k saved), and the next wake is still warm
+  — zero penalty. Pure win.
+- **Quiet stretch ≥ 1h**: the wake is cold (−380k once), but ≥15 sweeps were skipped
+  (≥615k saved). Still net-positive, and it only improves as the stretch lengthens (overnight:
+  ~4.9M eq saved per 8 quiet hours vs one 380k cold wake).
+
+So under the 1h TTL gating dominates at every quiet-stretch length. (Under a hypothetical 5-min
+TTL the break-even would be ~6 skipped sweeps ≈ 25 min of quiet — gating could lose ~190k eq on
+short gaps and would want hysteresis; worth re-checking if the account ever drops to 5-min
+caching, e.g. under usage overage.) Two supporting notes: the cold-wake penalty scales with
+parked-context size, so 6.3's context cap makes gating TTL-independent entirely; and the same
+numbers say **don't slow the cadence as an alternative to gating** — a >1h cadence turns *every*
+sweep into a 2× rewrite, ~20× the warm price. Document the TTL dependency next to
+`COORDINATOR_HEARTBEAT_INTERVAL_MS` so a future cadence tweak doesn't silently hit it.
 
 ### 6.3 Cap seat-occupant context; respawn past the crossover
 
