@@ -104,8 +104,9 @@ function sessionSummary(
 // needs no canvas persistence — the .jsonl is the source of truth. listSessions() stays a cheap
 // readdir+stat (handleSession leans on it too); the per-transcript title/turn parse is added only here.
 function handleSessions(res: ServerResponse, dir: string, repoPath: string): void {
-  const { sessionStatus } = getServerContext();
-  const sessions = listSessions(dir, repoPath).map((s) => {
+  const { sessionStatus, liveSessions } = getServerContext();
+  const onDisk = listSessions(dir, repoPath);
+  const sessions = onDisk.map((s) => {
     const marker = readCanvasSession(repoPath, s.id);
     return {
       ...s,
@@ -118,6 +119,31 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleColour: (marker?.roleColour as string | undefined) ?? null,
     };
   });
+  // Union in LIVE sessions the disk walk missed: a session that hasn't completed a single turn has a
+  // marker but NO transcript (`claude -p` writes the .jsonl per completed turn), so listSessions skips
+  // it — right for DEAD markers (their row would 404 on open) but a live one holds a real process and a
+  // cap slot while invisible here (a prompt-less spawn hid for 23h — the 20fd21de zombie). `noTurns`
+  // marks the row honest: live, nothing recorded yet. It disappears again once it exits turn-less, and
+  // graduates to a normal row on its first completed turn.
+  const listed = new Set(onDisk.map((s) => s.id));
+  for (const l of liveSessions.values()) {
+    if (l.repoPath !== repoPath || l.status === "exited" || listed.has(l.id)) continue;
+    const marker = readCanvasSession(repoPath, l.id);
+    sessions.push({
+      id: l.id,
+      mtime: (marker?.spawnedAt as number | undefined) ?? Date.now(),
+      bytes: 0,
+      title: null,
+      turns: 0,
+      messages: 0,
+      noTurns: true,
+      status: sessionStatus(repoPath, l.id),
+      roleId: (marker?.roleId as string | undefined) ?? null,
+      roleName: (marker?.roleName as string | undefined) ?? null,
+      roleColour: (marker?.roleColour as string | undefined) ?? null,
+    } as (typeof sessions)[number]);
+  }
+  sessions.sort((a, b) => b.mtime - a.mtime); // keep the newest-first contract across both sources
   sendJson(res, 200, { sessions });
 }
 
