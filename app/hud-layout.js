@@ -135,3 +135,35 @@ export function hudFitScale(boxes, viewportW, viewportH, margin = HUD_MARGIN) {
   if (maxX <= 0 || maxY <= 0 || availW <= 0 || availH <= 0) return 1;
   return Math.min(1, availW / maxX, availH / maxY);
 }
+
+// The smallest scale a pin will ever collapse the group to — a floor so a pathological pin (a card whose
+// on-screen centre sits IN the margin band, cx > availW) can't drive the scale to zero or negative and mint a
+// NaN/huge layout. It's a guard, not a target: the non-degenerate placement below never reaches it.
+export const MIN_HUD_SCALE = 0.05;
+
+// Placement for a card being PINNED (world → screen), keeping its on-screen CENTRE fixed as it joins the HUD
+// group. The group renders under `transform: scale(s)` from (0,0) (CanvasView `.hud-fit`), so a stored box
+// (x,y,w,h) paints at (x·s, y·s, w·s, h·s). Adding the card can itself change s — it may extend the group
+// bounding box — so placing against the PRE-pin scale still lands the centre off; we solve for the scale the
+// card will ACTUALLY render under and place against that. The fixed point has a closed form: solved as a
+// fixed point the new card's own fit bound is 2·(avail − centre)/size on each axis (its scaled half-body must
+// clear the margin), and the existing-bbox term is just hudFitScale over the other cards — both constants — so
+//   s = min( hudFitScale(existing…) , 2(availW−cx)/w , 2(availH−cy)/h )   (clamped to (0,1])
+// and then x = cx/s − w/2, y = cy/s − h/2 lands the centre back on (cx,cy). Stable — no iteration, no
+// oscillation: s equals the scale hudFitScale returns at render for the resulting box set (fixed-point
+// equality). In the common case (a card pinned in the central area) the new-card term exceeds the existing
+// scale, so s == the existing scale and NOTHING else rescales; the group only shrinks further when the centre
+// sits near enough to an edge that keeping it fixed geometrically forces the bbox out.
+//   existingBoxes — the OTHER shown screen cards (HUD singletons + already-pinned); the new card is excluded.
+//   (cx,cy)       — the card's on-screen centre now (screen px), preserved across the pin.
+//   (w,h)         — the card's intended on-screen (stored/unscaled) size.
+// Returns { x, y, s }: the stored top-left to commit and the resulting group scale (for the caller/tests).
+export function pinPlacement(existingBoxes, cx, cy, w, h, viewportW, viewportH, margin = HUD_MARGIN) {
+  const sExisting = hudFitScale(existingBoxes, viewportW, viewportH, margin);
+  const availW = viewportW - margin;
+  const availH = viewportH - margin;
+  const cardW = w > 0 ? (2 * (availW - cx)) / w : Infinity; // the card's own right-edge fit bound …
+  const cardH = h > 0 ? (2 * (availH - cy)) / h : Infinity; // … and bottom-edge bound
+  const s = Math.min(1, Math.max(MIN_HUD_SCALE, Math.min(sExisting, cardW, cardH)));
+  return { x: cx / s - w / 2, y: cy / s - h / 2, s };
+}
