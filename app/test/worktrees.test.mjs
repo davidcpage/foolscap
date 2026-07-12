@@ -159,6 +159,92 @@ test("teardown GUARD: skips an unmerged branch unless force", () => {
   assert.equal(forced.removed, true);
 });
 
+// ── BUG-8: the OCCUPANCY guard — never `git worktree remove` a tree a LIVE session is cwd-ed in ──────────
+// The recurring shape: a worker's merge-on-green (or a peer's) tore down the worktree the still-live worker
+// was running in; the process then failed every fs/git op (spawn ENOENT into the removed cwd) and exited
+// code=1, which session-host classifies as a self-death → a FALSE red "crashed" band. The fix: teardown
+// takes an `isOccupied(wtPath) => sid | null` lookup (built from the live-session registry) and DEFERS (with
+// an honest removed:false, deferred:true, occupant:<sid> result) while it names an occupant.
+
+test("teardown OCCUPANCY guard: skips (defers) a tree a live session occupies, even with force", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  const isOccupied = () => "sess-live-1"; // a live session (this sid) is cwd-ed in this worktree
+
+  const skipped = removeWorktree(repo, thread, key, { isOccupied });
+  assert.equal(skipped.removed, false);
+  assert.equal(skipped.deferred, true, "honest shape: deferred, not removed");
+  assert.equal(skipped.occupied, true);
+  assert.equal(skipped.occupant, "sess-live-1", "names the occupying session");
+  assert.match(skipped.reason, /live session sess-live-1 is running in this worktree/);
+  assert.ok(fs.existsSync(wt.path), "the live session's cwd is NOT yanked out from under it");
+  // The deferred teardown is recorded, not abandoned — pendingReap flags it for the reap sweep.
+  assert.equal(listWorktrees(repo, thread)[key].pendingReap, true, "record stamped pendingReap");
+
+  // force must NOT bypass the occupancy guard (force discards WORK; it must not crash a running session).
+  const forced = removeWorktree(repo, thread, key, { isOccupied, force: true });
+  assert.equal(forced.removed, false);
+  assert.equal(forced.deferred, true);
+  assert.ok(fs.existsSync(wt.path), "force still refuses to yank a live cwd");
+});
+
+test("teardown OCCUPANCY guard: reaps the deferred tree once the occupant has exited", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  // First attempt while occupied → deferred + pendingReap stamped.
+  removeWorktree(repo, thread, key, { isOccupied: () => "sess-live-1" });
+  assert.ok(fs.existsSync(wt.path));
+  // Occupant has exited (lookup now returns null) → the (now-safe) removal succeeds and the record is dropped.
+  const reaped = removeWorktree(repo, thread, key, { isOccupied: () => null });
+  assert.equal(reaped.removed, true);
+  assert.ok(!fs.existsSync(wt.path), "worktree removed once no live session occupies it");
+  assert.deepEqual(listWorktrees(repo, thread), {}, "record dropped");
+});
+
+test("merge-on-green OCCUPANCY guard: still merges the branch, DEFERS teardown of the live tree", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  commitInWorktree(wt.path, "app/feature.js", "export const feature = 1;\n", "add feature");
+  const before = gitOut(repo, "rev-parse", "HEAD");
+
+  // The classic BUG-8 case: the worker that ran merge-on-green is still alive (about to post its proof).
+  const r = mergeWorktree(repo, thread, key, { isOccupied: () => "sess-worker" });
+  assert.equal(r.merged, true, "the merge itself still lands — the branch value is preserved");
+  assert.equal(r.deferred, true, "honest shape: teardown deferred, not done");
+  assert.equal(r.occupied, true);
+  assert.equal(r.occupant, "sess-worker");
+  assert.equal(r.removed, false, "teardown deferred — the live worker's cwd is NOT yanked");
+  assert.equal(r.teardown.deferred, true, "the nested teardown result is honest too");
+  // main advanced with the feature (the valuable half happened) …
+  assert.notEqual(gitOut(repo, "rev-parse", "HEAD"), before, "main advanced with the merge");
+  assert.ok(fs.existsSync(path.join(repo, "app", "feature.js")), "feature landed on main");
+  // … but the worktree is preserved (no crash) and flagged for the reap sweep.
+  assert.ok(fs.existsSync(wt.path), "worktree preserved while the session is live");
+  assert.equal(listWorktrees(repo, thread)[key].pendingReap, true, "deferred teardown flagged pendingReap");
+
+  // Once the worker exits, the deferred teardown completes (what reapPendingWorktreesTick drives). The branch
+  // is already merged, so the reap is safe by construction even across a server restart.
+  const reaped = removeWorktree(repo, thread, key, { isOccupied: () => null });
+  assert.equal(reaped.removed, true);
+  assert.ok(!fs.existsSync(wt.path), "worktree reaped after the occupant exits");
+});
+
+test("teardown with no occupancy predicate behaves exactly as before (removes a clean merged tree)", () => {
+  const repo = tmpRepo();
+  const thread = "node:thread:abc";
+  const key = "node:thread:abc";
+  const wt = ensureWorktree(repo, thread, key);
+  const r = removeWorktree(repo, thread, key); // no isOccupied — legacy callers unaffected
+  assert.equal(r.removed, true);
+  assert.ok(!fs.existsSync(wt.path));
+});
+
 test("teardown on a work item with no worktree is a no-op, not a throw", () => {
   const repo = tmpRepo();
   const r = removeWorktree(repo, "node:thread:abc", "node:thread:abc");
