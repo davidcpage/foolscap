@@ -315,8 +315,10 @@ export function buildCard(
     if (name === "roleSave") {
       const path = nodeSub.get()?.title ?? "";
       // Same as roleDoc: write to the REPO root, not the `role` root the id prefix would otherwise yield.
-      signals.roleSave = (doc: { name: string; colour?: string | null; charter?: string }): Promise<boolean> =>
-        writeFileContent("repo", path, renderRoleFile({ name: doc.name, colour: doc.colour ?? undefined, charter: doc.charter }));
+      // `loops` and `model` ride through even though the card doesn't edit them — a save that omitted them
+      // would silently strip those frontmatter lines from the role.md (the card passes its parsed doc back).
+      signals.roleSave = (doc: { name: string; colour?: string | null; charter?: string; loops?: boolean; model?: string | null }): Promise<boolean> =>
+        writeFileContent("repo", path, renderRoleFile({ name: doc.name, colour: doc.colour ?? undefined, charter: doc.charter, loops: doc.loops, model: doc.model }));
       continue;
     }
     // `cellOutputs` is the notebook card's OFF-LOG cell-output projection (notebook-runtime.ts), keyed by

@@ -6,6 +6,7 @@ export interface Role {
   name: string;
   colour: string | null;
   loops: boolean;
+  model: string | null;
   charter: string;
 }
 
@@ -17,7 +18,7 @@ export function roleIdFor(name: string): string;
 export function readRole(repoPath: string, roleId: string): Role | null;
 export function createRole(
   repoPath: string,
-  role: { name: string; charter?: string; colour?: string; loops?: boolean },
+  role: { name: string; charter?: string; colour?: string; loops?: boolean; model?: string },
 ): Role;
 export function listRoles(
   repoPath: string,

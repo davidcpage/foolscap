@@ -8,9 +8,10 @@ export function renderRoleFile(role: {
   name: string;
   colour?: string | null;
   loops?: boolean;
+  model?: string | null;
   charter?: string;
 }): string;
 export function parseRoleFile(
   text: string,
   roleId: string,
-): { roleId: string; name: string; colour: string | null; loops: boolean; charter: string };
+): { roleId: string; name: string; colour: string | null; loops: boolean; model: string | null; charter: string };

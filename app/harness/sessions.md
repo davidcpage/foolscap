@@ -11,10 +11,15 @@ permission-gated).
 
 ## Spawn
 
-`POST /api/session/spawn?board=<board>` `{ prompt?, roleId?, thread?, card? }` → `{ id, carded }`.
+`POST /api/session/spawn?board=<board>` `{ prompt?, roleId?, thread?, card?, model? }` → `{ id, carded }`.
 - `thread:<id>` → the SERVER drops the worker's session card + `member:open` edge, positions it by the
   thread card, and onboards it to *await its task on the thread* — you then assign via a tagged thread post.
   **Never put the task in the spawn prompt.** `card:true` → a standalone card, no edge.
+- `model:<id>` (or `scripts/canvas spawn --model <id>`) picks the Claude model the session runs. Precedence:
+  explicit spawn param > the role's `model:` frontmatter (role.md) > the server default `claude-opus-4-8`.
+  Role-based spawns (mention-spawn, the Coordinator heartbeat) pick up the role's `model:` automatically —
+  the shipped Coordinator/pm role pins `claude-fable-5`. Which model a worker gets is the spawner's
+  (usually the Coordinator's) call.
 - `429` when the live-session cap (`MAX_LIVE_SESSIONS=12`, across all boards) is hit — `terminate` one to
   free a slot.
 

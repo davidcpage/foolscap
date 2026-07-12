@@ -41,15 +41,17 @@ export default {
     // commit immediately, so doc.colour is already current).
     const liveCharter = (root) => charterEl(root)?.value ?? doc.charter ?? "";
     const same = (a, b) => (a ?? "") === (b ?? "");
+    // loops/model aren't edited here but MUST ride every save — omitting them would strip those
+    // frontmatter lines from the role.md on the next colour/charter save.
     const pickColour = (root, colour) => {
       if (!save || same(colour, doc.colour)) return;
-      save({ roleId: doc.roleId, name: doc.name, colour, charter: liveCharter(root) });
+      save({ roleId: doc.roleId, name: doc.name, colour, loops: doc.loops, model: doc.model, charter: liveCharter(root) });
     };
     const saveCharter = (root) => {
       if (!save) return;
       const charter = liveCharter(root);
       if (same(charter.trim(), (doc.charter ?? "").trim())) return; // no-op guard
-      save({ roleId: doc.roleId, name: doc.name, colour: doc.colour ?? null, charter });
+      save({ roleId: doc.roleId, name: doc.name, colour: doc.colour ?? null, loops: doc.loops, model: doc.model, charter });
     };
     // Save (if changed) and drop back to the formatted-prose view. Reads the textarea before it's unmounted,
     // so the toggle click never discards an in-progress edit.
