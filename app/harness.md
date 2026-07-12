@@ -50,7 +50,8 @@ board state only by **asking** — read the board, pull your inbox — and messa
 **tool output, never a user turn**. A post is **logged** for every member but **wakes** only those you
 **@-tag**; an **untagged post wakes no one** — with one narrow exception: it nudges the thread's **Coordinator
 seat if that seat is live** (the steward should learn of ambient activity on a thread it owns; a *dormant*
-Coordinator is not spun up per post — it catches the logged message on its next heartbeat). A handle in
+Coordinator is not spun up per post — only a real event, e.g. an @-tag or ask, revives it, and the logged
+backlog is waiting when it does). A handle in
 **inline code** (`` `@a9` ``) is a mention, not a wake — the escape for naming someone in prose. So name who
 you actually need, leave a post untagged
 unless you mean to interrupt, and **act on what you pulled this turn** (reading the inbox consumes the nudge
