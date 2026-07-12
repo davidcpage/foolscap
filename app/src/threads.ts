@@ -106,6 +106,26 @@ export function removeMembership(editor: Editor, edgeId: string): void {
   editor.commit({ type: "removeEdge", actor: "user", payload: { id: edgeId as Id<"edge"> } });
 }
 
+// LEAVE a thread — the durable mutation plus its view. Durable membership is authoritative and only an
+// explicit act may drop it (the snapshot diff no longer reads a vanished edge as a leave), so the Leave
+// button must say so out loud: POST /leave drops the ledger membership + releases any seat, and the local
+// removeMembership clears the wire immediately (the server's best-effort removeEdge re-arriving is a no-op).
+// Fire-and-forget on the network half: a failed POST leaves the membership standing (honest — the ledger,
+// not the canvas, is the record), and the edge redraw on next reopen makes that visible.
+export function leaveThread(editor: Editor, edgeId: string): void {
+  const e = editor.store.get<"edge">(edgeId as Id<"edge">);
+  if (!e) return;
+  const sid = String(e.from).replace(/^node:(?:live|session):/, "");
+  const threadId = String(e.to);
+  removeMembership(editor, edgeId);
+  if (sid === String(e.from)) return; // not a session-shaped endpoint — nothing durable to drop
+  void fetch(`/api/thread/${encodeURIComponent(threadId)}/leave?board=${activeBoardId()}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from: sid }),
+  }).catch(() => {});
+}
+
 // Post a message to a thread through the server fan-out endpoint. `from` is the sender's session id, or a
 // non-session marker like "human" when the board owner posts from the thread card. Returns a thin ok/error
 // so the post box can surface a 403 (not a member) / 404 honestly.

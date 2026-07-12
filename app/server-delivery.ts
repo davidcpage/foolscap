@@ -341,7 +341,7 @@ export function announceNewMemberships(
   after: Array<Record<string, unknown>> | null,
   origin: string,
 ): void {
-  const { boards, fsState, sidFromSessionNode, forgetDurableMember } = getServerContext();
+  const { fsState } = getServerContext();
   const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
   const afterEdges = memberEdgesOf(after);
   if (before == null) {
@@ -353,19 +353,16 @@ export function announceNewMemberships(
     if (beforeEdges.get(id)?.type === e.type) continue; // unchanged phase — already onboarded (or baseline-seeded)
     maybeAnnounceMembership(boardId, { type: "addEdge", payload: { id, from: e.from, to: e.to, type: e.type } }, origin);
   }
-  for (const [id, e] of beforeEdges) {
+  for (const [id] of beforeEdges) {
     if (afterEdges.has(id)) continue;
     maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
-    // Decouple the CARD (a view) from MEMBERSHIP (durable). A member:open edge can vanish two ways:
-    //   • the session's CARD was deleted — its node is ALSO gone from `after` → KEEP the membership (the
-    //     session stays logged + wakeable, just cardless: the delete-card-keep-session fix).
-    //   • a real LEAVE — the card still stands, only the edge was disconnected → DROP the membership.
-    // The node's presence in `after` is the honest discriminator (the /leave endpoint drops it directly).
-    if (e.type === "member:open") {
-      const nodeGone = !(after ?? []).some((r) => r.typeName === "node" && r.id === e.from);
-      const sid = sidFromSessionNode(e.from);
-      if (!nodeGone && sid) forgetDurableMember(boards.get(boardId)?.repoPath, e.to, sid);
-    }
+    // A vanished edge NEVER drops durable membership. The old "edge gone, node still standing = real leave"
+    // discriminator read display-layer noise as intent: snapshot saves race (multiple tabs, in-flight saves,
+    // a save capturing the ms-wide window between a spawn's addNode and its addEdge), and any pair that
+    // presents edge-gone-node-present silently erased a LIVE member from the ledger (the 2026-07-12 worker
+    // drops). Membership is durable state; only an explicit act may drop it — POST /leave (which the canvas
+    // Leave button now calls) or the done-member detach sweep. The snapshot diff may ANNOUNCE joins; it may
+    // not unmake them.
   }
 }
 

@@ -170,6 +170,25 @@ export function sessionThreads(records: Array<Record<string, unknown>>, sid: str
   return out;
 }
 
+// The threads `sid` is a member of BY THE LEDGER ALONE (marker ∪ in-memory durable ∪ emitted bridge) — no
+// snapshot-edge-derived entries, unlike sessionThreads. This is the REOPEN/REDRAW source: the client
+// repaints member:open edges from it (openSession → redrawMemberEdges), and an entry here that the ledger
+// doesn't back would be re-onboarded as a fresh join by the announce funnel the moment the redrawn edge hits
+// a snapshot save — the pill-click-on-a-Done-session spurious join. A display repaint may only ever MIRROR
+// the ledger, so its source must be the ledger. (Read paths — inbox, delivery — keep sessionThreads' wider
+// union: there a stale extra entry is harmless, a missing one loses messages.) The marker sweep also covers
+// the in-memory map going cold across a plugin re-eval; membership reads stay marker-honest either way.
+export function durableSessionThreads(repoPath: string | undefined, sid: string): string[] {
+  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const out: string[] = [];
+  for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
+  for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
+  if (repoPath)
+    for (const meta of listThreads(repoPath))
+      if (meta.threadId && !out.includes(meta.threadId) && threadMembersFromMeta(meta).includes(sid)) out.push(meta.threadId);
+  return out;
+}
+
 // ── relative-offset layout (P2) ─────────────────────────────────────────────────────────────────────
 // The PRIMARY thread of a session is the one it joined EARLIEST (min joinedAt across its memberships) — a
 // session's card is anchored to (moves with / reopens relative to) this thread only; a secondary thread
