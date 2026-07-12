@@ -1192,6 +1192,26 @@ setServerContext({
 // same vocabulary; imported at the top of this file. Extracted concerns (Phase 1: weather, card-types)
 // export a route array that is SPREAD into the stage table at the arm-order position their inline entry held.
 
+// The dispatch seam's error boundary (BUG-4b). A route's `run` is typed `void` but most handlers are async;
+// a synchronous throw OR a rejected promise used to escape the dispatcher as an UNHANDLED rejection — never a
+// response — hanging the request and risking a process-level crash on unhandled rejections. Funnel both here:
+// call the handler inside a try, and if it returned a thenable attach a `.catch`. On either failure, log with
+// the method+path for triage and send a 500 — but ONLY when nothing has been written yet (`!headersSent`), so
+// a handler that already started a response (an SSE stream, a partial body) that later errors is logged
+// without corrupting or double-writing its stream. One boundary retires the whole unhandled-rejection class.
+export function runRoute(req: IncomingMessage, res: ServerResponse, url: URL, run: () => unknown): void {
+  const onError = (err: unknown) => {
+    console.error(`[api] unhandled handler error for ${req.method ?? "?"} ${url.pathname}:`, err);
+    if (!res.headersSent) sendJson(res, 500, { error: "internal error" });
+  };
+  try {
+    const r = run();
+    if (r != null && typeof (r as { then?: unknown }).then === "function") (r as Promise<unknown>).catch(onError);
+  } catch (err) {
+    onError(err);
+  }
+}
+
 // STAGE 1 — GLOBAL routes (tried before the shared board gate; board-scoped ones call reqBoard themselves).
 const GLOBAL_ROUTES: GlobalRoute[] = [
   // The feeds stream is global (one connection per tab; feed names are themselves board-suffixed).
@@ -1331,7 +1351,7 @@ export function fsApi(): Plugin {
         for (const r of GLOBAL_ROUTES) {
           if (r.method && req.method !== r.method) continue;
           const g = r.match(url.pathname);
-          if (g) return r.run(req, res, url, g);
+          if (g) return runRoute(req, res, url, () => r.run(req, res, url, g));
         }
 
         // The shared BOARD gate: the remaining endpoints are board-scoped: ?board=<boardId> picks which
@@ -1345,7 +1365,7 @@ export function fsApi(): Plugin {
         for (const r of BOARD_ROUTES) {
           if (r.method && req.method !== r.method) continue;
           const g = r.match(url.pathname);
-          if (g) return r.run(req, res, url, g, boardId, board);
+          if (g) return runRoute(req, res, url, () => r.run(req, res, url, g, boardId, board));
         }
 
         // The shared ROOT gate: `root` is resolved to a confined dir from the board's KNOWN roots (never a
@@ -1358,7 +1378,7 @@ export function fsApi(): Plugin {
         for (const r of ROOT_ROUTES) {
           if (r.method && req.method !== r.method) continue;
           const g = r.match(url.pathname);
-          if (g) return r.run(req, res, url, g, boardId, board, root);
+          if (g) return runRoute(req, res, url, () => r.run(req, res, url, g, boardId, board, root));
         }
         return next();
       });

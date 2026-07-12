@@ -39,6 +39,7 @@ const sess = await import("../server-sessions.ts");
 const delivery = await import("../server-delivery.ts");
 const ledger = await import("../thread-ledger.js");
 const filesRoute = await import("../routes/files.ts");
+const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatch-seam error boundary (BUG-4b)
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -186,6 +187,130 @@ test("publishFeed reaches subscribers with a fsState that has NO wsClients (form
   assert.match(frames[0], /git:HEAD/);
   assert.ok(fake.fsState.wsClients instanceof Set, "getWsClients lazily created the ws set on the bare fsState");
 });
+
+test("getBusClients lazily inits the per-board SSE map in place and is idempotent", () => {
+  const st = {};
+  const bus = ctx.getBusClients(st);
+  assert.ok(bus instanceof Map);
+  assert.equal(st.busClients, bus, "the accessor stores the map back on fsState (in place)");
+  assert.equal(ctx.getBusClients(st), bus, "a second read returns the SAME instance, not a fresh map");
+});
+
+test("dispatchBusCommand runs on a BARE fsState with no busClients (former busClients! crash site, BUG-4a)", () => {
+  // Pre-BUG-4a this threw `Cannot read properties of undefined (reading 'get')` at `fsState.busClients!` —
+  // the exact crash-class the lazy accessors were built to remove, in the most-called delivery function.
+  let tracked = 0;
+  const fake = { fsState: {}, trackEmittedMembership: () => tracked++ };
+  ctx.setServerContext(fake);
+  let delivered;
+  assert.doesNotThrow(() => {
+    delivered = delivery.dispatchBusCommand("board-x", { type: "addNode", payload: { id: "node:z", type: "note" } }, "test");
+  });
+  assert.equal(delivered, 0, "no live tab of this board → delivered 0");
+  assert.ok(fake.fsState.busClients instanceof Map, "getBusClients lazily created the per-board map on the bare fsState");
+  assert.equal(tracked, 0, "delivered=0 means no membership announce/track fired");
+  // The un-delivered create was held for replay (persist-gap buffer), also on a lazily-inited map — no crash.
+  assert.ok(fake.fsState.pendingBusReplay instanceof Map);
+  assert.deepEqual(delivery.drainPendingBusReplay("board-x").map((c) => c.payload.id), ["node:z"]);
+});
+
+// ── runRoute: the dispatch-seam error boundary (BUG-4b) ──────────────────────────────────────────────
+// A minimal ServerResponse double: records the status/body sendJson writes, and mirrors the real
+// `headersSent` flag (flips true once end() is called), so the boundary's `!headersSent` guard is exercised.
+function fakeRes() {
+  return {
+    statusCode: 200,
+    headersSent: false,
+    _headers: {},
+    _body: undefined,
+    setHeader(k, v) {
+      this._headers[k] = v;
+    },
+    end(body) {
+      this.headersSent = true;
+      this._body = body;
+    },
+  };
+}
+const fakeReq = (method = "POST") => ({ method });
+const fakeUrl = (p = "/api/thing") => new URL(p, "http://localhost");
+const flush = () => new Promise((r) => setImmediate(r)); // let a rejected promise's .catch microtask run
+
+test("runRoute turns a SYNCHRONOUS handler throw into a logged 500 (BUG-4b)", () => {
+  const res = fakeRes();
+  const errs = [];
+  const orig = console.error;
+  console.error = (...a) => errs.push(a);
+  try {
+    plugin.runRoute(fakeReq(), res, fakeUrl("/api/boom"), () => {
+      throw new Error("sync boom");
+    });
+  } finally {
+    console.error = orig;
+  }
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(JSON.parse(res._body), { error: "internal error" });
+  assert.ok(errs.some((a) => String(a[0]).includes("/api/boom")), "the error was logged with the method+path");
+});
+
+test("runRoute turns an ASYNC handler rejection into a logged 500, NOT an unhandled rejection (BUG-4b)", async () => {
+  const rejections = [];
+  const onUnhandled = (r) => rejections.push(r);
+  process.on("unhandledRejection", onUnhandled);
+  const res = fakeRes();
+  const errs = [];
+  const orig = console.error;
+  console.error = (...a) => errs.push(a);
+  try {
+    plugin.runRoute(fakeReq(), res, fakeUrl("/api/async-boom"), async () => {
+      throw new Error("async boom");
+    });
+    await flush();
+    await flush();
+  } finally {
+    console.error = orig;
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.equal(res.statusCode, 500, "the parked request got a 500 instead of hanging");
+  assert.deepEqual(JSON.parse(res._body), { error: "internal error" });
+  assert.equal(rejections.length, 0, "the rejection was caught at the seam — no unhandled rejection escaped");
+  assert.ok(errs.some((a) => String(a[0]).includes("/api/async-boom")), "logged with the path");
+});
+
+test("runRoute leaves a well-behaved handler untouched (no double-write on success)", async () => {
+  const res = fakeRes();
+  plugin.runRoute(fakeReq(), res, fakeUrl(), async () => {
+    sendJsonLike(res, 200, { ok: true });
+  });
+  await flush();
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(JSON.parse(res._body), { ok: true });
+});
+
+test("runRoute does NOT double-write when a handler that already sent headers later throws", async () => {
+  const res = fakeRes();
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    plugin.runRoute(fakeReq(), res, fakeUrl("/api/stream"), async () => {
+      sendJsonLike(res, 201, { partial: true }); // handler wrote its own response first...
+      throw new Error("late boom"); // ...then failed
+    });
+    await flush();
+    await flush();
+  } finally {
+    console.error = orig;
+  }
+  assert.equal(res.statusCode, 201, "the boundary honored !headersSent and did not overwrite with a 500");
+  assert.deepEqual(JSON.parse(res._body), { partial: true });
+});
+
+// A tiny sendJson stand-in matching server-http.sendJson's contract, for the success/already-sent cases.
+function sendJsonLike(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
 
 test("threadMemberSids unions edge members with cardless durable members over a fake context", () => {
   // A bare fsState (no durableMembers, no emittedMembers) resolves the member:open EDGE with no crash.
