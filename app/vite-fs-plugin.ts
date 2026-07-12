@@ -40,6 +40,7 @@ import { askRoutes } from "./routes/asks.js";
 import { threadRoutes } from "./routes/threads.js";
 import { sessionLifecycleRoutes, sessionReadRoutes } from "./routes/sessions.js";
 import { kernelRoutes } from "./routes/kernel.js";
+import { shutdownKernel } from "./server-kernel.js";
 import { isInternalPath, openRootWatcher } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
@@ -560,6 +561,7 @@ export interface CanvasFsState {
   busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
   liveKernels?: Map<string, unknown>; // boardId\0nodeId → live Jupyter kernel (server-kernel.ts; typed there to avoid a cycle; lazy-init via `??=`)
+  kernelsReconciled?: boolean; // one-shot flag: the gateway-orphan sweep ran once this server lifetime (server-kernel.ts; survives re-eval on fsState, resets on restart)
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
   lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
@@ -690,7 +692,18 @@ function attachWs(server: ViteDevServer): void {
           // Same confinement as GET /api/watch: the root must be one of this BOARD's known roots.
           const dir = rootDir(client.boardId, root);
           if (!dir) return;
-          client.watches.set(root, openRootWatcher(dir, (ev) => client.send({ ch: "watch", root, ev })));
+          client.watches.set(
+            root,
+            openRootWatcher(dir, (ev) => {
+              client.send({ ch: "watch", root, ev });
+              // BUG-3: a deleted `.ipynb` can't be re-run, so reap its kernel rather than leaving a stray
+              // Python process bound to a file that no longer exists. Node id is `node:<root>:<relPath>`
+              // (routes/kernel.ts parseNodeId); shutdownKernel is a no-op when no kernel is live for it.
+              if (ev.type === "unlink" && ev.path.toLowerCase().endsWith(".ipynb")) {
+                void shutdownKernel(client.boardId, `node:${root}:${ev.path}`);
+              }
+            }),
+          );
         } else if (msg.unsub === "watch" && root) {
           client.watches.get(root)?.();
           client.watches.delete(root);
