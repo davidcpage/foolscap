@@ -11,7 +11,7 @@ import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
 import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, stampFired, upsertJob } from "./standing-jobs.js";
-import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval } from "./coordinator-heartbeat.js";
+import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval, heartbeatSweepSignature } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { readWatchers } from "./doc-watch.js";
 import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
@@ -456,6 +456,12 @@ export function ensureCoordinatorHeartbeat(repoPath: string, threadId: string): 
   }
 }
 
+// §6.1 sweep-gate memory: per Coordinator job (claim key + job id), the sweep signature captured at its
+// LAST REAL FIRE. In-memory on purpose — losing it (restart / hot re-eval) merely un-gates the next due
+// fire, one extra sweep. Captured AT FIRE TIME, so the occupant's own acts during the sweep (its posts
+// bump lastTs) read as fresh change: at most one echo sweep per active episode, then the gate engages.
+const lastSweptSig = new Map<string, string>();
+
 // Trigger 3 — STANDING JOBS (R6, W6). The server-fired timer half of the wakeable substrate: every loop
 // heartbeat, fire the standing jobs that have come due across every board's threads. TIMERS NUDGE, NEVER
 // SPAWN (human-locked invariant, thread mrcauz0v-f): a role-seat job whose seat is a LIVE session NUDGES it;
@@ -473,6 +479,16 @@ function standingJobsTick(): void {
     } catch {
       continue;
     }
+    // §6.1 sweep gate — the board's sweep-relevant state, folded once per board and only when some
+    // Coordinator job actually reaches its nudge (lazy: a board with nothing due computes nothing).
+    let sweepSig: string | null = null;
+    const boardSweepSig = () => {
+      if (sweepSig !== null) return sweepSig;
+      const sessions: { sid: string; status: string }[] = [];
+      for (const s of liveSessions.values())
+        if (s.repoPath === board.repoPath && s.status !== "exited") sessions.push({ sid: s.id, status: s.status });
+      return (sweepSig = heartbeatSweepSignature({ threads, sessions }, now));
+    };
     for (const t of threads) {
       // Read the marker once for both the due-check's intent (part 4 backoff) and the seat resolution below.
       const tMeta = readThreadMeta(board.repoPath, t.threadId);
@@ -499,6 +515,21 @@ function standingJobsTick(): void {
         const sid = tMeta?.seats?.[job.role]?.sid; // reuse the marker read once at the top of this thread
         const live = typeof sid === "string" ? liveSessions.get(sid) : undefined;
         if (planRoleJobFire(live?.status ?? null, seatIntent) !== "nudge") continue; // skip / none → no fire, no stamp
+
+        // §6.1 — GATE the Coordinator heartbeat server-side (token-efficiency-review-2026-07-11.md): a
+        // nudge replays the occupant's whole parked context, and the server already knows whether a sweep
+        // would find anything. Skip the nudge when the board's sweep-relevant state is UNCHANGED since the
+        // last fire. No stamp on a gated skip, so the job stays due and re-checks every scheduler tick —
+        // the sweep fires the tick a change lands, never later than it would have un-gated. Stall detection
+        // survives inside the signature (staleness-bucket crossings read as change). Keyed by claim key +
+        // job id, so `job rm` + re-enable starts ungated (a deliberate way to force a sweep); the map is
+        // in-memory only — a server restart just costs one extra sweep.
+        if (job.role === COORDINATOR_ROLE) {
+          const gateKey = `${boardId}|${key}#${job.id}`;
+          const sig = boardSweepSig();
+          if (lastSweptSig.get(gateKey) === sig) continue; // nothing changed since the last sweep — no nudge, no stamp
+          lastSweptSig.set(gateKey, sig);
+        }
         sendSessionInput(live!.id, standingJobNudge(job, lastKnownOrigin), { keepWaitingOn: true });
         stampFired(board.repoPath, t.threadId, job.id, now);
       }

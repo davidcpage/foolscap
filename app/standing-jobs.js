@@ -168,8 +168,9 @@ export function jobClaimKey(threadId, job) {
 
 /**
  * PURE — is a wake ACTUALLY scheduled for session `sid`, given the thread markers `markers` (listThreads)?
- * A role-seat job fires INTO its role's seat every interval (standingJobsTick nudges or respawns the seat's
- * current occupant), so a live standing job schedules a wake for `sid` exactly when some marker carries a job
+ * A role-seat job fires INTO its role's seat every interval (standingJobsTick NUDGES the seat's live occupant
+ * — timers nudge, never spawn: a dormant seat is left for a real event to revive, per 4f5a3ad), so a live
+ * standing job schedules a wake for `sid` exactly when some marker carries a job
  * with a `role` whose seat is currently occupied by `sid`. A BARE (roleless) job always spawns a FRESH worker
  * — it targets no existing session — so it never schedules a wake for an already-live `sid`. This is the gate
  * behind the calm "scheduled" band: the static `loops` role flag means only "this is a looping-TYPE role", not

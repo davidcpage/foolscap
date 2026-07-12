@@ -15,8 +15,10 @@ import {
   COORDINATOR_HEARTBEAT_INTERVAL_MS,
   COORDINATOR_HEARTBEAT_INSTRUCTION,
   HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS,
+  HEARTBEAT_STALE_BUCKET_MS,
   coordinatorHeartbeatJobSpec,
   heartbeatEffectiveInterval,
+  heartbeatSweepSignature,
 } from "../coordinator-heartbeat.js";
 import {
   MIN_INTERVAL_MS,
@@ -123,6 +125,174 @@ test("a Coordinator heartbeat job on a thread: due-logic + seat-keyed single-fli
   // A role job keys its single-flight claim by the role's SEAT, so a timer fire and a reactive seat wake
   // mutually exclude — one Coordinator per thread, never two racing onto the seat.
   assert.equal(jobClaimKey(TID, job), seatSurfaceKey(TID, "Coordinator"));
+
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+// ── the server-side sweep gate (§6.1) ───────────────────────────────────────────────────────────
+// heartbeatSweepSignature folds the board's sweep-relevant state to a stable string; standingJobsTick
+// skips the nudge when it equals the signature stored at the last fire. Equal ⇒ a sweep finds nothing.
+
+const NOW = 10_000_000;
+const baseState = () => ({
+  threads: [
+    {
+      threadId: "node:thread:a",
+      lastTs: NOW - 60_000,
+      intents: {
+        Implementer: { intent: "working", ts: NOW - 120_000, sid: "s-imp" },
+        Coordinator: { intent: "working", ts: NOW - 120_000, sid: "s-coord" },
+      },
+    },
+    { threadId: "node:thread:b", lastTs: NOW - 500_000 },
+  ],
+  sessions: [
+    { sid: "s-imp", status: "idle" },
+    { sid: "s-coord", status: "idle" },
+  ],
+});
+
+test("heartbeatSweepSignature — deterministic and order-insensitive (threads, intent keys, sessions)", () => {
+  const sig = heartbeatSweepSignature(baseState(), NOW);
+  assert.equal(heartbeatSweepSignature(baseState(), NOW), sig, "same state → same signature");
+
+  const shuffled = baseState();
+  shuffled.threads.reverse();
+  shuffled.sessions.reverse();
+  // re-key an intents map in reverse insertion order
+  const a = shuffled.threads.find((t) => t.threadId === "node:thread:a");
+  a.intents = Object.fromEntries(Object.entries(a.intents).reverse());
+  assert.equal(heartbeatSweepSignature(shuffled, NOW), sig, "ordering of inputs never changes the signature");
+
+  // degenerate inputs render, never throw
+  assert.equal(heartbeatSweepSignature(undefined, NOW), "");
+  assert.equal(heartbeatSweepSignature({ threads: [null], sessions: [null] }, NOW), "");
+});
+
+test("heartbeatSweepSignature — every sweep-relevant change moves it", () => {
+  const sig = heartbeatSweepSignature(baseState(), NOW);
+  const mutations = [
+    ["a new post (lastTs bump)", (s) => (s.threads[0].lastTs = NOW - 1_000)],
+    ["a new thread appears", (s) => s.threads.push({ threadId: "node:thread:c", lastTs: NOW })],
+    ["a peer intent changes value (working → done)", (s) => (s.threads[0].intents.Implementer.intent = "done")],
+    ["a session status flips (idle → running)", (s) => (s.sessions[0].status = "running")],
+    ["a session appears", (s) => s.sessions.push({ sid: "s-new", status: "idle" })],
+    ["a session disappears", (s) => s.sessions.pop()],
+  ];
+  for (const [what, mutate] of mutations) {
+    const state = baseState();
+    mutate(state);
+    assert.notEqual(heartbeatSweepSignature(state, NOW), sig, `${what} changes the signature`);
+  }
+});
+
+test("heartbeatSweepSignature — an exited session is not sweep-relevant", () => {
+  const state = baseState();
+  state.sessions.push({ sid: "s-gone", status: "exited" });
+  assert.equal(heartbeatSweepSignature(state, NOW), heartbeatSweepSignature(baseState(), NOW));
+});
+
+// Stall detection survives the gate: a stall IS a state — the AGE of a non-self working/blocked:peer
+// intent, quantized to HEARTBEAT_STALE_BUCKET_MS buckets. Each bucket crossing reads as change, so a
+// silently-stalled peer re-fires the sweep once per bucket (not never, and not every 4 minutes).
+test("heartbeatSweepSignature — a stalled peer intent re-reads as change once per staleness bucket", () => {
+  const sig0 = heartbeatSweepSignature(baseState(), NOW);
+  const inBucket = heartbeatSweepSignature(baseState(), NOW + HEARTBEAT_STALE_BUCKET_MS - 130_000);
+  assert.equal(inBucket, sig0, "time passing WITHIN a bucket is not a change");
+  const crossed = heartbeatSweepSignature(baseState(), NOW + HEARTBEAT_STALE_BUCKET_MS);
+  assert.notEqual(crossed, sig0, "a bucket crossing IS a change — the stalled peer gets re-swept");
+  for (const intent of ["blocked:peer"]) {
+    const state = baseState();
+    state.threads[0].intents.Implementer.intent = intent;
+    assert.notEqual(
+      heartbeatSweepSignature(state, NOW + 10 * HEARTBEAT_STALE_BUCKET_MS),
+      heartbeatSweepSignature(state, NOW),
+      `${intent} ages into buckets too`,
+    );
+  }
+});
+
+test("heartbeatSweepSignature — the sweeper's own seat and human-parked/done intents never age", () => {
+  // Only the Coordinator (self) intent + a blocked:human elsewhere: a quiet board must SETTLE — no
+  // bucket may tick the watcher awake forever on its own stance, and a human block is woken by the
+  // human's reply (a post), not by re-sweeping.
+  const quiet = () => ({
+    threads: [
+      {
+        threadId: "node:thread:a",
+        lastTs: NOW - 60_000,
+        intents: {
+          Coordinator: { intent: "working", ts: NOW - 120_000, sid: "s-coord" },
+          Reviewer: { intent: "blocked:human", ts: NOW - 120_000, sid: "s-rev" },
+          Implementer: { intent: "done", ts: NOW - 120_000, sid: "s-imp" },
+        },
+      },
+    ],
+    sessions: [{ sid: "s-coord", status: "idle" }],
+  });
+  assert.equal(
+    heartbeatSweepSignature(quiet(), NOW + 100 * HEARTBEAT_STALE_BUCKET_MS),
+    heartbeatSweepSignature(quiet(), NOW),
+    "self-working + blocked:human + done: signature is time-invariant — the gate holds indefinitely",
+  );
+  // a custom selfRole is honoured (the gate is reusable for a non-Coordinator sweeper role)
+  const state = baseState();
+  assert.notEqual(
+    heartbeatSweepSignature(state, NOW + HEARTBEAT_STALE_BUCKET_MS, "Implementer"),
+    heartbeatSweepSignature(state, NOW, "Implementer"),
+    "with self=Implementer the Coordinator intent is the one that ages",
+  );
+});
+
+// The gate must stay comfortably inside the measured 1h prompt-cache TTL (§6.2, comment at the interval
+// consts): a cadence past the TTL turns every sweep into a ~2× cold rewrite of the parked context.
+test("every heartbeat cadence stays well inside the 1h prompt-cache TTL", () => {
+  const TTL = 60 * 60_000;
+  assert.ok(COORDINATOR_HEARTBEAT_INTERVAL_MS <= TTL / 2, "base cadence ≤ half the TTL");
+  assert.ok(HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS <= TTL / 2, "blocked:human backoff ≤ half the TTL");
+  assert.ok(HEARTBEAT_STALE_BUCKET_MS <= TTL / 2, "staleness re-sweep bucket ≤ half the TTL");
+});
+
+// The mocked GATED tick — the exact composition standingJobsTick now runs for a due, live+idle
+// Coordinator seat: plan says nudge → compare the board signature to the one stored at the last fire →
+// equal = skip (NO stamp: stays due, re-checks next tick) / different = fire + stamp + store.
+test("mocked tick: the §6.1 gate — unchanged state skips the nudge (no stamp), a change fires it", () => {
+  const repo = tmpRepo();
+  const t0 = 7_000_000;
+  const { job } = upsertJob(repo, TID, { ...coordinatorHeartbeatJobSpec(), ts: t0 });
+  const lastSwept = new Map(); // the tick's in-memory gate map
+  const gateKey = `board|${jobClaimKey(TID, job)}#${job.id}`;
+
+  const tick = (state, now) => {
+    if (!jobDue(readJobs(repo, TID)[0], now)) return "not-due";
+    if (planRoleJobFire("idle", "working") !== "nudge") return "no-nudge";
+    const sig = heartbeatSweepSignature(state, now);
+    if (lastSwept.get(gateKey) === sig) return "gated";
+    lastSwept.set(gateKey, sig);
+    stampFired(repo, TID, job.id, now);
+    return "fired";
+  };
+
+  const t1 = t0 + job.intervalMs;
+  assert.equal(tick(baseState(), t1), "fired", "first due fire is never gated (no stored signature)");
+  assert.equal(tick(baseState(), t1 + 1_000), "not-due", "just fired → re-based to the next interval");
+
+  const t2 = t1 + job.intervalMs;
+  assert.equal(tick(baseState(), t2), "gated", "due again but NOTHING changed → the nudge is skipped");
+  assert.equal(jobDue(readJobs(repo, TID)[0], t2), true, "a gated skip does NOT stamp — the job stays due");
+  assert.equal(tick(baseState(), t2 + 15_000), "gated", "…and re-evaluates every scheduler tick");
+
+  const changed = baseState();
+  changed.threads[0].lastTs = t2 + 20_000; // a peer posts
+  assert.equal(tick(changed, t2 + 30_000), "fired", "the tick a change lands, the sweep fires immediately");
+  assert.equal(jobDue(readJobs(repo, TID)[0], t2 + 30_000), false, "a real fire stamps — re-based again");
+
+  // RESTART SAFETY: the gate map is in-memory ON PURPOSE — losing it can only UN-gate, never mis-skip
+  // (a skip requires an EQUAL stored signature; an absent one always fires). So the first due sweep
+  // after a server restart fires unconditionally, even on a byte-identical board state.
+  lastSwept.clear(); // ← the restart
+  const t3 = t2 + 30_000 + job.intervalMs;
+  assert.equal(tick(changed, t3), "fired", "first due sweep after a restart is never gated");
 
   fs.rmSync(repo, { recursive: true, force: true });
 });
