@@ -306,14 +306,14 @@ function loopTick(): void {
 // thread falls out for free on the first tick — no separate codepath. Reads markers only for durable
 // members (a handful), so it's cheap; runs on loopTick beside the reaper.
 function detachDoneMembersTick(): void {
-  const { boards, liveSessions } = getServerContext();
+  const { boards, liveSessions, threadLog, publishThreadFeed } = getServerContext();
   const now = Date.now();
   const isLive = (sid: string) => {
     const s = liveSessions.get(sid);
     return !!s && s.status !== "exited";
   };
   let detached = 0;
-  for (const [, board] of boards) {
+  for (const [boardId, board] of boards) {
     let threads: ThreadMetaMarker[];
     try {
       threads = listThreads(board.repoPath);
@@ -322,13 +322,18 @@ function detachDoneMembersTick(): void {
     }
     for (const t of threads) {
       const meta = readThreadMeta(board.repoPath, t.threadId);
+      let dropped = false;
       for (const sid of threadMembersFromMeta(meta)) {
         const marker = readCanvasSession(board.repoPath, sid);
         if (!shouldDetachDoneMember(sid, marker, now, DETACH_DELAY_MS, isLive)) continue;
         removeThreadMember(board.repoPath, t.threadId, sid); // authoritative: drops durable membership → pill clears
         releaseSeat(board.repoPath, t.threadId, sid); // no-op unless this sid still holds a seat here
         detached++;
+        dropped = true;
       }
+      // The marker write fires threads:<board> (the rail), but the OPEN card's pills ride the thread:<id>
+      // feed's `members` — republish it so the detached pill clears now, not at the next unrelated post.
+      if (dropped) publishThreadFeed(boardId, t.threadId, threadLog(boardId, t.threadId), false);
     }
   }
   if (detached) console.warn(`[detach-done] dropped ${detached} done member(s) from their thread(s) (grace ${DETACH_DELAY_MS / 1000}s elapsed)`);

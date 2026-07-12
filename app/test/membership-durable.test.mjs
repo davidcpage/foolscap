@@ -141,6 +141,31 @@ test("announceNewMemberships: card delete (edge + node gone together) keeps memb
   assert.ok(ledger.threadMembersFromMeta(ledger.readThreadMeta(repo, THREAD)).includes(SID));
 });
 
+test("announceNewMemberships: a save that removes a member edge REPUBLISHES the thread's roster frame (pill freshness)", () => {
+  const repo = tmpRepo();
+  const before = [...threadCard(THREAD), ...cardAndEdge(SID, THREAD)];
+  const after = threadCard(THREAD); // select-delete of the session card: node + edge gone together
+  const published = [];
+  const { fsState } = makeCtx(repo, after, { publishThreadFeed: (b, t) => published.push({ board: b, thread: t }) });
+  ledger.addThreadMember(repo, THREAD, SID, 100);
+  fsState.durableMembers.set(THREAD, new Set([SID]));
+  delivery.announceNewMemberships(BOARD, before, after, "127.0.0.1:0");
+  // Without this republish the card's pill rides the LAST-published frame (or none on a fresh tab), so a
+  // deleted card dropped the pill of a still-durable member. One publish per touched thread, and the frame
+  // it derives (threadMemberSids over the after-records ∪ durable tier) still carries the member.
+  assert.deepEqual(published, [{ board: BOARD, thread: THREAD }], "one roster republish for the touched thread");
+  assert.ok(snap.threadMemberSids(after, THREAD).includes(SID), "the fresh roster still carries the durable member");
+});
+
+test("announceNewMemberships: a save with no membership-edge change republishes NOTHING (no feed churn)", () => {
+  const repo = tmpRepo();
+  const records = [...threadCard(THREAD), ...cardAndEdge(SID, THREAD)];
+  const published = [];
+  makeCtx(repo, records, { publishThreadFeed: (b, t) => published.push(t) });
+  delivery.announceNewMemberships(BOARD, records, records, "127.0.0.1:0");
+  assert.equal(published.length, 0);
+});
+
 // ── 2. /leave is the explicit drop — ledger-first, works with no card/edge, and is never silent ─────
 
 test("POST /leave: a cardless ledger member (headless join) leaves — marker drops it, a system line records it", async () => {

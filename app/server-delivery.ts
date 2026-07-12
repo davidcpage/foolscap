@@ -341,7 +341,7 @@ export function announceNewMemberships(
   after: Array<Record<string, unknown>> | null,
   origin: string,
 ): void {
-  const { fsState } = getServerContext();
+  const { fsState, threadLog, publishThreadFeed: publishThreadFeedCtx } = getServerContext();
   const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
   const afterEdges = memberEdgesOf(after);
   if (before == null) {
@@ -353,9 +353,11 @@ export function announceNewMemberships(
     if (beforeEdges.get(id)?.type === e.type) continue; // unchanged phase — already onboarded (or baseline-seeded)
     maybeAnnounceMembership(boardId, { type: "addEdge", payload: { id, from: e.from, to: e.to, type: e.type } }, origin);
   }
-  for (const [id] of beforeEdges) {
+  const rosterTouched = new Set<string>(); // threads whose DISPLAY roster just lost an edge
+  for (const [id, e] of beforeEdges) {
     if (afterEdges.has(id)) continue;
     maybeAnnounceMembership(boardId, { type: "removeEdge", payload: { id } }, origin); // clear dedup → a rejoin re-announces
+    rosterTouched.add(e.to);
     // A vanished edge NEVER drops durable membership. The old "edge gone, node still standing = real leave"
     // discriminator read display-layer noise as intent: snapshot saves race (multiple tabs, in-flight saves,
     // a save capturing the ms-wide window between a spawn's addNode and its addEdge), and any pair that
@@ -364,6 +366,12 @@ export function announceNewMemberships(
     // Leave button now calls) or the done-member detach sweep. The snapshot diff may ANNOUNCE joins; it may
     // not unmake them.
   }
+  // A vanished edge never mutates the durable roster, but it DOES change what the thread card can derive
+  // locally: the card's edge-driven pill is gone, and a still-durable member must survive as a cardless
+  // (closed, reopenable) pill via the feed's `members`. That fallback is only as fresh as the last publish
+  // — a card delete published nothing, so the pill rode a stale frame or (on a freshly-loaded tab with no
+  // frame yet) vanished outright. Republish the roster frame so the display snaps to durable truth.
+  for (const threadId of rosterTouched) publishThreadFeedCtx(boardId, threadId, threadLog(boardId, threadId), false);
 }
 
 // When a membership edge crosses the bus, ONBOARD the affected session. Onboarding (and only onboarding) is
