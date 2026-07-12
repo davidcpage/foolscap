@@ -131,13 +131,17 @@ export function appendThreadMsg(
   const log = threadLog(boardId, threadId); // lazy-seeds from the ledger — never mint seq 1 onto a real tail
   const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
   const msg: ThreadMsg = { seq, ts: Date.now(), from, text, ...extra };
-  log.push(msg);
-  let truncated = false;
-  if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
-  publishThreadFeed(boardId, threadId, log, truncated);
+  // DURABLE-BEFORE-LIVE (BUG-6). Persist to the fsync'd .jsonl ledger BEFORE we mutate the in-memory log or
+  // publish the live feed — the honest ordering. appendThreadLine now THROWS on failure (it no longer
+  // swallows), so a post that can't be made durable propagates out of here to the caller (→ HTTP 500) rather
+  // than returning a dishonest 200 with the message alive only in the bounded in-memory tail (the vanishing
+  // 2026-07-12 posts). And because the feed publish is AFTER a successful append, the card/live feed never
+  // shows a message that isn't on disk — the former publish-then-append inversion. The marker upsert stays
+  // best-effort: it is the rail's INDEX, not the conversation, and the message is already durable in the
+  // .jsonl (lazy threadLog re-reads that marker-independently on the next touch after a restart).
   const repoPath = boards.get(boardId)?.repoPath;
   if (repoPath) {
-    appendThreadLine(repoPath, threadId, msg);
+    appendThreadLine(repoPath, threadId, msg); // fsync'd; throws if it can't be made durable
     // Refresh the marker. Title/brief ride along only when the snapshot can resolve the thread node
     // (so a momentary no-snapshot post bumps activity without clobbering a good title with a blank one).
     const records = boardSnapshotRecords(boardId);
@@ -146,6 +150,12 @@ export function appendThreadMsg(
     if (thread) { meta.title = thread.title ?? ""; meta.text = typeof thread.text === "string" ? thread.text : ""; }
     upsertThreadMeta(repoPath, threadId, meta);
   }
+  // Only now is the message live: it is durably on disk (or the board has no repo tier at all). Push it to the
+  // bounded in-memory tail and publish the feed.
+  log.push(msg);
+  let truncated = false;
+  if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
+  publishThreadFeed(boardId, threadId, log, truncated);
   return msg;
 }
 
@@ -478,7 +488,14 @@ function maybeAnnounceMembership(
         `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
     );
     if (others.length) {
-      appendThreadMsg(boardId, thread.id, "system", `${sid} joined the thread. members now: ${roster}.`);
+      // Best-effort: appendThreadMsg now throws if the durable append fails (BUG-6), but a "joined" SYSTEM
+      // line failing to persist must not abort onboarding — the durable membership is already recorded on the
+      // marker above, so the join itself stands. Log it and still wake the room.
+      try {
+        appendThreadMsg(boardId, thread.id, "system", `${sid} joined the thread. members now: ${roster}.`);
+      } catch (e) {
+        console.warn(`[thread] join system line for ${sid} on ${thread.id} not persisted:`, (e as Error)?.message ?? e);
+      }
       wakeThreadMembers(boardId, thread.id, sid, { broadcast: true }); // a join is a room event — reaches level-`all` seats
     }
     const js = liveSessions.get(sid);

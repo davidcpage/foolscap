@@ -111,7 +111,13 @@ export async function handleThreadReply(
 
   settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
   // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
+  // Best-effort: appendThreadMsg throws on a durable failure (BUG-6), but the ask is ALREADY settled (the
+  // answer reached the asker) — the reply succeeded; only the card echo failed. Log it, don't 500 the reply.
+  try {
+    appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
+  } catch (e) {
+    console.warn(`[thread] ask echo for ${ask.askId} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
+  }
   sendJson(res, 200, { ok: true, askId: ask.askId, channel: threadId, delivered: true });
 }
 
