@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
+import { getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
 import {
   appendThreadLine,
@@ -321,7 +321,7 @@ export function dispatchBusCommand(
   origin: string,
 ): number {
   const { fsState, trackEmittedMembership } = getServerContext();
-  const busClients = fsState.busClients!;
+  const busClients = getBusClients(fsState);
   const wsClients = getWsClients(fsState);
   const clients = busClients.get(boardId); // SSE compat path — the app's tabs ride /api/ws now
   const sockets = [...wsClients].filter((c) => c.boardId === boardId);

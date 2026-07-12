@@ -1,5 +1,6 @@
 import type { IncomingMessage } from "node:http";
 import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, PendingAsk, PendingPermission, RootInfo, SessionBand, SnapNode, ThreadMsg, WsClient } from "./vite-fs-plugin.js";
+import type { SseClient } from "./server-http.js";
 import type { WorkIntent } from "./work-intent.js";
 import type { ThreadMetaMarker } from "./thread-ledger.js";
 import type { EnsuredWorktree } from "./worktrees.js";
@@ -220,6 +221,9 @@ export function getPendingPermissions(fsState: CanvasFsState): Map<string, Pendi
 }
 export function getWsClients(fsState: CanvasFsState): Set<WsClient> {
   return (fsState.wsClients ??= new Set<WsClient>());
+}
+export function getBusClients(fsState: CanvasFsState): Map<string, Set<SseClient>> {
+  return (fsState.busClients ??= new Map<string, Set<SseClient>>());
 }
 export function getPendingHistoryMode(fsState: CanvasFsState): Map<string, "full" | "future"> {
   return (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
