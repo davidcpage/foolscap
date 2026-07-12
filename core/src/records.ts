@@ -70,6 +70,43 @@ export interface LayoutRecord extends BaseRecord {
 export type AnyRecord = NodeRecord | EdgeRecord | LayoutRecord;
 export type RecordId = AnyRecord["id"];
 
+// ── the record-shape contract (one home for the magic strings) ────────────────────────
+// The string literals that identify a record's shape, as named constants so the ENGINE and any
+// out-of-engine reader (the server's snapshot resolvers) share ONE spelling of the schema instead
+// of each re-deriving it with hand-matched literals (`typeName === "node"`, `type === "member:open"`)
+// over `Record<string, unknown>` — the drift the arch review flagged (§3.2). `as const` keeps each
+// value its own literal type, so `typeName: RECORD_TYPE.node` still narrows the discriminated union.
+//
+// RECORD_TYPE is the engine's own schema (the three record kinds). NODE_TYPE / EDGE_TYPE are the
+// coordination-layer vocabulary the engine carries OPAQUELY — it never interprets these, but they are
+// the contract every reader keys off, so their canonical spelling lives here beside the records they tag
+// (see the EdgeRecord `type` note: "the engine is blind to all of this"). These are non-exhaustive: a
+// `type` field is a free string; only the values readers actually match on are named.
+
+/** Record `typeName` discriminants — the three record kinds the store holds. */
+export const RECORD_TYPE = {
+  node: "node",
+  edge: "edge",
+  layout: "layout",
+} as const;
+
+/** Node `type` values the coordination layer keys off (session cards, thread/channel cards). */
+export const NODE_TYPE = {
+  session: "session",
+  thread: "thread", // the node type since §8 step 2
+  channel: "channel", // carried-over legacy type — existing channels live on as long-lived threads
+} as const;
+
+/** Edge `type` values readers match on: the default relationship + the membership joins. */
+export const EDGE_TYPE = {
+  links: "links",
+  memberOpen: "member:open",
+  memberPending: "member:pending",
+} as const;
+
+/** Shared prefix of every membership edge type (`member:open`, `member:pending`, …). */
+export const MEMBER_EDGE_PREFIX = "member:";
+
 // Map a record's typeName to its concrete type, for typed get/query.
 export type RecordOf = {
   node: NodeRecord;
