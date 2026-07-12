@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody, readBodyBuffer, readText, MAX_BYTES, MAX_NOTEBOOK_BYTES } from "../server-http.js";
-import { transformNotebook } from "../ipynb-codec.js";
+import { transformNotebook, notebookHasElisionMarkers } from "../ipynb-codec.js";
 import {
   safeResolve,
   isInternalPath,
@@ -68,7 +68,14 @@ function handleNotebookFile(res: ServerResponse, abs: string, rel: string, mode:
     return sendJson(res, 200, { path: rel, content: raw.content, truncated: true, version: fileVersion(abs) });
   }
   const { content, trimmed } = transformNotebook(raw.content, { mode });
-  sendJson(res, 200, { path: rel, content, truncated: false, trimmed, version: fileVersion(abs) });
+  // BUG-2: a TRIMMED projection is NOT the on-disk bytes (images elided to markers / text clamped / whole
+  // outputs dropped), so stamping fileVersion(abs) — the hash of the FULL file — would be a lie: a reader
+  // could echo it as baseVersion and the CAS would pass, letting the lossy projection overwrite the real
+  // outputs. Poison the version to null on any trimmed read, so a CAS-guarded write-back is refused (409,
+  // baseVersion:null vs the real hash → stale) and the reader must re-read. Only an UNtrimmed read (content
+  // == the real bytes) carries a real version and is a safe CAS base. The write path (handleFileWrite) also
+  // hard-rejects a body carrying elision markers, independent of the CAS, for a reader that omits baseVersion.
+  sendJson(res, 200, { path: rel, content, truncated: false, trimmed, version: trimmed ? null : fileVersion(abs) });
 }
 
 function handleFile(res: ServerResponse, root: string, rel: string, notebook: string | null): void {
@@ -123,9 +130,24 @@ async function handleFileWrite(
     return sendJson(res, 400, { error: "bad json" });
   }
   if (typeof body.content !== "string") return sendJson(res, 400, { error: "content required" });
-  // Bound the write at the one place a byte cap belongs (CLAUDE.md): the same MAX_BYTES the read previews
-  // at — a card's editable view is preview-sized, so a write larger than that is out of this path's scope.
-  if (Buffer.byteLength(body.content, "utf8") > MAX_BYTES) return sendJson(res, 413, { error: "too large" });
+  const isNotebook = path.extname(rel).toLowerCase() === ".ipynb";
+  // Bound the write at the one place a byte cap belongs (CLAUDE.md), keyed on extension to MATCH the read
+  // ceiling: a `.ipynb` reads against MAX_NOTEBOOK_BYTES (image outputs run to MiB), so it must WRITE against
+  // the same ceiling — else a full-fidelity notebook write-back over 128 KiB 413s and the card/kernel can't
+  // save (BUG-2). Every other text file stays preview-sized at MAX_BYTES (a card's editable view).
+  const writeCap = isNotebook ? MAX_NOTEBOOK_BYTES : MAX_BYTES;
+  if (Buffer.byteLength(body.content, "utf8") > writeCap) return sendJson(res, 413, { error: "too large" });
+  // BUG-2 hard guard: never let the lossy AGENT read projection round-trip back to disk. A bare `.ipynb` GET
+  // elides base64 images to markers and clamps huge text; writing that body verbatim erases every real
+  // output. Refuse a notebook write whose OUTPUTS carry those elision markers — independent of the CAS, so
+  // it catches a writer that omits baseVersion too. 422 (well-formed but semantically unacceptable): the
+  // caller must re-derive from the full notebook, never persist a read projection.
+  if (isNotebook && notebookHasElisionMarkers(body.content))
+    return sendJson(res, 422, {
+      error:
+        "notebook write carries output-elision markers from a lossy agent read projection — refusing to erase real outputs; edit the full notebook, do not write back the agent read",
+      path: rel,
+    });
   // W12 — optimistic-concurrency CAS: a write MAY carry `baseVersion` (the version it read). If it does and
   // the file has since moved, reject 409 with the current version + content so the writer can rebase — the
   // conflict IS the coordination (docs/simple-markdown-editor-lessons.md Idea 2). Opt-in: a write that omits
