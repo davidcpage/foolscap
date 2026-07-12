@@ -1,14 +1,14 @@
 import { layoutId, type Gesture, type Id, type LayoutRecord } from "../core.js";
 import { boxContainsPoint, boxCorners, MIN_SIZE, resizeBox, vecDist, type Box, type Corner, type Vec } from "../geometry.js";
 import type { PointerInput } from "../input.js";
-import { selectionBounds } from "../selection.js";
+import { resizeTargetId, selectionBounds } from "../selection.js";
 import { DRAG_THRESHOLD, HANDLE_HIT, HIT_MARGIN, type InteractionContext, type Tool } from "./tool.js";
 
 // The default tool: the bulk of a canvas's feel. Internal sub-states as a discriminated union —
 //   idle      → nothing in flight
 //   pointing  → pressed on a node; a click unless the pointer crosses the drag threshold
 //   dragging  → moving the selection; ONE editor gesture coalesces all frames into one diff/event
-//   handle    → pressed on a resize handle of the lone selected node; a resize once threshold crosses
+//   handle    → pressed on a resize handle of the selection's resize target; a resize once threshold crosses
 //   resizing  → dragging that corner; ONE gesture coalesces every frame into one diff/resizeNodes event
 //   marquee   → rubber-band selecting empty space
 //
@@ -63,10 +63,11 @@ export class SelectTool implements Tool {
       }
     }
 
-    // A resize handle wins over everything: it sits at the lone selected node's corner, drawn on top,
-    // and is the smaller target, so a press there means resize even though the node's box is also under
-    // the pointer. Geometry-only hit-test (the index doesn't know about handles), gated to a single
-    // selection — the only case the renderer draws handles for.
+    // A resize handle wins over everything: it sits at the resize target's corner, drawn on top, and
+    // is the smaller target, so a press there means resize even though the node's box is also under
+    // the pointer. Geometry-only hit-test (the index doesn't know about handles), gated to the
+    // selection's resize target (lone node, or a cluster's seed) — the only cases the renderer draws
+    // handles for.
     const handle = this.hitHandle(page);
     if (handle) {
       this.state = { kind: "handle", ...handle, originScreen: e.point };
@@ -138,15 +139,19 @@ export class SelectTool implements Tool {
     return !!b && boxContainsPoint(b, page);
   }
 
-  // Which resize handle (if any) a page point grabs. Only the lone selected node carries handles (the
-  // renderer draws them only then), so a multi-selection or empty selection never resizes. The grab
-  // radius is a screen-px constant ÷ live zoom, so the hot zone stays the rendered handle's size at any
-  // zoom — the same constant-on-screen trick HIT_MARGIN uses.
+  // Which resize handle (if any) a page point grabs. Handles live on the selection's resize TARGET —
+  // the lone selected node, or a cluster's seed (a thread whose expansion covers the rest of the
+  // selection; resizeTargetId is shared with the renderer's overlay so tool and handles agree) — so any
+  // other multi-selection or an empty one never resizes. The grab radius is a screen-px constant ÷ live
+  // zoom, so the hot zone stays the rendered handle's size at any zoom — the same constant-on-screen
+  // trick HIT_MARGIN uses.
   private hitHandle(page: Vec): { corner: Corner; nodeId: string; startBox: Box } | null {
-    if (this.ctx.selection.size !== 1) return null;
-    const nodeId = this.ctx.selection.ids()[0]!;
+    const nodeId = resizeTargetId(this.ctx.selection.ids(), this.ctx.expandSelection);
+    if (!nodeId) return null;
     const l = this.ctx.editor.store.get<"layout">(layoutId(nodeId as Id<"node">)) as LayoutRecord | undefined;
-    if (!l) return null;
+    // Screen-anchored (pinned/floating) cards keep their x/y in screen px and carry their own
+    // screen-space handles (FloatingResizeHandles) — page-space corner math would test a wrong point.
+    if (!l || l.anchor === "screen") return null;
     const box: Box = { x: l.x, y: l.y, w: l.w, h: l.h };
     const r = HANDLE_HIT / this.ctx.camera.state.z;
     const corners = boxCorners(box);

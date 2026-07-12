@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
-import { layoutId, selectionBounds, type Box, type CameraState, type Id, type InteractionManager, type Vec } from "./lib";
+import { layoutId, resizeTargetId, selectionBounds, type Box, type CameraState, type Id, type InteractionManager, type Vec } from "./lib";
 import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
 import { acceptMembership, isAttentionEdge, leaveThread, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
@@ -351,11 +351,12 @@ const EdgeLine = memo(function EdgeLine({
   );
 })
 
-// Channel-1 selection chrome. A MULTI-selection draws its group-extent box (no handles — the select
-// tool only resizes a lone node). A SINGLE selection draws corner resize handles on its box: the node
-// already shows `.selected`, so the handles are the only thing added, and they're what the tool's
-// hitHandle geometry expects to find. Subscribes to selection + the layout query (so a live drag/resize
-// frame re-fires it and the handles track the box) + the camera (handles are sized in screen px).
+// Channel-1 selection chrome: corner resize handles on the selection's resize TARGET — the lone
+// selected node, or a cluster's seed (a thread whose auto-expansion covers the rest of the selection;
+// resizeTargetId is shared with the tool's hitHandle so drawn handles and the corner hit-test can never
+// disagree). Any other multi-selection draws nothing extra (each card's own `.node.selected` frame is
+// the chrome). Subscribes to selection + the layout query (so a live drag/resize frame re-fires it and
+// the handles track the box) + the camera (handles are sized in screen px).
 function SelectionOverlay({ m }: { m: InteractionManager }) {
   const ids = useSignal(m.selection.signal);
   const z = useSignalValue(m.camera.signal, camZ); // handles are sized by zoom; pan never moves them
@@ -363,15 +364,13 @@ function SelectionOverlay({ m }: { m: InteractionManager }) {
   const layoutQuery = useMemo(() => store.query({ typeName: "layout" }), [store]);
   useSignal(layoutQuery);
   if (ids.size === 0) return null;
+  const target = resizeTargetId([...ids], m.expandSelection);
   // This overlay lives INSIDE .page (page-space). A floating (anchor "screen") card's layout x/y are
   // SCREEN pixels, so its bounds here would land at a wrong page point — the "detached handles off in
-  // the distance" bug. Floating cards show selection via their own .node.selected ring instead, so
-  // drop them from the box/handles entirely.
-  const worldIds = [...ids].filter((id) => store.get<"layout">(layoutId(id as Id<"node">))?.anchor !== "screen");
-  if (worldIds.length === 0) return null;
-  // Multi-select shows each card's own .node.selected frame; no surrounding group bounding-box overlay.
-  if (worldIds.length >= 2) return null;
-  const bounds = selectionBounds(store, worldIds);
+  // the distance" bug. Floating cards carry their own screen-space handles (FloatingResizeHandles) and
+  // show selection via their `.node.selected` ring, so draw nothing for a screen-anchored target.
+  if (!target || store.get<"layout">(layoutId(target as Id<"node">))?.anchor === "screen") return null;
+  const bounds = selectionBounds(store, [target]);
   if (!bounds) return null;
   return <ResizeHandles box={bounds} z={z} />;
 }

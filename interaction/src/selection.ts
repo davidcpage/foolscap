@@ -46,6 +46,29 @@ export class Selection {
 }
 
 /**
+ * Which lone node a selection's resize handles belong to: the single selected node, or — for a
+ * CLUSTER (one seed whose directed expansion covers every other selected card, e.g. a thread and its
+ * open member cards) — the seed itself. null for any other multi-selection. Shared by the select
+ * tool's corner hit-test and the renderer's handle overlay so they can never disagree about where
+ * handles live: without this, selecting a thread auto-pulls its members in and the size-1 handle gate
+ * made every populated thread card permanently unresizable.
+ */
+export function resizeTargetId(ids: readonly string[], expand?: (nodeId: string) => string[]): string | null {
+  if (ids.length === 1) return ids[0]!;
+  if (ids.length < 2 || !expand) return null;
+  let target: string | null = null;
+  for (const id of ids) {
+    const cluster = expand(id);
+    if (!cluster.length) continue;
+    const covered = new Set([id, ...cluster]);
+    if (!ids.every((other) => covered.has(other))) continue;
+    if (target) return null; // two seeds each cover the whole selection — ambiguous, no handles
+    target = id;
+  }
+  return target;
+}
+
+/**
  * Bounding box of the selected nodes in page space (null if empty / no layouts) — drives the
  * selection rectangle + resize handles a renderer would draw. Recomputed on demand from the store's
  * layout records (a coarse op, not a hot path), reading current handle values so it reflects a drag.

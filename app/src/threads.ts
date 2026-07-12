@@ -37,6 +37,12 @@ export function edgeClass(type: string): string {
   return "edge-" + type.replace(/:/g, "-");
 }
 
+// The one default size for a thread card, whatever path creates it. Every UI path passes it
+// explicitly; the agent bus injects it for an addNode that omits w/h (agentBus.ts), because core's
+// generic 200×120 fallback renders a thread's head + log + composer unreadably cramped.
+export const THREAD_CARD_W = 460;
+export const THREAD_CARD_H = 420;
+
 // Create a fresh thread card at `at`. The `title` is the task; the `text` is the (optional) brief —
 // editable inline like any card. Returns the new thread node id.
 export function createThread(editor: Editor, at: { x: number; y: number }, title = "thread", brief = ""): string {
@@ -44,7 +50,7 @@ export function createThread(editor: Editor, at: { x: number; y: number }, title
   editor.commit({
     type: "addNode",
     actor: "user",
-    payload: { id, type: "thread", title, text: brief, color: "purple", x: at.x, y: at.y, w: 460, h: 420 },
+    payload: { id, type: "thread", title, text: brief, color: "purple", x: at.x, y: at.y, w: THREAD_CARD_W, h: THREAD_CARD_H },
   });
   return id;
 }

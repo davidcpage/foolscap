@@ -14,7 +14,7 @@ import { filePreview, setFileContent, setGone, refreshListing, writeFileContent,
 import { annotationsWatchEvent } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
-import { MEMBER_OPEN } from "./threads";
+import { MEMBER_OPEN, THREAD_CARD_H, THREAD_CARD_W } from "./threads";
 import { detachedMemberCards } from "./reconcile-members";
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
@@ -997,8 +997,6 @@ export function reconcileDetachedMemberCards(m: InteractionManager, threads: Cha
 // a card for this thread is already on the board, FLY to it (select + fitSelection) instead of littering a
 // duplicate; otherwise add it (at the drop point, else viewport-centred) and select it. actor "user" (like
 // createThread / addSessionsCard) so a reopen is an undoable, attributed act.
-const THREAD_CARD_W = 460;
-const THREAD_CARD_H = 420;
 // Cross-card jump-to-message (user waiting-state, P3): the threads-list card's preview popover opens a thread
 // AND asks its card to scroll to a specific mention. The two are decoupled in time — a freshly-opened card
 // mounts async and its feed arrives later — so a request is BOTH stashed in a module map (read once by the

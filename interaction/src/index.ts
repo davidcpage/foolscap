@@ -25,7 +25,7 @@ export { Camera, pageToScreen, screenToPage } from "./camera.js";
 export type { SpatialIndex } from "./spatial.js";
 export { BruteForceIndex, syncIndexFromStore } from "./spatial.js";
 
-export { Selection, selectionBounds, worldBounds } from "./selection.js";
+export { Selection, resizeTargetId, selectionBounds, worldBounds } from "./selection.js";
 
 export type { InputEvent, PointerInput, WheelInput, KeyInput, ModifierState } from "./input.js";
 export { bindDom } from "./input.js";

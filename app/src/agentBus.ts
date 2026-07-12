@@ -1,5 +1,6 @@
 import type { InteractionManager } from "./lib";
 import { onBusCommand } from "./feeds";
+import { THREAD_CARD_H, THREAD_CARD_W } from "./threads";
 
 // The browser end of the agent bus (demo §10 step 4). Inbound: commands posted to /api/command
 // arrive over the tab's shared WebSocket (feeds.ts owns it; a standing SSE stream per tab was what
@@ -23,7 +24,14 @@ export function connectAgentBus(m: InteractionManager): () => void {
 
   return onBusCommand((cmd) => {
     try {
-      editor.commit({ type: cmd.type, payload: cmd.payload ?? {}, actor: cmd.actor ?? "claude" });
+      let payload = cmd.payload ?? {};
+      // An agent's addNode for a thread usually omits w/h, and core's generic 200×120 fallback renders
+      // a thread card (head + log + composer) unreadably cramped — give it the same default size every
+      // UI creation path passes explicitly. Explicit w/h in the payload still wins.
+      if (cmd.type === "addNode" && payload.type === "thread") {
+        payload = { w: THREAD_CARD_W, h: THREAD_CARD_H, ...payload };
+      }
+      editor.commit({ type: cmd.type, payload, actor: cmd.actor ?? "claude" });
     } catch (err) {
       // an unknown command type — the Editor's validation IS the bus's validation
       console.warn("[agent-bus] rejected:", cmd.type, err);
