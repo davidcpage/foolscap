@@ -185,7 +185,7 @@ async function handleSessionSpawn(
   const pendingHistoryMode = getPendingHistoryMode(fsState);
   let body: {
     prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
-    worktree?: unknown; base?: unknown; worktreeKey?: unknown;
+    worktree?: unknown; base?: unknown; worktreeKey?: unknown; model?: unknown;
   } = {};
   try {
     const raw = await readBody(req);
@@ -212,6 +212,13 @@ async function handleSessionSpawn(
     roleName = role.name;
     roleColour = role.colour;
   }
+  // Optional: the model this session runs. Explicit here beats the role's `model:` frontmatter beats
+  // DEFAULT_SESSION_MODEL (resolveSessionModel in server-sessions.ts) — the spawner chooses, per spawn.
+  let model: string | null = null;
+  if (body.model != null && body.model !== "") {
+    if (typeof body.model !== "string") return sendJson(res, 400, { error: "model must be a string" });
+    model = body.model;
+  }
   // `thread` is the canonical spawn-into scope since §8 step 2; `channel` stays a working alias so live
   // agents and old recipes don't break mid-transition.
   const scope = typeof body.thread === "string" && body.thread ? body.thread : body.channel;
@@ -233,7 +240,7 @@ async function handleSessionSpawn(
   }
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd);
+    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }

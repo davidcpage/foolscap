@@ -107,13 +107,13 @@ export function readRole(repoPath, roleId) {
  * a bundled default is allowed — that is exactly how a board OVERRIDES a shipped role. Returns the created
  * { roleId, name, colour, charter }.
  */
-export function createRole(repoPath, { name, charter, colour, loops } = {}) {
+export function createRole(repoPath, { name, charter, colour, loops, model } = {}) {
   if (!isValidRoleName(name)) throw new Error("invalid role name (use letters, digits, hyphens)");
   const roleId = roleIdFor(name);
   if (fs.existsSync(rolePath(repoPath, roleId))) throw new Error(`role "${roleId}" already exists`);
   fs.mkdirSync(roleDir(repoPath, roleId), { recursive: true });
-  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter, loops }));
-  return { roleId, name, colour: colour ?? null, loops: !!loops, charter: (charter ?? "").trim() };
+  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter, loops, model }));
+  return { roleId, name, colour: colour ?? null, loops: !!loops, model: model ?? null, charter: (charter ?? "").trim() };
 }
 
 /**

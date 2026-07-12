@@ -18,6 +18,7 @@ test("render → parse round-trips name/colour/charter", () => {
     name: "Oracle",
     colour: "purple",
     loops: false,
+    model: null,
     charter: "Answer in file:line.",
   });
 });
@@ -41,6 +42,16 @@ test("loops round-trips: rendered only when true, parsed to a boolean", () => {
   assert.equal(parseRoleFile("---\nname: X\nloops: false\n---\nc", "x").loops, false);
 });
 
+test("model round-trips: rendered only when set, parsed to null when absent", () => {
+  const pinned = renderRoleFile({ name: "Coordinator", loops: true, model: "claude-fable-5", charter: "c" });
+  assert.match(pinned, /^model: claude-fable-5$/m);
+  assert.equal(parseRoleFile(pinned, "coordinator").model, "claude-fable-5");
+  // omitted unless set; absent frontmatter ⇒ null (the spawner's default model applies)
+  const plain = renderRoleFile({ name: "Plain", charter: "hi" });
+  assert.doesNotMatch(plain, /model:/);
+  assert.equal(parseRoleFile(plain, "plain").model, null);
+});
+
 test("parseRoleFile falls back to roleId when the frontmatter omits name", () => {
   const text = "---\ncolour: blue\n---\n\nbody";
   assert.deepEqual(parseRoleFile(text, "fallback"), {
@@ -48,6 +59,7 @@ test("parseRoleFile falls back to roleId when the frontmatter omits name", () =>
     name: "fallback",
     colour: "blue",
     loops: false,
+    model: null,
     charter: "body",
   });
 });

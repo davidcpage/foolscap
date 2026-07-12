@@ -38,7 +38,7 @@ function tmpBundled(roles) {
 test("createRole writes role.md under .canvas/roles/ and round-trips through readRole", () => {
   const repo = tmpRepo();
   const made = createRole(repo, { name: "Oracle", colour: "purple", charter: "Answer in file:line." });
-  assert.deepEqual(made, { roleId: "oracle", name: "Oracle", colour: "purple", loops: false, charter: "Answer in file:line." });
+  assert.deepEqual(made, { roleId: "oracle", name: "Oracle", colour: "purple", loops: false, model: null, charter: "Answer in file:line." });
   // It lives where the gitignored, shadow-versioned home expects it.
   const f = path.join(canvasRolesDir(repo), "oracle", "role.md");
   assert.ok(fs.existsSync(f), "role.md is under .canvas/roles/<roleId>/");
@@ -52,6 +52,7 @@ test("createRole writes role.md under .canvas/roles/ and round-trips through rea
     name: "Oracle",
     colour: "purple",
     loops: false,
+    model: null,
     charter: "Answer in file:line.",
   });
 });

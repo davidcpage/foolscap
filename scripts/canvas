@@ -27,7 +27,7 @@ usage() {
   cat <<USAGE
 canvas — session/coordination verbs over the agent bus
   scripts/canvas spawn [--thread THREAD] [--role ROLE] [--card] [--prompt TEXT] [--board ID]
-                       [--worktree [--base REF] [--worktree-key KEY]]
+                       [--worktree [--base REF] [--worktree-key KEY]] [--model MODEL]
         spawn a new session; prints {"id":...,"carded":bool}. With --thread the SERVER cards it, joins
         it, positions the card next to the thread, and onboards it to AWAIT its task on the thread —
         then POST the task as a thread message tagging it (do NOT put the task in --prompt; --prompt is
@@ -38,6 +38,8 @@ canvas — session/coordination verbs over the agent bus
         (the durable work-item key). --base sets the branch base (default HEAD). The worktree is keyed by
         WORK ITEM (role seat if --role, else the thread, or --worktree-key), so a RESPAWN re-attaches to
         the same tree/branch — never a fresh cut. Prints a "worktree":{path,branch,reused,linked} block.
+        --model picks the Claude model the session runs (explicit > role model: frontmatter > the
+        server default, claude-opus-4-8).
   scripts/canvas worktree list <THREAD>                list a thread's work-item worktrees (key→path/branch)
   scripts/canvas worktree rm <THREAD> [--key KEY | --role ROLE] [--force] [--from ID]
         tear down a work-item's worktree on COMPLETION (not session exit). Guarded: skips+warns if the tree
@@ -597,7 +599,7 @@ PY
 cmd="${1:-}"; shift || true
 case "$cmd" in
   spawn)
-    prompt=""; thread=""; role=""; card=""; worktree=""; base=""; wtkey=""
+    prompt=""; thread=""; role=""; card=""; worktree=""; base=""; wtkey=""; model=""
     while [ $# -gt 0 ]; do
       case "$1" in
         --prompt)       prompt="${2:-}"; shift 2 ;;
@@ -608,13 +610,14 @@ case "$cmd" in
         --worktree)     worktree="1"; shift ;;
         --base)         base="${2:-}"; shift 2 ;;
         --worktree-key) wtkey="${2:-}"; shift 2 ;;
+        --model)        model="${2:-}"; shift 2 ;;
         --board)        BOARD="${2:-}"; shift 2 ;;
         *) echo "spawn: unexpected arg '$1'" >&2; exit 2 ;;
       esac
     done
-    body=$(python3 - "$prompt" "$thread" "$role" "$card" "$worktree" "$base" "$wtkey" <<'PY'
+    body=$(python3 - "$prompt" "$thread" "$role" "$card" "$worktree" "$base" "$wtkey" "$model" <<'PY'
 import json, sys
-prompt, thread, role, card, worktree, base, wtkey = sys.argv[1:8]
+prompt, thread, role, card, worktree, base, wtkey, model = sys.argv[1:9]
 o = {}
 if prompt:   o["prompt"] = prompt
 if thread:   o["thread"] = thread
@@ -623,6 +626,7 @@ if card:     o["card"] = True
 if worktree: o["worktree"] = True
 if base:     o["base"] = base
 if wtkey:    o["worktreeKey"] = wtkey
+if model:    o["model"] = model
 print(json.dumps(o))
 PY
 )

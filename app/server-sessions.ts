@@ -75,6 +75,50 @@ const BASELINE_ALLOWED_TOOLS = [
 // the top of this file — the spawn path below reads it to size MCP_TOOL_TIMEOUT a minute above the hold.
 const PERMISSION_TOOL = "mcp__canvas__permission_prompt"; // mcp__<server>__<tool> under --mcp-config's "canvas"
 
+// Which Claude model a spawned session runs. Without an explicit `--model`, `claude -p` inherits
+// ~/.claude/settings.json — on this machine that's Fable 5, so every implementation worker silently
+// burned Fable quota (canvas-workers-fable-fallback-opus memory). Spawns therefore ALWAYS pass --model,
+// resolved explicit spawn param > role `model:` frontmatter > this default: plain workers land on
+// Opus 4.8, the Coordinator/pm role pins Fable via its frontmatter, and any spawn can override per-call.
+export const DEFAULT_SESSION_MODEL = "claude-opus-4-8";
+
+/** The model a spawn runs: explicit spawn param > role `model:` frontmatter > DEFAULT_SESSION_MODEL. */
+export function resolveSessionModel(
+  explicit?: string | null,
+  role?: { model?: string | null } | null,
+): string {
+  return explicit || role?.model || DEFAULT_SESSION_MODEL;
+}
+
+// The full `claude -p` argv for a session spawn — extracted PURE so the spawn-arg contract (which model a
+// child runs, which flags always ride) is testable without launching a process (session-spawn-model.test.mjs).
+export function buildSessionArgs(opts: {
+  id: string;
+  resume: boolean;
+  model: string;
+  mcpConfig: unknown;
+  settingsOverride: unknown;
+  appendPrompt: string;
+}): string[] {
+  return [
+    "-p",
+    opts.resume ? "--resume" : "--session-id",
+    opts.id,
+    "--input-format", "stream-json",
+    "--output-format", "stream-json",
+    "--include-partial-messages",
+    "--verbose",
+    "--model", opts.model, // always explicit — never inherit ~/.claude/settings.json (see DEFAULT_SESSION_MODEL)
+    "--permission-mode", SESSION_PERMISSION_MODE,
+    "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
+    "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
+    "--mcp-config", JSON.stringify(opts.mcpConfig),
+    "--settings", JSON.stringify(opts.settingsOverride), // built-in memory → .canvas/memory (additive over project settings)
+    "--permission-prompt-tool", PERMISSION_TOOL, // gate hits → the card's allow/deny, not silent denial
+    "--append-system-prompt", opts.appendPrompt,
+  ];
+}
+
 // AskUserQuestion is auto-cancelled in `-p` headless mode (VERIFIED: the CLI synthesises an
 // is_error="Answer questions?" tool_result and continues — it never waits for an answer on stdin, so
 // there's no tool_result loop to hook). So we DISALLOW it (below) and steer the session to a convention
@@ -444,6 +488,7 @@ export function ensureLiveSession(
   roleId: string | null = null,
   threadId: string | null = null,
   cwd: string = repoPath, // the process working dir — a worktree checkout for `spawn --worktree`, else the board root
+  model: string | null = null, // explicit per-spawn model; null → role `model:` frontmatter → DEFAULT_SESSION_MODEL
 ): LiveSession {
   const { liveSessions, fsState, boardIdentity, publishSession } = getServerContext();
   const existing = liveSessions.get(id);
@@ -509,22 +554,9 @@ export function ensureLiveSession(
   // repoPath, so every mounted board gets its own store. (This repo's INTERACTIVE sessions are pointed at
   // the same dir via `.claude/settings.local.json`; --settings here covers spawned workers on any board.)
   const settingsOverride = { autoMemoryDirectory: path.join(repoPath, ".canvas", "memory") };
-  const args = [
-    "-p",
-    resume ? "--resume" : "--session-id",
-    id,
-    "--input-format", "stream-json",
-    "--output-format", "stream-json",
-    "--include-partial-messages",
-    "--verbose",
-    "--permission-mode", SESSION_PERMISSION_MODE,
-    "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
-    "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
-    "--mcp-config", JSON.stringify(mcpConfig),
-    "--settings", JSON.stringify(settingsOverride), // built-in memory → .canvas/memory (additive over project settings)
-    "--permission-prompt-tool", PERMISSION_TOOL, // gate hits → the card's allow/deny, not silent denial
-    "--append-system-prompt", appendPrompt,
-  ];
+  const args = buildSessionArgs({
+    id, resume, model: resolveSessionModel(model, role), mcpConfig, settingsOverride, appendPrompt,
+  });
   // Does this session's role run an operating loop? Then its idle sessions are woken on the server heartbeat
   // (loopTick), and read calm "scheduled" rather than amber "waiting" between ticks. First heartbeat is one
   // BASE interval out — the spawn's own first-turn prompt is the session's opening tick.
