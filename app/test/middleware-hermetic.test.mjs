@@ -13,6 +13,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import { Readable } from "node:stream";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -37,6 +38,7 @@ const orch = await import("../server-orchestration.ts");
 const sess = await import("../server-sessions.ts");
 const delivery = await import("../server-delivery.ts");
 const ledger = await import("../thread-ledger.js");
+const filesRoute = await import("../routes/files.ts");
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -415,4 +417,112 @@ test("captureReopenSets is idempotent — an unchanged open-set writes nothing (
   snap.captureReopenSets("b1", records); // same open-set again
   const marker2 = fs.readFileSync(path.join(ledger.canvasThreadsDir(repo), encodeURIComponent("node:thread:t1") + ".meta.json"), "utf8");
   assert.equal(marker1, marker2, "unchanged reopen-set → marker byte-identical");
+});
+
+// ── Group F: BUG-2 — the .ipynb read-edit-write cycle can no longer erase outputs ───────────────────────
+// The /api/file file routes driven directly (no live server) against a scratch repo. Proves the whole
+// clobber chain is closed: an agent GET returns the lossy projection with a POISONED version, and a POST of
+// that projection is REFUSED (422) with the on-disk outputs intact — while a legitimate small edit still
+// round-trips and a full-fidelity notebook over 128 KiB no longer 413s. (docs/architecture-review BUG-2.)
+
+// The one route we exercise: GET/POST /api/file. `board` only needs repoPath (reanchor's arg); root == repo.
+const fileRoute = filesRoute.fileRootRoutes.find((r) => r.match("/api/file"));
+
+// Drive the route with a minimal req/res. GET is synchronous (sendJson); POST awaits readBody, so `res.done`
+// resolves when the handler calls res.end. Returns { status, body } once the response is written.
+function driveFile(repo, { method, pathParam, notebook, body }) {
+  const req = Readable.from(body != null ? [Buffer.from(body, "utf8")] : []);
+  req.method = method;
+  let resolveEnd;
+  const done = new Promise((r) => (resolveEnd = r));
+  const res = {
+    statusCode: 200,
+    setHeader() {},
+    writeHead(s) { this.statusCode = s; },
+    end(chunk) { this._body = chunk; resolveEnd(); },
+  };
+  const qs = new URLSearchParams({ path: pathParam });
+  if (notebook) qs.set("notebook", notebook);
+  const url = new URL(`http://x/api/file?${qs.toString()}`);
+  fileRoute.run(req, res, url, [], "b1", { repoPath: repo }, repo);
+  return done.then(() => ({ status: res.statusCode, body: JSON.parse(res._body) }));
+}
+
+// A minimal nbformat-v4 notebook carrying a real (large) base64 image output — the value the clobber erases.
+function imageNotebookText(b64) {
+  return JSON.stringify({
+    cells: [
+      { cell_type: "code", execution_count: 1, source: ["plt.plot([1,2,3])\n"], outputs: [{ output_type: "display_data", data: { "image/png": b64, "text/plain": ["<Figure>"] }, metadata: {} }] },
+      { cell_type: "markdown", source: ["# Notes\n"] },
+    ],
+    metadata: { kernelspec: { name: "python3" } }, nbformat: 4, nbformat_minor: 5,
+  });
+}
+
+test("BUG-2: an agent read-edit-write of an image-bearing .ipynb can no longer erase its outputs", async () => {
+  const repo = tmpRepo();
+  const rel = "notebooks/plot.ipynb";
+  const abs = path.join(repo, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  const realB64 = "A".repeat(200_000); // a ~200 KB base64 image — the real output on disk
+  const onDisk = imageNotebookText(realB64);
+  fs.writeFileSync(abs, onDisk, "utf8");
+
+  // 1) Agent GET returns the LOSSY projection (image elided to a marker) with a POISONED version.
+  const read = await driveFile(repo, { method: "GET", pathParam: rel });
+  assert.equal(read.status, 200);
+  assert.equal(read.body.trimmed, true, "the image output was elided on the agent read");
+  assert.equal(read.body.version, null, "a trimmed read stamps a null version — not a valid CAS base");
+  assert.ok(!read.body.content.includes(realB64), "the projection does not carry the real base64");
+
+  // 2) POST that projection back — the naive read-edit-write. It MUST be refused, outputs untouched on disk.
+  const clobber = await driveFile(repo, { method: "POST", pathParam: rel, body: JSON.stringify({ content: read.body.content }) });
+  assert.equal(clobber.status, 422, "a write carrying elision markers is rejected");
+  assert.match(clobber.body.error, /elision markers/);
+  assert.equal(fs.readFileSync(abs, "utf8"), onDisk, "the real outputs are still on disk, byte-identical");
+
+  // 3) Even a CAS-honest writer that echoes the poisoned version is refused (baseVersion:null vs real hash).
+  const casRefused = await driveFile(repo, { method: "POST", pathParam: rel, body: JSON.stringify({ content: read.body.content, baseVersion: read.body.version }) });
+  assert.equal(casRefused.status, 422, "marker guard fires before the CAS; either way the write is refused");
+  assert.equal(fs.readFileSync(abs, "utf8"), onDisk, "still intact");
+});
+
+test("BUG-2: a legitimate small edit of a clean notebook still round-trips (200)", async () => {
+  const repo = tmpRepo();
+  const rel = "notebooks/clean.ipynb";
+  const abs = path.join(repo, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  // A small, output-light notebook — the agent read is NOT trimmed, so it carries a real version.
+  const original = JSON.stringify({ cells: [{ cell_type: "code", source: ["1+1\n"], outputs: [{ output_type: "stream", name: "stdout", text: ["2\n"] }], execution_count: 1 }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+  fs.writeFileSync(abs, original, "utf8");
+
+  const read = await driveFile(repo, { method: "GET", pathParam: rel });
+  assert.equal(read.body.trimmed, false, "nothing to elide → not trimmed");
+  assert.ok(read.body.version, "an untrimmed read carries a real version (a safe CAS base)");
+
+  // Edit a cell source, keep the real (marker-free) outputs, write back with the read version.
+  const edited = JSON.parse(read.body.content);
+  edited.cells[0].source = ["2+2\n"];
+  const write = await driveFile(repo, { method: "POST", pathParam: rel, body: JSON.stringify({ content: JSON.stringify(edited), baseVersion: read.body.version }) });
+  assert.equal(write.status, 200, "a clean edit passes the marker guard AND the CAS");
+  assert.ok(write.body.ok);
+  assert.match(fs.readFileSync(abs, "utf8"), /2\+2/, "the edit landed on disk");
+});
+
+test("BUG-2: a full-fidelity .ipynb write over 128 KiB no longer 413s (write cap keyed on extension)", async () => {
+  const repo = tmpRepo();
+  const rel = "notebooks/big.ipynb";
+  const abs = path.join(repo, rel);
+  fs.mkdirSync(path.dirname(abs), { recursive: true });
+  // A marker-free notebook well over the old MAX_BYTES (128 KiB) — a real image-bearing write-back.
+  const big = imageNotebookText("A".repeat(400_000)); // ~400 KB, no elision markers
+  assert.ok(Buffer.byteLength(big, "utf8") > 128 * 1024, "fixture exceeds the old 128 KiB text cap");
+  const write = await driveFile(repo, { method: "POST", pathParam: rel, body: JSON.stringify({ content: big }) });
+  assert.equal(write.status, 200, "a >128 KiB .ipynb write is accepted against the notebook ceiling");
+  assert.equal(fs.readFileSync(abs, "utf8"), big, "the full notebook is on disk");
+
+  // A same-size NON-notebook text write is still bounded at 128 KiB (the cap is keyed on extension).
+  const bigTxt = "x".repeat(200_000);
+  const txt = await driveFile(repo, { method: "POST", pathParam: "notes/big.txt", body: JSON.stringify({ content: bigTxt }) });
+  assert.equal(txt.status, 413, "a >128 KiB .txt write is still too large");
 });

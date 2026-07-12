@@ -46,6 +46,15 @@ function clampText(s, maxChars, label) {
   return s.slice(0, maxChars) + `\n<… ${label} truncated: ${s.length} chars total, ${maxChars} shown>`;
 }
 
+// The two marker SHAPES the AGENT path stamps into an output value — kept here beside their producers so the
+// detector (`notebookHasElisionMarkers`, below) can never drift from what `elideOutputForAgent` writes. The
+// image marker REPLACES the whole value (elideOutputForAgent → `<mime output elided: N bytes>`); the text
+// marker is a SUFFIX appended by clampText. Both are the tell that a value is a lossy read projection, never
+// the file's real output — writing one back would erase the real output (BUG-2), so a write carrying either
+// must be refused. Anchored/precise so an incidental cell-source string can't false-trip the detector.
+const ELIDED_IMAGE_MARKER = /^<image\/(?:png|jpe?g|gif|bmp|webp|tiff|x-icon) output elided: \d+ bytes>$/i;
+const CLAMPED_TEXT_MARKER = /\n<… .+? truncated: \d+ chars total, \d+ shown>$/;
+
 // AGENT path — elide one output in place. Base64 raster images become a byte-count marker; oversized
 // text/stream/traceback outputs are clamped. Returns true if anything was trimmed. Cell SOURCE is never
 // touched (that's what an agent is reading for).
@@ -175,4 +184,41 @@ export function transformNotebook(text, opts = {}) {
     }
   }
   return { content: JSON.stringify(nb), trimmed, parsed: true };
+}
+
+// Does a value (a joined source/text/data-mime string) carry one of the agent path's elision markers?
+function valueHasElisionMarker(s) {
+  return typeof s === "string" && (ELIDED_IMAGE_MARKER.test(s) || CLAMPED_TEXT_MARKER.test(s));
+}
+
+// True if any OUTPUT in this notebook text carries an agent-projection elision marker — i.e. the text is (or
+// contains) the lossy agent read projection, not a full-fidelity notebook. The BUG-2 guard: /api/file must
+// REFUSE to write such a body, because persisting it replaces every real output with a marker (data loss on
+// a well-behaved read-edit-write). We inspect only OUTPUT fields (data mime values, stream text, error
+// traceback) — the exact places `elideOutputForAgent` stamps markers — so a marker string that merely
+// appears in cell SOURCE (a test, a doc snippet) never false-trips this. Malformed / non-notebook JSON → false
+// (nothing to protect; it isn't our projection). Mirrors elideOutputForAgent's traversal on purpose.
+export function notebookHasElisionMarkers(text) {
+  let nb;
+  try {
+    nb = JSON.parse(text);
+  } catch {
+    return false;
+  }
+  if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) return false;
+  for (const cell of nb.cells) {
+    if (!cell || !Array.isArray(cell.outputs)) continue;
+    for (const out of cell.outputs) {
+      if (!out || typeof out !== "object") continue;
+      if (out.data && typeof out.data === "object") {
+        for (const mime of Object.keys(out.data)) {
+          if (valueHasElisionMarker(joinMaybe(out.data[mime]))) return true;
+        }
+      }
+      if (out.output_type === "stream" && valueHasElisionMarker(joinMaybe(out.text))) return true;
+      if (out.output_type === "error" && Array.isArray(out.traceback) && valueHasElisionMarker(out.traceback.join("\n")))
+        return true;
+    }
+  }
+  return false;
 }

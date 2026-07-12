@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { transformNotebook } from "../ipynb-codec.js";
+import { transformNotebook, notebookHasElisionMarkers } from "../ipynb-codec.js";
 
 // The notebook-aware /api/file codec (docs/ipynb-card.md; brief: "make .ipynb handling notebook-aware for
 // size"). Two shapes of the same notebook: the RENDER path (the card — keep images, drop only whole outputs
@@ -203,4 +203,47 @@ test("full: malformed / non-notebook JSON passes through unchanged (parsed=false
   const a = transformNotebook(clipped, { mode: "full" });
   assert.equal(a.parsed, false);
   assert.equal(a.content, clipped);
+});
+
+// ── notebookHasElisionMarkers: the BUG-2 write guard's detector ────────────────────────────────────────
+// The lossy AGENT projection must never round-trip back to disk (writing markers erases real outputs). The
+// detector recognises EXACTLY what the agent path stamps — and nothing else, so a clean notebook (or a
+// marker string sitting in cell SOURCE) is never falsely refused.
+
+test("markers: the AGENT projection of an image-bearing notebook is detected", () => {
+  const agent = transformNotebook(JSON.stringify(nbWithImage(bigB64)), { mode: "agent" }).content;
+  assert.equal(notebookHasElisionMarkers(agent), true, "the image-elision marker is caught");
+});
+
+test("markers: a clamped-text agent projection is detected", () => {
+  const nb = {
+    cells: [{ cell_type: "code", source: ["print('x')\n"], outputs: [{ output_type: "stream", name: "stdout", text: ["y".repeat(10000)] }] }],
+    metadata: {}, nbformat: 4, nbformat_minor: 5,
+  };
+  const agent = transformNotebook(JSON.stringify(nb), { mode: "agent" });
+  assert.equal(agent.trimmed, true, "the long stream output was clamped");
+  assert.equal(notebookHasElisionMarkers(agent.content), true, "the text-clamp marker is caught");
+});
+
+test("markers: a clean full-fidelity notebook is NOT flagged (a legitimate edit round-trips)", () => {
+  // The FULL projection keeps the real base64 image — no markers — so it must pass the write guard.
+  const full = transformNotebook(JSON.stringify(nbWithImage(bigB64)), { mode: "full" }).content;
+  assert.equal(notebookHasElisionMarkers(full), false);
+  // A small, output-free notebook is likewise clean.
+  const small = JSON.stringify({ cells: [{ cell_type: "code", source: ["1+1\n"], outputs: [] }], metadata: {}, nbformat: 4, nbformat_minor: 5 });
+  assert.equal(notebookHasElisionMarkers(small), false);
+});
+
+test("markers: a marker STRING in cell SOURCE (not an output) does not false-trip", () => {
+  const nb = {
+    cells: [{ cell_type: "code", source: ["print('<image/png output elided: 123 bytes>')\n"], outputs: [] }],
+    metadata: {}, nbformat: 4, nbformat_minor: 5,
+  };
+  assert.equal(notebookHasElisionMarkers(JSON.stringify(nb)), false, "only OUTPUT fields are inspected");
+});
+
+test("markers: malformed / non-notebook JSON is not flagged (nothing to protect)", () => {
+  assert.equal(notebookHasElisionMarkers('{"cells":[{"outputs":[{"data":{"image/png":"AAA'), false);
+  assert.equal(notebookHasElisionMarkers("not json at all"), false);
+  assert.equal(notebookHasElisionMarkers(JSON.stringify({ not: "a notebook" })), false);
 });

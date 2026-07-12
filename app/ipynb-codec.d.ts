@@ -29,3 +29,12 @@ export interface TransformResult {
 
 /** Transform a `.ipynb`'s raw JSON text for the card (render) or an agent read (agent, default). */
 export function transformNotebook(text: string, opts?: TransformOpts): TransformResult;
+
+/**
+ * True if any OUTPUT in this notebook text carries an agent-projection elision marker (base64-image byte
+ * marker or a text-clamp suffix) — i.e. the text is the lossy agent read projection, not a full notebook.
+ * The BUG-2 write guard: refuse a `.ipynb` write body for which this is true, else the real outputs are
+ * erased. Malformed / non-notebook JSON → false. Inspects only output fields, so a marker in cell source
+ * never false-trips.
+ */
+export function notebookHasElisionMarkers(text: string): boolean;
