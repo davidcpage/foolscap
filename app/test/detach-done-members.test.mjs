@@ -1,12 +1,16 @@
-// P5 — the done-member DETACH sweep, proven end-to-end against the REAL ledger code. The ctx-bound tick
-// (server-orchestration.detachDoneMembersTick) is a thin board→thread iteration around exactly the
-// per-member core this file replays: readCanvasSession → shouldDetachDoneMember → removeThreadMember +
-// releaseSeat. So these tests exercise the authoritative, tab-independent half (durable membership + seat
-// drop) — the part that clears the pill — plus the reopen-set filter that keeps a detach from being undone
-// on thread reopen. (The best-effort client card-removal is a browser-only reactor; see the P5 report.)
+// P5 — the done-member DETACH sweep. Two layers of coverage:
+//   (1) sweepThread — the per-member core (readCanvasSession → shouldDetachDoneMember → drop-membership +
+//       releaseSeat) replayed over the REAL ledger, covering the seat drop and the reopen-set filter.
+//   (2) the REAL ctx-bound tick (server-orchestration.detachDoneMembersTick) driven against a REAL fsState +
+//       a minimal fake ServerContext (the middleware-hermetic pattern). This is the half the hand-replay
+//       CANNOT see: the tick must clear BOTH the durable-member MARKER and the in-memory `fsState.durableMembers`
+//       MIRROR — a marker-only drop (the BUG-1 regression: it called removeThreadMember, not forgetDurableMember)
+//       left the mirror stale until restart, so pills never cleared and stale sids kept flowing into wake fan-out.
+// (The best-effort client card-removal is a browser-only reactor; see the P5 report.)
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { registerHooks } from "node:module";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +27,26 @@ import {
 } from "../thread-ledger.js";
 import { recordSessionEnd, readCanvasSession } from "../session-ledger.js";
 import { shouldDetachDoneMember } from "../auto-wake.js";
+
+// The split server modules import each other by the TS/Vite `.js`-specifier convention (`./server-context.js`
+// resolving to server-context.ts). `node --test` resolves raw, so rewrite a relative `.js` import to its `.ts`
+// sibling ONLY when the `.js` doesn't exist (hand-authored `.js` modules stay unchanged) — mirrors Vite/tsc.
+// Must be registered before the dynamic imports below. (Same hook as middleware-hermetic.test.mjs.)
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if ((specifier.startsWith("./") || specifier.startsWith("../")) && specifier.endsWith(".js")) {
+      try {
+        return nextResolve(specifier, context);
+      } catch {
+        return nextResolve(specifier.slice(0, -3) + ".ts", context);
+      }
+    }
+    return nextResolve(specifier, context);
+  },
+});
+const orch = await import("../server-orchestration.ts");
+const snap = await import("../server-snapshot.ts");
+const serverCtx = await import("../server-context.ts");
 
 const DELAY = 2 * 60_000;
 const tmpRepo = () => fs.mkdtempSync(path.join(os.tmpdir(), "detach-done-"));
@@ -114,4 +138,71 @@ test("reopen-set filter: a detached member frozen in the reopen-set is not resto
   for (const s of Object.values(meta?.seats ?? {})) if (s?.sid) members.add(s.sid);
   const restored = readReopenSet(meta).filter((sid) => members.has(sid));
   assert.deepEqual(restored, ["still-member"], "only the still-durable member is restored; the detached one is dropped");
+});
+
+// ── the REAL ctx-bound tick against a REAL fsState (the half sweepThread cannot see: the in-memory mirror) ──
+// Wire a minimal fake ServerContext whose fsState carries a real `durableMembers` map and the REAL
+// forgetDurableMember/recordDurableMember (which both read that fsState via getServerContext). Then drive the
+// actual orch.detachDoneMembersTick and assert BOTH tiers — marker AND in-memory mirror — clear together.
+function wireDetachContext(repo) {
+  const fsState = { durableMembers: new Map() };
+  const published = [];
+  const fake = {
+    boards: new Map([["b1", { repoPath: repo }]]),
+    liveSessions: new Map(),
+    fsState,
+    threadLog: () => [],
+    publishThreadFeed: (boardId, threadId) => published.push({ boardId, threadId }),
+    forgetDurableMember: snap.forgetDurableMember,
+  };
+  serverCtx.setServerContext(fake);
+  return { fsState, published, liveSessions: fake.liveSessions };
+}
+
+test("real tick: a done+aged member is dropped from BOTH the marker and the in-memory durableMembers mirror", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:real1";
+  const { fsState, published } = wireDetachContext(repo);
+  // recordDurableMember writes both tiers — exactly the member:open sighting path the server uses.
+  snap.recordDurableMember(repo, T, "done-sid", 1);
+  snap.recordDurableMember(repo, T, "live-sid", 1);
+  recordSessionEnd(repo, "done-sid", "done", Date.now() - DELAY - 10_000); // aged past the grace window
+  // Sanity: both tiers currently hold both sids.
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)).sort(), ["done-sid", "live-sid"]);
+  assert.deepEqual([...fsState.durableMembers.get(T)].sort(), ["done-sid", "live-sid"]);
+
+  orch.detachDoneMembersTick();
+
+  // MARKER: the done member is gone, the (never-ended, so not-live-but-also-not-done) live-sid stays.
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)), ["live-sid"], "marker: done member dropped");
+  // MIRROR (the BUG-1 regression assertion): removeThreadMember-only left "done-sid" here until restart.
+  assert.deepEqual([...(fsState.durableMembers.get(T) ?? [])], ["live-sid"], "in-memory mirror: done member dropped too");
+  assert.ok(published.some((p) => p.threadId === T), "the pill-clearing thread-feed republish fired");
+});
+
+test("real tick: a live session with a stale done marker is spared in BOTH tiers", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:real2";
+  const { fsState, liveSessions } = wireDetachContext(repo);
+  snap.recordDurableMember(repo, T, "revived-sid", 1);
+  recordSessionEnd(repo, "revived-sid", "done", Date.now() - DELAY - 10_000); // old done marker...
+  liveSessions.set("revived-sid", { status: "running" }); // ...but the process is live again
+
+  orch.detachDoneMembersTick();
+
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)), ["revived-sid"], "marker: live member spared");
+  assert.deepEqual([...fsState.durableMembers.get(T)], ["revived-sid"], "mirror: live member spared");
+});
+
+test("real tick: a just-done member inside the grace window is left in BOTH tiers", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:real3";
+  const { fsState } = wireDetachContext(repo);
+  snap.recordDurableMember(repo, T, "fresh-done", 1);
+  recordSessionEnd(repo, "fresh-done", "done", Date.now() - 1); // ended a moment ago
+
+  orch.detachDoneMembersTick();
+
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)), ["fresh-done"], "marker: fresh-done retained");
+  assert.deepEqual([...fsState.durableMembers.get(T)], ["fresh-done"], "mirror: fresh-done retained");
 });

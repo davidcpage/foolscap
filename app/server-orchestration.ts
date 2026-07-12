@@ -8,7 +8,7 @@ import { getServerContext, getWsClients } from "./server-context.js";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
-import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, removeThreadMember, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
+import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval, heartbeatSweepSignature } from "./coordinator-heartbeat.js";
@@ -295,7 +295,7 @@ function loopTick(): void {
 
 // P5 — the done-member DETACH sweep. Board-wide over every thread's DURABLE member roster: a member whose
 // session ended cleanly (endReason:"done") more than DETACH_DELAY_MS ago and is not currently live gets its
-// membership dropped (removeThreadMember) and any seat released (releaseSeat). Both are marker writes on the
+// membership dropped (forgetDurableMember — marker AND the in-memory durableMembers mirror) and any seat released (releaseSeat). Both are marker writes on the
 // thread ledger — TAB-INDEPENDENT and AUTHORITATIVE: the write fires the threads:<board> feed, the pill
 // (now durable-membership-driven) clears with or without a live tab. The on-canvas session card is NOT
 // removed here — that's a canvas mutation that 503s without a tab (canvas-mutations-need-live-tab); a live
@@ -305,8 +305,8 @@ function loopTick(): void {
 // thread it belonged to (finished globally), and the one-time cleanup of the stale done-members already on a
 // thread falls out for free on the first tick — no separate codepath. Reads markers only for durable
 // members (a handful), so it's cheap; runs on loopTick beside the reaper.
-function detachDoneMembersTick(): void {
-  const { boards, liveSessions, threadLog, publishThreadFeed } = getServerContext();
+export function detachDoneMembersTick(): void {
+  const { boards, liveSessions, threadLog, publishThreadFeed, forgetDurableMember } = getServerContext();
   const now = Date.now();
   const isLive = (sid: string) => {
     const s = liveSessions.get(sid);
@@ -326,7 +326,7 @@ function detachDoneMembersTick(): void {
       for (const sid of threadMembersFromMeta(meta)) {
         const marker = readCanvasSession(board.repoPath, sid);
         if (!shouldDetachDoneMember(sid, marker, now, DETACH_DELAY_MS, isLive)) continue;
-        removeThreadMember(board.repoPath, t.threadId, sid); // authoritative: drops durable membership → pill clears
+        forgetDurableMember(board.repoPath, t.threadId, sid); // authoritative: drops durable membership (marker + the in-memory fsState.durableMembers mirror) → pill clears; the marker-only removeThreadMember left the mirror stale until restart (BUG-1)
         releaseSeat(board.repoPath, t.threadId, sid); // no-op unless this sid still holds a seat here
         detached++;
         dropped = true;
