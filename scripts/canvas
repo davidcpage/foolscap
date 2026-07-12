@@ -114,6 +114,13 @@ canvas — session/coordination verbs over the agent bus
         you find any fact NOT on it. Resolves the store from the canonical checkout, so it works from a worktree.
   scripts/canvas memory doctor                          hygiene check: flags memory files missing a description:
         frontmatter or that look non-atomic (large / many headings). Advisory; changes nothing.
+
+  scripts/canvas usage [--thread ID] [--limit N] [--json]   roll up the Claude transcript usage records for
+        this board's canvas-owned sessions (token-efficiency review §6.6). Per session: cache-write /
+        cache-read / output tokens + turn count + dominant model; aggregated per thread (via the .canvas
+        thread rosters + marker read cursors) and corpus-wide. Read-only — exists so token regressions
+        (a broken prefix cache, a chattier sweep) are visible. --limit caps the per-session table
+        (default 30, 0 = all); --thread narrows to one thread's sessions.
 env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
 USAGE
 }
@@ -168,6 +175,19 @@ memory_dir() {
     if [ -d "$root/.canvas/memory" ]; then echo "$root/.canvas/memory"; return; fi
   fi
   echo "$REPO_ROOT/.canvas/memory" # default (may not exist; the helper reports it)
+}
+
+# Resolve the BOARD ROOT (the checkout whose .canvas/ holds the session/thread markers) — same worktree
+# fallback as memory_dir: an isolated worktree has no .canvas of its own, so climb to the canonical checkout.
+canvas_root() {
+  if [ -d "$REPO_ROOT/.canvas/sessions" ]; then echo "$REPO_ROOT"; return; fi
+  local gcd root
+  gcd="$(git -C "$REPO_ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  if [ -n "$gcd" ]; then
+    root="$(dirname "$gcd")" # <root>/.git → <root>
+    if [ -d "$root/.canvas/sessions" ]; then echo "$root"; return; fi
+  fi
+  echo "$REPO_ROOT" # default (an empty board — the roll-up reports an empty corpus)
 }
 
 # ── doc-annotation verbs (docs/doc-annotations.md) ──────────────────────────────────────────────────
@@ -777,6 +797,9 @@ PY
       ""|-h|--help) echo "usage: canvas memory search <query> [--limit N] [--json] [--doctor] | memory doctor" >&2; exit 2 ;;
       *) echo "memory: unknown subcommand '$sub' (search|doctor)" >&2; exit 2 ;;
     esac ;;
+  usage)
+    # Token roll-up over the transcript usage records (§6.6) — read-only, node-only (no server needed).
+    node "$REPO_ROOT/app/usage-rollup.js" --repo "$(canvas_root)" "$@" ;;
   anno)
     anno "$@" ;;
   job)
