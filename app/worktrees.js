@@ -148,7 +148,7 @@ function worktreeExists(repoPath, wtPath) {
   const want = realpath(wtPath);
   return parseWorktreePorcelain(out).some((w) => realpath(w.path) === want);
 }
-function realpath(p) {
+export function realpath(p) {
   try {
     return fs.realpathSync(p);
   } catch {
@@ -299,9 +299,20 @@ function isUnmerged(repoPath, branch) {
  * unmerged, it SKIPS and warns (returns removed:false with a reason) rather than destroying unreviewed work
  * — unless `force`. On success, removes the worktree, deletes the (now-merged) branch, and drops the record.
  *
- * Returns { removed, reason?, dirty?, unmerged?, path?, branch? }.
+ * OCCUPANCY GUARD (BUG-8): a worktree teardown MUST NOT `git worktree remove` a tree that a LIVE session is
+ * currently running in (its process cwd). Deleting the dir out from under the process breaks every
+ * subsequent tool/fs/git op (a spawn into the removed cwd fails ENOENT), the process then exits code=1, and
+ * session-host classifies that self-death as a FALSE red "crashed" band (confirmed: worker 088ebe34 crashed
+ * <1s after its own merge-on-green tore down its cwd). Pass `isOccupied` — a `(wtPath) => sid | null` the
+ * caller builds from the live-session registry (it returns the OCCUPANT's sid, or null when free) — and
+ * removal is DEFERRED (not abandoned) while a live session occupies the tree: the record is stamped
+ * `pendingReap` so the board-wide sweep (reapPendingWorktreesTick) removes the tree the moment the occupant
+ * exits. NOT bypassed by `force`: force discards unreviewed WORK; it must never crash a running session.
+ *
+ * Returns { removed, reason?, dirty?, unmerged?, deferred?, occupied?, occupant?, path?, branch? }. A DEFERRED
+ * teardown is honest — removed:false, deferred:true, occupant:<sid> — so a caller/log never reads it as done.
  */
-export function removeWorktree(repoPath, threadId, key, { force = false } = {}) {
+export function removeWorktree(repoPath, threadId, key, { force = false, isOccupied = null } = {}) {
   const record = listWorktrees(repoPath, threadId)[key];
   if (!record?.path) return { removed: false, reason: "no worktree recorded for this work item" };
   const { path: wtPath, branch } = record;
@@ -309,6 +320,20 @@ export function removeWorktree(repoPath, threadId, key, { force = false } = {}) 
     // Already gone on disk (removed by hand / pruned) — just drop the stale record so it doesn't linger.
     dropRecord(repoPath, threadId, key);
     return { removed: true, path: wtPath, branch, reason: "worktree already absent; cleared stale record" };
+  }
+  const occupant = isOccupied ? isOccupied(wtPath) : null;
+  if (occupant) {
+    // A live session is cwd-ed here — DEFER (stamp pendingReap), never yank it out from under the process.
+    recordWorktree(repoPath, threadId, key, { ...record, pendingReap: true });
+    return {
+      removed: false,
+      deferred: true,
+      occupied: true,
+      occupant,
+      path: wtPath,
+      branch,
+      reason: `skipped: live session ${occupant} is running in this worktree (its cwd) — removing it now would crash that session; it will be reaped automatically once the session exits (or end the session first)`,
+    };
   }
   const dirty = isDirty(wtPath);
   const unmerged = isUnmerged(repoPath, branch);
@@ -402,7 +427,7 @@ function runGate(wtPath, pkgs) {
  * Returns { merged, branch, base?, testsRun, testsPassed, removed?, teardown?, gate?, conflict?, dirty?, reason? }.
  * Never throws for an expected refusal/conflict — those come back as merged:false with a reason.
  */
-export function mergeWorktree(repoPath, threadId, key, { base = "main", noVerify = false, force = false } = {}) {
+export function mergeWorktree(repoPath, threadId, key, { base = "main", noVerify = false, force = false, isOccupied = null } = {}) {
   const record = listWorktrees(repoPath, threadId)[key];
   if (!record?.path) return { merged: false, testsRun: [], testsPassed: null, reason: "no worktree recorded for this work item" };
   const { path: wtPath, branch } = record;
@@ -439,7 +464,22 @@ export function mergeWorktree(repoPath, threadId, key, { base = "main", noVerify
     return { merged: false, branch, base, testsRun, testsPassed: noVerify ? null : true, conflict: true, output, reason: `merge into ${base} conflicted — aborted (canonical tree left clean); resolve on the branch and re-merge` };
   }
 
-  // TEARDOWN — the branch is merged now, so removeWorktree's dirty/unmerged guard passes cleanly.
-  const teardown = removeWorktree(repoPath, threadId, key, { force });
-  return { merged: true, branch, base, testsRun, testsPassed: noVerify ? null : true, removed: teardown.removed, teardown };
+  // TEARDOWN — the branch is merged now, so removeWorktree's dirty/unmerged guard passes cleanly. The
+  // OCCUPANCY guard still applies: if a live session is cwd-ed in this tree (the common merge-on-green case —
+  // the worker that merged is still alive to post its proof, or a peer merged a still-live worker's tree),
+  // teardown is DEFERRED (removed:false, occupied:true) so we never yank a live cwd → no false crashed band.
+  // The merge itself already landed; the tree is reaped by reapPendingWorktreesTick once the occupant exits.
+  const teardown = removeWorktree(repoPath, threadId, key, { force, isOccupied });
+  return {
+    merged: true,
+    branch,
+    base,
+    testsRun,
+    testsPassed: noVerify ? null : true,
+    removed: teardown.removed, // false when deferred — never reads as a completed cleanup
+    deferred: teardown.deferred === true,
+    occupied: teardown.occupied === true,
+    occupant: teardown.occupant,
+    teardown,
+  };
 }

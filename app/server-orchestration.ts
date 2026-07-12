@@ -14,6 +14,7 @@ import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, st
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval, heartbeatSweepSignature } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { readWatchers } from "./doc-watch.js";
+import { listWorktrees, removeWorktree, realpath as wtRealpath } from "./worktrees.js";
 import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./routes/card-types.js";
@@ -287,6 +288,8 @@ function loopTick(): void {
   autoWakeReapTick(); // P2/W5: wind down auto-wake workers idle past the keep-alive window (own iteration)
   detachDoneMembersTick(); // P5: drop done sessions from their threads' durable rosters (+ release seat) after
   //                          the grace window — pills clear; the client reconciler best-effort closes the card
+  reapPendingWorktreesTick(); // BUG-8: remove worktrees whose teardown was deferred (a live session was cwd-ed
+  //                              in them) once the occupant has exited — no false "crashed" band, no leak
   standingJobsTick(); // R6/W6: fire the standing jobs that have come due (own iteration over the markers) —
   //                     this is now the SOLE heartbeat driver, incl. the migrated Coordinator heartbeat
   reconcileSessionBands(); // mrcmofwf-10: republish any session whose live band has drifted from its last
@@ -337,6 +340,41 @@ export function detachDoneMembersTick(): void {
     }
   }
   if (detached) console.warn(`[detach-done] dropped ${detached} done member(s) from their thread(s) (grace ${DETACH_DELAY_MS / 1000}s elapsed)`);
+}
+
+// BUG-8 — the DEFERRED-worktree reap sweep (back half of the merge-on-green crash fix). A worktree teardown
+// (merge-on-green or explicit rm) NEVER yanks a tree a live session is cwd-ed in — that yank is what made a
+// worker exit code=1 → a false "crashed" band. Instead the teardown stamps the record `pendingReap` and
+// defers. This board-wide sweep finishes the job: for every worktree flagged pendingReap, once NO live
+// session occupies it any more, it runs the (now-safe) removal so the already-merged tree doesn't linger.
+// Cheap — reads only the worktree records on each thread marker, skips anything still occupied — and runs on
+// loopTick beside detachDoneMembersTick. The occupancy predicate mirrors the route's: a live session whose
+// process cwd realpaths to the worktree path.
+export function reapPendingWorktreesTick(): void {
+  const { boards, liveSessions } = getServerContext();
+  const occupants = new Map<string, string>(); // realpath(cwd) → occupying session sid
+  for (const s of liveSessions.values()) if (s.status !== "exited") occupants.set(wtRealpath(s.cwd), s.id);
+  const isOccupied = (wtPath: string) => occupants.get(wtRealpath(wtPath)) ?? null;
+  let reaped = 0;
+  for (const [, board] of boards) {
+    let threads: ThreadMetaMarker[];
+    try {
+      threads = listThreads(board.repoPath);
+    } catch {
+      continue;
+    }
+    for (const t of threads) {
+      const wts = listWorktrees(board.repoPath, t.threadId);
+      for (const [key, rec] of Object.entries(wts)) {
+        if (!rec?.pendingReap) continue;
+        if (isOccupied(rec.path)) continue; // occupant still live — wait for it to exit
+        // Pass isOccupied so this is race-safe (a session could re-attach between the check and the call).
+        const r = removeWorktree(board.repoPath, t.threadId, key, { isOccupied });
+        if (r.removed) reaped++;
+      }
+    }
+  }
+  if (reaped) console.warn(`[worktree-reap] removed ${reaped} deferred worktree(s) whose live occupant has exited`);
 }
 
 // Start the single global heartbeat timer. Pinned on globalThis so a hot re-eval clears and restarts the

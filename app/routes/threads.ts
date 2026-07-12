@@ -10,7 +10,7 @@ import { isNotificationLevel, NOTIFICATION_LEVELS } from "../notification-levels
 import { listRoles } from "../role-ledger.js";
 import { isSurfaceClaimed, seatSurfaceKey } from "../auto-wake.js";
 import { readJobs, removeJob, upsertJob } from "../standing-jobs.js";
-import { listWorktrees as listThreadWorktrees, mergeWorktree, removeWorktree, workItemKey } from "../worktrees.js";
+import { listWorktrees as listThreadWorktrees, mergeWorktree, removeWorktree, workItemKey, realpath as wtRealpath } from "../worktrees.js";
 import {
   markSeenMentions,
   pinMessage,
@@ -645,7 +645,7 @@ async function handleThreadWorktree(
   boardId: string,
   threadId: string,
 ): Promise<void> {
-  const { boardSnapshotRecords, threadNode, sessionNodeForSid, threadMemberSids, boards, publishFeed } = getServerContext();
+  const { boardSnapshotRecords, threadNode, sessionNodeForSid, threadMemberSids, boards, publishFeed, liveSessions } = getServerContext();
   let body: { from?: unknown; op?: unknown; key?: unknown; roleId?: unknown; force?: unknown; base?: unknown; noVerify?: unknown };
   try {
     body = JSON.parse(await readBody(req));
@@ -679,14 +679,22 @@ async function handleThreadWorktree(
   const roleId = typeof body.roleId === "string" && body.roleId ? body.roleId : null;
   const key = workItemKey({ threadId, roleId, explicitKey });
 
+  // BUG-8 occupancy guard: never tear down a worktree a LIVE session is currently cwd-ed in (yanking its cwd
+  // makes the process exit code=1 → a false "crashed" band). Build the predicate from the live-session
+  // registry; teardown defers (stamps pendingReap) while it's true, and reapPendingWorktreesTick cleans up
+  // once the occupant exits.
+  const occupants = new Map<string, string>(); // realpath(cwd) → occupying session sid
+  for (const s of liveSessions.values()) if (s.status !== "exited") occupants.set(wtRealpath(s.cwd), s.id);
+  const isOccupied = (wtPath: string) => occupants.get(wtRealpath(wtPath)) ?? null;
+
   if (op === "merge") {
     const base = typeof body.base === "string" && body.base ? body.base : "main";
-    const result = mergeWorktree(repoPath, threadId, key!, { base, noVerify: body.noVerify === true, force: body.force === true });
+    const result = mergeWorktree(repoPath, threadId, key!, { base, noVerify: body.noVerify === true, force: body.force === true, isOccupied });
     publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a merged worktree drops off the marker)
     return sendJson(res, result.merged ? 200 : 409, { thread: threadId, key, ...result });
   }
 
-  const result = removeWorktree(repoPath, threadId, key!, { force: body.force === true });
+  const result = removeWorktree(repoPath, threadId, key!, { force: body.force === true, isOccupied });
   publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull (a removed worktree drops off the marker)
   return sendJson(res, result.removed ? 200 : 409, { thread: threadId, key, ...result });
 }
