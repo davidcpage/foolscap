@@ -6,6 +6,7 @@ import { sendJson, readBody } from "../server-http.js";
 import { getPendingHistoryMode, getServerContext } from "../server-context.js";
 import { exact, re, type GlobalRoute } from "./router.js";
 import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession } from "../session-ledger.js";
+import { durableSessionThreads } from "../server-snapshot.js";
 import { sessionSummaryFromText } from "../session-summary.js";
 import { readRole } from "../role-ledger.js";
 import { ensureWorktree } from "../worktrees.js";
@@ -38,7 +39,7 @@ function sessionTranscriptDir(repoPath: string, id: string): string {
 }
 
 function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): void {
-  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionThreads, sessionAnchor } = getServerContext();
+  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionAnchor } = getServerContext();
   let chosen = id;
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
@@ -57,9 +58,12 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   ensureSessionFeed(tdir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
   // The threads this session is a DURABLE member of, so the client can redraw the `member:open` edge(s) on
   // reopen: the card + its edge vanished on close, but the membership outlived them (delete-card-keep-session).
-  // This only REPORTS existing membership — it changes no server state, keeping card-close/reopen display-only.
+  // LEDGER-ONLY on purpose (durableSessionThreads, not sessionThreads): the client repaints edges from this
+  // list, and a snapshot-edge-derived entry the ledger doesn't back would be re-onboarded as a fresh join
+  // when the redrawn edge lands — the pill-click-on-a-Done-session spurious join. Reporting only what the
+  // ledger holds keeps card-close/reopen (and every pill-click) provably display-only.
   const records = boardSnapshotRecords(boardId) ?? [];
-  const threads = sessionThreads(records, chosen);
+  const threads = durableSessionThreads(repoPath, chosen);
   // P2 relative-offset layout: the session's PRIMARY thread (earliest joined) + its stored offset, so the
   // client places the reopened card at primaryThreadCardPos + offset instead of a fresh cascade spot. Null
   // primaryThread / offset → the client falls back to spawnAt. A pure read (changes no server state).

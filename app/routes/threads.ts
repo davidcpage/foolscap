@@ -71,6 +71,7 @@ async function handleThreadMessage(
   threadId: string,
 ): Promise<void> {
   const {
+    boards,
     boardSnapshotRecords,
     threadNode,
     threadMemberSids,
@@ -93,14 +94,22 @@ async function handleThreadMessage(
   if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
+  // Existence gate is the LEDGER marker, falling back to the canvas node (the seen pattern, 6100261): a
+  // thread persists in `.canvas/threads/` with no card on the board, and a card-only brand-new thread has a
+  // node but no marker until its first post. Requiring the node 404'd posts to any off-canvas thread.
+  const meta = readThreadMeta(boards.get(boardId)?.repoPath ?? "", threadId);
+  if (!meta && !(records && threadNode(records, threadId)))
+    return sendJson(res, 404, { error: "channel not found" });
 
   const from = body.from;
-  const members = threadMemberSids(records, threadId);
+  // Membership is the snapshot ∪ ledger union: the marker is authoritative (it survives a snapshot that
+  // never carried the member's edge — a headless join — and an fsState re-eval), the snapshot covers the
+  // just-drawn-edge window before its announce lands in the ledger.
+  const members = records ? threadMemberSids(records, threadId) : [];
+  for (const sid of threadMembersFromMeta(meta)) if (!members.includes(sid)) members.push(sid);
   // Consent: a SESSION must have joined to post (symmetry with receiving). A non-session `from` (the human
   // at the channel card) is the board owner and may post to any channel — §7, legibility not authz.
-  if (sessionNodeForSid(records, from) && !members.includes(from))
+  if (records && sessionNodeForSid(records, from) && !members.includes(from))
     return sendJson(res, 403, { error: "sender is not a member of this channel" });
 
   // W11 — mention-gated CAS guard (compare-and-swap on the poster's read cursor). A live SESSION poster may
@@ -111,7 +120,7 @@ async function handleThreadMessage(
   // then reposts). Card-only intents/pins go through their own handlers, so this path is real messages only.
   const posting = liveSessions.get(from);
   if (posting && body.force !== true) {
-    const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
+    const memberEntries = members.map((sid) => ({ sid, name: records ? sessionNameForSid(records, sid) : null }));
     const blocking = unreadMentions({
       log: threadLogs.get(threadId) ?? [],
       cursor: posting.read[threadId] ?? 0,
@@ -133,7 +142,7 @@ async function handleThreadMessage(
   // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
   // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
   // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
-  const memberEntries = members.map((sid) => ({ sid, name: sessionNameForSid(records, sid) }));
+  const memberEntries = members.map((sid) => ({ sid, name: records ? sessionNameForSid(records, sid) : null }));
   const { wakeAll, human, members: tagged, unknown } = resolveTags(body.text, memberEntries);
   const ss = liveSessions.get(from);
   if (ss) {
@@ -250,8 +259,18 @@ async function handleThreadMembership(
   action: "join" | "leave" | "invite",
   origin: string,
 ): Promise<void> {
-  const { boardSnapshotRecords, threadNode, sessionNodeForSid, boards, dispatchBusCommand, forgetDurableMember, historyKey } =
-    getServerContext();
+  const {
+    boardSnapshotRecords,
+    threadNode,
+    threadMemberSids,
+    sessionNodeForSid,
+    boards,
+    dispatchBusCommand,
+    forgetDurableMember,
+    appendThreadMsg,
+    publishFeed,
+    historyKey,
+  } = getServerContext();
   const pendingHistoryMode = getPendingHistoryMode(getServerContext().fsState);
   let body: { from?: unknown; target?: unknown; history?: unknown };
   try {
@@ -260,40 +279,55 @@ async function handleThreadMembership(
     return sendJson(res, 400, { error: "body must be JSON" });
   }
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  const repoPath = boards.get(boardId)?.repoPath;
   const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
 
   // For join/leave the actor is the joining session; for invite it's the target being proposed.
   const subjectSid = action === "invite" ? (typeof body.target === "string" ? body.target : "") : body.from;
   if (!subjectSid) return sendJson(res, 400, { error: "missing target" });
+
+  if (action === "leave") {
+    // LEAVE is LEDGER-FIRST. Durable membership is the record and the member:open edge only its view — and
+    // since the snapshot diff no longer infers a leave from a vanished edge, this endpoint (with the
+    // done-member detach sweep) is the ONLY way a membership ends. It must therefore work for a member whose
+    // card/edge never reached the snapshot (a headless join) or is gone (card closed): existence-gate on the
+    // ledger marker, membership on the union (snapshot ∪ durable), and treat the edge removal as best-effort
+    // display cleanup — its absence, or the absence of a live tab, must not block the durable mutation.
+    if (!readThreadMeta(repoPath ?? "", threadId) && !(records && threadNode(records, threadId)))
+      return sendJson(res, 404, { error: "channel not found" });
+    const isMember =
+      (records ? threadMemberSids(records, threadId).includes(body.from) : false) ||
+      threadMembersFromMeta(readThreadMeta(repoPath ?? "", threadId)).includes(body.from);
+    if (!isMember) return sendJson(res, 404, { error: "not a member of this channel" });
+    // Release the seat this leaver holds (§5): a seat survives a process EXIT (respawn re-fills it), but an
+    // explicit LEAVE is a deliberate departure — give the seat back so the next same-role join fills fresh,
+    // and self-heal a seat stuck to a departed sid. Best-effort; keyed on the leaver's sid, not the role.
+    if (repoPath) releaseSeat(repoPath, threadId, body.from);
+    forgetDurableMember(repoPath, threadId, body.from);
+    // Membership changes are never silent (the 2026-07-12 drops were): log the departure for the record.
+    appendThreadMsg(boardId, threadId, "system", `${body.from} left the thread.`);
+    publishFeed("threads:" + boardId, { ts: Date.now() }); // rail roster refresh
+    const sessionNode = records ? sessionNodeForSid(records, body.from) : null;
+    const edgeId = sessionNode && records ? memberEdge(records, sessionNode, threadId) : null;
+    if (edgeId) dispatchBusCommand(boardId, { type: "removeEdge", actor: body.from, payload: { id: edgeId } }, origin);
+    return sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid });
+  }
+
+  // join/invite still need the canvas: they CREATE the membership's view (an edge needs a session node to
+  // hang off), and the member:open onboarding funnel resolves the joiner through the snapshot.
+  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
+  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
   const sessionNode = sessionNodeForSid(records, subjectSid);
   if (!sessionNode) return sendJson(res, 400, { error: `no session card on this board for ${subjectSid}` });
 
   // An optional history choice rides the invite/join — stash it for the member:open onboarding to consume
   // when it seeds the cursor (a pending invite carries it through to the eventual accept). Absent ⇒ default.
-  if (action !== "leave") {
-    const mode = historyMode(body.history);
-    if (mode) pendingHistoryMode.set(historyKey(threadId, subjectSid), mode);
-  }
+  const mode = historyMode(body.history);
+  if (mode) pendingHistoryMode.set(historyKey(threadId, subjectSid), mode);
 
-  let cmd: { type: string; payload: Record<string, unknown>; actor: string };
-  if (action === "leave") {
-    const id = memberEdge(records, sessionNode, threadId);
-    if (!id) return sendJson(res, 404, { error: "not a member of this channel" });
-    cmd = { type: "removeEdge", actor: body.from, payload: { id } };
-    // Release the seat this leaver holds (§5): a seat survives a process EXIT (respawn re-fills it), but an
-    // explicit LEAVE is a deliberate departure — give the seat back so the next same-role join fills fresh,
-    // and self-heal a seat stuck to a departed sid. Best-effort; keyed on the leaver's sid, not the role.
-    // Drop the durable membership too: THIS is a real leave (unlike a card delete, which keeps membership).
-    const repoPath = boards.get(boardId)?.repoPath;
-    if (repoPath) releaseSeat(repoPath, threadId, body.from);
-    forgetDurableMember(repoPath, threadId, body.from);
-  } else {
-    const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
-    const type = action === "join" ? "member:open" : "member:pending";
-    cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
-  }
+  const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
+  const type = action === "join" ? "member:open" : "member:pending";
+  const cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
   const delivered = dispatchBusCommand(boardId, cmd, origin);
   if (delivered === 0) return sendJson(res, 503, { error: "no tab of this board is live to apply it", delivered: 0 });
   // T3b: a join doesn't return until its member:open edge is in the saved snapshot (waitForEdgePersisted),
@@ -483,13 +517,23 @@ async function handleThreadPin(
   if (body.pinned != null && typeof body.pinned !== "boolean")
     return sendJson(res, 400, { error: "pinned must be a boolean" });
   const pinned = body.pinned !== false; // default true — a bare pin call pins
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
   const repoPath = boards.get(boardId)?.repoPath;
   if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  // Existence gate is the LEDGER marker, canvas-node fallback (the seen pattern, 6100261): pinning is a
+  // durable ledger op that must not need the thread's card on the board.
+  const records = boardSnapshotRecords(boardId);
+  const meta = readThreadMeta(repoPath, threadId);
+  if (!meta && !(records && threadNode(records, threadId)))
+    return sendJson(res, 404, { error: "thread not found" });
+  // Consent mirrors message/seen: a SESSION must be a member, judged on the snapshot ∪ ledger union — a
+  // ledger member whose edge never reached the snapshot (headless join) must not 403; the human always may.
+  if (
+    records &&
+    sessionNodeForSid(records, body.from) &&
+    !threadMemberSids(records, threadId).includes(body.from) &&
+    !threadMembersFromMeta(meta).includes(body.from)
+  )
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
 
   let pins: PinnedMsg[];
   if (pinned) {
@@ -548,7 +592,12 @@ async function handleThreadSeen(
   // one exists); the human at the card is not a session node and always may. An absent/node-less snapshot
   // therefore never blocks the human — the only caller the rail badge depends on.
   const records = boardSnapshotRecords(boardId);
-  if (records && sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
+  if (
+    records &&
+    sessionNodeForSid(records, body.from) &&
+    !threadMemberSids(records, threadId).includes(body.from) &&
+    !threadMembersFromMeta(readThreadMeta(repoPath, threadId)).includes(body.from)
+  )
     return sendJson(res, 403, { error: "sender is not a member of this thread" });
   const seen = markSeenMentions(repoPath, threadId, body.seqs as number[]);
   // Republish the card feed (shrinks youWaitingSeqs) + nudge the rail (clears/decrements signal (a)) so both
@@ -582,13 +631,24 @@ async function handleThreadWorktree(
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
   const op = typeof body.op === "string" ? body.op : "list";
   if (op !== "list" && op !== "remove" && op !== "merge") return sendJson(res, 400, { error: `unknown op "${op}" (list|remove|merge)` });
-  const records = boardSnapshotRecords(boardId);
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "thread not found" });
-  if (sessionNodeForSid(records, body.from) && !threadMemberSids(records, threadId).includes(body.from))
-    return sendJson(res, 403, { error: "sender is not a member of this thread" });
   const repoPath = boards.get(boardId)?.repoPath;
   if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  // Existence gate is the LEDGER marker, canvas-node fallback (the seen pattern, 6100261): worktree ops are
+  // git+marker acts, tab-independent by design — they must not need the thread's card on the board.
+  const records = boardSnapshotRecords(boardId);
+  const meta = readThreadMeta(repoPath, threadId);
+  if (!meta && !(records && threadNode(records, threadId)))
+    return sendJson(res, 404, { error: "thread not found" });
+  // Consent on the snapshot ∪ ledger union. The 2026-07-12 merges 403'd here: the workers were LEDGER
+  // members whose member:open edges never reached the snapshot (headless joins), and the old gate read the
+  // snapshot alone. The marker is the authoritative membership tier — honor it directly.
+  if (
+    records &&
+    sessionNodeForSid(records, body.from) &&
+    !threadMemberSids(records, threadId).includes(body.from) &&
+    !threadMembersFromMeta(meta).includes(body.from)
+  )
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
 
   if (op === "list") return sendJson(res, 200, { thread: threadId, worktrees: listThreadWorktrees(repoPath, threadId) });
   const explicitKey = typeof body.key === "string" && body.key ? body.key : null;

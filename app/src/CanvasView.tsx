@@ -2,7 +2,7 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { layoutId, selectionBounds, type Box, type CameraState, type Id, type InteractionManager, type Vec } from "./lib";
 import { NodeView } from "./NodeView";
 import { useSignal, useSignalValue } from "./reactive";
-import { acceptMembership, isAttentionEdge, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
+import { acceptMembership, isAttentionEdge, leaveThread, MEMBER_OPEN, MEMBER_PENDING, removeMembership } from "./threads";
 import { claimWheelGesture, wheelClaimableByCard } from "./interior";
 import { HUD_CARDS, hudChrome, hudFitScale, isHudCard } from "./hud";
 
@@ -474,7 +474,9 @@ function EdgeActions({ m, edgeId, onClose }: { m: InteractionManager; edgeId: st
       {e.type === MEMBER_OPEN && (
         <>
           <span className="edge-actions-label">member</span>
-          <button onClick={() => { removeMembership(m.editor, edgeId); drop(); }}>Leave</button>
+          {/* leaveThread, not removeMembership: the durable drop must be the explicit /leave POST — the
+              snapshot diff no longer infers a leave from a vanished edge (the 2026-07-12 drop fix). */}
+          <button onClick={() => { leaveThread(m.editor, edgeId); drop(); }}>Leave</button>
         </>
       )}
     </div>

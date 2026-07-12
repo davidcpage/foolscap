@@ -15,6 +15,7 @@ import { annotationsWatchEvent } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
 import { MEMBER_OPEN } from "./threads";
+import { detachedMemberCards } from "./reconcile-members";
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
@@ -965,27 +966,23 @@ function redrawMemberEdges(m: InteractionManager, nodeId: Id<"node">, sid: strin
 // A thread MISSING from the roster map (not in the fetched list, or an older server that omits `members`) is
 // treated as "still a member" — we never remove a card on the word of a thread we couldn't confirm, so a
 // partial/failed fetch or a legacy server can only under-remove, never wrongly nuke a valid card.
+//
+// TWO-STRIKE GRACE (2026-07-12, BUG-5 — overlaps BUG-4 item c): a pass's roster can PREDATE a fresh join,
+// and a single stale pass removed a live worker's card 120ms after spawn (board evt mrhhlq43-a). The
+// decision core (reconcile-members.ts) now removes only a card that has stayed orphaned across a grace
+// window — the first sighting stamps it, a re-confirmed membership clears it. Module-level strike map: the
+// stamps must survive across passes but belong to this tab only (display state, never persisted).
+const orphanFirstSeen = new Map<string, number>();
 export function reconcileDetachedMemberCards(m: InteractionManager, threads: ChannelMeta[] | undefined): void {
   if (!threads) return;
   const roster = new Map<string, Set<string>>();
   for (const t of threads) if (t.chanId) roster.set(t.chanId, new Set(t.members ?? []));
-  // Group this board's member:open edges by their session card node (a card may belong to several threads).
-  const edgedThreadsByNode = new Map<string, string[]>();
+  // This board's member:open edges; the pure core groups them by session card node and applies the grace.
+  const edges: Array<{ from: string; to: string }> = [];
   for (const r of m.editor.store.getSnapshot().records) {
-    if (r.typeName !== "edge" || r.type !== MEMBER_OPEN) continue;
-    const list = edgedThreadsByNode.get(r.from) ?? [];
-    list.push(r.to);
-    edgedThreadsByNode.set(r.from, list);
+    if (r.typeName === "edge" && r.type === MEMBER_OPEN) edges.push({ from: r.from, to: r.to });
   }
-  for (const [node, edgedThreads] of edgedThreadsByNode) {
-    const sid = node.replace(/^node:(?:live|session):/, "");
-    if (sid === node) continue; // not a session-shaped node id (no live/session prefix) → leave it
-    // Keep the card if it is STILL a durable member of ANY edged thread, or ANY of those threads is unconfirmed.
-    const keep = edgedThreads.some((tid) => {
-      const members = roster.get(tid);
-      return !members || members.has(sid);
-    });
-    if (keep) continue;
+  for (const node of detachedMemberCards(edges, roster, orphanFirstSeen, Date.now())) {
     if (m.editor.store.get<"node">(node as Id<"node">))
       m.editor.commit({ type: "removeNode", actor: "system", payload: { id: node as Id<"node"> } });
   }
