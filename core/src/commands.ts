@@ -1,4 +1,4 @@
-import { layoutId, nodeId, edgeId, NOTE_COLORS, type Id } from "./records.js";
+import { layoutId, nodeId, edgeId, NOTE_COLORS, RECORD_TYPE, EDGE_TYPE, type Id } from "./records.js";
 import type { Store } from "./store.js";
 
 // Command handlers: the "one mutation API, three clients" surface (doc §9.1). Human gestures, the
@@ -17,8 +17,8 @@ export const defaultCommands: Record<string, CommandHandler> = {
     store.put([
       // `name` is the optional display handle (see NodeRecord) — only stamped when supplied, so an ordinary
       // card stays name-less and the renderer falls back to its title.
-      { typeName: "node", id, type: p.type ?? "note", title: p.title ?? "", text: p.text ?? "", color: p.color ?? pickColor(store), ...(p.name ? { name: p.name } : {}) },
-      { typeName: "layout", id: layoutId(id), nodeId: id, x: p.x ?? 0, y: p.y ?? 0, w: p.w ?? 200, h: p.h ?? 120, z: p.z ?? nextZ(store), ...(p.anchor ? { anchor: p.anchor } : {}) },
+      { typeName: RECORD_TYPE.node, id, type: p.type ?? "note", title: p.title ?? "", text: p.text ?? "", color: p.color ?? pickColor(store), ...(p.name ? { name: p.name } : {}) },
+      { typeName: RECORD_TYPE.layout, id: layoutId(id), nodeId: id, x: p.x ?? 0, y: p.y ?? 0, w: p.w ?? 200, h: p.h ?? 120, z: p.z ?? nextZ(store), ...(p.anchor ? { anchor: p.anchor } : {}) },
     ]);
   },
 
@@ -56,7 +56,7 @@ export const defaultCommands: Record<string, CommandHandler> = {
     // session card removes the memberships pointing out of it, a computed card removes its input wires.
     // One store.remove → one diff → one undoable IntentEvent that restores node + layout + edges together.
     const edges = store.getSnapshot().records
-      .filter((r) => r.typeName === "edge" && (r.from === p.id || r.to === p.id))
+      .filter((r) => r.typeName === RECORD_TYPE.edge && (r.from === p.id || r.to === p.id))
       .map((r) => r.id);
     store.remove([p.id, layoutId(p.id), ...edges]);
   },
@@ -120,7 +120,7 @@ export const defaultCommands: Record<string, CommandHandler> = {
   },
 
   addEdge(store, p: { id?: Id<"edge">; from: Id<"node">; to: Id<"node">; type?: string }) {
-    store.put([{ typeName: "edge", id: p.id ?? edgeId(), from: p.from, to: p.to, type: p.type ?? "links" }]);
+    store.put([{ typeName: RECORD_TYPE.edge, id: p.id ?? edgeId(), from: p.from, to: p.to, type: p.type ?? EDGE_TYPE.links }]);
   },
 
   removeEdge(store, p: { id: Id<"edge"> }) {
@@ -134,7 +134,7 @@ export const defaultCommands: Record<string, CommandHandler> = {
 function nextZ(store: Store): number {
   let max = -1;
   for (const r of store.getSnapshot().records) {
-    if (r.typeName === "layout" && r.z > max) max = r.z;
+    if (r.typeName === RECORD_TYPE.layout && r.z > max) max = r.z;
   }
   return max + 1;
 }
@@ -149,6 +149,6 @@ function zOf(store: Store, id: Id<"node">): number {
 // it gives a fresh board its bright variety without the caller having to choose.
 function pickColor(store: Store): string {
   let count = 0;
-  for (const r of store.getSnapshot().records) if (r.typeName === "node") count++;
+  for (const r of store.getSnapshot().records) if (r.typeName === RECORD_TYPE.node) count++;
   return NOTE_COLORS[count % NOTE_COLORS.length]!;
 }

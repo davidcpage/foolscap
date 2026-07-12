@@ -21,6 +21,7 @@ export type {
   RecordOf,
 } from "./records.js";
 export { edgeId, layoutId, nodeId, NOTE_COLORS, uid } from "./records.js";
+export { EDGE_TYPE, MEMBER_EDGE_PREFIX, NODE_TYPE, RECORD_TYPE } from "./records.js";
 
 export type { RecordsDiff } from "./diff.js";
 export { applyDiff, emptyDiff, invertDiff, isEmptyDiff, squashDiffs, summarizeDiff } from "./diff.js";

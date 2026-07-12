@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { RECORD_TYPE, EDGE_TYPE, MEMBER_EDGE_PREFIX } from "../core/src/records.js";
 import { getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
 import {
@@ -68,7 +69,7 @@ const roleOfName = (name: string | null): string | null =>
 function memberEdgesOf(records: Array<Record<string, unknown>> | null | undefined): Map<string, { from: string; to: string; type: string }> {
   const out = new Map<string, { from: string; to: string; type: string }>();
   for (const r of records ?? [])
-    if (r.typeName === "edge" && typeof r.type === "string" && r.type.startsWith("member:") && typeof r.id === "string")
+    if (r.typeName === RECORD_TYPE.edge && typeof r.type === "string" && r.type.startsWith(MEMBER_EDGE_PREFIX) && typeof r.id === "string")
       out.set(r.id, { from: String(r.from), to: String(r.to), type: r.type });
   return out;
 }
@@ -305,7 +306,7 @@ export function ensureCommandId(
   const isEdge = cmd.type === "addEdge";
   if (!isNode && !isEdge) return null;
   const payload = cmd.payload && typeof cmd.payload === "object" ? (cmd.payload as Record<string, unknown>) : {};
-  if (typeof payload.id !== "string" || !payload.id) payload.id = `${isEdge ? "edge" : "node"}:${mkUuid()}`;
+  if (typeof payload.id !== "string" || !payload.id) payload.id = `${isEdge ? RECORD_TYPE.edge : RECORD_TYPE.node}:${mkUuid()}`;
   cmd.payload = payload;
   return String(payload.id);
 }
@@ -455,14 +456,14 @@ function maybeAnnounceMembership(
   const p = cmd.payload ?? {};
   if (cmd.type === "removeEdge") {
     if (typeof p.id === "string") {
-      announcedMemberships.delete(announceKey(p.id, "member:open"));
-      announcedMemberships.delete(announceKey(p.id, "member:pending"));
+      announcedMemberships.delete(announceKey(p.id, EDGE_TYPE.memberOpen));
+      announcedMemberships.delete(announceKey(p.id, EDGE_TYPE.memberPending));
     }
     return;
   }
   if (cmd.type !== "addEdge") return;
   const type = String(p.type ?? "");
-  if (!type.startsWith("member:")) return;
+  if (!type.startsWith(MEMBER_EDGE_PREFIX)) return;
   const records = boardSnapshotRecords(boardId);
   if (!records) return;
   const thread = threadNode(records, String(p.to));
@@ -473,7 +474,7 @@ function maybeAnnounceMembership(
   const description = descriptionOf(thread);
   const descLine = description ? `brief: ${description}\n` : ""; // optional — omit when blank
 
-  if (type === "member:pending") {
+  if (type === EDGE_TYPE.memberPending) {
     if (announcedMemberships.has(announceKey(String(p.id), type))) return;
     announcedMemberships.add(announceKey(String(p.id), type));
     sendSessionInput(
@@ -485,7 +486,7 @@ function maybeAnnounceMembership(
     );
     return;
   }
-  if (type === "member:open") {
+  if (type === EDGE_TYPE.memberOpen) {
     // Record the DURABLE membership on EVERY sighting (idempotent), ahead of the onboarding dedup: this is
     // the single funnel every join path reaches — a bus addEdge (spawn/join/invite-accept) AND a human-drawn
     // join replayed here from the snapshot diff. The membership now outlives the card/edge (deleting the card

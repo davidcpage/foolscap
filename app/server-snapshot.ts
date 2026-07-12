@@ -1,4 +1,5 @@
 import { getServerContext } from "./server-context.js";
+import { RECORD_TYPE, NODE_TYPE, EDGE_TYPE } from "../core/src/records.js";
 import {
   addThreadMember,
   listThreads,
@@ -84,7 +85,7 @@ export function seedThreadLogs(repoPath: string): void {
   // — the migration gap for memberships that predate the fix. Idempotent; writes the marker as it adopts.
   const snap = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
   for (const r of snap?.records ?? [])
-    if (r.typeName === "edge" && String(r.type) === "member:open") {
+    if (r.typeName === RECORD_TYPE.edge && String(r.type) === EDGE_TYPE.memberOpen) {
       const sid = sidFromSessionNode(String(r.from));
       if (sid) recordDurableMember(repoPath, String(r.to), sid, Date.now());
     }
@@ -127,7 +128,7 @@ export function trackEmittedMembership(cmd: { type: string; payload?: Record<str
     if (typeof p.id === "string") emittedMembers.delete(p.id);
     return;
   }
-  if (cmd.type !== "addEdge" || String(p.type ?? "") !== "member:open") return;
+  if (cmd.type !== "addEdge" || String(p.type ?? "") !== EDGE_TYPE.memberOpen) return;
   const sid = typeof p.from === "string" ? sidFromSessionNode(p.from) : null;
   if (typeof p.id === "string" && typeof p.to === "string" && sid)
     emittedMembers.set(p.id, { thread: p.to, sid, ts: Date.now() });
@@ -162,7 +163,7 @@ export function sessionThreads(records: Array<Record<string, unknown>>, sid: str
   const node = sessionNodeForSid(records, sid);
   if (node)
     for (const r of records)
-      if (r.typeName === "edge" && r.from === node && String(r.type) === "member:open" && threadNode(records, String(r.to)))
+      if (r.typeName === RECORD_TYPE.edge && r.from === node && String(r.type) === EDGE_TYPE.memberOpen && threadNode(records, String(r.to)))
         out.push(String(r.to));
   for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
   // Durable members whose card/edge is gone: still a member of these threads (the card was only a view).
@@ -252,7 +253,7 @@ export function sessionAnchor(
 // The x,y of a node's layout record in a snapshot, or null (a node with no layout / off-canvas). Pure.
 function nodeLayoutPos(records: Array<Record<string, unknown>>, nodeId: string): { x: number; y: number } | null {
   const l = records.find(
-    (r) => r.typeName === "layout" && (r as { nodeId?: unknown }).nodeId === nodeId,
+    (r) => r.typeName === RECORD_TYPE.layout && (r as { nodeId?: unknown }).nodeId === nodeId,
   ) as { x?: unknown; y?: unknown } | undefined;
   return l && typeof l.x === "number" && typeof l.y === "number" ? { x: l.x, y: l.y } : null;
 }
@@ -273,7 +274,7 @@ export function captureMemberOffsets(boardId: string, records: Array<Record<stri
   // Every session card currently on the board, by sid (a session card carries its full sid as the title).
   const seen = new Set<string>();
   for (const r of records) {
-    if (r.typeName !== "node" || r.type !== "session" || typeof r.title !== "string" || !r.title) continue;
+    if (r.typeName !== RECORD_TYPE.node || r.type !== NODE_TYPE.session || typeof r.title !== "string" || !r.title) continue;
     const sid = r.title;
     if (seen.has(sid)) continue;
     seen.add(sid);
@@ -305,7 +306,7 @@ export function captureReopenSets(boardId: string, records: Array<Record<string,
   // Every thread card currently on the board, by id.
   const threadIds = new Set<string>();
   for (const r of records) {
-    if (r.typeName === "node" && (r.type === "thread" || r.type === "channel")) threadIds.add(String(r.id));
+    if (r.typeName === RECORD_TYPE.node && (r.type === NODE_TYPE.thread || r.type === NODE_TYPE.channel)) threadIds.add(String(r.id));
   }
   for (const threadId of threadIds) {
     // Open members: the source session card of each member:open edge pointing at this thread that is itself
@@ -314,7 +315,7 @@ export function captureReopenSets(boardId: string, records: Array<Record<string,
     // node, so a dangling edge contributes nothing.
     const open: string[] = [];
     for (const r of records) {
-      if (r.typeName !== "edge" || r.to !== threadId || String(r.type) !== "member:open") continue;
+      if (r.typeName !== RECORD_TYPE.edge || r.to !== threadId || String(r.type) !== EDGE_TYPE.memberOpen) continue;
       const sid = nodeSessionId(records, String(r.from));
       if (sid && !open.includes(sid)) open.push(sid);
     }
@@ -343,25 +344,25 @@ export function boardSnapshotRecords(boardId: string): Array<Record<string, unkn
 // node:live:<sid>, title = the full sid). Resolve a node id to its session id, or null if the node isn't
 // a session card. Reading the title (not parsing the id) keeps this robust to the id scheme.
 export function nodeSessionId(records: Array<Record<string, unknown>>, nodeId: string): string | null {
-  const n = records.find((r) => r.typeName === "node" && r.id === nodeId) as SnapNode | undefined;
-  return n && n.type === "session" && typeof n.title === "string" && n.title ? n.title : null;
+  const n = records.find((r) => r.typeName === RECORD_TYPE.node && r.id === nodeId) as SnapNode | undefined;
+  return n && n.type === NODE_TYPE.session && typeof n.title === "string" && n.title ? n.title : null;
 }
 
 // The reverse: a session id → its card's node id (so an agent that knows only its own sid can join/leave
 // without ever handling a node id). Null if no session card on the board carries that title.
 export function sessionNodeForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
   const n = records.find(
-    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
+    (r) => r.typeName === RECORD_TYPE.node && r.type === NODE_TYPE.session && r.title === sid,
   ) as SnapNode | undefined;
   return n ? String(n.id) : null;
 }
 
 // The channel card by id (or null if that id isn't a channel node).
 export function threadNode(records: Array<Record<string, unknown>>, threadId: string): SnapNode | null {
-  const n = records.find((r) => r.typeName === "node" && r.id === threadId) as SnapNode | undefined;
+  const n = records.find((r) => r.typeName === RECORD_TYPE.node && r.id === threadId) as SnapNode | undefined;
   // "thread" is the node type since §8 step 2; "channel" is the carried-over legacy type (existing
   // channels live on as long-lived threads — same card, same machinery).
-  return n && (n.type === "thread" || n.type === "channel") ? n : null;
+  return n && (n.type === NODE_TYPE.thread || n.type === NODE_TYPE.channel) ? n : null;
 }
 
 // A session card's display NAME (the new `name` field a role-spawned card carries, `<RoleName>.<short-sid>`),
@@ -369,7 +370,7 @@ export function threadNode(records: Array<Record<string, unknown>>, threadId: st
 // reaches a role by its handle. Found by the same title===sid convention as sessionNodeForSid.
 export function sessionNameForSid(records: Array<Record<string, unknown>>, sid: string): string | null {
   const n = records.find(
-    (r) => r.typeName === "node" && r.type === "session" && r.title === sid,
+    (r) => r.typeName === RECORD_TYPE.node && r.type === NODE_TYPE.session && r.title === sid,
   ) as (SnapNode & { name?: unknown }) | undefined;
   return n && typeof n.name === "string" && n.name ? n.name : null;
 }
@@ -379,7 +380,7 @@ export function threadMemberSids(records: Array<Record<string, unknown>>, thread
   const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
   const out: string[] = [];
   for (const r of records) {
-    if (r.typeName === "edge" && r.to === threadId && String(r.type) === "member:open") {
+    if (r.typeName === RECORD_TYPE.edge && r.to === threadId && String(r.type) === EDGE_TYPE.memberOpen) {
       const sid = nodeSessionId(records, String(r.from));
       if (sid && !out.includes(sid)) out.push(sid);
     }
