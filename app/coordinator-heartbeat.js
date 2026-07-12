@@ -40,6 +40,16 @@ export const COORDINATOR_ROLE = "Coordinator";
 // working/blocked:peer — it's how the Coordinator detects a peer finishing (a `done` intent wakes no one). It
 // backs off only while the Coordinator is blocked:human (see heartbeatEffectiveInterval). Clamped up to the
 // standing-job floor (MIN_INTERVAL_MS) by normInterval.
+//
+// CACHE-TTL DEPENDENCY (docs/token-efficiency-review-2026-07-11.md §6.2) — every cadence here must stay WELL
+// UNDER the 1-HOUR prompt-cache TTL (measured: spawned sessions write exclusively to the `ephemeral_1h`
+// bucket, refreshed on each use). A sweep inside the TTL replays the parked context at ~0.1× (cache read); a
+// cadence PAST the TTL turns *every* sweep into a ~2× cold rewrite of the whole parked context — ~20× the
+// warm price at observed sizes. This is also what makes the server-side gate below (heartbeatSweepSignature)
+// a strict win: a gated-out quiet stretch under 1h costs nothing (the next wake is still warm), and past 1h
+// the one-time cold rewrite is far smaller than the sweeps skipped. Re-check that arithmetic before slowing
+// this cadence or if the account ever drops to a 5-minute TTL (e.g. usage overage) — at a 5-min TTL the gate
+// wants hysteresis and a >5-min cadence goes cold every fire.
 export const COORDINATOR_HEARTBEAT_INTERVAL_MS = 240_000; // 4 min — a calm re-sweep pulse for a parked Coordinator
 
 // Part 4 — intent-keyed backoff. A Coordinator that has EXPLICITLY declared `blocked:human` (it escalated and
@@ -59,6 +69,53 @@ export const HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS = 30 * 60_000; // 30 min
 export function heartbeatEffectiveInterval(baseIntervalMs, intent) {
   if (intent === "blocked:human") return Math.max(baseIntervalMs, HEARTBEAT_BLOCKED_HUMAN_INTERVAL_MS);
   return baseIntervalMs;
+}
+
+// ── the server-side sweep gate (token-efficiency-review-2026-07-11.md §6.1) ─────────────────────────
+// The server already knows everything a NO-OP sweep would discover — thread activity, declared intents,
+// live session statuses — so it can decide "is there anything to sweep?" for free, in code, and skip the
+// nudge (each one replays the Coordinator's whole parked context) when nothing changed since the last
+// sweep. standingJobsTick computes this signature just before a Coordinator nudge and fires ONLY when it
+// differs from the one stored at the previous fire; a gated skip does NOT stamp the job, so the gate
+// re-evaluates every scheduler tick and the sweep fires the tick a change lands (never later than it
+// would have un-gated). Stall detection survives because a stall IS a state: a non-self `working`/
+// `blocked:peer` intent's AGE is quantized into buckets of this size, and each bucket crossing changes
+// the signature — so a silently-stalled peer re-fires the sweep once per bucket, not once per 4 minutes.
+export const HEARTBEAT_STALE_BUCKET_MS = 30 * 60_000; // re-sweep a stalled (unchanged working/blocked:peer) state this often
+
+/**
+ * The sweep-relevant board state, folded to a stable string — equal signatures ⇒ a sweep would find
+ * nothing new. PURE; order-insensitive (threads, intent keys, and sessions are sorted). Components:
+ *   - per thread: `lastTs` (any post/ask/answer bumps it — message content need not be read);
+ *   - per declared intent (seat-keyed, `meta.intents`): its VALUE, plus — for stall detection — the
+ *     quantized AGE of a non-self `working`/`blocked:peer` (self = `selfRole`, the sweeper's own seat:
+ *     the watcher's own heartbeat must not tick itself awake forever on a quiet board);
+ *   - per live (non-exited) session: `sid=status` (a peer starting/finishing a turn, appearing, or
+ *     exiting is sweep-relevant; `blocked:human` ages are NOT bucketed — the human's reply is a post).
+ * The caller captures the signature AT FIRE TIME, so state the occupant itself mutates DURING the sweep
+ * (its posts bump lastTs) reads as fresh change → at most one echo sweep per active episode, then the
+ * gate engages. `threads` = thread meta markers (listThreads); `sessions` = `{sid, status}` of the
+ * board's live sessions.
+ */
+export function heartbeatSweepSignature({ threads, sessions } = {}, now, selfRole = COORDINATOR_ROLE) {
+  const parts = [];
+  const byId = [...(threads ?? [])].filter((t) => t && typeof t.threadId === "string");
+  byId.sort((a, b) => a.threadId.localeCompare(b.threadId));
+  for (const t of byId) {
+    parts.push(`t:${t.threadId}@${t.lastTs ?? 0}`);
+    const intents = t.intents ?? {};
+    for (const key of Object.keys(intents).sort()) {
+      const rec = intents[key] ?? {};
+      let p = `i:${t.threadId}/${key}=${rec.intent ?? ""}`;
+      if (key !== selfRole && (rec.intent === "working" || rec.intent === "blocked:peer"))
+        p += `~${Math.floor(Math.max(0, now - (rec.ts ?? 0)) / HEARTBEAT_STALE_BUCKET_MS)}`;
+      parts.push(p);
+    }
+  }
+  const live = [...(sessions ?? [])].filter((s) => s && s.sid && s.status !== "exited");
+  live.sort((a, b) => String(a.sid).localeCompare(String(b.sid)));
+  for (const s of live) parts.push(`s:${s.sid}=${s.status}`);
+  return parts.join("|");
 }
 
 // The sweep instruction — the heartbeat's payload, carried verbatim into the job worker's brief/nudge. It is
