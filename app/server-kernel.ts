@@ -49,13 +49,25 @@ interface LiveKernel {
   wsSession: string; // the jupyter session id stamped on every message header
   status: "starting" | "idle" | "busy" | "dead";
   pending: Map<string, PendingExec>; // msg_id → in-flight execution
+  idleTimer?: ReturnType<typeof setTimeout>; // armed while idle; fires shutdownKernel (the idle-reap, below)
 }
+
+// Reap a kernel left idle this long. A dev notebook rarely needs a warm kernel longer than this, and a
+// reaped kernel is transparently re-started on the next Run — so this bounds the "open a notebook, walk
+// away" leak without surprising an active user (every Run re-arms the clock).
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 
 const kernelKey = (boardId: string, nodeId: string) => `${boardId}\0${nodeId}`;
 
+// The re-eval-surviving server state (globalThis-pinned via server-context). Both the kernel registry and
+// the one-shot reconcile flag hang off it, so they survive a Vite plugin re-eval but reset on a real restart.
+function kernelState(): { liveKernels?: Map<string, LiveKernel>; kernelsReconciled?: boolean } {
+  return (getServerContext() as unknown as { fsState: { liveKernels?: Map<string, LiveKernel>; kernelsReconciled?: boolean } }).fsState;
+}
+
 function liveKernels(): Map<string, LiveKernel> {
-  const { fsState } = getServerContext() as unknown as { fsState: { liveKernels?: Map<string, LiveKernel> } };
-  return (fsState.liveKernels ??= new Map());
+  const s = kernelState();
+  return (s.liveKernels ??= new Map());
 }
 
 // ── the live-status feed (mirror `session:<id>`) ────────────────────────────────────────────────────
@@ -208,6 +220,86 @@ async function gatewayFetch(baseUrl: string, token: string, pathname: string, in
   });
 }
 
+// ── idle reap ───────────────────────────────────────────────────────────────────────────────────────
+// A kernel with no in-flight work is a candidate for the idle timeout. Arm the clock when it falls idle,
+// clear it the moment a cell runs. unref'd so it never keeps the dev server alive on its own.
+function clearIdleReap(k: LiveKernel): void {
+  if (k.idleTimer) {
+    clearTimeout(k.idleTimer);
+    k.idleTimer = undefined;
+  }
+}
+function armIdleReap(k: LiveKernel): void {
+  clearIdleReap(k);
+  if (k.pending.size) return; // still working — not idle
+  k.idleTimer = setTimeout(() => {
+    void shutdownKernel(k.boardId, k.nodeId);
+  }, IDLE_TIMEOUT_MS);
+  k.idleTimer.unref?.();
+}
+
+// ── single-flight + reconcile (BUG-3) ───────────────────────────────────────────────────────────────
+
+// Deduplicate concurrent async starts by key: the first caller runs `factory`, callers arriving while it is
+// in flight await the SAME promise, and the slot clears when it settles. Mirrors jupyter-host.js's
+// `launching` guard (jupyter-host.js:197-214). This is what stops two fast Runs on one notebook from racing
+// two kernels into existence (the second silently orphaning the first). Exported for direct unit testing.
+export function singleFlight<T>(inflight: Map<string, Promise<T>>, key: string, factory: () => Promise<T>): Promise<T> {
+  const existing = inflight.get(key);
+  if (existing) return existing;
+  const p = factory().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+// Reconcile the gateway's kernels against the broker's registry. The detached gateway (jupyter-host.js)
+// survives a dev-server RESTART but `liveKernels` does not — so every kernel created before the restart is
+// orphaned INSIDE the surviving gateway, and ensureKernel would start a fresh one right next to it. Sweep
+// once per server lifetime: GET the gateway's kernels and DELETE any the broker no longer tracks. Returns
+// the reaped ids (for the caller's log line + the test). Best-effort — a gateway error just skips the sweep
+// (a kernel we couldn't list stays put rather than risking a wrong delete). Exported for direct unit testing.
+export async function reconcileGatewayKernels(
+  gw: { baseUrl: string; token: string },
+  knownKernelIds: Set<string>,
+): Promise<string[]> {
+  let list: Array<{ id?: string }>;
+  try {
+    const res = await gatewayFetch(gw.baseUrl, gw.token, "/api/kernels");
+    if (!res.ok) return [];
+    list = (await res.json()) as Array<{ id?: string }>;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(list)) return [];
+  const reaped: string[] = [];
+  for (const { id } of list) {
+    if (!id || knownKernelIds.has(id)) continue;
+    const ok = await gatewayFetch(gw.baseUrl, gw.token, `/api/kernels/${id}`, { method: "DELETE" })
+      .then((r) => r.ok)
+      .catch(() => false);
+    if (ok) reaped.push(id);
+  }
+  return reaped;
+}
+
+// Run the reconcile sweep at most once per server lifetime. The flag lives on fsState (survives a Vite
+// re-eval, resets on a real restart), so a re-eval — after which `liveKernels` is still populated — does NOT
+// re-sweep and reap live kernels; only a genuine restart (empty `liveKernels`) reaps the orphans. Set the
+// flag BEFORE the await so concurrent first-run starters don't double-sweep.
+async function reconcileGatewayOnce(gw: { baseUrl: string; token: string }): Promise<void> {
+  const s = kernelState();
+  if (s.kernelsReconciled) return;
+  s.kernelsReconciled = true;
+  const known = new Set([...liveKernels().values()].map((k) => k.kernelId));
+  const reaped = await reconcileGatewayKernels(gw, known).catch(() => [] as string[]);
+  if (reaped.length) {
+    console.log(`[kernel] reconcile: reaped ${reaped.length} orphaned kernel(s) after restart: ${reaped.join(", ")}`);
+  }
+}
+
+// In-flight guard for kernel starts (mirrors jupyter-host's `launching`), keyed by (board,node).
+const kernelStarting = new Map<string, Promise<LiveKernel>>();
+
 // Route an inbound WS frame to its in-flight execution (correlated by parent_header.msg_id) and update the
 // live feed. Appends outputs; resolves the pending promise when the cell goes idle.
 function onKernelMessage(k: LiveKernel, raw: WebSocket.RawData): void {
@@ -255,6 +347,7 @@ function onKernelMessage(k: LiveKernel, raw: WebSocket.RawData): void {
   if (msgType === "status" && content.execution_state === "idle") {
     k.pending.delete(parentId);
     k.status = k.pending.size ? "busy" : "idle";
+    if (k.status === "idle") armIdleReap(k); // fully idle again — restart the reap clock
     pending.resolve({
       execCount: pending.execCount,
       outputs: pending.outputs,
@@ -263,15 +356,23 @@ function onKernelMessage(k: LiveKernel, raw: WebSocket.RawData): void {
   }
 }
 
-// Start (or reuse) the kernel for one notebook. Ensures the gateway is up, creates a kernel, opens the
-// upstream WS, and wires message routing. Throws on env/gateway failure (the route turns it into 5xx/blocker).
+// Start (or reuse) the kernel for one notebook. A single-flight guard (BUG-3) collapses concurrent starts
+// for the same notebook onto one kernel; a live kernel is returned directly without entering the guard.
 async function ensureKernel(boardId: string, nodeId: string, appDir: string): Promise<LiveKernel> {
   const key = kernelKey(boardId, nodeId);
   const existing = liveKernels().get(key);
   if (existing && existing.status !== "dead" && existing.ws.readyState === WebSocket.OPEN) return existing;
   if (existing) liveKernels().delete(key); // dead/closed — replace
+  return singleFlight(kernelStarting, key, () => startKernel(boardId, nodeId, appDir));
+}
 
+// Actually start a kernel: ensure the gateway is up, reconcile away restart-orphans (once per lifetime),
+// create a kernel, open the upstream WS, and wire message routing. Throws on env/gateway failure (the route
+// turns it into 5xx/blocker). Only ever called through ensureKernel's single-flight guard.
+async function startKernel(boardId: string, nodeId: string, appDir: string): Promise<LiveKernel> {
+  const key = kernelKey(boardId, nodeId);
   const gw = await ensureGateway(appDir); // { baseUrl, token }
+  await reconcileGatewayOnce(gw); // reap kernels orphaned in the surviving gateway by a prior restart
   publishKernel(boardId, nodeId, { status: "starting", envLabel: gw.envLabel });
 
   const res = await gatewayFetch(gw.baseUrl, gw.token, "/api/kernels", {
@@ -295,12 +396,14 @@ async function ensureKernel(boardId: string, nodeId: string, appDir: string): Pr
   ws.on("message", (raw) => onKernelMessage(k, raw));
   ws.on("close", () => {
     k.status = "dead";
+    clearIdleReap(k);
     for (const p of k.pending.values()) p.resolve({ execCount: p.execCount, outputs: p.outputs, errored: true });
     k.pending.clear();
     publishKernel(boardId, nodeId, { status: "dead" });
   });
   k.status = "idle";
   liveKernels().set(key, k);
+  armIdleReap(k); // idle from birth — start the reap clock (every Run re-arms it)
   publishKernel(boardId, nodeId, { status: "idle", kernelId });
   return k;
 }
@@ -319,6 +422,7 @@ function executeCell(k: LiveKernel, code: string, cellId: string): Promise<{ exe
   return new Promise((resolve) => {
     k.pending.set(msgId, { cellId, outputs: [], execCount: null, resolve });
     k.status = "busy";
+    clearIdleReap(k); // active again — cancel any pending reap; onKernelMessage re-arms when it goes idle
     k.ws.send(JSON.stringify(msg));
   });
 }
@@ -399,6 +503,7 @@ export async function restartKernel(boardId: string, nodeId: string): Promise<Ke
   k.pending.clear();
   const res = await gatewayFetch(k.baseUrl, k.token, `/api/kernels/${k.kernelId}/restart`, { method: "POST" });
   k.status = "idle";
+  armIdleReap(k); // back to idle after a restart — restart the reap clock
   publishKernel(boardId, nodeId, { status: "idle", restarted: true });
   return { ok: res.ok, ran: 0, error: res.ok ? undefined : `restart failed: ${res.status}` };
 }
@@ -409,6 +514,7 @@ export async function shutdownKernel(boardId: string, nodeId: string): Promise<K
   const k = liveKernels().get(key);
   if (!k) return { ok: true, ran: 0 };
   liveKernels().delete(key);
+  clearIdleReap(k);
   try { k.ws.close(); } catch { /* already closed */ }
   const res = await gatewayFetch(k.baseUrl, k.token, `/api/kernels/${k.kernelId}`, { method: "DELETE" }).catch(() => null);
   publishKernel(boardId, nodeId, { status: "dead", shutdown: true });
