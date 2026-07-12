@@ -138,7 +138,16 @@ async function handleThreadMessage(
 
   // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
   // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
-  const msg = appendThreadMsg(boardId, threadId, from, body.text);
+  // HONEST ACCEPT (BUG-6): appendThreadMsg persists to the fsync'd ledger BEFORE it publishes the feed and
+  // throws if it can't be made durable — so a 200 here MEANS the post is on disk and survives a restart. A
+  // durable-append failure returns 500 (nothing published, no one woken) rather than a dishonest 200 that
+  // loses the message; the caller can retry.
+  let msg: ThreadMsg;
+  try {
+    msg = appendThreadMsg(boardId, threadId, from, body.text);
+  } catch (e) {
+    return sendJson(res, 500, { error: "message could not be persisted — not accepted, retry", detail: String((e as Error)?.message ?? e) });
+  }
   // @-tags decide the wake set: `@all` (or a non-tagging client) wakes the whole room (null), a tagged post
   // wakes only the named members, an untagged post wakes no one (ambient — still logged for the cursor read).
   // Pair each member sid with its card name so `@RoleName` resolves by handle, not just sid prefix.
@@ -305,7 +314,14 @@ async function handleThreadMembership(
     if (repoPath) releaseSeat(repoPath, threadId, body.from);
     forgetDurableMember(repoPath, threadId, body.from);
     // Membership changes are never silent (the 2026-07-12 drops were): log the departure for the record.
-    appendThreadMsg(boardId, threadId, "system", `${body.from} left the thread.`);
+    // Best-effort: appendThreadMsg throws on a durable failure (BUG-6), but the durable LEAVE already landed
+    // above (releaseSeat/forgetDurableMember) — a failed system line must not un-leave the member or 500 the
+    // leave. Log it and continue.
+    try {
+      appendThreadMsg(boardId, threadId, "system", `${body.from} left the thread.`);
+    } catch (e) {
+      console.warn(`[thread] leave system line for ${body.from} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
+    }
     publishFeed("threads:" + boardId, { ts: Date.now() }); // rail roster refresh
     const sessionNode = records ? sessionNodeForSid(records, body.from) : null;
     const edgeId = sessionNode && records ? memberEdge(records, sessionNode, threadId) : null;
@@ -416,7 +432,15 @@ async function handleThreadIntent(
     return sendJson(res, 403, { error: "sender is not a member of this channel" });
 
   const note = typeof body.note === "string" && body.note.trim() ? body.note.trim() : undefined;
-  const { msg, seat } = recordThreadIntent(boardId, threadId, body.from, body.intent, note);
+  // Honest accept (BUG-6): the intent's card entry persists via appendThreadMsg (throws on a durable failure),
+  // so an un-persistable declaration returns 500 rather than a dishonest 200 that loses the work-intent.
+  let declared: { msg: ThreadMsg; seat: string | null };
+  try {
+    declared = recordThreadIntent(boardId, threadId, body.from, body.intent, note);
+  } catch (e) {
+    return sendJson(res, 500, { error: "intent could not be persisted — not recorded, retry", detail: String((e as Error)?.message ?? e) });
+  }
+  const { msg, seat } = declared;
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, from: body.from, seat, intent: body.intent, seq: msg.seq });
 }
 

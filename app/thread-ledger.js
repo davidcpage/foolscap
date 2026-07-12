@@ -59,15 +59,23 @@ function metaPath(repoPath, threadId) {
 }
 
 /**
- * Append one message to a thread's durable log. Best-effort: a failed write never blocks the fan-out, it
- * just means that message isn't restored after a cold restart (the in-memory log still served it live).
+ * Append one message to a thread's durable log, DURABLY — write + fsync under one fd, so a line that returns
+ * from here is on stable storage before the caller returns its HTTP 200 (BUG-6). This is NO LONGER
+ * best-effort: a failure THROWS so the accept path can surface it (return 500) instead of the former silent
+ * swallow, which returned 200 with the message alive only in the bounded in-memory tail — it then vanished on
+ * the next cold restart (the 2026-07-12 lost Coordinator merge-confirmation). The fsync matters: without it a
+ * crash between the append and the OS's own flush would lose a post we already told the caller we accepted.
+ * The caller (appendThreadMsg) persists via this BEFORE publishing the live feed, so the feed never shows a
+ * message that isn't on disk.
  */
 export function appendThreadLine(repoPath, threadId, msg) {
+  fs.mkdirSync(canvasThreadsDir(repoPath), { recursive: true });
+  const fd = fs.openSync(logPath(repoPath, threadId), "a");
   try {
-    fs.mkdirSync(canvasThreadsDir(repoPath), { recursive: true });
-    fs.appendFileSync(logPath(repoPath, threadId), JSON.stringify(msg) + "\n");
-  } catch {
-    /* not fatal — the log is a durability index, not the live source */
+    fs.writeSync(fd, JSON.stringify(msg) + "\n");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

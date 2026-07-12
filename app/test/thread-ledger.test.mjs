@@ -56,6 +56,37 @@ test("a message log round-trips and lands under the board's .canvas/ home", () =
   assert.ok(fs.existsSync(f), "log lives under .canvas/threads/ with an encoded name");
 });
 
+test("BUG-6: an accepted post is durably re-readable with FRESH state (survives a restart)", () => {
+  // The accept path's durable step is appendThreadLine (fsync'd). A post that returned 200 must be readable
+  // after a cold restart — modelled here by re-reading with NO in-memory cache via readThreadLog, exactly what
+  // the server does through threadLog/seedThreadLogs on boot. This is the durability guarantee the honest
+  // accept path (durable-before-200) now makes.
+  const repo = tmpRepo();
+  const id = "node:thread:durable";
+  appendThreadLine(repo, id, msg(1, "persisted before the 200"));
+  appendThreadLine(repo, id, msg(2, "and this one too"));
+  // Fresh-state re-read — no process memory involved, marker-independent (the .jsonl IS the message store).
+  assert.deepEqual(
+    readThreadLog(repo, id),
+    [msg(1, "persisted before the 200"), msg(2, "and this one too")],
+    "both accepted posts survive a restart via a marker-independent .jsonl re-read",
+  );
+  assert.equal(readThreadMeta(repo, id), null, "durability does not depend on the marker — the .jsonl alone carries it");
+});
+
+test("BUG-6: a durable append that CANNOT be persisted THROWS — it is no longer swallowed", () => {
+  // The 2026-07-12 loss: appendThreadLine swallowed a write error and let the accept path return a dishonest
+  // 200 with the message only in the bounded in-memory tail (gone on the next restart). It must now surface
+  // the failure so the accept path returns 500. Force a write failure with a repoPath that is a FILE, so the
+  // `.canvas/threads` mkdir fails ENOTDIR.
+  const filePath = fs.mkdtempSync(path.join(os.tmpdir(), "thread-ledger-notdir-")) + "/afile";
+  fs.writeFileSync(filePath, "i am a file, not a directory");
+  assert.throws(
+    () => appendThreadLine(filePath, "node:thread:x", msg(1, "boom")),
+    "a durable append that can't be made durable surfaces the error instead of swallowing it",
+  );
+});
+
 test("readThreadLog tolerates a ragged first line (a tail-cut / torn mid-write append)", () => {
   const repo = tmpRepo();
   const id = "node:thread:ragged";
