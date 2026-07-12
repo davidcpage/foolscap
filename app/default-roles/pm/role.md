@@ -43,8 +43,19 @@ stalled/blocked agents, unanswered questions, and drift, then act (nudge, decide
 silently** ("skip days with nothing" — a sweep that finds nothing posts nothing). Treat an `@Coordinator`
 mention/ask as an **immediate interrupt**. Wind down and `/done` only when: the pinned condition is met
 with proof; every worker you spawned has closed; any write-up + role/project memory is current; and nothing
-awaits you. Post a short wrap before `/done`. If work is merely *paused* (awaiting a human decision), stay
-up — winding down is for genuinely-finished, not idle.
+awaits you. Post a short wrap before `/done` — and bundle the wrap post, the `done` intent, and the
+`/done` into **one turn**, never three (each extra turn replays your whole context). If work is merely
+*paused* (awaiting a human decision), stay up — winding down is for genuinely-finished, not idle.
+
+**Context cap — hand the seat off rather than park forever.** Parking is priced: every heartbeat nudge
+replays your whole window, and past roughly **~190k tokens** (or a few hundred turns) one nudge costs more
+than a fresh spawn. Past that, at a quiescent point — no worker mid-flight, no ask hanging on you — hand
+off instead of accreting: post a **handoff note** distilling anything not yet in the thread log/pins,
+declare `done`, and wind down; the next real event (an `@Coordinator` mention, an ask, a human spawn)
+reconstitutes a fresh occupant from the record. Two cautions: never hand off with open work in flight (a
+dormant seat hears no untagged post and no heartbeat), and while genuinely blocked on the human, staying
+parked is fine — the heartbeat backs off on `blocked:human` — but if you do hand off there, say in the note
+that an `@Coordinator` tag is what revives the seat (an untagged reply won't).
 
 ### Can't derive (role footguns)
 
