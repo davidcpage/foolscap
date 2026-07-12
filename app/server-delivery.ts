@@ -55,6 +55,13 @@ const isSidLive = (sid: string): boolean => {
   return !!s && s.status !== "exited";
 };
 
+// The ROLE a session card name encodes — "<Role>.<short-sid>" → "<Role>" (a nameless card → the whole
+// string, null for no name). The seat key IS the role name (fillSeat), so this is how a stale @-mentioned
+// sid maps back to the SEAT it named when that seat has since been re-filled to a fresh occupant — the
+// BUG-7 stale-sid fallback in wakeThreadMembers. Mirrors the role split in maybeAnnounceMembership.
+const roleOfName = (name: string | null): string | null =>
+  name ? (name.includes(".") ? name.slice(0, name.indexOf(".")) : name) : null;
+
 // The member:* edges of a snapshot's records, id → {from,to,type}. The diff source for
 // announceNewMemberships (null/absent records → empty map — read as "no membership edges", the safe
 // direction: a real change re-saves a whole snapshot ~400ms later).
@@ -176,27 +183,58 @@ export function wakeThreadMembers(
   exceptSid: string,
   opts: { broadcast: boolean; mentioned?: Set<string>; origin?: string },
 ): number {
-  const { boards, liveSessions, boardSnapshotRecords, threadMemberSids, maybeRespawnDormantSeat } = getServerContext();
+  const { boards, liveSessions, boardSnapshotRecords, threadMemberSids, maybeRespawnDormantSeat, sessionNameForSid } = getServerContext();
   const records = boardSnapshotRecords(boardId);
   if (!records) return 0;
   const meta = boards.get(boardId)?.repoPath ? readThreadMeta(boards.get(boardId)!.repoPath, threadId) : null;
   let woken = 0;
+  const wokenSids = new Set<string>(); // live sids already nudged this pass — so the seat fallback can't double-nudge
+  const staleMentioned: string[] = []; // @-mentioned sids that resolved NON-LIVE — candidates for the seat fallback
   for (const sid of threadMemberSids(records, threadId)) {
     if (sid === exceptSid) continue;
     const mentioned = opts.mentioned?.has(sid) ?? false;
     if (!wakesSeat(threadLevelForSid(meta, sid), { mentioned, broadcast: opts.broadcast })) continue;
     const s = liveSessions.get(sid);
     if (!s || s.status === "exited") {
-      // Dormant seat (P2/W5, R1): the member is addressable but no live process backs it. An @-ADDRESSED
-      // message reconstitutes it from the durable record; a bare broadcast to a dormant room wakes no one
-      // (the R1 "addresses a dormant seat" condition — a broadcast never respawns). `origin` gates it: only
-      // the thread-message path (which passes it) reconstitutes; a join broadcast has none, so it's inert.
-      if (mentioned && opts.origin) maybeRespawnDormantSeat(boardId, threadId, sid, opts.origin, meta);
+      // Dormant/stale @-addressed member: defer to the SEAT fallback below rather than respawning here. The
+      // old inline maybeRespawnDormantSeat(sid) only fired when the seat STILL pointed at THIS sid, so it
+      // missed BUG-7 — an @-tag that resolved (via a stale board snapshot or a lingering durable card name)
+      // to an OLD sid whose seat is now held by a DIFFERENT, LIVE session (the live Coordinator that sat on
+      // "Scheduled" while its @-tag woke no one), or a seat that was re-filled then exited. A bare broadcast
+      // to a dormant room still wakes no one (R1: only an @-mention reconstitutes); `origin` still gates the
+      // respawn to the thread-message path (a join broadcast has none).
+      if (mentioned && opts.origin) staleMentioned.push(sid);
       continue;
     }
     s.nudge = true;
     woken++;
+    wokenSids.add(sid);
     if (s.status === "idle") flushNudge(s);
+  }
+  // STALE-SID SEAT FALLBACK (BUG-7). An @-tag that resolved ONLY to non-live sids must not silently no-op —
+  // and it must not suppress the untagged→Coordinator fallback below for nothing. Walk each such sid back to
+  // the SEAT it named — the seat still pointing at it (a dormant, not-yet-refilled seat), else the ROLE its
+  // card name carried (its seat may since have been re-occupied by a fresh sid) — and reach that seat's
+  // CURRENT occupant from the FRESH durable marker (not the possibly-stale snapshot roster the loop walked):
+  // nudge it if live, else reconstitute the dormant seat. This is the @-mention override applied at the SEAT
+  // level, so it fires ONLY for `mentioned` sids on the thread-message path (staleMentioned is empty for an
+  // untagged/broadcast post) — the "timers/untagged never spawn" invariant (4f5a3ad) stays closed.
+  for (const staleSid of staleMentioned) {
+    const handle = seatForSid(meta?.seats, staleSid) ?? roleOfName(sessionNameForSid(records, staleSid));
+    const occupant = handle ? meta?.seats?.[handle]?.sid : undefined;
+    if (!handle || !occupant) continue; // a bare (unseated) participant — a dropped nudge, unchanged
+    const occ = liveSessions.get(occupant);
+    if (occ && occ.status !== "exited") {
+      if (wokenSids.has(occupant)) continue; // the live occupant was already reached directly by the loop
+      occ.nudge = true;
+      woken++;
+      wokenSids.add(occupant);
+      if (occ.status === "idle") flushNudge(occ);
+    } else {
+      // Truly dormant seat: reconstitute it — the same @-addressed respawn the inline call used to do, now
+      // keyed off the seat's CURRENT occupant sid so a re-filled-then-exited seat still resolves its handle.
+      maybeRespawnDormantSeat(boardId, threadId, occupant, opts.origin!, meta);
+    }
   }
   // Untagged → the thread's Coordinator seat (Option B). An untagged post wakes no member above (neither
   // broadcast nor a mention — principle 3's ambient case). But the Coordinator is the thread's STEWARD and is
