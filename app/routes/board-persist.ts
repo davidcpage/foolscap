@@ -11,6 +11,7 @@ import {
   readBoardSnapshot,
   writeBoardSnapshot,
 } from "../board-persist.js";
+import { dropBoardEngine, foldBoardEvent, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) — Phase 1 split ─
 // The browser's EventStore/SnapshotStore (core's persistence seam) are HTTP clients over these endpoints
@@ -56,6 +57,10 @@ async function handleBoardPersistWrite(
         if (last === undefined || ev.seq > last) lastEventSeq.set(boardId, ev.seq);
       }
       appendBoardEvent(repoPath, ev);
+      // §9 stage 1: fold the just-appended event into the live server-materialized store (read authority),
+      // so every server-side read reflects it without waiting on the debounced snapshot.json cache. Purely
+      // OBSERVES the append — the write above is unchanged; a fold error self-heals (drops → rehydrate).
+      foldBoardEvent(boardId, repoPath, ev);
       return sendJson(res, 200, { ok: true });
     }
     if (kind === "snapshot") {
@@ -80,6 +85,9 @@ async function handleBoardPersistWrite(
         return sendJson(res, 409, { error: "stale snapshot", storedSeq: before.seq, gotSeq: snap.seq });
       }
       writeBoardSnapshot(repoPath, snap as Record<string, unknown>);
+      // Keep the live store (§9 stage 1 read authority) in step with a snapshot that carries state no
+      // event fold has seen (directly-authored save / lost echo). No-op for an ordinary debounced save.
+      reconcileBoardEngineOnSnapshot(boardId, repoPath, snap);
       sendJson(res, 200, { ok: true });
       try {
         ctx.announceNewMemberships(boardId, before ? (before.records ?? []) : null, snap.records ?? [], ctx.originOf(req));
@@ -109,6 +117,7 @@ async function handleBoardPersistWrite(
         ? (body.snapshot as Record<string, unknown>)
         : null;
     const imported = importBoardPersist(repoPath, events, snapshot);
+    if (imported) dropBoardEngine(boardId); // adopted files replace board state out-of-band — rehydrate on next read
     // ALWAYS log adoptions: whichever tab wins this race seeds the board's durable state forever, and
     // the wrong winner is invisible after the fact. The user-agent is what tells a leaked HEADLESS
     // probe tab (this exact incident: a stale HeadlessChrome's near-empty IndexedDB beat the real
@@ -138,6 +147,7 @@ export const boardPersistRoutes: GlobalRoute[] = [
       }
       if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
         clearBoardPersist(b.repoPath);
+        dropBoardEngine(b.boardId); // files cleared out-of-band — drop the live store so the next read rehydrates empty
         return sendJson(res, 200, { ok: true });
       }
       if (req.method === "POST") {
