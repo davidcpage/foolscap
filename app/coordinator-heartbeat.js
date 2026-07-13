@@ -84,18 +84,41 @@ export function heartbeatEffectiveInterval(baseIntervalMs, intent) {
 export const HEARTBEAT_STALE_BUCKET_MS = 30 * 60_000; // re-sweep a stalled (unchanged working/blocked:peer) state this often
 
 /**
+ * A live session's whole-session BAND (session-status.ts — `sessionStatus`), COARSENED for the sweep so a
+ * steadily-working session reads STABLY tick over tick. PURE.
+ *
+ * The bug this fixes: the raw process status oscillates running↔idle EVERY turn (`sessionStatus` →
+ * `working` while mid-turn, the default idle `waiting` between turns), so a long build flipped the
+ * signature every few seconds and the §6.1 gate never engaged — an active build woke the Coordinator each
+ * cadence. But running and idle-between-turns both mean the same thing to a stall sweep: "this session is
+ * actively engaged." So they fold to ONE token. The distinct calm band `scheduled` (a looping role parked
+ * on its own heartbeat, no demand on anyone) is KEPT so a `scheduled`→working transition (a parked session
+ * picking up work — the "idle→working" a sweep should notice) still fires; and the terminal bands
+ * (`done`/`crashed`/`ended`) are kept so a working→done/crashed transition fires (such a session also
+ * usually just leaves the live set). `blocked:human`/`blocked:peer` need no distinct session token here —
+ * they ride the INTENT component below (value + stall bucket), which is where their stall is tracked.
+ */
+export function sweepSessionActivity(band) {
+  if (band === "scheduled") return "scheduled";
+  if (band === "done" || band === "crashed" || band === "ended") return band;
+  return "working"; // working | waiting | waiting-agent | null → one "actively engaged" token
+}
+
+/**
  * The sweep-relevant board state, folded to a stable string — equal signatures ⇒ a sweep would find
  * nothing new. PURE; order-insensitive (threads, intent keys, and sessions are sorted). Components:
  *   - per thread: `lastTs` (any post/ask/answer bumps it — message content need not be read);
  *   - per declared intent (seat-keyed, `meta.intents`): its VALUE, plus — for stall detection — the
  *     quantized AGE of a non-self `working`/`blocked:peer` (self = `selfRole`, the sweeper's own seat:
  *     the watcher's own heartbeat must not tick itself awake forever on a quiet board);
- *   - per live (non-exited) session: `sid=status` (a peer starting/finishing a turn, appearing, or
- *     exiting is sweep-relevant; `blocked:human` ages are NOT bucketed — the human's reply is a post).
+ *   - per live session: `sid=activity`, where `activity` is the COARSENED whole-session band
+ *     (sweepSessionActivity): a session appearing/disappearing or crossing between engaged/scheduled/
+ *     terminal is sweep-relevant, but the running↔idle micro-flip of a steadily-working session is NOT.
+ *     `sessions[].status` therefore carries the session's BAND (sessionStatus), not the raw process state;
+ *     the caller has already dropped exited sessions.
  * The caller captures the signature AT FIRE TIME, so state the occupant itself mutates DURING the sweep
  * (its posts bump lastTs) reads as fresh change → at most one echo sweep per active episode, then the
- * gate engages. `threads` = thread meta markers (listThreads); `sessions` = `{sid, status}` of the
- * board's live sessions.
+ * gate engages. `threads` = thread meta markers (listThreads); `sessions` = `{sid, status}` (status = band).
  */
 export function heartbeatSweepSignature({ threads, sessions } = {}, now, selfRole = COORDINATOR_ROLE) {
   const parts = [];
@@ -114,7 +137,7 @@ export function heartbeatSweepSignature({ threads, sessions } = {}, now, selfRol
   }
   const live = [...(sessions ?? [])].filter((s) => s && s.sid && s.status !== "exited");
   live.sort((a, b) => String(a.sid).localeCompare(String(b.sid)));
-  for (const s of live) parts.push(`s:${s.sid}=${s.status}`);
+  for (const s of live) parts.push(`s:${s.sid}=${sweepSessionActivity(s.status)}`);
   return parts.join("|");
 }
 
