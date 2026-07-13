@@ -7,7 +7,9 @@ export interface HostSessionInfo {
   cwd: string;
   busy: boolean;
   spawnedAt: number;
-  pid: number;
+  pid: number | undefined;
+  provider: "claude" | "codex";
+  providerSessionId?: string | null;
 }
 export interface HostExitRecord {
   id: string;

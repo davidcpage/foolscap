@@ -6,4 +6,8 @@ export interface SessionHost {
   socketPath: string;
   pid: number;
 }
-export function createHost(opts: { socketPath: string; logPath: string }): Promise<SessionHost>;
+export function createHost(opts: {
+  socketPath: string;
+  logPath: string;
+  codexRuntimeFactory?: (...args: any[]) => Promise<import("./codex-host-runtime.js").CodexHostRuntime>;
+}): Promise<SessionHost>;

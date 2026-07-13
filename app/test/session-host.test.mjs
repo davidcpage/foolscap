@@ -8,7 +8,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createHost } from "../session-host.js";
-import { makeLineSplitter, isResultLine, isUserWrite } from "../session-host-protocol.js";
+import { makeLineSplitter, isResultLine, isUserWrite, PROTOCOL_VERSION } from "../session-host-protocol.js";
 
 const FAKE = new URL("./fixtures/fake-claude.mjs", import.meta.url).pathname;
 
@@ -87,12 +87,27 @@ test("protocol helpers: result-line and user-write predicates parse, not just gr
   assert.ok(!isUserWrite(JSON.stringify({ type: "control_request", request: { subtype: "interrupt" } })));
 });
 
+test("hello rejects an old sidecar protocol before it can misread provider-aware spawns", async () => {
+  const { socketPath, logPath } = tmpSock();
+  const host = await createHost({ socketPath, logPath });
+  try {
+    const c = await connect(socketPath);
+    const r = await c.request({ op: "hello", ver: PROTOCOL_VERSION - 1 });
+    assert.deepEqual({ ok: r.ok, error: r.error, ver: r.ver }, {
+      ok: false, error: "version-mismatch", ver: PROTOCOL_VERSION,
+    });
+    await c.close();
+  } finally {
+    await host.shutdown();
+  }
+});
+
 test("spawn → line events stream; a turn answers and the busy bit falls back to idle", async () => {
   const { socketPath, logPath } = tmpSock();
   const host = await createHost({ socketPath, logPath });
   try {
     const c = await connect(socketPath);
-    assert.equal((await c.request({ op: "hello", ver: 1, pid: process.pid })).ok, true);
+    assert.equal((await c.request({ op: "hello", ver: PROTOCOL_VERSION, pid: process.pid })).ok, true);
     assert.equal((await c.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() })).ok, true);
     await c.waitEvent((e) => e.op === "line" && e.id === "s1" && e.line.includes('"init"'));
 
@@ -112,7 +127,7 @@ test("busy bit: a user write sets it, a hung turn holds it, an interrupt-style w
   const host = await createHost({ socketPath, logPath });
   try {
     const c = await connect(socketPath);
-    await c.request({ op: "hello", ver: 1 });
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
     await c.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
     c.send({ op: "write", id: "s1", data: userMsg("hang") });
     await sleep(100);
@@ -129,12 +144,68 @@ test("busy bit: a user write sets it, a hung turn holds it, an interrupt-style w
   }
 });
 
+test("one host-owned Codex runtime multiplexes logical sessions and releases one without killing the other", async () => {
+  const { socketPath, logPath } = tmpSock();
+  let factoryCalls = 0;
+  let closeCalls = 0;
+  const prompts = [];
+  const releases = [];
+  const codexRuntimeFactory = async ({ onEvent }) => {
+    factoryCalls++;
+    return {
+      pid: 4242,
+      account: { type: "chatgpt", email: "plan@example.test", planType: "team" },
+      async start(sid) { return { threadId: `thread-${sid}` }; },
+      async resume(sid, threadId) { return { sid, threadId }; },
+      async prompt(sid, text) {
+        prompts.push([sid, text]);
+        onEvent(sid, { method: "turn/started", params: { threadId: `thread-${sid}`, turn: { id: `turn-${sid}` } } });
+        onEvent(sid, { method: "item/agentMessage/delta", params: { threadId: `thread-${sid}`, itemId: `item-${sid}`, delta: `reply:${text}` } });
+        onEvent(sid, { method: "turn/completed", params: { threadId: `thread-${sid}`, turn: { id: `turn-${sid}`, status: "completed" } } });
+      },
+      async steer() {},
+      async interrupt() {},
+      async read() { return { thread: { turns: [] } }; },
+      async release(sid) { releases.push(sid); return true; },
+      close() { closeCalls++; },
+    };
+  };
+  const host = await createHost({ socketPath, logPath, codexRuntimeFactory });
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+    const a = await c.request({ op: "spawn", id: "ca", provider: "codex", cwd: "/tmp/a" });
+    const b = await c.request({ op: "spawn", id: "cb", provider: "codex", cwd: "/tmp/b" });
+    assert.deepEqual(
+      [a.provider, a.providerSessionId, b.providerSessionId],
+      ["codex", "thread-ca", "thread-cb"],
+    );
+    assert.equal(factoryCalls, 1, "both logical sessions share one app-server runtime");
+
+    c.send({ op: "write", id: "ca", data: userMsg("alpha") });
+    c.send({ op: "write", id: "cb", data: userMsg("beta") });
+    await c.waitEvent((e) => e.op === "line" && e.id === "ca" && e.line.includes("reply:alpha"));
+    await c.waitEvent((e) => e.op === "line" && e.id === "cb" && e.line.includes("reply:beta"));
+    assert.deepEqual(prompts, [["ca", "alpha"], ["cb", "beta"]]);
+
+    await c.request({ op: "kill", id: "ca" });
+    await c.waitEvent((e) => e.op === "exit" && e.id === "ca" && e.reason === "killed");
+    assert.deepEqual(releases, ["ca"]);
+    assert.deepEqual((await c.request({ op: "list" })).sessions.map((s) => s.id), ["cb"]);
+    assert.equal(closeCalls, 0, "releasing a thread does not kill the shared app-server");
+    await c.close();
+  } finally {
+    await host.shutdown();
+  }
+  assert.equal(closeCalls, 1, "host shutdown owns app-server shutdown");
+});
+
 test("spawn env EXTENDS the host's environment for that child (per-spawn knobs like MCP_TOOL_TIMEOUT)", async () => {
   const { socketPath, logPath } = tmpSock();
   const host = await createHost({ socketPath, logPath });
   try {
     const c = await connect(socketPath);
-    await c.request({ op: "hello", ver: 1 });
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
     // The child prints one env var and idles; PATH must survive (extend, never replace).
     const probe = 'console.log(JSON.stringify({v: process.env.CANVAS_TEST_KNOB ?? null, path: !!process.env.PATH})); setInterval(() => {}, 1000);';
     await c.request({ op: "spawn", id: "e1", cmd: process.execPath, args: ["-e", probe], cwd: os.tmpdir(), env: { CANVAS_TEST_KNOB: "660000" } });
@@ -155,14 +226,14 @@ test("children survive client detach; a reattaching client lists them with a cor
   const host = await createHost({ socketPath, logPath });
   try {
     const c1 = await connect(socketPath);
-    await c1.request({ op: "hello", ver: 1 });
+    await c1.request({ op: "hello", ver: PROTOCOL_VERSION });
     await c1.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: "/tmp" });
     c1.send({ op: "write", id: "s1", data: userMsg("hang") });
     await sleep(100);
     await c1.close();
 
     const c2 = await connect(socketPath);
-    assert.equal((await c2.request({ op: "hello", ver: 1 })).ok, true, "slot freed by the detach");
+    assert.equal((await c2.request({ op: "hello", ver: PROTOCOL_VERSION })).ok, true, "slot freed by the detach");
     const list = await c2.request({ op: "list" });
     assert.deepEqual(
       list.sessions.map((s) => ({ id: s.id, cwd: s.cwd, busy: s.busy })),
@@ -180,9 +251,9 @@ test("second attached client is rejected busy — first wins, no takeover", asyn
   const host = await createHost({ socketPath, logPath });
   try {
     const c1 = await connect(socketPath);
-    await c1.request({ op: "hello", ver: 1, pid: 111 });
+    await c1.request({ op: "hello", ver: PROTOCOL_VERSION, pid: 111 });
     const c2 = await connect(socketPath);
-    const r = await c2.request({ op: "hello", ver: 1, pid: 222 });
+    const r = await c2.request({ op: "hello", ver: PROTOCOL_VERSION, pid: 222 });
     assert.equal(r.ok, false);
     assert.equal(r.error, "busy");
     assert.equal(r.clientPid, 111, "the rejection names the holder");
@@ -198,7 +269,7 @@ test("exit reasons: a client kill is 'killed', a self-death while attached is 's
   const host = await createHost({ socketPath, logPath });
   try {
     const c = await connect(socketPath);
-    await c.request({ op: "hello", ver: 1 });
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
     await c.request({ op: "spawn", id: "k", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
     await c.request({ op: "spawn", id: "d", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
     await c.request({ op: "kill", id: "k" });
@@ -220,14 +291,14 @@ test("a death while detached lands in the exits backlog with cwd, and ack-exits 
   const host = await createHost({ socketPath, logPath });
   try {
     const c1 = await connect(socketPath);
-    await c1.request({ op: "hello", ver: 1 });
+    await c1.request({ op: "hello", ver: PROTOCOL_VERSION });
     const spawned = await c1.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: "/tmp" });
     await c1.close();
     process.kill(spawned.pid); // dies with nobody attached — no owner asked for this → "self"
     await sleep(150);
 
     const c2 = await connect(socketPath);
-    await c2.request({ op: "hello", ver: 1 });
+    await c2.request({ op: "hello", ver: PROTOCOL_VERSION });
     const list = await c2.request({ op: "list" });
     assert.equal(list.sessions.length, 0);
     assert.equal(list.exits.length, 1);
@@ -246,7 +317,7 @@ test("host shutdown kills the children as reason:'shutdown' (not a crash) and un
   const { socketPath, logPath } = tmpSock();
   const host = await createHost({ socketPath, logPath });
   const c = await connect(socketPath);
-  await c.request({ op: "hello", ver: 1 });
+  await c.request({ op: "hello", ver: PROTOCOL_VERSION });
   await c.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
   const done = c.waitEvent((e) => e.op === "exit" && e.id === "s1");
   await host.shutdown();
@@ -259,7 +330,7 @@ test("the socket 'shutdown' op stops everything — even while another client ho
   const { socketPath, logPath } = tmpSock();
   const host = await createHost({ socketPath, logPath });
   const devServer = await connect(socketPath);
-  await devServer.request({ op: "hello", ver: 1 });
+  await devServer.request({ op: "hello", ver: PROTOCOL_VERSION });
   await devServer.request({ op: "spawn", id: "s1", cmd: process.execPath, args: [FAKE], cwd: os.tmpdir() });
   const exited = devServer.waitEvent((e) => e.op === "exit" && e.id === "s1");
 

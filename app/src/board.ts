@@ -9,14 +9,12 @@
 export interface Board {
   boardId: string;
   name: string;
-  // The dev repo's board — the one that historically owned the global `canvas-notes` DB. Only this board
-  // adopts that legacy data on first boot; a freshly-mounted repo must NOT inherit it.
+  // The dev repo's board, used for navigation and display ordering.
   isDefault: boolean;
 }
 
 // Fall back to a fixed local id if the board API is unreachable (server down, offline). This keeps the
-// app bootable — it just persists under a generic board until the server can name the real one. Treated as
-// default so a legacy DB still migrates in the offline case.
+// app bootable — it just persists under a generic board until the server can name the real one.
 const FALLBACK: Board = { boardId: "default", name: "board", isDefault: true };
 
 // The resolved board for this page. Set once by resolveBoard() before the engine builds or any card

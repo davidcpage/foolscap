@@ -11,7 +11,7 @@ import {
   type InputEvent,
   type LayoutRecord,
 } from "./lib";
-import { IdbEventStore, IdbSnapshotStore, boardDbName, migrateLegacyBoard } from "./idb";
+import { IdbEventStore, IdbSnapshotStore, boardDbName } from "./idb";
 import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, importBoardPersist } from "./remote-store";
 import { activeBoard, activeBoardId, boardHref, listBoards, resolveBoard, type BoardListing } from "./board";
 import { ViewStore } from "./views";
@@ -93,18 +93,17 @@ interface Engine {
 //   4. build the manager AFTER the store is populated, so its spatial index seeds from real records;
 //   5. restore the camera pose, attach the snapshot half (debounced channel-2 saves), write a baseline;
 //   6. wire undo last, so the hydrated board isn't undoable.
-async function createEngine(boardId: string, isDefault: boolean): Promise<Engine> {
+async function createEngine(boardId: string): Promise<Engine> {
   // The durable tier is the SERVER now (step 4: `<repo>/.canvas/board/` via remote-store.ts), so the
   // board travels with the repo and hydrates the same in any browser. IndexedDB is read exactly once
   // more per board — the adoption below — and left intact as a fallback, never written again.
   let boot = await fetchBoardPersist(boardId);
   if (boot.events.length === 0 && !boot.snapshot) {
-    // Nothing server-side yet: adopt this browser's pre-step-4 state for the board, if any. The old
-    // migration chain still applies first (legacy global DB → per-board DB, DEFAULT board only), so a
-    // board last touched before per-board DBs existed adopts through both hops. The server refuses the
-    // import once ANY state exists (another tab may have won the race) — re-fetch and trust it.
+    // Nothing server-side yet: adopt this browser's checkout-scoped pre-step-4 state for the board, if
+    // any. The server refuses the import once ANY state exists (another tab may have won the race) —
+    // re-fetch and trust it. The old origin-global `canvas-notes` DB is deliberately never consulted:
+    // it cannot identify which checkout owns its contents.
     const dbName = boardDbName(boardId);
-    if (isDefault) await migrateLegacyBoard(dbName);
     const [events, snapshot] = await Promise.all([
       new IdbEventStore(dbName).loadAll(),
       new IdbSnapshotStore(dbName).load(),
@@ -279,7 +278,7 @@ export function App() {
     if (started.current) return;
     started.current = true;
     void resolveBoard()
-      .then((board) => createEngine(board.boardId, board.isDefault))
+      .then((board) => createEngine(board.boardId))
       .then(setEngine);
   }, []);
   if (!engine) return <div className="app loading" />;

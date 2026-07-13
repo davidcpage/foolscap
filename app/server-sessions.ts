@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import chokidar from "chokidar";
 import { getPendingHistoryMode, getPendingPermissions, getServerContext } from "./server-context.js";
 import { markCanvasSession, projectsDirForCwd, readCanvasSession, recordSessionEnd, updateCanvasSession } from "./session-ledger.js";
-import { localProc, remoteProc, type ProcHooks } from "./session-proc.js";
+import { localProc, remoteProc, type ClaudeSpawnSpec, type ProcHooks, type SpawnSpec } from "./session-proc.js";
 import { connectSessionHost, type SessionHostClient, type HostSessionInfo } from "./session-host-client.js";
 import { sessionHostSocketPath } from "./session-host-protocol.js";
 import { listThreads, ownBlockedIntentKeys, readThreadMeta, sessionDeclaredDone, sessionIdleIntent, upsertThreadMeta, type ThreadMetaMarker } from "./thread-ledger.js";
@@ -277,6 +277,97 @@ function ctxOf(u: any): number {
     (Number(u.cache_creation_input_tokens) || 0);
 }
 
+const codexUserText = (content: unknown): string => Array.isArray(content)
+  ? content.filter((p: any) => p?.type === "text").map((p: any) => p.text ?? "").join("")
+  : "";
+
+function seedCodexHistory(s: LiveSession, result: any): void {
+  if (s.lines.length) return;
+  for (const turn of result?.thread?.turns ?? []) {
+    for (const item of turn?.items ?? []) {
+      if (item?.type === "userMessage") {
+        const text = codexUserText(item.content);
+        if (text) s.lines.push(JSON.stringify({ type: "user", message: { role: "user", content: text } }));
+      } else if (item?.type === "agentMessage" && typeof item.text === "string") {
+        s.lines.push(JSON.stringify({
+          type: "assistant", message: { role: "assistant", content: [{ type: "text", text: item.text }] },
+        }));
+      }
+    }
+  }
+}
+
+function foldCodexEvent(s: LiveSession, e: any): void {
+  const { flushNudge } = getServerContext();
+  const p = e?.params ?? {};
+  switch (e?.method) {
+    case "canvas/provider-bound":
+      s.providerSessionId = typeof p.providerSessionId === "string" ? p.providerSessionId : s.providerSessionId;
+      updateCanvasSession(s.repoPath, s.id, {
+        provider: "codex",
+        providerSessionId: s.providerSessionId,
+        // Plan provenance is durable; the signed-in email is deliberately not copied into the repo marker.
+        codexAccount: p.account
+          ? { type: p.account.type, planType: p.account.planType }
+          : null,
+      });
+      break;
+    case "canvas/history":
+      seedCodexHistory(s, p);
+      break;
+    case "turn/started":
+      resumeRunning(s);
+      s.verb = "Thinking";
+      break;
+    case "item/agentMessage/delta": {
+      const itemId = typeof p.itemId === "string" ? p.itemId : "agent-message";
+      if (!s.inflight || s.inflight[0]?.id !== itemId)
+        s.inflight = [{ type: "text", text: "", id: itemId }];
+      s.inflight[0].text = (s.inflight[0].text ?? "") + (typeof p.delta === "string" ? p.delta : "");
+      s.verb = "Responding";
+      resumeRunning(s);
+      break;
+    }
+    case "item/started":
+      if (p.item?.type === "commandExecution") s.verb = "Running";
+      else if (p.item?.type === "fileChange") s.verb = "Editing";
+      else if (p.item?.type === "mcpToolCall") s.verb = "Using tool";
+      resumeRunning(s);
+      break;
+    case "item/completed":
+      if (p.item?.type === "agentMessage" && typeof p.item.text === "string") {
+        s.lines.push(JSON.stringify({
+          type: "assistant", message: { role: "assistant", content: [{ type: "text", text: p.item.text }] },
+        }));
+        s.inflight = null;
+      }
+      break;
+    case "thread/tokenUsage/updated": {
+      const last = p.tokenUsage?.last;
+      if (last) s.usage = { input: Number(last.inputTokens) || 0, output: Number(last.outputTokens) || 0 };
+      break;
+    }
+    case "turn/completed":
+      s.inflight = null;
+      s.status = "idle";
+      s.verb = null;
+      if (s.autoWake) s.idleSince = Date.now();
+      if (s.nudge) flushNudge(s);
+      break;
+    case "thread/status/changed":
+      if (p.status?.type === "active") resumeRunning(s);
+      else if (p.status?.type === "idle" || p.status?.type === "notLoaded") {
+        s.status = "idle";
+        s.verb = null;
+      }
+      break;
+    case "canvas/error":
+      s.status = "idle";
+      s.verb = null;
+      break;
+  }
+}
+
 // A short, human label for what the live turn is doing right now, derived from the in-flight content
 // block's tool name. Mirrors the terminal's progress verb — purely cosmetic channel-1 chrome.
 function toolVerb(name: string): string {
@@ -303,6 +394,10 @@ function toolVerb(name: string): string {
 // the CONSOLIDATED `user`/`assistant` events (already in the on-disk .jsonl codec's shape).
 function foldSessionEvent(s: LiveSession, e: any): void {
   const { foldShadowEdits, flushNudge } = getServerContext();
+  if (e?.type === "codex_event") {
+    foldCodexEvent(s, e);
+    return;
+  }
   // The harness advertises its skills in the `system`/`init` event that opens every `-p --output-format
   // stream-json` session. Capture the names so the card can offer `/`-completion. Framing only — nothing
   // folds into the transcript. VERIFIED LIVE 2026-06-20 against a real `claude -p` capture: the on-disk
@@ -499,6 +594,7 @@ export function ensureLiveSession(
   threadId: string | null = null,
   cwd: string = repoPath, // the process working dir — a worktree checkout for `spawn --worktree`, else the board root
   model: string | null = null, // explicit per-spawn model; null → role `model:` frontmatter → DEFAULT_SESSION_MODEL
+  provider: "claude" | "codex" = "claude",
 ): LiveSession {
   const { liveSessions, fsState, boardIdentity } = getServerContext();
   const existing = liveSessions.get(id);
@@ -514,6 +610,7 @@ export function ensureLiveSession(
   // recorded on a prior marker so a --resume keeps its role. Its charter is appended to the system prompt
   // and its identity stamped on the marker (below), so the role survives a restart and names the card.
   const prior = readCanvasSession(repoPath, id) ?? {};
+  const effectiveProvider = resume && prior.provider === "codex" ? "codex" : provider;
   const effectiveRoleId = roleId ?? (typeof prior.roleId === "string" ? prior.roleId : null);
   const role = effectiveRoleId ? readRole(repoPath, effectiveRoleId) : null;
 
@@ -579,22 +676,35 @@ export function ensureLiveSession(
   // The hooks close over `s` (declared just below) — they only fire async, well after it's assigned.
   if (REMOTE_SESSIONS && fsState.hostClient && !fsState.hostClient.connected)
     throw new Error("session host unreachable (reconnecting) — retry in a moment");
+  if (effectiveProvider === "codex" && (!REMOTE_SESSIONS || !fsState.hostClient))
+    throw new Error("Codex sessions require the long-lived session host");
   // MCP_TOOL_TIMEOUT must OUTLAST the server's permission hold, or the CLI gives up on the relay first
   // and the prompt dies with an opaque client-side error instead of our honest hold-timeout deny.
-  const spawnSpec = {
-    cmd: "claude", args, cwd, // worktree checkout for a --worktree session; the board root otherwise
-    env: { MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000) },
-  };
+  const spawnSpec: SpawnSpec = effectiveProvider === "codex"
+    ? {
+        provider: "codex", cwd,
+        ...(model ? { model } : {}),
+        developerInstructions: appendPrompt,
+        ...(resume && typeof prior.providerSessionId === "string"
+          ? { resumeProviderId: prior.providerSessionId }
+          : {}),
+      }
+    : {
+        provider: "claude", cmd: "claude", args, cwd,
+        env: { MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000) },
+      };
   const proc =
     REMOTE_SESSIONS && fsState.hostClient
       ? remoteProc(fsState.hostClient, id, wireSessionHooks(() => s), { spawn: spawnSpec })
-      : localProc(spawnSpec, wireSessionHooks(() => s));
+      : localProc(spawnSpec as ClaudeSpawnSpec, wireSessionHooks(() => s));
   const s: LiveSession = {
     // Start IDLE, not running: a freshly-spawned process is waiting on stdin (it emits `system/init`, never
     // a `result`, until it's first prompted), so "running" would be a turn that never ends — and the inbox,
     // which flushes idle-immediately / at a turn boundary, would queue forever with no boundary to drain at.
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
-    id, repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, model: null, turnOut: 0,
+    id, provider: effectiveProvider,
+    providerSessionId: effectiveProvider === "codex" && typeof prior.providerSessionId === "string" ? prior.providerSessionId : null,
+    repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, model: null, turnOut: 0,
     // Cursors revive from the marker (persistSessionState) so a --resume / sidecar adoption doesn't reset
     // them to 0 and re-deliver every joined thread's backlog as unread.
     read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
@@ -610,6 +720,10 @@ export function ensureLiveSession(
   markCanvasSession(repoPath, id, {
     spawnedAt: Date.now(),
     origin,
+    provider: effectiveProvider,
+    ...(effectiveProvider === "codex" && typeof prior.providerSessionId === "string"
+      ? { providerSessionId: prior.providerSessionId }
+      : {}),
     ...(cwd !== repoPath ? { cwd } : {}), // durable note of a worktree cwd (legibility; boardRootForCwd re-derives repoPath)
     ...(effectiveRoleId
       ? {
@@ -693,7 +807,8 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
     onExit: (x) => hooks.onExit(x),
   });
   const s: LiveSession = {
-    id: info.id, repoPath: boardRoot, cwd: info.cwd, proc, lines: [], inflight: null,
+    id: info.id, provider: info.provider ?? "claude", providerSessionId: info.providerSessionId ?? null,
+    repoPath: boardRoot, cwd: info.cwd, proc, lines: [], inflight: null,
     status: info.busy ? "running" : "idle", skills: null, verb: info.busy ? "Working" : null,
     usage: null, model: null, turnOut: 0,
     read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
@@ -703,7 +818,7 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
     origin: typeof marker.origin === "string" ? marker.origin : "localhost:5173",
     pendingEdits: new Map(), // an Edit claimed pre-restart commits unattributed — accepted loss
   };
-  seedFromTranscript(s);
+  if (s.provider === "claude") seedFromTranscript(s);
   liveSessions.set(info.id, s);
   buffering = false;
   for (const line of pending) hooks.onLine(line);
@@ -1223,6 +1338,8 @@ export function publishSession(s: LiveSession): void {
     content,
     truncated,
     status: s.status,
+    provider: s.provider,
+    providerSessionId: s.providerSessionId ?? undefined,
     // The ONE whole-session status band (sessionStatus) the card renders its frame from — the SAME value
     // the thread participant pill reads off /api/sessions, so the two surfaces can't drift. Sent on every
     // publish (including `null` = bandless/never-run) so the card stops recomputing the band client-side;

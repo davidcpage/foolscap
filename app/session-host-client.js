@@ -15,7 +15,7 @@
 
 import net from "node:net";
 import { spawn } from "node:child_process";
-import { makeLineSplitter } from "./session-host-protocol.js";
+import { makeLineSplitter, PROTOCOL_VERSION } from "./session-host-protocol.js";
 
 const RECONNECT_MS = 2000;
 const CONNECT_TRIES = 10; // × 200ms — covers the autostarted host's boot
@@ -101,8 +101,14 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
   };
 
   const hello = async () => {
-    const r = await request({ op: "hello", ver: 1, pid: clientPid ?? process.pid });
-    if (!r.ok) throw new Error(`session host busy (client pid ${r.clientPid ?? "?"} holds the slot)`);
+    const r = await request({ op: "hello", ver: PROTOCOL_VERSION, pid: clientPid ?? process.pid });
+    if (!r.ok) {
+      if (r.error === "version-mismatch")
+        throw new Error(`session host protocol mismatch (host ${r.ver ?? "?"}, client ${PROTOCOL_VERSION}); stop the old session host`);
+      throw new Error(`session host busy (client pid ${r.clientPid ?? "?"} holds the slot)`);
+    }
+    if (r.ver !== PROTOCOL_VERSION)
+      throw new Error(`session host protocol mismatch (host ${r.ver ?? "?"}, client ${PROTOCOL_VERSION}); stop the old session host`);
   };
 
   // Forever-reconnect after a drop. On success, sweep: attached ids the fresh host doesn't list are gone
@@ -148,7 +154,7 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
       // same way a self-death reads), keeping ensureLiveSession synchronous.
       // `env` extends the HOST's environment for this child (an old host ignores the field — the spawn
       // still lands, just without the knobs; degrade, don't reject).
-      void request({ op: "spawn", id, cmd: spec.cmd, args: spec.args, cwd: spec.cwd, env: spec.env }).then((r) => {
+      void request({ op: "spawn", id, ...spec }).then((r) => {
         if (!r.ok) {
           const h = hooks.get(id);
           hooks.delete(id);

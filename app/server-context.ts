@@ -178,6 +178,7 @@ export interface ServerContext {
     threadId?: string | null,
     cwd?: string,
     model?: string | null, // explicit per-spawn model; null → role `model:` frontmatter → DEFAULT_SESSION_MODEL
+    provider?: "claude" | "codex",
   ) => LiveSession; // spawn/adopt a live process into the registry (session-host engine)
   sendSessionInput: (id: string, text: string, opts?: { keepWaitingOn?: boolean }) => boolean; // write a prompt to stdin
   sendSessionInterrupt: (id: string) => boolean; // halt the current turn via the stdin control channel

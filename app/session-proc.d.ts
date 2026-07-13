@@ -17,14 +17,25 @@ export interface ProcHooks {
 }
 
 /** `env` EXTENDS the owner's environment for this child (per-spawn knobs), never replaces it. */
-export interface SpawnSpec {
+export interface ClaudeSpawnSpec {
+  provider?: "claude";
   cmd: string;
   args: string[];
   cwd: string;
   env?: Record<string, string>;
 }
 
-export function localProc(opts: SpawnSpec, hooks: ProcHooks): SessionProc;
+export interface CodexSpawnSpec {
+  provider: "codex";
+  cwd: string;
+  model?: string;
+  developerInstructions?: string;
+  resumeProviderId?: string;
+}
+
+export type SpawnSpec = ClaudeSpawnSpec | CodexSpawnSpec;
+
+export function localProc(opts: ClaudeSpawnSpec, hooks: ProcHooks): SessionProc;
 
 export function remoteProc(
   client: import("./session-host-client.js").SessionHostClient,

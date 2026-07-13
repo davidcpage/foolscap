@@ -134,6 +134,7 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleId: (marker?.roleId as string | undefined) ?? null,
       roleName: (marker?.roleName as string | undefined) ?? null,
       roleColour: (marker?.roleColour as string | undefined) ?? null,
+      provider: marker?.provider === "codex" ? "codex" : "claude",
       // The serving model, known only for a session the registry holds live (folded from its stream /
       // seeded transcript). Dead rows read null — the list renders no chip rather than a stale guess.
       model: liveSessions.get(s.id)?.model ?? null,
@@ -161,6 +162,7 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleId: (marker?.roleId as string | undefined) ?? null,
       roleName: (marker?.roleName as string | undefined) ?? null,
       roleColour: (marker?.roleColour as string | undefined) ?? null,
+      provider: l.provider,
       model: l.model ?? null,
     } as (typeof sessions)[number]);
   }
@@ -185,7 +187,7 @@ async function handleSessionSpawn(
   const pendingHistoryMode = getPendingHistoryMode(fsState);
   let body: {
     prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
-    worktree?: unknown; base?: unknown; worktreeKey?: unknown; model?: unknown;
+    worktree?: unknown; base?: unknown; worktreeKey?: unknown; model?: unknown; provider?: unknown;
   } = {};
   try {
     const raw = await readBody(req);
@@ -199,6 +201,9 @@ async function handleSessionSpawn(
   if (refusal) return sendJson(res, 403, { error: refusal });
   if (liveSessionCount() >= MAX_LIVE_SESSIONS)
     return sendJson(res, 429, { error: `live-session cap reached (${MAX_LIVE_SESSIONS}); terminate one first` });
+  const provider = body.provider == null || body.provider === "" ? "claude" : body.provider;
+  if (provider !== "claude" && provider !== "codex")
+    return sendJson(res, 400, { error: 'provider must be "claude" or "codex"' });
   // Optional: spawn this session AS a role — its charter is appended to the system prompt and its identity
   // stamped on the marker (agent-roles.md). An unknown roleId is a client error, not a silent bare spawn.
   let roleId: string | null = null;
@@ -240,7 +245,7 @@ async function handleSessionSpawn(
   }
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model);
+    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model, provider);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }
@@ -283,7 +288,7 @@ async function handleSessionSpawn(
   }
   if (typeof body.prompt === "string" && body.prompt.trim()) sendSessionInput(id, body.prompt);
   sendJson(res, 200, {
-    id, roleId, roleName, roleColour, carded,
+    id, provider, roleId, roleName, roleColour, carded,
     ...(worktree ? { worktree: { path: worktree.path, branch: worktree.branch, reused: worktree.reused, linked: worktree.linked } } : {}),
   });
 }
@@ -312,10 +317,13 @@ async function handleSessionInput(req: IncomingMessage, res: ServerResponse, id:
 function handleSessionResume(req: IncomingMessage, res: ServerResponse, repoPath: string, id: string): void {
   const { readSessionFile, ensureLiveSession, originOf } = getServerContext();
   if (!/^[\w-]+$/.test(id)) return sendJson(res, 400, { error: "bad session id" });
-  if (!readSessionFile(sessionTranscriptDir(repoPath, id), id))
+  const marker = readCanvasSession(repoPath, id);
+  const isCodex = marker?.provider === "codex" && typeof marker?.providerSessionId === "string";
+  if (!isCodex && !readSessionFile(sessionTranscriptDir(repoPath, id), id))
     return sendJson(res, 404, { error: "no transcript for that session" });
   try {
-    ensureLiveSession(id, repoPath, true, originOf(req));
+    const cwd = typeof marker?.cwd === "string" ? marker.cwd : repoPath;
+    ensureLiveSession(id, repoPath, true, originOf(req), null, null, cwd, null, isCodex ? "codex" : "claude");
   } catch (err) {
     return sendJson(res, 500, { error: "failed to resume", detail: String(err) });
   }

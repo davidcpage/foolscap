@@ -32,6 +32,7 @@ import net from "node:net";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 import { spawn } from "node:child_process";
+import { createCodexHostRuntime } from "./codex-host-runtime.js";
 import {
   PROTOCOL_VERSION,
   makeLineSplitter,
@@ -60,7 +61,7 @@ function probeSocket(socketPath) {
  * Start the host. Resolves once listening; rejects if another host already owns the socket. The returned
  * handle is for tests and the CLI — the protocol is the real interface.
  */
-export async function createHost({ socketPath, logPath }) {
+export async function createHost({ socketPath, logPath, codexRuntimeFactory = createCodexHostRuntime }) {
   const log = (msg) => {
     const line = `${new Date().toISOString()} ${msg}\n`;
     try {
@@ -77,12 +78,15 @@ export async function createHost({ socketPath, logPath }) {
 
   /** id → { child, cwd, busy, spawnedAt, killedByClient } */
   const children = new Map();
+  /** id → one logical Codex thread multiplexed through the shared app-server runtime */
+  const codexSessions = new Map();
   /** deaths not yet delivered/acked: {id, cwd, code, signal, ts, reason} */
   const exits = [];
   const conns = new Set(); // every open conn — server.close() waits for them, so shutdown must destroy them
   let attached = null; // the one client conn
   let attachedPid = null;
   let shuttingDown = false;
+  let codexRuntimePromise = null;
 
   const sendTo = (conn, msg) => {
     if (!conn || conn.destroyed) return;
@@ -103,8 +107,91 @@ export async function createHost({ socketPath, logPath }) {
     log(`exit ${id} code=${code} signal=${signal ?? "-"} reason=${reason}`);
   };
 
+  const recordCodexExit = (id, entry, reasonOverride = null) => {
+    if (!codexSessions.delete(id)) return;
+    const reason = reasonOverride ?? (shuttingDown ? "shutdown" : entry.killedByClient ? "killed" : "self");
+    const rec = { id, cwd: entry.cwd, code: null, signal: null, ts: Date.now(), reason, provider: "codex" };
+    if (attached && !attached.destroyed) event({ op: "exit", ...rec });
+    else {
+      exits.push(rec);
+      if (exits.length > MAX_EXIT_BACKLOG) exits.splice(0, exits.length - MAX_EXIT_BACKLOG);
+    }
+    log(`exit ${id} provider=codex reason=${reason}`);
+  };
+
+  const codexLine = (id, method, params = {}) =>
+    event({ op: "line", id, line: JSON.stringify({ type: "codex_event", method, params }) });
+
+  const onCodexEvent = (id, message) => {
+    if (!id) return; // account/config scoped notifications do not belong to one session card
+    const entry = codexSessions.get(id);
+    if (!entry) return;
+    if (message.method === "turn/started") entry.busy = true;
+    else if (message.method === "turn/completed") entry.busy = false;
+    else if (message.method === "thread/status/changed") {
+      const type = message.params?.status?.type;
+      if (type === "active") entry.busy = true;
+      else if (type === "idle" || type === "notLoaded" || type === "systemError") entry.busy = false;
+    }
+    codexLine(id, message.method, message.params);
+  };
+
+  const getCodexRuntime = () => {
+    if (codexRuntimePromise) return codexRuntimePromise;
+    const starting = codexRuntimeFactory({
+      cwd: new URL(".", import.meta.url).pathname,
+      onEvent: onCodexEvent,
+      onClose: () => {
+        codexRuntimePromise = null;
+        for (const [id, entry] of [...codexSessions]) recordCodexExit(id, entry);
+      },
+    });
+    codexRuntimePromise = starting;
+    void starting.catch(() => {
+      if (codexRuntimePromise === starting) codexRuntimePromise = null;
+    });
+    return starting;
+  };
+
+  const doCodexSpawn = async (msg) => {
+    const { id, cwd } = msg;
+    if (children.has(id) || codexSessions.has(id)) return { ok: false, error: "id already live" };
+    const entry = {
+      cwd,
+      busy: false,
+      spawnedAt: Date.now(),
+      killedByClient: false,
+      providerSessionId: null,
+    };
+    codexSessions.set(id, entry);
+    try {
+      const runtime = await getCodexRuntime();
+      entry.pid = runtime.pid;
+      const spec = { cwd, model: msg.model, developerInstructions: msg.developerInstructions };
+      const bound = msg.resumeProviderId
+        ? await runtime.resume(id, msg.resumeProviderId, spec)
+        : await runtime.start(id, spec);
+      entry.providerSessionId = bound.threadId;
+      codexLine(id, "canvas/provider-bound", {
+        provider: "codex",
+        providerSessionId: bound.threadId,
+        account: runtime.account,
+      });
+      if (msg.resumeProviderId) {
+        const history = await runtime.read(id);
+        codexLine(id, "canvas/history", history);
+      }
+      log(`spawn ${id} provider=codex thread=${bound.threadId} cwd=${cwd}`);
+      return { ok: true, pid: runtime.pid, provider: "codex", providerSessionId: bound.threadId };
+    } catch (err) {
+      codexSessions.delete(id);
+      log(`spawn ${id} provider=codex failed: ${String(err)}`);
+      return { ok: false, error: String(err) };
+    }
+  };
+
   const doSpawn = (id, cmd, args, cwd, env) => {
-    if (children.has(id)) return { ok: false, error: "id already live" };
+    if (children.has(id) || codexSessions.has(id)) return { ok: false, error: "id already live" };
     let child;
     try {
       // `env` EXTENDS the host's environment (per-spawn knobs like MCP_TOOL_TIMEOUT), never replaces it.
@@ -131,10 +218,45 @@ export async function createHost({ socketPath, logPath }) {
     return { ok: true, pid: child.pid };
   };
 
+  const userText = (data) => {
+    try {
+      const content = JSON.parse(data)?.message?.content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) return content.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("");
+    } catch {
+      // malformed writes are ignored by both provider paths
+    }
+    return "";
+  };
+
+  const writeCodex = (id, entry, data) => {
+    void getCodexRuntime().then(async (runtime) => {
+      try {
+        if (isUserWrite(data)) {
+          const text = userText(data);
+          if (!text) throw new Error("Codex prompt contained no text");
+          const wasBusy = entry.busy;
+          entry.busy = true;
+          if (wasBusy) await runtime.steer(id, text);
+          else await runtime.prompt(id, text);
+          return;
+        }
+        const parsed = JSON.parse(data);
+        if (parsed?.type === "control_request" && parsed?.request?.subtype === "interrupt")
+          await runtime.interrupt(id);
+      } catch (err) {
+        entry.busy = false;
+        codexLine(id, "canvas/error", { message: String(err) });
+      }
+    });
+  };
+
   const handle = (conn, msg) => {
     const reply = (body) => sendTo(conn, { op: "reply", req: msg.req, ...body });
     switch (msg.op) {
       case "hello": {
+        if (msg.ver !== PROTOCOL_VERSION)
+          return reply({ ok: false, error: "version-mismatch", ver: PROTOCOL_VERSION });
         if (attached && !attached.destroyed && attached !== conn)
           return reply({ ok: false, error: "busy", clientPid: attachedPid });
         attached = conn;
@@ -143,8 +265,17 @@ export async function createHost({ socketPath, logPath }) {
         return reply({ ok: true, pid: process.pid, ver: PROTOCOL_VERSION });
       }
       case "spawn":
+        if (msg.provider === "codex") {
+          void doCodexSpawn(msg).then(reply);
+          return;
+        }
         return reply(doSpawn(msg.id, msg.cmd, msg.args ?? [], msg.cwd, msg.env));
       case "write": {
+        const codex = codexSessions.get(msg.id);
+        if (codex) {
+          writeCodex(msg.id, codex, msg.data);
+          return msg.req != null ? reply({ ok: true }) : undefined;
+        }
         const entry = children.get(msg.id);
         if (!entry) return msg.req != null ? reply({ ok: false, error: "not-alive" }) : undefined;
         if (isUserWrite(msg.data)) entry.busy = true;
@@ -152,6 +283,20 @@ export async function createHost({ socketPath, logPath }) {
         return msg.req != null ? reply({ ok: true }) : undefined;
       }
       case "kill": {
+        const codex = codexSessions.get(msg.id);
+        if (codex) {
+          codex.killedByClient = true;
+          void getCodexRuntime()
+            .then(async (runtime) => {
+              if (codex.busy) {
+                try { await runtime.interrupt(msg.id); } catch { /* release still proceeds */ }
+              }
+              return runtime.release(msg.id);
+            })
+            .catch(() => false)
+            .finally(() => recordCodexExit(msg.id, codex));
+          return reply({ ok: true });
+        }
         const entry = children.get(msg.id);
         if (!entry) return reply({ ok: false, error: "not-alive" });
         entry.killedByClient = true;
@@ -161,13 +306,15 @@ export async function createHost({ socketPath, logPath }) {
       case "list":
         return reply({
           ok: true,
-          sessions: [...children.entries()].map(([id, e]) => ({
-            id,
-            cwd: e.cwd,
-            busy: e.busy,
-            spawnedAt: e.spawnedAt,
-            pid: e.child.pid,
-          })),
+          sessions: [
+            ...[...children.entries()].map(([id, e]) => ({
+              id, cwd: e.cwd, busy: e.busy, spawnedAt: e.spawnedAt, pid: e.child.pid, provider: "claude",
+            })),
+            ...[...codexSessions.entries()].map(([id, e]) => ({
+              id, cwd: e.cwd, busy: e.busy, spawnedAt: e.spawnedAt,
+              pid: e.pid, provider: "codex", providerSessionId: e.providerSessionId,
+            })),
+          ],
           exits: [...exits],
         });
       case "ack-exits": {
@@ -237,6 +384,15 @@ export async function createHost({ socketPath, logPath }) {
     );
     // Bounded wait: let exit events reach the attached client, but never hang the host's own exit.
     await Promise.race([Promise.all(waits), new Promise((r) => setTimeout(r, 2000))]);
+    for (const [id, entry] of [...codexSessions]) recordCodexExit(id, entry, "shutdown");
+    if (codexRuntimePromise) {
+      try {
+        (await codexRuntimePromise).close();
+      } catch {
+        /* a failed/lost app-server is already reflected in the logical-session exits */
+      }
+      codexRuntimePromise = null;
+    }
     for (const conn of conns) conn.destroy(); // server.close waits on open conns — drop them explicitly
     await new Promise((resolve) => server.close(resolve));
     try {

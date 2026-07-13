@@ -126,6 +126,8 @@ interface ContentBlock {
 // bookkeeping. The single in-memory record every view of a running agent reads.
 export interface LiveSession {
   id: string;
+  provider: "claude" | "codex";
+  providerSessionId: string | null; // Codex thread id; null for Claude and while a new Codex thread binds
   repoPath: string; // the board's CANONICAL repo — where its `.canvas/` home (markers, threads, memory) lives
   // The process's working directory. Equals repoPath for an ordinary session; for a WORKTREE session
   // (`spawn --worktree`) it's the isolated worktree checkout under `.canvas/worktrees/`, while repoPath
