@@ -3,7 +3,7 @@ import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal, onFeedsReconnect } from "./feeds";
 import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, type RootId } from "./loader";
+import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, rootOfId, type RootId } from "./loader";
 // The role.md codec — the ONE source for `role.md text <-> {name,colour,charter}`, shared with the server
 // ledger (role-ledger.js). The host parses/serialises here so the role CARD stays a pure view (it can only
 // import /vendor/, never this) — exactly how the host hands cards parsed sessionList/dirListing data.
@@ -213,14 +213,6 @@ export function mountTemplate(
       litRender(nothing, container);
     },
   };
-}
-
-// Parse the rootId out of a node id (`node:<root>:<path>`). The root is colon-free (a slug), so the first
-// two colons bound it; ids without a (root, path) shape (node:clock, node:session:<id>) don't match and
-// fall back to the canonical "repo" — which those cards never read, so the fallback is harmless.
-function rootOfId(id: string): RootId {
-  const m = /^node:([^:]+):/.exec(id);
-  return (m ? m[1] : "repo") as RootId;
 }
 
 // Build the capability object for one card: content fields off the node's channel-1 handle, plus
