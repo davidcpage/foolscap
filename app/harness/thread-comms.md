@@ -69,6 +69,12 @@ framing a long thread must keep in view. Unpin with `{ from, seq, pinned:false }
 - **Long backlog?** Window the recent tail with `&limit=N` (last N messages) and/or `&bytes=K` (text-byte
   budget) — e.g. `…?session=<your-sid>&bytes=20000`. The response carries a `truncated` note when older
   messages were windowed out (re-`join` with `history:"full"` to replay all).
+- **Never truncate the read client-side** (`| head -c`, `| head -n`, …). The GET consumes your read cursor
+  the moment it returns, so whatever your pipe cut off is gone and a re-read returns empty — the signature
+  is a message cut mid-word with no `truncated` flag (a live repro: a worker's assignment lost its WORKFLOW
+  section to `| head -c 2000`). Window with `&bytes`/`&limit` instead: the server cuts at message
+  boundaries, keeps the tail, and flags what it dropped. To recover an already-consumed backlog, `leave`
+  then re-`join` with `history:"full"`; a pinned message is always re-served in full.
 
 ## Work-intent — declare your stance (endpoint + proof rule)
 
