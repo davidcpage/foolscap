@@ -26,8 +26,56 @@ registerHooks({
   },
 });
 
-const { buildSessionArgs, resolveSessionModel, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
+const { buildSessionArgs, resolveSessionModel, resolveClaudeCommand, projectCodexHistory, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
 const { readRole } = await import("../role-ledger.js");
+
+test("Claude executable discovery honors the explicit GUI-safe override", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-command-"));
+  const command = path.join(dir, "claude");
+  fs.writeFileSync(command, "#!/bin/sh\n");
+  fs.chmodSync(command, 0o755);
+  const prior = process.env.CANVAS_CLAUDE_COMMAND;
+  process.env.CANVAS_CLAUDE_COMMAND = command;
+  try {
+    assert.equal(resolveClaudeCommand(), command);
+  } finally {
+    if (prior == null) delete process.env.CANVAS_CLAUDE_COMMAND;
+    else process.env.CANVAS_CLAUDE_COMMAND = prior;
+  }
+});
+
+test("Claude usage User-Agent uses GUI-safe executable discovery", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-ua-"));
+  const command = path.join(dir, "claude");
+  fs.writeFileSync(command, "#!/bin/sh\necho 'Claude Code 9.8.7'\n");
+  fs.chmodSync(command, 0o755);
+  const prior = process.env.CANVAS_CLAUDE_COMMAND;
+  process.env.CANVAS_CLAUDE_COMMAND = command;
+  try {
+    const { claudeUserAgent } = await import("../server-orchestration.ts");
+    assert.equal(await claudeUserAgent(), "claude-code/9.8.7");
+  } finally {
+    if (prior == null) delete process.env.CANVAS_CLAUDE_COMMAND;
+    else process.env.CANVAS_CLAUDE_COMMAND = prior;
+  }
+});
+
+test("Codex thread/read history projects every turn item without rollout-file scraping", () => {
+  const projected = projectCodexHistory({ thread: { turns: [{ status: "failed", error: { message: "safe failure" }, items: [
+    { id: "u", type: "userMessage", content: [{ type: "text", text: "hello" }, { type: "image", imageUrl: "data:x" }] },
+    { id: "r", type: "reasoning", summary: ["considering"], content: [] },
+    { id: "c", type: "commandExecution", command: "pwd", cwd: "/repo", status: "completed", aggregatedOutput: "/repo" },
+    { id: "w", type: "webSearch", query: "docs", status: "completed" },
+    { id: "a", type: "agentMessage", text: "done" },
+  ] }] } });
+  const text = projected.lines.join("\n");
+  assert.ok(text.includes("hello") && text.includes("[image attached]"));
+  assert.ok(text.includes("considering"));
+  assert.ok(text.includes('"name":"Bash"') && text.includes("/repo"));
+  assert.ok(text.includes('"name":"Codex:webSearch"'), "unknown app-server items survive via generic activity rows");
+  assert.ok(text.includes("done"));
+  assert.equal(projected.error, "safe failure");
+});
 const { parseRoleFile } = await import("../role-format.js");
 
 /** The value following a flag in an argv array (asserts the flag appears exactly once). */

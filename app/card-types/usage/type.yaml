@@ -1,9 +1,7 @@
-# The usage card type — the canvas mirror of Claude Code's /usage (card-types-as-data.md §3). It holds
+# The usage card type — provider-explicit plan/account state for Claude and Codex. It holds
 # TWO off-log reads, both channel-1 (never the canvas log):
-#   • `usage` — the account-level PLAN windows (5-hour session + weekly all-models / Sonnet / Opus),
-#     exactly the bars the TUI's /usage shows. There's no local mirror, so the dev-server middleware
-#     polls Anthropic's OAuth usage endpoint server-side (with the locally-stored token, 180s cadence,
-#     no token cost) and republishes it on the `usage` feed. This is the card's primary, always-on read.
+#   • `usage` — a provider map. Claude comes from Anthropic's OAuth usage endpoint; Codex account,
+#     ChatGPT/workspace billing, rolling windows, and credits come from app-server account methods.
 #   • `session` — the per-card live transcript tail (keyed by this card's title = a session id), from
 #     which it derives a SECONDARY per-session token/context gauge off each assistant `message.usage`.
 #     Optional: present only when the card is titled with a session that also has a session card live.

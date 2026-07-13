@@ -167,6 +167,16 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
       conn.write(JSON.stringify({ op: "write", id, data }) + "\n");
       return true;
     },
+    answerRequest(id, requestId, answer) {
+      if (!connected || !conn) return false;
+      conn.write(JSON.stringify({ op: "answer-request", id, requestId, answer }) + "\n");
+      return true;
+    },
+    async codexUsage() {
+      const r = await request({ op: "usage" });
+      if (!r.ok) throw new Error(r.error || "Codex usage unavailable");
+      return r.usage;
+    },
     killSession(id) {
       if (!connected || !conn) return;
       conn.write(JSON.stringify({ op: "kill", id, req: ++req }) + "\n");

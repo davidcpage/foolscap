@@ -5,16 +5,46 @@
 import { spawnCodexAppServer } from "./codex-app-server.js";
 import { createCodexSessionRouter } from "./codex-session-router.js";
 
-export async function createCodexHostRuntime({ cwd, onEvent, onClose, spawnServer = spawnCodexAppServer }) {
+export async function createCodexHostRuntime({ cwd, onEvent, onRequest, onClose, spawnServer = spawnCodexAppServer }) {
   const server = spawnServer({ cwd });
   let intentionalClose = false;
+  let account = null;
+  let rateLimitState = null;
+  let usageError = null;
+  let usageFetchedAt = null;
+  let billingError = null;
   const router = createCodexSessionRouter({
     client: server,
-    onEvent,
-    // The first live slice runs workspace-confined with approvalPolicy:"never". A server request is
-    // therefore unexpected and must fail closed until the canvas approval bridge lands.
-    onRequest: async (_sid, message) => {
-      throw new Error(`unsupported Codex server request ${message.method}`);
+    onEvent: (sid, message) => {
+      if (!sid && message.method === "account/rateLimits/updated") {
+        rateLimitState = mergeRateLimitUpdate(rateLimitState, message.params?.rateLimits);
+        usageError = billingError;
+        usageFetchedAt = Date.now();
+      } else if (!sid && message.method === "account/updated") {
+        const authMode = message.params?.authMode;
+        if (authMode && authMode !== "chatgpt") {
+          const type = authMode === "apikey" ? "apiKey" : authMode;
+          account = mergePresent(account, { type, planType: message.params?.planType });
+          billingError = `Codex app-server requires ChatGPT login; refusing account type ${type}`;
+          usageError = billingError;
+        } else {
+          account = mergePresent(account, { type: authMode, planType: message.params?.planType });
+          billingError = null;
+          usageError = null;
+        }
+      }
+      onEvent(sid, message);
+    },
+    onRequest: async (sid, message) => {
+      if (!sid) throw new Error(`Codex request ${message.method} was not associated with a canvas session`);
+      const answer = await onRequest(sid, normalizeRequest(message));
+      if (message.method === "item/tool/requestUserInput")
+        return { answers: answersFor(message.params?.questions, answer?.text) };
+      if (message.method === "item/permissions/requestApproval") {
+        if (answer?.behavior !== "allow") return { permissions: {}, scope: "turn" };
+        return { permissions: message.params?.permissions ?? {}, scope: "turn" };
+      }
+      return { decision: answer?.behavior === "allow" ? "accept" : "decline" };
     },
   });
   server.onClose((reason) => {
@@ -24,27 +54,48 @@ export async function createCodexHostRuntime({ cwd, onEvent, onClose, spawnServe
   try {
     await server.ready;
     const accountResult = await server.request("account/read", { refreshToken: true });
-    const account = accountResult?.account;
+    account = accountResult?.account;
     if (account?.type !== "chatgpt") {
       const actual = account?.type ?? (accountResult?.requiresOpenaiAuth ? "not logged in" : "unknown");
       throw new Error(`Codex app-server requires ChatGPT login; refusing account type ${actual}`);
+    }
+
+    try {
+      rateLimitState = await server.request("account/rateLimits/read", null);
+      usageFetchedAt = Date.now();
+    } catch (err) {
+      // Authentication is the billing safety boundary; usage telemetry is best-effort and must not
+      // prevent sessions from starting when the account endpoint is temporarily unavailable.
+      usageError = err instanceof Error ? err.message : String(err);
     }
 
     const threadSpec = (spec) => ({
       cwd: spec.cwd,
       ...(spec.model ? { model: spec.model } : {}),
       ...(spec.developerInstructions ? { developerInstructions: spec.developerInstructions } : {}),
-      approvalPolicy: "never",
+      approvalPolicy: "on-request",
       sandbox: "workspace-write",
     });
+    const requireChatgpt = (fn) => (...args) => {
+      if (billingError) return Promise.reject(new Error(billingError));
+      return fn(...args);
+    };
 
     return {
       pid: server.pid,
       account: { type: account.type, email: account.email ?? null, planType: account.planType },
-      start: (sid, spec) => router.start(sid, threadSpec(spec)),
-      resume: (sid, providerSessionId, spec) => router.resume(sid, providerSessionId, threadSpec(spec)),
-      prompt: (sid, text) => router.prompt(sid, text),
-      steer: (sid, text) => router.steer(sid, text),
+      usage: () => ({
+        provider: "codex",
+        billing: "chatgpt-plan",
+        account: { type: account.type, email: account.email ?? null, planType: account.planType },
+        ...(rateLimitState ?? {}),
+        error: usageError,
+        fetchedAt: usageFetchedAt,
+      }),
+      start: requireChatgpt((sid, spec) => router.start(sid, threadSpec(spec))),
+      resume: requireChatgpt((sid, providerSessionId, spec) => router.resume(sid, providerSessionId, threadSpec(spec))),
+      prompt: requireChatgpt((sid, text) => router.prompt(sid, text)),
+      steer: requireChatgpt((sid, text) => router.steer(sid, text)),
       interrupt: (sid) => router.interrupt(sid),
       read: (sid) => router.read(sid, true),
       release: (sid) => router.release(sid),
@@ -60,4 +111,67 @@ export async function createCodexHostRuntime({ cwd, onEvent, onClose, spawnServe
     server.kill();
     throw err;
   }
+}
+
+function mergePresent(previous, update) {
+  const merged = { ...(previous ?? {}) };
+  for (const [key, value] of Object.entries(update ?? {})) {
+    // App-server documents rolling rate-limit/account updates as sparse: nullable metadata being
+    // unavailable must not erase a previously observed value.
+    if (value !== undefined && value !== null) merged[key] = value;
+  }
+  return merged;
+}
+
+function mergeRateLimitSnapshot(previous, update) {
+  const merged = mergePresent(previous, update);
+  for (const key of ["primary", "secondary", "credits", "individualLimit"]) {
+    if (update?.[key] && typeof update[key] === "object")
+      merged[key] = mergePresent(previous?.[key], update[key]);
+  }
+  return merged;
+}
+
+export function mergeRateLimitUpdate(previous, update) {
+  if (!update || typeof update !== "object") return previous;
+  const prior = previous ?? {};
+  const snapshot = mergeRateLimitSnapshot(prior.rateLimits, update);
+  const byId = { ...(prior.rateLimitsByLimitId ?? {}) };
+  const limitId = update.limitId ?? snapshot.limitId;
+  if (typeof limitId === "string" && limitId) byId[limitId] = mergeRateLimitSnapshot(byId[limitId], update);
+  return {
+    ...prior,
+    rateLimits: snapshot,
+    ...(Object.keys(byId).length ? { rateLimitsByLimitId: byId } : {}),
+  };
+}
+
+function normalizeRequest(message) {
+  const p = message.params ?? {};
+  if (message.method === "item/tool/requestUserInput")
+    return { kind: "input", questions: p.questions ?? [], turnId: p.turnId, itemId: p.itemId };
+  if (!["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"].includes(message.method))
+    throw new Error(`unsupported Codex server request ${message.method}`);
+  const toolName = message.method === "item/commandExecution/requestApproval" ? "Bash"
+    : message.method === "item/fileChange/requestApproval" ? "Edit"
+    : message.method === "item/permissions/requestApproval" ? "Permissions"
+    : "Codex";
+  const input = toolName === "Bash"
+    ? { command: p.command, cwd: p.cwd, reason: p.reason }
+    : toolName === "Edit"
+      ? { grantRoot: p.grantRoot, reason: p.reason }
+      : { cwd: p.cwd, permissions: p.permissions, reason: p.reason };
+  return { kind: "approval", toolName, input, turnId: p.turnId, itemId: p.itemId };
+}
+
+function answersFor(questions, text) {
+  const value = typeof text === "string" ? text : "";
+  const result = {};
+  for (const q of Array.isArray(questions) ? questions : []) {
+    if (typeof q?.id !== "string") continue;
+    const escaped = String(q.question ?? "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = value.match(new RegExp(`"${escaped}"="([^"]*)"`));
+    result[q.id] = { answers: [match?.[1] || value] };
+  }
+  return result;
 }

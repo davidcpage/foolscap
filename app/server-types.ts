@@ -98,7 +98,8 @@ export interface PendingPermission {
   toolName: string; // e.g. "Bash" — the tool the CLI is asking about
   input: unknown; // the tool's input object, echoed back on allow (updatedInput)
   ts: number;
-  res: ServerResponse; // the MCP relay's parked connection, resolved on decision/timeout
+  res?: ServerResponse; // Claude: the MCP relay's parked connection
+  providerRequestId?: string; // Codex: request retained by the long-lived host
   timer: ReturnType<typeof setTimeout>;
 }
 
@@ -148,6 +149,8 @@ export interface LiveSession {
   skills: string[] | null; // slash-invocable skills the harness advertised this session (for /-completion)
   verb: string | null; // what the live turn is doing now ("Thinking"/"Running"/…) — channel-1 chrome, null when idle
   usage: { input: number; output: number } | null; // this turn's tokens: input = latest context size, output = accrued
+  plan?: Array<{ step: string; status?: string }>; // provider-neutral live plan projection
+  error?: string | null; // latest provider error, cleared at the next turn
   // The model actually SERVING this session — folded from the stream (init's requested model, then each
   // assistant message's authoritative `message.model`, which tracks a server-side refusal fallback, e.g.
   // fable-5 → opus-4-8; see canvas-workers-fable-fallback-opus memory). Rendered as a chip on the session

@@ -1138,6 +1138,11 @@ test("usage template renders the account plan bars from the `usage` feed", async
   );
   assert.ok(stale.includes("14% used"), "last-good bars survive a rate-limit");
   assert.ok(stale.includes("rate-limited"), "staleness pill shown");
+  const cachedNoCredentials = flatten(
+    mod.render({ fields: { title: "", text: "", color: "green" }, signals: { usage: { ...usage, error: "no-credentials" } } }),
+  );
+  assert.ok(cachedNoCredentials.includes("14% used"), "a credential lookup miss does not blank cached last-good bars");
+  assert.ok(cachedNoCredentials.includes("stale · no-credentials"));
 
   // Untitled with no session → the secondary token gauge is absent, plan bars stand alone.
   assert.ok(!out.includes("this session"), "no session gauge when untitled");
@@ -1159,6 +1164,36 @@ test("usage template renders the account plan bars from the `usage` feed", async
   assert.ok(withExtra.includes("£3.50") && withExtra.includes("£20.00"), "minor units formatted as currency");
   assert.ok(withExtra.includes("width:18%"), "extra-usage fill = used/limit");
   assert.ok(!out.includes("Extra usage"), "no extra-usage row when the field is absent");
+});
+
+test("usage template keeps provider and billing identity explicit for Claude and Codex", async () => {
+  const mod = await loadTemplate("usage");
+  const out = flatten(mod.render({
+    fields: { title: "", text: "", color: "green" },
+    signals: { usage: { schema: 2, providers: {
+      claude: {
+        provider: "claude", billing: "anthropic-plan",
+        five_hour: { utilization: 14, resets_at: "2026-06-20T19:29:00+00:00" }, error: null,
+      },
+      codex: {
+        provider: "codex", billing: "chatgpt-plan",
+        account: { type: "chatgpt", email: "person@example.test", planType: "business" },
+        rateLimitsByLimitId: { codex: {
+          limitId: "codex", primary: { usedPercent: 23, resetsAt: 1_800_000_000 },
+          secondary: { usedPercent: 7, resetsAt: 1_800_500_000 },
+          credits: { hasCredits: true, unlimited: false, balance: "42.5" },
+        } },
+        rateLimitResetCredits: { availableCount: 2 }, error: null,
+      },
+    } } },
+  }));
+  assert.ok(out.includes("Claude · Anthropic plan"));
+  assert.ok(out.includes("billing: Anthropic plan"));
+  assert.ok(out.includes("Codex · business plan"));
+  assert.ok(out.includes("billing: ChatGPT/workspace"));
+  assert.ok(out.includes("person@example.test"));
+  assert.ok(out.includes("23% used") && out.includes("42.5 agentic credits"));
+  assert.ok(out.includes("rate-limit resets") && out.includes(">2<"));
 });
 
 test("usage template adds the per-session token gauge when titled with a live session", async () => {
@@ -1588,6 +1623,24 @@ test("session template surfaces held permission prompts: allow/deny rows + the w
   );
   assert.ok(!cleared.includes("ses-perms"), "a resolved prompt leaves with its feed frame");
   assert.ok(cleared.includes("● Working…"), "…and the pill returns to the live verb");
+});
+
+test("session template renders provider-neutral plan and error projections", async () => {
+  const mod = await loadTemplate("session");
+  const out = flatten(mod.render({
+    fields: { title: "codex123", text: "", color: "blue" },
+    signals: {
+      session: {
+        content: "", truncated: false, status: "idle", provider: "codex",
+        plan: [{ step: "Wire the card", status: "in_progress" }, { step: "Run tests", status: "pending" }],
+        error: "turn failed safely",
+      },
+    },
+  }));
+  assert.ok(out.includes("plan"));
+  assert.ok(out.includes("Wire the card"));
+  assert.ok(out.includes("Run tests"));
+  assert.ok(out.includes("turn failed safely"));
 });
 
 // Drift lock (card side, thread mrcmofwf-10): the card's CLIENT idle fallback — used only for a bandless

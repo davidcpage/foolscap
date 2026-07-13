@@ -1220,16 +1220,30 @@ export async function fetchRoles(): Promise<Role[]> {
   }
 }
 
-export async function spawnLiveSession(m: InteractionManager, at?: Pos, roleId?: string): Promise<void> {
+export type SessionProvider = "claude" | "codex";
+
+export function sessionSpawnBody(roleId?: string, provider: SessionProvider = "claude"): {
+  roleId?: string;
+  provider: SessionProvider;
+} {
+  return { ...(roleId ? { roleId } : {}), provider };
+}
+
+export async function spawnLiveSession(
+  m: InteractionManager,
+  at?: Pos,
+  roleId?: string,
+  provider: SessionProvider = "claude",
+): Promise<void> {
   // When spawning UNDER a role, the server reads that role's role.md, appends the charter to the system
   // prompt, stamps roleId/roleName on the session marker, and returns the role's display name so the card
   // can carry a friendly handle. A bare spawn (no roleId) behaves exactly as before.
   const res = await fetch(`/api/session/spawn?board=${activeBoardId()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(roleId ? { roleId } : {}),
+    body: JSON.stringify(sessionSpawnBody(roleId, provider)),
   });
-  if (!res.ok) return; // no claude on PATH, or the spawn failed — leave the board unchanged
+  if (!res.ok) return; // provider executable unavailable, or the spawn failed — leave the board unchanged
   const { id, roleName } = (await res.json()) as { id: string; roleName?: string };
   // The card's display NAME = "<RoleName>.<short-sid>" when spawned under a role, so two instances of the
   // same role stay distinguishable (and @RoleName prefix-matching can disambiguate by the sid suffix). The

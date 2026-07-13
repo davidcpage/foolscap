@@ -52,6 +52,7 @@ import {
   registerFileCommands,
   reprojectContent,
   spawnLiveSession,
+  type SessionProvider,
   fetchRoles,
   addRolesCard,
   watchDataset,
@@ -970,12 +971,13 @@ function NewSessionItem({
 }) {
   const [open, setOpen] = useState(false);
   const [roles, setRoles] = useState<Role[] | null>(null); // null = not yet fetched
+  const [provider, setProvider] = useState<SessionProvider>("claude");
   const toggle = () => {
     const next = !open;
     setOpen(next);
     if (next && roles === null) void fetchRoles().then(setRoles);
   };
-  const spawn = (roleId?: string) => run(() => void spawnLiveSession(m, at, roleId));
+  const spawn = (roleId?: string) => run(() => void spawnLiveSession(m, at, roleId, provider));
   return (
     <div className="menu-roles">
       <button className="menu-expand" aria-expanded={open} onClick={toggle}>
@@ -984,6 +986,22 @@ function NewSessionItem({
       </button>
       {open && (
         <div className="menu-rolelist">
+          <div className="menu-provider" role="group" aria-label="Session provider">
+            <button
+              className={`menu-provideropt${provider === "claude" ? " active" : ""}`}
+              aria-pressed={provider === "claude"}
+              onClick={() => setProvider("claude")}
+            >
+              Claude
+            </button>
+            <button
+              className={`menu-provideropt${provider === "codex" ? " active" : ""}`}
+              aria-pressed={provider === "codex"}
+              onClick={() => setProvider("codex")}
+            >
+              Codex
+            </button>
+          </div>
           <button className="menu-roleopt" onClick={() => spawn()}>
             <span className="menu-roleswatch menu-roleswatch-none" />
             No role

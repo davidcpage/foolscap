@@ -1,4 +1,4 @@
-// card-types/usage/render.js — the canvas mirror of Claude Code's /usage, as a runtime-loaded
+// card-types/usage/render.js — provider-explicit plan/account usage, as a runtime-loaded
 // template (card-types-as-data.md §7). It renders TWO off-log reads, both channel-1 (no commit, no
 // log, no persistence — the clock rule):
 //
@@ -45,7 +45,8 @@ function fmt(n) {
 // for one further out — matching the TUI's two forms. Absolute (not a live countdown), so no `now`
 // capability is needed and the line is faithful to what /usage prints.
 function resetLabel(iso) {
-  const d = new Date(iso);
+  const raw = typeof iso === "number" && iso < 10_000_000_000 ? iso * 1000 : iso;
+  const d = new Date(raw);
   if (isNaN(d.getTime())) return "";
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
@@ -107,10 +108,10 @@ function extraUsageSection(extra, spend) {
 }
 
 // A header + message panel for the states with no bars to draw (loading, not signed in, endpoint down).
-function planNote(msg) {
+function planNote(msg, title = "⚡ plan usage") {
   return html`
     <div>
-      <div style="font-weight:600;margin-bottom:8px;color:${INK};">⚡ plan usage</div>
+      <div style="font-weight:600;margin-bottom:8px;color:${INK};">${title}</div>
       <div style="font-size:11px;line-height:1.5;color:${MUTE};">${msg}</div>
     </div>
   `;
@@ -120,18 +121,20 @@ function planNote(msg) {
 // seven_day_opus, extra_usage, spend, error, fetchedAt }. The server keeps the last good windows
 // across a transient error (rate-limit/offline), so we draw bars whenever we have ANY window and only
 // fall back to a note when there's genuinely nothing to show.
-function planSection(usage) {
-  if (!usage) return planNote("Connecting to the usage feed…");
-  if (usage.error === "no-credentials")
+function claudePlanSection(usage) {
+  const title = "Claude · Anthropic plan";
+  if (!usage) return planNote("Connecting to Claude usage…", title);
+  const hasData = usage.five_hour || usage.seven_day || usage.seven_day_sonnet || usage.seven_day_opus;
+  if (usage.error === "no-credentials" && !hasData)
     return planNote(
       "Not signed in to Claude Code — no OAuth token in the keychain or ~/.claude/.credentials.json. Sign in with the CLI and this fills in.",
+      title,
     );
 
-  const hasData = usage.five_hour || usage.seven_day || usage.seven_day_sonnet || usage.seven_day_opus;
   if (!hasData) {
     if (usage.error === "http-401")
-      return planNote("Login expired. Re-run Claude Code to refresh your token, then this updates.");
-    return planNote(usage.error ? `Couldn't reach the usage endpoint (${usage.error}). Retrying…` : "No usage data yet.");
+      return planNote("Login expired. Re-run Claude Code to refresh your token, then this updates.", title);
+    return planNote(usage.error ? `Couldn't reach the usage endpoint (${usage.error}). Retrying…` : "No usage data yet.", title);
   }
 
   // Showing last-good windows through a transient error → a small honest staleness pill, not a blank.
@@ -145,7 +148,7 @@ function planSection(usage) {
   return html`
     <div>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
-        <span style="font-weight:600;color:${INK};">⚡ plan usage</span>
+        <span style="font-weight:600;color:${INK};">${title}</span>
         ${trouble
           ? html`<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:#fef3c7;color:#92400e;"
               >${trouble}</span
@@ -156,9 +159,60 @@ function planSection(usage) {
       ${planBar("Current week (all models)", usage.seven_day)}
       ${planBar("Current week (Opus)", usage.seven_day_opus)}
       ${extraUsageSection(usage.extra_usage, usage.spend)}
-      <div style="font-size:9px;color:${FAINT};">account windows · polled server-side every 3 min</div>
+      <div style="font-size:9px;color:${FAINT};">billing: Anthropic plan · polled server-side every 3 min</div>
     </div>
   `;
+}
+
+function codexSnapshot(usage) {
+  const byId = usage?.rateLimitsByLimitId;
+  return byId?.codex ?? (byId && Object.values(byId)[0]) ?? usage?.rateLimits ?? null;
+}
+
+function codexPlanSection(usage) {
+  const account = usage?.account;
+  const plan = account?.planType ? String(account.planType).replaceAll("_", " ") : "ChatGPT";
+  const title = `Codex · ${plan} plan`;
+  if (!usage) return planNote("Connecting to Codex app-server…", title);
+  const limits = codexSnapshot(usage);
+  if (!limits) return planNote(usage.error ? `Codex account state unavailable (${usage.error}). Retrying…` : "No Codex rate-limit data yet.", title);
+  const primary = limits.primary;
+  const secondary = limits.secondary;
+  const credits = limits.credits;
+  const trouble = limits.rateLimitReachedType
+    ? String(limits.rateLimitReachedType).replaceAll("_", " ")
+    : usage.error ? `stale · ${usage.error}` : null;
+  const creditText = credits?.unlimited
+    ? "unlimited agentic credits"
+    : credits?.balance != null
+      ? `${credits.balance} agentic credits${credits.hasCredits ? "" : " · depleted"}`
+      : credits?.hasCredits === false ? "agentic credits depleted" : null;
+  const resetCredits = usage.rateLimitResetCredits?.availableCount;
+
+  return html`
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid ${BORDER};">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+        <span style="font-weight:600;color:${INK};">${title}</span>
+        ${trouble
+          ? html`<span style="font-size:9px;padding:1px 6px;border-radius:8px;background:#fef3c7;color:#92400e;">${trouble}</span>`
+          : ""}
+      </div>
+      ${primary ? gaugeBar("Current session", Math.max(0, Math.min(100, primary.usedPercent ?? 0)), `${primary.usedPercent ?? 0}% used`, primary.resetsAt ? resetLabel(primary.resetsAt) : "") : ""}
+      ${secondary ? gaugeBar("Current week", Math.max(0, Math.min(100, secondary.usedPercent ?? 0)), `${secondary.usedPercent ?? 0}% used`, secondary.resetsAt ? resetLabel(secondary.resetsAt) : "") : ""}
+      ${creditText ? statRow("credits", creditText) : ""}
+      ${Number.isFinite(resetCredits) ? statRow("rate-limit resets", String(resetCredits)) : ""}
+      ${account?.email ? html`<div style="font-size:9px;color:${FAINT};margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${account.email}</div>` : ""}
+      <div style="font-size:9px;color:${FAINT};margin-top:3px;">billing: ChatGPT/workspace · source: Codex app-server</div>
+    </div>
+  `;
+}
+
+function planSection(usage) {
+  if (!usage) return planNote("Connecting to the usage feed…");
+  // Shape migration: pre-step-5 feeds placed Claude fields at the top level. Render them as Claude,
+  // while all new feed values name both provider and billing identity explicitly.
+  const providers = usage.providers ?? { claude: usage };
+  return html`${claudePlanSection(providers.claude)}${codexPlanSection(providers.codex)}`;
 }
 
 // ── per-session token gauge (secondary) ─────────────────────────────────────────────────────────

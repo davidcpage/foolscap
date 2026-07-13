@@ -133,10 +133,11 @@ field rather than making them the renderer contract.
    Replay while Vite is detached still comes from `thread/read`; approval bridging remains in step 4.
 3. **Durable identity (implemented for explicit spawns).** Markers and spawn configuration carry provider
    fields; old boards and role files retain the implicit Claude default.
-4. **Vertical Codex card.** Wire spawn/input/interrupt/resume, normalize message/activity events, and map
-   app-server server requests onto the existing card gate surface.
-5. **History and usage.** Project `thread/read`, surface account/rate-limit/credit state, and extend usage
-   reporting without scraping provider-private rollout files.
+4. **Vertical Codex card (implemented).** Spawn/input/steer/interrupt/resume/release run through the
+   provider-aware host; message/activity/plan/completion/error events fold into the card projection, and
+   app-server approval/user-input requests reuse the existing permission and interactive-question gates.
+5. **History and usage (implemented).** Project every `thread/read` turn item, surface account/rate-limit/
+   credit state, and extend usage reporting without scraping provider-private rollout files.
 6. **Renderer convergence.** Have both native adapters emit the normalized projection; delete remaining
    Claude-only labels from shared session chrome.
 
@@ -152,32 +153,49 @@ field rather than making them the renderer contract.
 
 ## 9. Handoff checkpoint (2026-07-13)
 
-Steps 1–3 of the delivery plan are implemented in this checkout:
+Steps 1–4 of the delivery plan are implemented in this checkout:
 
 - the newline-delimited app-server peer and logical-session router multiplex canvas session ids over one
   Codex app-server connection;
 - the long-lived session host owns the shared Codex runtime and exposes provider-aware spawn/adoption;
 - explicit spawns persist provider and provider-thread identity while existing markers continue to default
   to Claude;
+- the New Session menu exposes an explicit Claude/Codex picker, and executable discovery covers the
+  reduced PATH inherited by GUI-launched dev servers while retaining environment overrides;
 - ChatGPT authentication is required and API-key billing is refused by default;
+- Codex turns now project live message deltas, tool activity, plans, completion, token usage, and errors
+  without exposing app-server JSON-RPC shapes to the renderer;
+- command, file-change, and permission approvals use the existing card allow/deny gate, while
+  `requestUserInput` uses the existing interactive question widget;
+- the sidecar retains pending Codex gates while Vite is detached and replays their normalized projection
+  on adoption; two logical sessions route turns and gates independently over one app-server;
 - the origin-global legacy IndexedDB adoption path has been removed. Board-local browser adoption remains
   keyed by the checkout-derived board id;
 - the working board was explicitly migrated into this checkout's `.canvas/` state. Operational session
   paths were rewritten, historical transcripts were copied where present, and repository-bound roots and
   worktrees were deliberately not carried over.
 
-Verification at this checkpoint: app typecheck passes; the complete app suite passes with 731 tests and
-23 intentional skips. The Claude session path remains covered alongside the new Codex host tests.
+Verification at this checkpoint: app typecheck passes; the complete app suite passes with 756 tests.
+The Claude session path remains covered alongside the new Codex vertical-card tests. Protocol tests use a
+fake app-server and do not spend a paid turn.
 
-### Next implementation slice
+### Step 5 checkpoint
 
-Continue with delivery-plan step 4, **Vertical Codex card**. Wire the existing provider-aware host through
-the full canvas route/card lifecycle: spawn, input, steer/interrupt, resume, and release. Fold Codex message,
-activity, plan, completion, and error notifications into a card-facing projection, and bridge app-server
-requests onto the existing human permission/input gate without exposing provider JSON-RPC shapes to the
-renderer. Preserve the Claude path and prove that two canvas Codex sessions route independently through
-the single app-server process.
+Delivery-plan step 5 is now implemented:
 
-History reconstruction via `thread/read`, account/usage presentation, and renderer-wide normalization of
-the Claude and Codex projections remain later steps (5 and 6); they need not be pulled into the first
-vertical slice except where a minimal resume path requires them.
+- resumed Codex sessions project every turn and every app-server item from `thread/read`; known message,
+  reasoning, plan, command, file-change, and MCP items retain their native card representation, while
+  newer provider item kinds degrade to a generic activity row instead of disappearing;
+- the long-lived host reads `account/read` and `account/rateLimits/read`, merges sparse
+  `account/rateLimits/updated` notifications, and exposes ChatGPT account, rolling-window, agentic-credit,
+  and rate-limit-reset state to the Plan Usage card;
+- a runtime auth-mode switch away from ChatGPT blocks new billed work instead of silently moving to API-key
+  billing;
+- the usage feed is provider-explicit (`Claude · Anthropic plan`, `Codex · ChatGPT/workspace`) and uses
+  app-server methods only for Codex—it never reads rollout files;
+- Claude polling honors `Retry-After` plus bounded exponential backoff, uses the same GUI-safe executable
+  discovery as session spawning for its required User-Agent, and preserves last-good provider snapshots in
+  the ignored, mode-0600 `.canvas/cache/plan-usage.json` across full dev-server restarts.
+
+Verification at this checkpoint: the complete app suite passes with 765 tests; app typecheck passes.
+Renderer-wide normalization of the Claude and Codex projections remains delivery-plan step 6.

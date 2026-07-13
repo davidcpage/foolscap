@@ -962,6 +962,21 @@ export default {
           </details>
         `
       : "";
+    const providerPlan = live && Array.isArray(live.plan) ? live.plan : [];
+    const planPanel = providerPlan.length
+      ? html`
+          <details class="ses-tasks" open>
+            <summary><span class="ses-tasks-label">plan</span></summary>
+            <div class="ses-tasks-list">
+              ${providerPlan.map((p) => html`
+                <div class="ses-task ses-task-${p.status || "pending"}">
+                  <span class="ses-task-glyph">${taskGlyph(p.status)}</span>
+                  <span class="ses-task-subject">${p.step}</span>
+                </div>`)}
+            </div>
+          </details>`
+      : "";
+    const providerError = live && typeof live.error === "string" ? live.error : null;
 
     const copyId = (e) => {
       const btn = e.currentTarget;
@@ -1005,8 +1020,9 @@ export default {
         </span>
         ${endBtn}
       </div>
-      ${activity}${taskPanel}
+      ${activity}${taskPanel}${planPanel}
       <div class="ses-body" data-autoscroll data-text>
+        ${providerError ? html`<div class="ses-error">${providerError}</div>` : ""}
         ${turnRows}
         ${turns.length === 0 ? html`<div class="ses-empty">no turns</div>` : ""}
       </div>

@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createCodexAppServerPeer } from "../codex-app-server.js";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createCodexAppServerPeer, resolveCodexCommand } from "../codex-app-server.js";
 import { createCodexSessionRouter } from "../codex-session-router.js";
 
 function fakeAppServer() {
@@ -58,6 +61,21 @@ function fakeAppServer() {
     },
   };
 }
+
+test("Codex executable discovery honors the explicit GUI-safe override", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "codex-command-"));
+  const command = path.join(dir, "codex");
+  fs.writeFileSync(command, "#!/bin/sh\n");
+  fs.chmodSync(command, 0o755);
+  const prior = process.env.CANVAS_CODEX_COMMAND;
+  process.env.CANVAS_CODEX_COMMAND = command;
+  try {
+    assert.equal(resolveCodexCommand(), command);
+  } finally {
+    if (prior == null) delete process.env.CANVAS_CODEX_COMMAND;
+    else process.env.CANVAS_CODEX_COMMAND = prior;
+  }
+});
 
 test("app-server peer performs initialize/initialized and correlates errors", async () => {
   const fake = fakeAppServer();

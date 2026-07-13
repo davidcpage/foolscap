@@ -233,6 +233,7 @@ for (const s of liveSessions.values()) {
         legacy.stdin.write(l + "\n");
         return true;
       },
+      answerRequest: () => false,
       kill: () => legacy.kill(),
     };
   }

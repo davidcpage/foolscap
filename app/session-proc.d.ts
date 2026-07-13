@@ -8,6 +8,8 @@ export interface SessionProc {
   readonly alive: boolean;
   /** Write ONE stream-json line to the child's stdin (the \n is appended). False if not alive. */
   write(jsonLine: string): boolean;
+  /** Resolve a provider-owned human gate. Unsupported by local Claude children. */
+  answerRequest(requestId: string, answer: unknown): boolean;
   kill(): void;
 }
 

@@ -15,6 +15,8 @@ export class CodexAppServerError extends Error {
   data?: unknown;
 }
 
+export function resolveCodexCommand(): string;
+
 export interface CodexAppServerPeer {
   readonly ready: Promise<unknown>;
   readonly closed: boolean;

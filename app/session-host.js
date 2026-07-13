@@ -8,6 +8,8 @@
 //   client → host   {op:"hello", req, ver, pid}       → reply {ok,pid,ver} | {ok:false,error:"busy",clientPid}
 //                   {op:"spawn", req, id, cmd, args, cwd, env?} → reply {ok,pid} | {ok:false,error}
 //                   {op:"write", req?, id, data}      → reply {ok:false,error:"not-alive"} only on a dead id
+//                   {op:"answer-request", id, requestId, answer} → settle a Codex human gate
+//                   {op:"usage", req}                → ChatGPT account + app-server rate-limit snapshot
 //                   {op:"kill",  req, id}             → SIGTERM; the exit records reason:"killed"
 //                   {op:"list",  req}                 → reply {ok, sessions:[{id,cwd,busy,spawnedAt,pid}],
 //                                                              exits:[{id,cwd,code,signal,ts,reason}]}
@@ -80,6 +82,9 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
   const children = new Map();
   /** id → one logical Codex thread multiplexed through the shared app-server runtime */
   const codexSessions = new Map();
+  /** host request id -> provider-neutral human gate retained even while Vite is detached */
+  const codexRequests = new Map();
+  let codexRequestSeq = 0;
   /** deaths not yet delivered/acked: {id, cwd, code, signal, ts, reason} */
   const exits = [];
   const conns = new Set(); // every open conn — server.close() waits for them, so shutdown must destroy them
@@ -122,6 +127,20 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
   const codexLine = (id, method, params = {}) =>
     event({ op: "line", id, line: JSON.stringify({ type: "codex_event", method, params }) });
 
+  const requestsOf = (sid) => [...codexRequests.values()]
+    .filter((r) => r.sid === sid)
+    .map((r) => ({ requestId: r.requestId, ...r.request }));
+
+  const settleCodexRequest = (requestId, answer, error = null) => {
+    const pending = codexRequests.get(requestId);
+    if (!pending) return false;
+    codexRequests.delete(requestId);
+    if (error) pending.reject(error);
+    else pending.resolve(answer);
+    codexLine(pending.sid, "canvas/request-resolved", { requestId });
+    return true;
+  };
+
   const onCodexEvent = (id, message) => {
     if (!id) return; // account/config scoped notifications do not belong to one session card
     const entry = codexSessions.get(id);
@@ -141,8 +160,15 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
     const starting = codexRuntimeFactory({
       cwd: new URL(".", import.meta.url).pathname,
       onEvent: onCodexEvent,
+      onRequest: (sid, request) => new Promise((resolve, reject) => {
+        const requestId = `codex-request-${++codexRequestSeq}`;
+        codexRequests.set(requestId, { requestId, sid, request, resolve, reject });
+        codexLine(sid, "canvas/request", { requestId, ...request });
+      }),
       onClose: () => {
         codexRuntimePromise = null;
+        for (const r of [...codexRequests.values()])
+          settleCodexRequest(r.requestId, null, new Error("Codex app-server exited while awaiting a decision"));
         for (const [id, entry] of [...codexSessions]) recordCodexExit(id, entry);
       },
     });
@@ -235,6 +261,11 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
         if (isUserWrite(data)) {
           const text = userText(data);
           if (!text) throw new Error("Codex prompt contained no text");
+          const inputRequest = [...codexRequests.values()].find((r) => r.sid === id && r.request.kind === "input");
+          if (inputRequest) {
+            settleCodexRequest(inputRequest.requestId, { text });
+            return;
+          }
           const wasBusy = entry.busy;
           entry.busy = true;
           if (wasBusy) await runtime.steer(id, text);
@@ -282,10 +313,26 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
         entry.child.stdin.write(msg.data + "\n");
         return msg.req != null ? reply({ ok: true }) : undefined;
       }
+      case "answer-request": {
+        const pending = codexRequests.get(msg.requestId);
+        if (!pending || pending.sid !== msg.id)
+          return msg.req != null ? reply({ ok: false, error: "no-such-request" }) : undefined;
+        settleCodexRequest(msg.requestId, msg.answer);
+        return msg.req != null ? reply({ ok: true }) : undefined;
+      }
+      case "usage": {
+        void getCodexRuntime().then(
+          (runtime) => reply({ ok: true, usage: runtime.usage() }),
+          (err) => reply({ ok: false, error: String(err) }),
+        );
+        return;
+      }
       case "kill": {
         const codex = codexSessions.get(msg.id);
         if (codex) {
           codex.killedByClient = true;
+          for (const r of [...codexRequests.values()])
+            if (r.sid === msg.id) settleCodexRequest(r.requestId, { behavior: "deny" });
           void getCodexRuntime()
             .then(async (runtime) => {
               if (codex.busy) {
@@ -313,6 +360,7 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
             ...[...codexSessions.entries()].map(([id, e]) => ({
               id, cwd: e.cwd, busy: e.busy, spawnedAt: e.spawnedAt,
               pid: e.pid, provider: "codex", providerSessionId: e.providerSessionId,
+              requests: requestsOf(id),
             })),
           ],
           exits: [...exits],

@@ -7,7 +7,7 @@ import chokidar from "chokidar";
 import { getServerContext, getShadowRoots, getWsClients } from "./server-context.js";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
-import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
+import { autoWakeReapTick, reconcileSessionBands, resolveClaudeCommand } from "./server-sessions.js";
 import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
@@ -19,6 +19,15 @@ import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, se
 import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./server-types.js";
+import {
+  CLAUDE_USAGE_POLL_MS,
+  claudeRateLimitDelay,
+  mergeUsageProvider,
+  readUsageCache,
+  retryAfterMs,
+  usageCachePath,
+  writeUsageCache,
+} from "./usage-feed-state.js";
 
 // ── the orchestration ENGINE: feeds + heartbeat/standing-jobs + shadow-git committer (P5 sub-step 3) ──
 // The third ENGINE module of the P5 god-file split (after server-delivery.ts and server-sessions.ts). It
@@ -199,31 +208,50 @@ function readClaudeOAuthToken(): Promise<string | null> {
   });
 }
 
-// The required `claude-code/<version>` User-Agent. Resolved once from `claude --version` (so it tracks
-// the installed CLI), cached, with a plain fallback if claude isn't on PATH — the prefix is what the
-// endpoint gates on, not the exact version.
+// The required `claude-code/<version>` User-Agent. Resolve the executable through the SAME GUI-safe
+// discovery as session spawning (explicit override, reduced PATH, and home-directory fallbacks).
 let claudeUA: string | null = null;
-function claudeUserAgent(): Promise<string> {
+export function claudeUserAgent(): Promise<string> {
   if (claudeUA) return Promise.resolve(claudeUA);
   return new Promise((resolve) => {
-    execFile("claude", ["--version"], (err, stdout) => {
+    let command: string;
+    try {
+      command = resolveClaudeCommand();
+    } catch {
+      return resolve((claudeUA = "claude-code/2.0.0"));
+    }
+    execFile(command, ["--version"], (err, stdout) => {
       const v = (!err && stdout.match(/\d+\.\d+\.\d+/)?.[0]) || "2.0.0";
       resolve((claudeUA = `claude-code/${v}`));
     });
   });
 }
 
-const USAGE_POLL_MS = 180_000; // 3 min — safe with the User-Agent; faster trips the 429 bucket
 export function startUsageFeed(): void {
-  const { feedValues } = getServerContext().fsState;
+  const context = getServerContext();
+  const { feedValues } = context.fsState;
+  const repoPath = context.boards.get(context.defaultBoardId)?.repoPath;
+  const cacheFile = repoPath ? usageCachePath(repoPath) : null;
+  const cached = cacheFile ? readUsageCache(cacheFile) : null;
+  if (cached && !feedValues.has("usage")) publishFeed("usage", cached);
+  const envelope = () => (feedValues.get("usage") as any) ?? { schema: 2, providers: {} };
+  const provider = (name: string) => envelope()?.providers?.[name] ?? {};
+  const publishProvider = (name: string, value: Record<string, unknown>, persist = false) => {
+    const next = mergeUsageProvider(envelope(), name, value);
+    publishFeed("usage", next);
+    if (persist && cacheFile) writeUsageCache(cacheFile, next);
+  };
+
   let backoff = 0; // extra ms added after a 429, cleared on the next success
-  const last = () => (feedValues.get("usage") as Record<string, unknown> | undefined) ?? {};
-  const poll = async () => {
-    let nextDelay = USAGE_POLL_MS;
+  const pollClaude = async () => {
+    let nextDelay = CLAUDE_USAGE_POLL_MS;
     try {
       const token = await readClaudeOAuthToken();
       if (!token) {
-        publishFeed("usage", { error: "no-credentials", fetchedAt: Date.now() });
+        publishProvider("claude", {
+          ...provider("claude"), provider: "claude", billing: "anthropic-plan",
+          error: "no-credentials", fetchedAt: Date.now(),
+        });
       } else {
         const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
           headers: {
@@ -234,25 +262,58 @@ export function startUsageFeed(): void {
           },
         });
         if (res.status === 429) {
-          // Throttled — keep the last good windows, just flag it, and wait longer next time.
-          backoff = Math.min(backoff ? backoff * 2 : USAGE_POLL_MS, 15 * 60_000);
-          nextDelay = USAGE_POLL_MS + backoff;
-          publishFeed("usage", { ...last(), error: "rate-limited", fetchedAt: Date.now() });
+          // Keep last-good windows and obey both server Retry-After and our exponential floor.
+          const retry = retryAfterMs(res.headers.get("retry-after"));
+          ({ backoff, delay: nextDelay } = claudeRateLimitDelay(backoff, retry));
+          publishProvider("claude", {
+            ...provider("claude"), provider: "claude", billing: "anthropic-plan",
+            error: "rate-limited", retryAt: Date.now() + nextDelay, fetchedAt: Date.now(),
+          });
         } else if (!res.ok) {
           // 401 ⇒ token expired/needs re-auth; anything else ⇒ the endpoint changed or is down.
-          publishFeed("usage", { ...last(), error: `http-${res.status}`, fetchedAt: Date.now() });
+          publishProvider("claude", {
+            ...provider("claude"), provider: "claude", billing: "anthropic-plan",
+            error: `http-${res.status}`, fetchedAt: Date.now(),
+          });
         } else {
           backoff = 0;
           const data = (await res.json()) as Record<string, unknown>;
-          publishFeed("usage", { ...data, error: null, fetchedAt: Date.now() });
+          publishProvider("claude", {
+            provider: "claude", billing: "anthropic-plan", ...data,
+            error: null, retryAt: null, fetchedAt: Date.now(),
+          }, true);
         }
       }
     } catch {
-      publishFeed("usage", { ...last(), error: "offline", fetchedAt: Date.now() });
+      publishProvider("claude", {
+        ...provider("claude"), provider: "claude", billing: "anthropic-plan",
+        error: "offline", fetchedAt: Date.now(),
+      });
     }
-    setTimeout(poll, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
+    setTimeout(pollClaude, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
   };
-  void poll();
+
+  const pollCodex = async () => {
+    let nextDelay = 60_000;
+    const client = getServerContext().fsState.hostClient;
+    if (!client) {
+      // attachSessionHost starts just after feeds; retry promptly without re-polling Anthropic.
+      nextDelay = 2_000;
+    } else {
+      try {
+        const value = await client.codexUsage();
+        publishProvider("codex", value as Record<string, unknown>, true);
+      } catch (err) {
+        publishProvider("codex", {
+          ...provider("codex"), provider: "codex", billing: "chatgpt-plan",
+          error: err instanceof Error ? err.message : String(err), fetchedAt: Date.now(),
+        });
+      }
+    }
+    setTimeout(pollCodex, nextDelay);
+  };
+  void pollClaude();
+  void pollCodex();
 }
 
 // ── card types WATCH feed (a template edit on disk pings the client, whose registry re-imports) ──────

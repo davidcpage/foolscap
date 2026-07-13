@@ -3777,6 +3777,28 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   overflow-y: auto;
   overflow-x: hidden;
 }
+.menu-provider {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 3px;
+  padding: 3px 5px 5px 1px;
+}
+.menu-list .menu-provideropt {
+  justify-content: center;
+  min-height: 25px;
+  padding: 3px 7px;
+  border: 1px solid #e4e4e7;
+  border-radius: 5px;
+  color: #71717a;
+  background: #fff;
+  font-size: 11px;
+}
+.menu-list .menu-provideropt.active {
+  border-color: #a5b4fc;
+  color: #3730a3;
+  background: #eef2ff;
+  font-weight: 600;
+}
 /* A role option: a colour swatch then the role name, left-aligned (overriding the menu's space-between). */
 .menu-list .menu-roleopt {
   justify-content: flex-start;

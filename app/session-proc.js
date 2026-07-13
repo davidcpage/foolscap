@@ -46,6 +46,9 @@ export function localProc({ cmd, args, cwd, env }, hooks) {
       child.stdin.write(jsonLine + "\n");
       return true;
     },
+    answerRequest() {
+      return false;
+    },
     kill() {
       if (!alive) return;
       killedByUs = true;
@@ -78,6 +81,10 @@ export function remoteProc(client, id, hooks, opts) {
     write(jsonLine) {
       if (!alive) return false;
       return client.writeSession(id, jsonLine);
+    },
+    answerRequest(requestId, answer) {
+      if (!alive) return false;
+      return client.answerRequest(id, requestId, answer);
     },
     kill() {
       if (!alive) return;

@@ -150,11 +150,20 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
   let closeCalls = 0;
   const prompts = [];
   const releases = [];
-  const codexRuntimeFactory = async ({ onEvent }) => {
+  let requestHuman;
+  const codexRuntimeFactory = async ({ onEvent, onRequest }) => {
     factoryCalls++;
+    requestHuman = onRequest;
     return {
       pid: 4242,
       account: { type: "chatgpt", email: "plan@example.test", planType: "team" },
+      usage() {
+        return {
+          provider: "codex", billing: "chatgpt-plan",
+          account: { type: "chatgpt", email: "plan@example.test", planType: "team" },
+          rateLimits: { primary: { usedPercent: 8 } }, error: null, fetchedAt: 123,
+        };
+      },
       async start(sid) { return { threadId: `thread-${sid}` }; },
       async resume(sid, threadId) { return { sid, threadId }; },
       async prompt(sid, text) {
@@ -172,7 +181,7 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
   };
   const host = await createHost({ socketPath, logPath, codexRuntimeFactory });
   try {
-    const c = await connect(socketPath);
+    let c = await connect(socketPath);
     await c.request({ op: "hello", ver: PROTOCOL_VERSION });
     const a = await c.request({ op: "spawn", id: "ca", provider: "codex", cwd: "/tmp/a" });
     const b = await c.request({ op: "spawn", id: "cb", provider: "codex", cwd: "/tmp/b" });
@@ -181,12 +190,37 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
       ["codex", "thread-ca", "thread-cb"],
     );
     assert.equal(factoryCalls, 1, "both logical sessions share one app-server runtime");
+    const usage = await c.request({ op: "usage" });
+    assert.equal(usage.usage.account.email, "plan@example.test");
+    assert.equal(usage.usage.billing, "chatgpt-plan");
 
     c.send({ op: "write", id: "ca", data: userMsg("alpha") });
     c.send({ op: "write", id: "cb", data: userMsg("beta") });
     await c.waitEvent((e) => e.op === "line" && e.id === "ca" && e.line.includes("reply:alpha"));
     await c.waitEvent((e) => e.op === "line" && e.id === "cb" && e.line.includes("reply:beta"));
     assert.deepEqual(prompts, [["ca", "alpha"], ["cb", "beta"]]);
+
+    const approval = requestHuman("ca", { kind: "approval", toolName: "Bash", input: { command: "git push" } });
+    const input = requestHuman("cb", {
+      kind: "input", questions: [{ id: "color", question: "Which color?", header: "Color", options: [] }],
+    });
+    const approvalEvent = await c.waitEvent((e) => e.op === "line" && e.id === "ca" && e.line.includes('"canvas/request"'));
+    await c.waitEvent((e) => e.op === "line" && e.id === "cb" && e.line.includes('"canvas/request"'));
+    const approvalId = JSON.parse(approvalEvent.line).params.requestId;
+    assert.deepEqual((await c.request({ op: "list" })).sessions.map((s) => [s.id, s.requests.length]), [["ca", 1], ["cb", 1]]);
+    await c.close();
+    c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+    assert.deepEqual(
+      (await c.request({ op: "list" })).sessions.map((s) => [s.id, s.requests.map((r) => r.kind)]),
+      [["ca", ["approval"]], ["cb", ["input"]]],
+      "a reattached Vite client can reconstruct both pending card gates",
+    );
+    assert.equal((await c.request({ op: "answer-request", id: "ca", requestId: approvalId, answer: { behavior: "allow" } })).ok, true);
+    assert.deepEqual(await approval, { behavior: "allow" });
+    c.send({ op: "write", id: "cb", data: userMsg("blue") });
+    assert.deepEqual(await input, { text: "blue" });
+    assert.deepEqual((await c.request({ op: "list" })).sessions.map((s) => [s.id, s.requests.length]), [["ca", 0], ["cb", 0]]);
 
     await c.request({ op: "kill", id: "ca" });
     await c.waitEvent((e) => e.op === "exit" && e.id === "ca" && e.reason === "killed");

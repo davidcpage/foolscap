@@ -6,10 +6,33 @@
 // carry ids; responses are distinguished by result/error, notifications by method without id.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { makeLineSplitter } from "./session-host-protocol.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_CLIENT_INFO = { name: "foolscap_canvas", title: "Foolscap Canvas", version: "0.1.0" };
+
+export function resolveCodexCommand() {
+  const candidates = [
+    process.env.CANVAS_CODEX_COMMAND,
+    ...String(process.env.PATH ?? "").split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, "codex")),
+    "/Applications/ChatGPT.app/Contents/Resources/codex",
+    path.join(os.homedir(), ".local", "bin", "codex"),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep looking; app launches commonly have a much smaller PATH than an interactive shell.
+    }
+  }
+  throw new CodexAppServerError(
+    "Codex executable not found; install it, add it to PATH, or set CANVAS_CODEX_COMMAND",
+  );
+}
 
 export class CodexAppServerError extends Error {
   constructor(message, details = {}) {
@@ -163,7 +186,7 @@ export function createCodexAppServerPeer({
 
 /** Spawn one shared app-server process. The returned peer is ready after the mandatory handshake. */
 export function spawnCodexAppServer({
-  command = "codex",
+  command,
   args = ["app-server", "--stdio"],
   cwd = process.cwd(),
   env,
@@ -172,6 +195,7 @@ export function spawnCodexAppServer({
   capabilities,
   spawnProcess = spawn,
 } = {}) {
+  command ??= resolveCodexCommand();
   const child = spawnProcess(command, args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],

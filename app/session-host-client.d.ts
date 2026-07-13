@@ -10,6 +10,7 @@ export interface HostSessionInfo {
   pid: number | undefined;
   provider: "claude" | "codex";
   providerSessionId?: string | null;
+  requests?: Array<Record<string, unknown> & { requestId: string }>;
 }
 export interface HostExitRecord {
   id: string;
@@ -27,6 +28,8 @@ export interface SessionHostClient {
   /** Fire-and-forget; a failed spawn surfaces as onExit({reason:"self"}) on the attached hooks. */
   spawnSession(id: string, spec: import("./session-proc.js").SpawnSpec): void;
   writeSession(id: string, data: string): boolean;
+  answerRequest(id: string, requestId: string, answer: unknown): boolean;
+  codexUsage(): Promise<Record<string, unknown>>;
   killSession(id: string): void;
   list(): Promise<{ sessions: HostSessionInfo[]; exits: HostExitRecord[] }>;
   ackExits(ids: string[]): Promise<void>;
