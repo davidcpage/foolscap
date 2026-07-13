@@ -423,22 +423,14 @@ let channelListValue: ChannelMeta[] | undefined;
 const channelListSubs = new Set<() => void>();
 let channelListInflight = false;
 
-// P2 relative-offset layout: the board-wide sid→primaryThread map, captured from the SAME /api/threads pull
-// (it rides that response) so it stays fresh on every threads-feed ping — exactly when a membership, and thus
-// a session's primacy, can change. Resolves which thread a multi-thread session is anchored to (via
-// primaryThreadOf). Undefined until the first fetch lands. (P3 removed the move-with-thread reactor that was
-// this map's client-side consumer; the map itself stays for the offset/primacy machinery.)
-let sessionAnchorsValue: Record<string, string> | undefined;
-
 async function fetchChannelList(force = false): Promise<void> {
   if (channelListInflight && !force) return; // a normal lazy fetch de-dupes; a forced refresh always runs
   channelListInflight = true;
   try {
     const r = await fetch(`/api/threads?board=${activeBoardId()}`);
     if (r.ok) {
-      const d = (await r.json()) as { threads?: ChannelMeta[]; anchors?: Record<string, string> };
+      const d = (await r.json()) as { threads?: ChannelMeta[] };
       channelListValue = d.threads ?? [];
-      sessionAnchorsValue = d.anchors ?? {};
       for (const fn of channelListSubs) fn();
     }
   } catch {
@@ -446,17 +438,6 @@ async function fetchChannelList(force = false): Promise<void> {
   } finally {
     channelListInflight = false;
   }
-}
-
-// The PRIMARY thread id of a session (its earliest-joined thread), or undefined when unknown (anchors not
-// yet fetched, or the session isn't a durable member of any thread). Disambiguates a multi-thread session;
-// a single-membership session doesn't need it. Reading it also ARMS the threads feed + a first pull
-// (idempotent), so a caller gets a live-refreshed map without a rail card being open. (Currently no
-// client-side caller — P3 retired the move-with-thread reactor — but kept for the P2 offset/primacy path.)
-export function primaryThreadOf(sid: string): string | undefined {
-  hookThreadsFeed();
-  if (sessionAnchorsValue === undefined) void fetchChannelList();
-  return sessionAnchorsValue?.[sid];
 }
 
 // The rail card's ⟳ refresh button — re-pull and notify. A live push covers the common case
