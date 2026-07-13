@@ -465,6 +465,16 @@ test("sessions template lists the off-log session list, each row draggable, with
   assert.ok(out.includes("1 turn ·"), "singular turn label");
   assert.ok(out.includes("2 KB") && out.includes("512 B"), "byte sizes formatted");
 
+  const providerRows = flatten(mod.render({
+    fields: card.fields,
+    signals: { ...card.signals, sessionList: [
+      { id: "codex", provider: "codex", mtime: Date.now(), bytes: null, turns: 0 },
+      { id: "claude", provider: "claude", mtime: Date.now(), bytes: null, noHistory: true, turns: 0 },
+    ] },
+  }));
+  assert.ok(providerRows.includes("app-server history"), "Codex history is not mislabelled 0 B");
+  assert.ok(providerRows.includes("no transcript"), "a prompt-less Claude crash stays visible and honest");
+
   // Every row is draggable (the drag-out promotion) and contained from the canvas drag (data-interactive,
   // so grabbing a row drags it OUT, not the whole card).
   assert.ok(out.includes('draggable="true"'), "rows are draggable");

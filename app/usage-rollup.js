@@ -19,7 +19,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { canvasSessionsDir, readCanvasSession, projectsDirForCwd } from "./session-ledger.js";
+import { canvasSessionsDir, readCanvasSession, projectsDirForCwd, projectsDirsForCwd } from "./session-ledger.js";
 import { listThreads, threadMembersFromMeta } from "./thread-ledger.js";
 
 /**
@@ -96,8 +96,10 @@ export function rollupUsage(repoPath, { dirForCwd = projectsDirForCwd } = {}) {
   for (const n of names) {
     const id = n.slice(0, -".json".length);
     const marker = readCanvasSession(repoPath, id) ?? {};
-    const tdir = marker.cwd ? dirForCwd(marker.cwd) : dirForCwd(repoPath);
-    const file = path.join(tdir, id + ".jsonl");
+    const cwd = marker.cwd || repoPath;
+    const dirs = dirForCwd === projectsDirForCwd ? projectsDirsForCwd(cwd) : [dirForCwd(cwd)];
+    const file = dirs.map((tdir) => path.join(tdir, id + ".jsonl")).find((candidate) => fs.existsSync(candidate));
+    if (!file) continue;
     let text, st;
     try {
       st = fs.statSync(file);

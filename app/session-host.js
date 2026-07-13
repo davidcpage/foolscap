@@ -327,6 +327,17 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
         );
         return;
       }
+      case "read-history": {
+        if (typeof msg.providerSessionId !== "string" || !msg.providerSessionId)
+          return reply({ ok: false, error: "missing provider session id" });
+        void getCodexRuntime().then(
+          (runtime) => runtime.readThread(msg.providerSessionId),
+        ).then(
+          (history) => reply({ ok: true, history }),
+          (err) => reply({ ok: false, error: String(err) }),
+        );
+        return;
+      }
       case "kill": {
         const codex = codexSessions.get(msg.id);
         if (codex) {

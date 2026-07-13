@@ -98,6 +98,10 @@ export async function createCodexHostRuntime({ cwd, onEvent, onRequest, onClose,
       steer: requireChatgpt((sid, text) => router.steer(sid, text)),
       interrupt: (sid) => router.interrupt(sid),
       read: (sid) => router.read(sid, true),
+      // Historical cards are not live logical sessions, so read their provider conversation directly
+      // without binding/subscribing it into the router or spending a turn.
+      readThread: requireChatgpt((providerSessionId) =>
+        server.request("thread/read", { threadId: providerSessionId, includeTurns: true })),
       release: (sid) => router.release(sid),
       close() {
         intentionalClose = true;

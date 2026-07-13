@@ -278,7 +278,8 @@ export function refreshListing(root: string, path: string): void {
 export interface SessionMeta {
   id: string;
   mtime: number;
-  bytes: number;
+  bytes: number | null;
+  noHistory?: boolean;
   title?: string | null; // the agent-written ai-title (or a truncated first prompt); absent if unreadable
   turns?: number; // human turns — user messages carrying text, not tool-result envelopes
   messages?: number; // raw user+assistant record count, every tool iteration included

@@ -23,6 +23,7 @@ export interface CodexHostRuntime {
   steer(sid: string, text: string): Promise<unknown>;
   interrupt(sid: string): Promise<unknown>;
   read(sid: string): Promise<unknown>;
+  readThread(providerSessionId: string): Promise<unknown>;
   release(sid: string): Promise<boolean>;
   close(): void;
 }

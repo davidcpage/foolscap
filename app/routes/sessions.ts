@@ -5,11 +5,12 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
 import { getPendingHistoryMode, getServerContext } from "../server-context.js";
 import { exact, re, type GlobalRoute } from "./router.js";
-import { isCanvasSession, listSessions, markCanvasSession, readCanvasSession } from "../session-ledger.js";
+import { isCanvasSession, listSessions, markCanvasSession, projectsDirsForCwd, readCanvasSession } from "../session-ledger.js";
 import { durableSessionThreads } from "../server-snapshot.js";
 import { sessionSummaryFromText } from "../session-summary.js";
 import { readRole } from "../role-ledger.js";
 import { ensureWorktree } from "../worktrees.js";
+import { MAX_SESSION_BYTES, projectCodexHistory } from "../server-sessions.js";
 
 // ── the sessions routes (read/list + lifecycle/spawn) — god-file split, Phase 4 ─────────────────────
 // The two GLOBAL-stage clusters that make sessions legible and drivable: the read/list pair (GET
@@ -33,13 +34,13 @@ import { ensureWorktree } from "../worktrees.js";
 // no marker yet). The single resolver the list (listSessions), the open (handleSession) and the resume all
 // go through, so a worktree session's transcript is found everywhere — not just the live-tail seed.
 function sessionTranscriptDir(repoPath: string, id: string): string {
-  const { sessionsDir } = getServerContext();
   const cwd = readCanvasSession(repoPath, id)?.cwd as string | undefined;
-  return cwd ? sessionsDir(cwd) : sessionsDir(repoPath);
+  const candidates = projectsDirsForCwd(cwd ?? repoPath);
+  return candidates.find((dir) => fs.existsSync(path.join(dir, id + ".jsonl"))) ?? candidates[0]!;
 }
 
-function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): void {
-  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionAnchor } = getServerContext();
+async function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): Promise<void> {
+  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionAnchor, publishFeed, fsState } = getServerContext();
   let chosen = id;
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
@@ -48,14 +49,59 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   // this handler was passed, but under its own cwd's projects dir (recorded on the marker). Without this a
   // listed worktree session 404s the moment its card is opened.
   const tdir = sessionTranscriptDir(repoPath, chosen);
-  const r = readSessionFile(tdir, chosen);
-  if (!r) return sendJson(res, 404, { error: "not found" });
+  const marker = readCanvasSession(repoPath, chosen);
+  const isCodex = marker?.provider === "codex";
+  const providerSessionId = isCodex && typeof marker?.providerSessionId === "string"
+    ? marker.providerSessionId
+    : null;
+  let r = readSessionFile(tdir, chosen);
+  if (isCodex && providerSessionId) {
+    if (!fsState.hostClient?.connected)
+      return sendJson(res, 503, { error: "session host unavailable for Codex history" });
+    if (typeof fsState.hostClient.codexHistory !== "function")
+      return sendJson(res, 503, {
+        error: "dev server restart required after the session-host protocol upgrade",
+      });
+    try {
+      const projected = projectCodexHistory(await fsState.hostClient.codexHistory(providerSessionId));
+      let content = projected.lines.join("\n");
+      let truncated = false;
+      if (Buffer.byteLength(content) > MAX_SESSION_BYTES) {
+        const buf = Buffer.from(content);
+        content = buf.subarray(buf.length - MAX_SESSION_BYTES).toString("utf8");
+        truncated = true;
+      }
+      r = { content, truncated };
+      publishFeed("session:" + chosen, {
+        ...r,
+        ended: true,
+        provider: "codex",
+        providerSessionId,
+        endReason: marker?.endReason,
+        error: projected.error ?? undefined,
+      });
+    } catch (err) {
+      return sendJson(res, 502, { error: "failed to read Codex history", detail: String(err) });
+    }
+  }
+  if (!r) {
+    if (!marker) return sendJson(res, 404, { error: "not found" });
+    r = { content: "", truncated: false };
+    publishFeed("session:" + chosen, {
+      ...r,
+      ended: true,
+      provider: isCodex ? "codex" : "claude",
+      providerSessionId: providerSessionId ?? undefined,
+      endReason: marker.endReason,
+      noHistory: true,
+    });
+  }
   // Backfill the ledger: a card asked for this transcript, so it's ON the board — that makes it canvas-
   // owned by adoption (whether we spawned it or it predates the ledger). Marking on first serve is what
   // migrates existing cards in (so they list again) without a client change, and keeps the list filtered
   // to externals nobody has placed. Write-once: a real spawn already wrote a richer marker; don't clobber it.
   if (!isCanvasSession(repoPath, chosen)) markCanvasSession(repoPath, chosen, { adoptedAt: Date.now() });
-  ensureSessionFeed(tdir, chosen, repoPath); // a card asked for this transcript → start live-tailing it (below)
+  if (!isCodex) ensureSessionFeed(tdir, chosen, repoPath); // Codex history was published from app-server above
   // The threads this session is a DURABLE member of, so the client can redraw the `member:open` edge(s) on
   // reopen: the card + its edge vanished on close, but the membership outlived them (delete-card-keep-session).
   // LEDGER-ONLY on purpose (durableSessionThreads, not sessionThreads): the client repaints edges from this
@@ -71,7 +117,6 @@ function handleSession(res: ServerResponse, dir: string, id: string | null, repo
   // The role this session instantiates (from its marker, as handleSessions ~117-118 already reads for the
   // list): so reopen can restamp the card's friendly `name` ("<Role>.<short-sid>", the spawn convention) and
   // the card title + member pill read the role label instead of the bare sid. null for a plain session.
-  const marker = readCanvasSession(repoPath, chosen);
   sendJson(res, 200, {
     id: chosen,
     content: r.content,
@@ -116,10 +161,20 @@ function sessionSummary(
   return summary;
 }
 
-// GET /api/sessions → every historical transcript (newest-first), for the Open-session dropdown. The
-// list IS the disk: a session card deleted from the canvas still appears here, so "reopen it later"
-// needs no canvas persistence — the .jsonl is the source of truth. listSessions() stays a cheap
-// readdir+stat (handleSession leans on it too); the per-transcript title/turn parse is added only here.
+function sessionSummaryForPath(abs: string, fallbackMtime: number): { title: string | null; turns: number; messages: number } {
+  let sourceMtime = fallbackMtime;
+  try {
+    sourceMtime = fs.statSync(abs).mtimeMs;
+  } catch {
+    // The transcript can disappear between the marker-driven list and this metadata pass. The summary
+    // reader below already degrades an unreadable path to an empty summary; keep that race non-fatal.
+  }
+  return sessionSummary(abs, sourceMtime);
+}
+
+// GET /api/sessions → every historical provider session (newest-first), for the Open-session dropdown.
+// Claude rows resolve their provider-authored `.jsonl`; Codex rows resolve their durable app-server thread
+// id. A card deleted from the canvas still appears here because the marker is the ownership index.
 function handleSessions(res: ServerResponse, dir: string, repoPath: string): void {
   const { sessionStatus, liveSessions } = getServerContext();
   const onDisk = listSessions(dir, repoPath);
@@ -127,7 +182,9 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
     const marker = readCanvasSession(repoPath, s.id);
     return {
       ...s,
-      ...sessionSummary(path.join(dir, s.id + ".jsonl"), s.mtime),
+      ...(marker?.provider === "codex" || s.noHistory
+        ? { title: null, turns: 0, messages: 0 }
+        : sessionSummaryForPath(path.join(sessionTranscriptDir(repoPath, s.id), s.id + ".jsonl"), s.mtime)),
       status: sessionStatus(repoPath, s.id),
       // The role this session instantiates, if any — lets the list/minimap render `<RoleName>.<short-sid>`,
       // with roleColour so a historical row's role chip tints the same as the live picker swatch.
@@ -403,7 +460,7 @@ export const sessionReadRoutes: GlobalRoute[] = [
       const ctx = getServerContext();
       const b = ctx.reqBoard(url);
       if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleSession(res, ctx.sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath, b.boardId);
+      return void handleSession(res, ctx.sessionsDir(b.repoPath), url.searchParams.get("id"), b.repoPath, b.boardId);
     },
   },
   {

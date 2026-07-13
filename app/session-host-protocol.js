@@ -9,7 +9,7 @@ import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 
 /**
  * The host's socket, checkout-scoped (one sidecar per app checkout, like one dev server) but living in

@@ -150,6 +150,7 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
   let closeCalls = 0;
   const prompts = [];
   const releases = [];
+  const historyReads = [];
   let requestHuman;
   const codexRuntimeFactory = async ({ onEvent, onRequest }) => {
     factoryCalls++;
@@ -175,6 +176,10 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
       async steer() {},
       async interrupt() {},
       async read() { return { thread: { turns: [] } }; },
+      async readThread(threadId) {
+        historyReads.push(threadId);
+        return { thread: { id: threadId, turns: [{ id: "historical-turn" }] } };
+      },
       async release(sid) { releases.push(sid); return true; },
       close() { closeCalls++; },
     };
@@ -193,6 +198,9 @@ test("one host-owned Codex runtime multiplexes logical sessions and releases one
     const usage = await c.request({ op: "usage" });
     assert.equal(usage.usage.account.email, "plan@example.test");
     assert.equal(usage.usage.billing, "chatgpt-plan");
+    const history = await c.request({ op: "read-history", providerSessionId: "provider-history" });
+    assert.equal(history.history.thread.id, "provider-history");
+    assert.deepEqual(historyReads, ["provider-history"], "history reads do not bind another live canvas session");
 
     c.send({ op: "write", id: "ca", data: userMsg("alpha") });
     c.send({ op: "write", id: "cb", data: userMsg("beta") });

@@ -24,12 +24,24 @@ import path from "node:path";
 
 /**
  * The ~/.claude/projects transcript dir for a process running in `cwd`. Claude Code slugs the absolute cwd
- * by replacing every "/" AND "." with "-" (so `/a/foolscap/.canvas` → `-a-foolscap--canvas`), which is why a
+ * by replacing every non-alphanumeric character with "-" (so `/a/foolscap/.canvas` →
+ * `-a-foolscap--canvas`), which is why a
  * board root (no dots) and its worktrees (which contain `.canvas`) resolve to DIFFERENT dirs. Single source
  * of truth for both the list (per-marker) and the per-session transcript read on the server side.
  */
 export function projectsDirForCwd(cwd) {
-  return path.join(os.homedir(), ".claude", "projects", cwd.replace(/[/.]/g, "-"));
+  return path.join(os.homedir(), ".claude", "projects", cwd.replace(/[^A-Za-z0-9]/g, "-"));
+}
+
+/**
+ * Current Claude slug first, followed by the app's historical slash/dot-only slug when they differ.
+ * The compatibility candidate matters for checkouts containing `_`: older Foolscap migration code copied
+ * transcripts into that legacy-computed directory, while Claude itself correctly writes `_` as `-`.
+ */
+export function projectsDirsForCwd(cwd) {
+  const current = projectsDirForCwd(cwd);
+  const legacy = path.join(os.homedir(), ".claude", "projects", cwd.replace(/[/.]/g, "-"));
+  return current === legacy ? [current] : [current, legacy];
 }
 
 /** The directory holding one marker file per canvas-owned session, under the board repo's `.canvas/` home. */
@@ -96,7 +108,8 @@ export function updateCanvasSession(repoPath, id, patch) {
  * worktree dir when it has a cwd, `dir` (the board-root projects dir) otherwise (board-root/adopted sessions,
  * whose markers carry no cwd). This also inverts the old external filter for free: a terminal `claude` run
  * nobody placed on the board has no marker, so it's simply never enumerated. A marker whose transcript is
- * missing (deleted, or not yet written) is skipped rather than listed with bogus stats.
+ * missing (deleted, failed before first write, or not yet written) remains visible from its marker with an
+ * honest `noHistory` flag. Codex history remains in app-server and therefore never invents a Claude file.
  *
  * `dirForCwd` resolves a session's `cwd` to its transcripts dir; it defaults to projectsDirForCwd and is a
  * seam only the tests use (they can't seed the real ~/.claude/projects).
@@ -112,14 +125,42 @@ export function listSessions(dir, repoPath, dirForCwd = projectsDirForCwd) {
     .map((n) => {
       const id = n.slice(0, -".json".length);
       const marker = readCanvasSession(repoPath, id);
-      const tdir = marker?.cwd ? dirForCwd(marker.cwd) : dir;
-      try {
-        const st = fs.statSync(path.join(tdir, id + ".jsonl"));
-        return { id, mtime: st.mtimeMs, bytes: st.size };
-      } catch {
-        return null; // owned but no transcript on disk — skip rather than list bogus stats
+      // Codex history is provider-authored and fetched through app-server (`thread/read`), so it has no
+      // Claude-projects `.jsonl` to stat. A bound provider id is the durable proof that this marker has a
+      // real conversation behind it; an unbound/failed spawn remains omitted once it is no longer live.
+      if (marker?.provider === "codex") {
+        const bound = typeof marker.providerSessionId === "string" && !!marker.providerSessionId;
+        return { id, mtime: markerTime(marker, 0), bytes: null, noHistory: !bound };
       }
+      const cwd = marker?.cwd ?? repoPath;
+      const primary = marker?.cwd ? dirForCwd(marker.cwd) : dir;
+      const dirs = dirForCwd === projectsDirForCwd
+        ? [primary, ...projectsDirsForCwd(cwd).filter((candidate) => candidate !== primary)]
+        : [primary];
+      for (const tdir of dirs) {
+        try {
+          const st = fs.statSync(path.join(tdir, id + ".jsonl"));
+          return { id, mtime: markerTime(marker, st.mtimeMs), bytes: st.size };
+        } catch {
+          // Try the compatibility directory before concluding there is no transcript.
+        }
+      }
+      // Ownership is still real even when Claude crashed before its first transcript write (or a file
+      // was removed). Keep the session legible/openable and say honestly that it has no transcript.
+      return { id, mtime: markerTime(marker, 0), bytes: null, noHistory: true };
     })
     .filter(Boolean)
     .sort((a, b) => b.mtime - a.mtime);
+}
+
+// Filesystem mtimes are transport metadata, not session metadata: a checkout migration/copy can stamp
+// hundreds of transcripts with the same copy time and scramble the Sessions rail. Markers already carry
+// durable lifecycle time, so prefer the end time (closest to the old transcript mtime), then spawn/adoption;
+// only legacy markers with no logical timestamp fall back to the file stat.
+function markerTime(marker, fallback) {
+  for (const key of ["endedAt", "spawnedAt", "adoptedAt"]) {
+    const value = marker?.[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  }
+  return fallback;
 }

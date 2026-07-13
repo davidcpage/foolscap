@@ -43,8 +43,12 @@ function timeAgo(ms) {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-// A compact file size from the transcript's byte length — a free "how big" proxy off the dir stat.
-function fmtSize(bytes) {
+// A compact file size for Claude's file-backed transcript. Codex history is provider-backed, not a zero-byte
+// file; a failed prompt-less Claude spawn likewise has no transcript rather than an empty one.
+function historyLabel(session) {
+  if (session.provider === "codex") return session.noHistory ? "no provider history" : "app-server history";
+  if (session.noHistory || session.bytes == null) return "no transcript";
+  const bytes = session.bytes;
   if (bytes < 1024) return `${bytes} B`;
   const kb = bytes / 1024;
   return kb < 1024 ? `${Math.round(kb)} KB` : `${(kb / 1024).toFixed(1)} MB`;
@@ -113,7 +117,7 @@ export default {
               <span class="ses-row-meta">
                 ${s.model /* serving model, known for live sessions only — tracks a refusal fallback */
                   ? html`<span class="ses-model" title=${`model: ${s.model}`}>${s.model.replace(/^claude-/, "")}</span> · `
-                  : ""}${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${fmtSize(s.bytes)}
+                  : ""}${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${historyLabel(s)}
               </span>
             </div>
           `,

@@ -177,6 +177,11 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
       if (!r.ok) throw new Error(r.error || "Codex usage unavailable");
       return r.usage;
     },
+    async codexHistory(providerSessionId) {
+      const r = await request({ op: "read-history", providerSessionId });
+      if (!r.ok) throw new Error(r.error || "Codex history unavailable");
+      return r.history;
+    },
     killSession(id) {
       if (!connected || !conn) return;
       conn.write(JSON.stringify({ op: "kill", id, req: ++req }) + "\n");

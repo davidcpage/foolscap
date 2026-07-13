@@ -12,6 +12,7 @@ import {
   isCanvasSession,
   listSessions,
   projectsDirForCwd,
+  projectsDirsForCwd,
   readCanvasSession,
   recordSessionEnd,
   updateCanvasSession,
@@ -68,15 +69,52 @@ test("listSessions finds a WORKTREE session's transcript via its marker cwd, not
   assert.deepEqual(ids, ["wtSession", "rootSession"], "both list; worktree session resolved via marker cwd, newest first");
 });
 
-test("listSessions skips an owned session whose transcript is missing (deleted / not yet written)", () => {
+test("listSessions keeps an owned session whose transcript is missing, marked honestly", () => {
   const repo = tmpRepo();
   const dir = transcriptsWith(["present"]);
   markCanvasSession(repo, "present", { spawnedAt: 1 });
   markCanvasSession(repo, "gone", { spawnedAt: 2 }); // marker exists but no .jsonl in dir
-  assert.deepEqual(listSessions(dir, repo).map((s) => s.id), ["present"], "orphan marker is skipped, not listed with bogus stats");
+  assert.deepEqual(listSessions(dir, repo), [
+    { id: "gone", mtime: 2, bytes: null, noHistory: true },
+    { id: "present", mtime: 1, bytes: 3 },
+  ]);
 });
 
-test("projectsDirForCwd slugs BOTH '/' and '.' — a board root is dotless but a worktree carries `.canvas`", () => {
+test("listSessions includes a bound Codex conversation without a Claude transcript", () => {
+  const repo = tmpRepo();
+  const dir = transcriptsWith([]);
+  markCanvasSession(repo, "codex", {
+    provider: "codex",
+    providerSessionId: "provider-thread-1",
+    spawnedAt: 10,
+    endedAt: 20,
+  });
+  markCanvasSession(repo, "failed", { provider: "codex", spawnedAt: 30 });
+  assert.deepEqual(
+    listSessions(dir, repo),
+    [
+      { id: "failed", mtime: 30, bytes: null, noHistory: true },
+      { id: "codex", mtime: 20, bytes: null, noHistory: false },
+    ],
+    "provider history is not misreported as a zero-byte Claude file",
+  );
+});
+
+test("listSessions uses durable lifecycle time when copied transcript mtimes collapse", () => {
+  const repo = tmpRepo();
+  const dir = transcriptsWith(["older", "newer"]);
+  const copiedAt = new Date(9_999_000);
+  fs.utimesSync(path.join(dir, "older.jsonl"), copiedAt, copiedAt);
+  fs.utimesSync(path.join(dir, "newer.jsonl"), copiedAt, copiedAt);
+  markCanvasSession(repo, "older", { spawnedAt: 100, endedAt: 200 });
+  markCanvasSession(repo, "newer", { spawnedAt: 300, endedAt: 400 });
+  assert.deepEqual(
+    listSessions(dir, repo).map(({ id, mtime }) => ({ id, mtime })),
+    [{ id: "newer", mtime: 400 }, { id: "older", mtime: 200 }],
+  );
+});
+
+test("projectsDirForCwd slugs every non-alphanumeric character like Claude", () => {
   // The board root (no dots) is unchanged from the old '/'-only rule, so this stays back-compatible…
   assert.ok(projectsDirForCwd("/Users/me/foolscap").endsWith("-Users-me-foolscap"));
   // …but a worktree cwd's `.canvas` MUST slug the dot too, or the computed dir won't match Claude Code's.
@@ -84,6 +122,12 @@ test("projectsDirForCwd slugs BOTH '/' and '.' — a board root is dotless but a
     projectsDirForCwd("/Users/me/foolscap/.canvas/worktrees/w-1").endsWith("-Users-me-foolscap--canvas-worktrees-w-1"),
     "'/.canvas' → '--canvas' (both the slash and the dot become '-')",
   );
+  assert.ok(
+    projectsDirForCwd("/Users/me/foolscap_codex").endsWith("-Users-me-foolscap-codex"),
+    "an underscore is a dash in Claude's real projects directory",
+  );
+  assert.equal(projectsDirsForCwd("/Users/me/foolscap").length, 1, "no redundant compatibility candidate");
+  assert.equal(projectsDirsForCwd("/Users/me/foolscap_codex").length, 2, "legacy migrated slug remains readable");
 });
 
 test("with no markers the list is empty, not the raw transcript dir (pre-ledger / all-external)", () => {

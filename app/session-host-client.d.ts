@@ -30,6 +30,7 @@ export interface SessionHostClient {
   writeSession(id: string, data: string): boolean;
   answerRequest(id: string, requestId: string, answer: unknown): boolean;
   codexUsage(): Promise<Record<string, unknown>>;
+  codexHistory(providerSessionId: string): Promise<Record<string, unknown>>;
   killSession(id: string): void;
   list(): Promise<{ sessions: HostSessionInfo[]; exits: HostExitRecord[] }>;
   ackExits(ids: string[]): Promise<void>;
