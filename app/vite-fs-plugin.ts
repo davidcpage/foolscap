@@ -20,7 +20,7 @@ import { boardStoreCanvasSnapshot, type BoardEngineEntry } from "./board-engine.
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
-import { getWsClients, setServerContext } from "./server-context.js";
+import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
@@ -546,14 +546,14 @@ export interface CanvasFsState {
   // shadow floor with no error anywhere. Pure recompute-on-miss caches (summaryCache, weatherCache,
   // rootsCache) are the deliberate exception — a re-eval only costs them a recompute.
   persistTimers?: Map<string, ReturnType<typeof setTimeout>>; // session-marker debounce (timers are process-bound, so handles stay valid across re-evals)
-  emittedMembers?: Map<string, { thread: string; sid: string; ts: number }>; // server-emitted memberships awaiting the snapshot
-  durableMembers?: Map<string, Set<string>>; // threadId → member sids that survive card/edge removal (marker-backed)
-  shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher
-  busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board
+  emittedMembers?: Map<string, { thread: string; sid: string; ts: number }>; // server-emitted memberships awaiting the snapshot (lazy-init via getEmittedMembers)
+  durableMembers?: Map<string, Set<string>>; // threadId → member sids that survive card/edge removal, marker-backed (lazy-init via getDurableMembers)
+  shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher (lazy-init via getShadowRoots)
+  busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board (lazy-init via getBusClients)
   lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
   liveKernels?: Map<string, unknown>; // boardId\0nodeId → live Jupyter kernel (server-kernel.ts; typed there to avoid a cycle; lazy-init via `??=`)
   kernelsReconciled?: boolean; // one-shot flag: the gateway-orphan sweep ran once this server lifetime (server-kernel.ts; survives re-eval on fsState, resets on restart)
-  announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
+  announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements (lazy-init via getAnnouncedMemberships)
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
   boardEngines?: Map<string, BoardEngineEntry>; // boardId → the live server-materialized core Store (board-engine.ts, design §9 stage 1); the single event-seq sequencer + append point (stage 2)
 }
@@ -933,7 +933,7 @@ function startFeeds(): void {
 //   GET  /api/canvas?board=  → { ts, tabs, snapshot, recentIntent } from the durable store; 404 only
 //                              when the board has never persisted anything
 
-const busClients = (fsState.busClients ??= new Map<string, Set<SseClient>>());
+const busClients = getBusClients(fsState);
 
 // The bus-client set for a board, created on first subscribe. (The SSE close handler in openSse deletes
 // the client from the set but leaves the empty set in the map — harmless; one entry per ever-seen board.)
@@ -956,7 +956,7 @@ function tabCountFor(boardId: string): number {
 // including any join still inside the ~400ms save window (the snapshot wouldn't list those yet). Idempotent:
 // re-removing an edge the store already dropped is a no-op.
 function cascadeNodeEdges(boardId: string, nodeId: string, actor: string, origin: string): void {
-  const emittedMembers = (fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+  const emittedMembers = getEmittedMembers(fsState);
   const records = boardSnapshotRecords(boardId) ?? [];
   const ids = new Set(connectedEdgeIds(records, nodeId));
   const sid = nodeSessionId(records, nodeId);

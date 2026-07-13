@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { RECORD_TYPE, EDGE_TYPE, MEMBER_EDGE_PREFIX } from "../core/src/records.js";
 import type { IntentEvent } from "../core/src/log.js";
 import { defaultCommands } from "../core/src/commands.js";
-import { getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
+import { getAnnouncedMemberships, getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { commitBoardCommand } from "./board-engine.js";
 import {
   appendThreadLine,
@@ -405,7 +405,7 @@ export function announceNewMemberships(
   origin: string,
 ): void {
   const { fsState, threadLog, publishThreadFeed: publishThreadFeedCtx } = getServerContext();
-  const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
+  const announcedMemberships = getAnnouncedMemberships(fsState);
   const afterEdges = memberEdgesOf(after);
   if (before == null) {
     for (const [id, e] of afterEdges) announcedMemberships.add(announceKey(id, e.type));
@@ -465,7 +465,7 @@ function maybeAnnounceMembership(
     recordDurableMember,
     ensureCoordinatorHeartbeat,
   } = getServerContext();
-  const announcedMemberships = (fsState.announcedMemberships ??= new Set<string>());
+  const announcedMemberships = getAnnouncedMemberships(fsState);
   const pendingHistoryMode = getPendingHistoryMode(fsState);
   const p = cmd.payload ?? {};
   if (cmd.type === "removeEdge") {

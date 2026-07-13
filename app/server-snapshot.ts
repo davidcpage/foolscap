@@ -1,4 +1,4 @@
-import { getServerContext } from "./server-context.js";
+import { getServerContext, getDurableMembers, getEmittedMembers } from "./server-context.js";
 import { RECORD_TYPE, NODE_TYPE, EDGE_TYPE } from "../core/src/records.js";
 import {
   addThreadMember,
@@ -62,7 +62,7 @@ export function threadLog(boardId: string, threadId: string): ThreadMsg[] {
 export function seedThreadLogs(repoPath: string): void {
   const { fsState, boardIdentity } = getServerContext();
   const threadLogs = fsState.threadLogs;
-  const durableMembers = (fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(fsState);
   for (const meta of listThreads(repoPath)) {
     const threadId = meta.threadId as string;
     // Rehydrate durable membership from the marker (survives a cold restart — the in-memory index doesn't).
@@ -110,7 +110,7 @@ export const sidFromSessionNode = (node: string): string | null =>
   : null;
 // Non-expired emitted memberships, pruning stale ones in passing.
 export function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
-  const emittedMembers = (getServerContext().fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+  const emittedMembers = getEmittedMembers(getServerContext().fsState);
   const now = Date.now();
   const out: Array<{ thread: string; sid: string }> = [];
   for (const [edgeId, m] of emittedMembers) {
@@ -122,7 +122,7 @@ export function liveEmittedMembers(): Array<{ thread: string; sid: string }> {
 // Record/forget a server-emitted membership for the immediate-membership window. Called from
 // dispatchBusCommand for every member:open / removeEdge it sends (spawn, join, invite).
 export function trackEmittedMembership(cmd: { type: string; payload?: Record<string, unknown> }): void {
-  const emittedMembers = (getServerContext().fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+  const emittedMembers = getEmittedMembers(getServerContext().fsState);
   const p = cmd.payload ?? {};
   if (cmd.type === "removeEdge") {
     if (typeof p.id === "string") emittedMembers.delete(p.id);
@@ -143,7 +143,7 @@ export function trackEmittedMembership(cmd: { type: string; payload?: Record<str
 // from (seedThreadLogs). Recorded on every member:open sighting; dropped only on a REAL leave (not card delete).
 // Record sid as a durable member of a thread (in-memory + marker). Idempotent; needs the board's repoPath.
 export function recordDurableMember(repoPath: string | undefined, threadId: string, sid: string, ts: number): void {
-  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(getServerContext().fsState);
   let set = durableMembers.get(threadId);
   if (!set) durableMembers.set(threadId, (set = new Set<string>()));
   set.add(sid);
@@ -151,14 +151,14 @@ export function recordDurableMember(repoPath: string | undefined, threadId: stri
 }
 // Forget a durable membership (in-memory + marker) — the REAL-leave companion, never called on a card delete.
 export function forgetDurableMember(repoPath: string | undefined, threadId: string, sid: string): void {
-  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(getServerContext().fsState);
   const set = durableMembers.get(threadId);
   if (set) { set.delete(sid); if (set.size === 0) durableMembers.delete(threadId); }
   if (repoPath) removeThreadMember(repoPath, threadId, sid);
 }
 
 export function sessionThreads(records: Array<Record<string, unknown>>, sid: string): string[] {
-  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(getServerContext().fsState);
   const out: string[] = [];
   const node = sessionNodeForSid(records, sid);
   if (node)
@@ -180,7 +180,7 @@ export function sessionThreads(records: Array<Record<string, unknown>>, sid: str
 // union: there a stale extra entry is harmless, a missing one loses messages.) The marker sweep also covers
 // the in-memory map going cold across a plugin re-eval; membership reads stay marker-honest either way.
 export function durableSessionThreads(repoPath: string | undefined, sid: string): string[] {
-  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(getServerContext().fsState);
   const out: string[] = [];
   for (const m of liveEmittedMembers()) if (m.sid === sid && !out.includes(m.thread)) out.push(m.thread);
   for (const [threadId, set] of durableMembers) if (set.has(sid) && !out.includes(threadId)) out.push(threadId);
@@ -355,7 +355,7 @@ export function sessionNameForSid(records: Array<Record<string, unknown>>, sid: 
 
 // The session ids of a channel's OPEN members (from each member:open edge session→channel).
 export function threadMemberSids(records: Array<Record<string, unknown>>, threadId: string): string[] {
-  const durableMembers = (getServerContext().fsState.durableMembers ??= new Map<string, Set<string>>());
+  const durableMembers = getDurableMembers(getServerContext().fsState);
   const out: string[] = [];
   for (const r of records) {
     if (r.typeName === RECORD_TYPE.edge && r.to === threadId && String(r.type) === EDGE_TYPE.memberOpen) {

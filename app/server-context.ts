@@ -205,14 +205,16 @@ export function getServerContext(): ServerContext {
 }
 
 // ── lazy fsState-map accessors ────────────────────────────────────────────────────────────────────
-// These four maps are declared OPTIONAL on CanvasFsState. They were historically initialized by a `??=`
-// block in vite-fs-plugin.ts's module body, so every consumer that reached them via a `!` non-null
-// assertion (`fsState.pendingAsks!`) silently depended on that shell init having run first — a load-order
-// coupling that a hermetic fake ServerContext, built without the shell, would crash against (undefined map).
-// Each accessor below initializes its map IN PLACE on first read, so any caller — the shell, an extracted
-// engine/route module, or a test fake — gets a live map with no ordering dependency. ONE accessor per map;
-// nothing else `??=`-inits these. (Pure functions of their fsState arg, so a test can call them on a bare
-// fake state without wiring the global context.)
+// These maps are declared OPTIONAL on CanvasFsState. They were historically initialized by a `??=`
+// block (or scattered `??=` init sites) in vite-fs-plugin.ts / the engine modules, so every consumer that
+// reached them via a `!` non-null assertion (`fsState.pendingAsks!`) silently depended on that init having
+// run first — a load-order coupling that a hermetic fake ServerContext, built without the shell, would crash
+// against (undefined map). Each accessor below initializes its map IN PLACE on first read, so any caller —
+// the shell, an extracted engine/route module, or a test fake — gets a live map with no ordering dependency.
+// ONE accessor per map; nothing else `??=`-inits these (the multi-site maps — durableMembers, emittedMembers,
+// shadowRoots, announcedMemberships — were folded onto their accessors here so no engine re-inits them inline).
+// (Pure functions of their fsState arg, so a test can call them on a bare fake state without wiring the
+// global context.)
 export function getPendingAsks(fsState: CanvasFsState): Map<string, PendingAsk> {
   return (fsState.pendingAsks ??= new Map<string, PendingAsk>());
 }
@@ -227,4 +229,18 @@ export function getBusClients(fsState: CanvasFsState): Map<string, Set<SseClient
 }
 export function getPendingHistoryMode(fsState: CanvasFsState): Map<string, "full" | "future"> {
   return (fsState.pendingHistoryMode ??= new Map<string, "full" | "future">());
+}
+export function getDurableMembers(fsState: CanvasFsState): Map<string, Set<string>> {
+  return (fsState.durableMembers ??= new Map<string, Set<string>>());
+}
+export function getEmittedMembers(fsState: CanvasFsState): Map<string, { thread: string; sid: string; ts: number }> {
+  return (fsState.emittedMembers ??= new Map<string, { thread: string; sid: string; ts: number }>());
+}
+export function getAnnouncedMemberships(fsState: CanvasFsState): Set<string> {
+  return (fsState.announcedMemberships ??= new Set<string>());
+}
+// ShadowRootHandle is a shadow-git-scoped alias (ReturnType<typeof watchRoot>); reach it via the already-
+// imported CanvasFsState field type so this module needs no shadow-git import to type the accessor.
+export function getShadowRoots(fsState: CanvasFsState): NonNullable<CanvasFsState["shadowRoots"]> {
+  return (fsState.shadowRoots ??= new Map());
 }
