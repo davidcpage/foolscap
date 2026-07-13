@@ -10,7 +10,7 @@ import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
 import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
-import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, stampFired, upsertJob } from "./standing-jobs.js";
+import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval, heartbeatSweepSignature } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { readWatchers } from "./doc-watch.js";
@@ -513,7 +513,7 @@ const lastSweptSig = new Map<string, string>();
 // DUE: stampFired re-bases the schedule to now only on a REAL fire. Jobs live on the thread marker, so they
 // survive their creator and a restart.
 function standingJobsTick(): void {
-  const { boards, liveSessions, sendSessionInput } = getServerContext();
+  const { boards, liveSessions, sendSessionInput, sessionStatus } = getServerContext();
   const now = Date.now();
   for (const [boardId, board] of boards) {
     let threads;
@@ -527,9 +527,14 @@ function standingJobsTick(): void {
     let sweepSig: string | null = null;
     const boardSweepSig = () => {
       if (sweepSig !== null) return sweepSig;
+      // `status` is the session's whole-session BAND (sessionStatus), not the raw process state: the sweep
+      // signature coarsens it (sweepSessionActivity) so a steadily-working session's running↔idle micro-flip
+      // no longer moves the signature. Exited sessions are dropped here (they leave the live set → a
+      // disappearance, which IS sweep-relevant).
       const sessions: { sid: string; status: string }[] = [];
       for (const s of liveSessions.values())
-        if (s.repoPath === board.repoPath && s.status !== "exited") sessions.push({ sid: s.id, status: s.status });
+        if (s.repoPath === board.repoPath && s.status !== "exited")
+          sessions.push({ sid: s.id, status: sessionStatus(board.repoPath, s.id) ?? "working" });
       return (sweepSig = heartbeatSweepSignature({ threads, sessions }, now));
     };
     for (const t of threads) {
@@ -541,6 +546,17 @@ function standingJobsTick(): void {
         // seat's declared intent — no stored backoff state (heartbeatEffectiveInterval is a no-op unless
         // blocked:human, so a bare/undeclared job fires exactly as before).
         const seatIntent = job.role ? tMeta?.intents?.[job.role]?.intent ?? null : null;
+        // Thread-close cleanup: a Coordinator heartbeat whose seat has STOOD DOWN (declared `done`) belongs
+        // to a closed thread — the occupant finished its work here and reap-only-on-done reclaims the idle
+        // session. REMOVE the job (not just skip it) so it stops accumulating on the marker and can never
+        // fire again; a later re-staffing of the seat re-creates it (ensureCoordinatorHeartbeat is
+        // idempotent on staffing). This is what stops a done subthread's heartbeat from lingering — and,
+        // paired with the seat-keyed gate below, from waking a Coordinator still live on another thread.
+        // Scoped to the Coordinator heartbeat: other role jobs may want distinct close semantics.
+        if (job.role === COORDINATOR_ROLE && seatIntent === "done") {
+          removeJob(board.repoPath, t.threadId, job.id);
+          continue;
+        }
         if (!jobDueWithInterval(job, now, heartbeatEffectiveInterval(job.intervalMs, seatIntent))) continue;
         const key = jobClaimKey(t.threadId, job);
         if (isSurfaceClaimed(key)) continue; // a prior fire's worker still servicing this surface — no double-fire
@@ -564,11 +580,19 @@ function standingJobsTick(): void {
         // would find anything. Skip the nudge when the board's sweep-relevant state is UNCHANGED since the
         // last fire. No stamp on a gated skip, so the job stays due and re-checks every scheduler tick —
         // the sweep fires the tick a change lands, never later than it would have un-gated. Stall detection
-        // survives inside the signature (staleness-bucket crossings read as change). Keyed by claim key +
-        // job id, so `job rm` + re-enable starts ungated (a deliberate way to force a sweep); the map is
-        // in-memory only — a server restart just costs one extra sweep.
+        // survives inside the signature (staleness-bucket crossings read as change). The map is in-memory
+        // only — a server restart just costs one extra sweep.
+        //
+        // DEDUPE (one Coordinator heartbeat per seat per board): the gate is keyed by the TARGET SESSION
+        // (board + sid), NOT by the per-thread job. A single Coordinator session seated on N threads
+        // accumulates N identical heartbeat jobs (meta + each subthread); keyed per-thread, each passed the
+        // gate independently and nudged the same session N times per cadence. Keyed by sid, the first job to
+        // fire stamps the board-wide signature and the rest gate out — one nudge per Coordinator session per
+        // board per signature change. Two distinct Coordinator sessions (different sids) still fire
+        // independently, as they should. `job rm` + re-enable still starts ungated (the sid's stamp is
+        // per-session, and a fresh sweep after any board change fires anyway).
         if (job.role === COORDINATOR_ROLE) {
-          const gateKey = `${boardId}|${key}#${job.id}`;
+          const gateKey = `${boardId}|coord:${sid}`;
           const sig = boardSweepSig();
           if (lastSweptSig.get(gateKey) === sig) continue; // nothing changed since the last sweep — no nudge, no stamp
           lastSweptSig.set(gateKey, sig);

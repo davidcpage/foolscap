@@ -19,12 +19,14 @@ import {
   coordinatorHeartbeatJobSpec,
   heartbeatEffectiveInterval,
   heartbeatSweepSignature,
+  sweepSessionActivity,
 } from "../coordinator-heartbeat.js";
 import {
   MIN_INTERVAL_MS,
   normInterval,
   upsertJob,
   readJobs,
+  removeJob,
   stampFired,
   jobDue,
   dueJobs,
@@ -146,10 +148,44 @@ const baseState = () => ({
     },
     { threadId: "node:thread:b", lastTs: NOW - 500_000 },
   ],
+  // sessions[].status is the whole-session BAND (sessionStatus), coarsened by sweepSessionActivity: the
+  // Implementer is actively building (`working`), the Coordinator is parked on its heartbeat (`scheduled`).
   sessions: [
-    { sid: "s-imp", status: "idle" },
-    { sid: "s-coord", status: "idle" },
+    { sid: "s-imp", status: "working" },
+    { sid: "s-coord", status: "scheduled" },
   ],
+});
+
+// ── sweep-signature session coarsening (the fix: steady-state working ≠ change) ─────────────────────
+test("sweepSessionActivity — folds the running↔idle working oscillation; keeps scheduled/terminal distinct", () => {
+  // running (mid-turn) and idle-between-turns both mean "actively engaged" → ONE token, so a long build
+  // no longer flips the signature every turn.
+  assert.equal(sweepSessionActivity("working"), "working");
+  assert.equal(sweepSessionActivity("waiting"), "working", "the default idle 'your turn' between turns is still working");
+  assert.equal(sweepSessionActivity("waiting-agent"), "working", "blocked:peer rides the intent component, not the session token");
+  assert.equal(sweepSessionActivity(null), "working", "a just-spawned live session with no band yet reads engaged");
+  // the one calm parked state stays distinct → a scheduled→working transition (a parked session picking up
+  // work — the 'idle→working' a sweep should notice) still fires
+  assert.equal(sweepSessionActivity("scheduled"), "scheduled");
+  // terminal bands stay distinct → a working→done/crashed transition fires even before the row leaves
+  assert.equal(sweepSessionActivity("done"), "done");
+  assert.equal(sweepSessionActivity("crashed"), "crashed");
+  assert.equal(sweepSessionActivity("ended"), "ended");
+});
+
+test("heartbeatSweepSignature — a working session's running↔idle micro-flip does NOT move the signature", () => {
+  // The bug: sessionStatus flips `working` (mid-turn) ↔ `waiting` (idle between turns) every turn, which
+  // used to change the sig each tick and defeat the §6.1 gate — an active build woke the Coordinator each
+  // cadence. Both coarsen to one token now, so the signature is stable across the oscillation.
+  const running = baseState();
+  running.sessions[0].status = "working";
+  const between = baseState();
+  between.sessions[0].status = "waiting";
+  assert.equal(
+    heartbeatSweepSignature(between, NOW),
+    heartbeatSweepSignature(running, NOW),
+    "running ⇄ idle-between-turns holds a stable signature — the gate engages during a steady build",
+  );
 });
 
 test("heartbeatSweepSignature — deterministic and order-insensitive (threads, intent keys, sessions)", () => {
@@ -175,8 +211,10 @@ test("heartbeatSweepSignature — every sweep-relevant change moves it", () => {
     ["a new post (lastTs bump)", (s) => (s.threads[0].lastTs = NOW - 1_000)],
     ["a new thread appears", (s) => s.threads.push({ threadId: "node:thread:c", lastTs: NOW })],
     ["a peer intent changes value (working → done)", (s) => (s.threads[0].intents.Implementer.intent = "done")],
-    ["a session status flips (idle → running)", (s) => (s.sessions[0].status = "running")],
-    ["a session appears", (s) => s.sessions.push({ sid: "s-new", status: "idle" })],
+    ["a parked session picks up work (scheduled → working)", (s) => (s.sessions[1].status = "working")],
+    ["a working session finishes (working → done)", (s) => (s.sessions[0].status = "done")],
+    ["a working session crashes (working → crashed)", (s) => (s.sessions[0].status = "crashed")],
+    ["a session appears", (s) => s.sessions.push({ sid: "s-new", status: "working" })],
     ["a session disappears", (s) => s.sessions.pop()],
   ];
   for (const [what, mutate] of mutations) {
@@ -228,7 +266,7 @@ test("heartbeatSweepSignature — the sweeper's own seat and human-parked/done i
         },
       },
     ],
-    sessions: [{ sid: "s-coord", status: "idle" }],
+    sessions: [{ sid: "s-coord", status: "scheduled" }],
   });
   assert.equal(
     heartbeatSweepSignature(quiet(), NOW + 100 * HEARTBEAT_STALE_BUCKET_MS),
@@ -316,5 +354,78 @@ test("mocked tick: fire-next-due re-bases only on a real fire (a nudge), never o
   assert.equal(jobDue(afterNudge, fireAt), false, "just fired → not due");
   assert.equal(jobDue(afterNudge, fireAt + job.intervalMs), true, "due again one interval after the fire");
 
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+// ── job DEDUPE: one Coordinator heartbeat per seat per board (no-leak) ────────────────────────────
+// A single Coordinator SESSION seated on N threads accumulates N identical heartbeat jobs (meta + each
+// subthread). Keyed per-thread, each used to pass the board-wide §6.1 gate independently and nudge the
+// same session N times per cadence. The production gate is keyed by the TARGET SESSION (board + sid), so
+// the first job to fire stamps the board-wide signature and the siblings gate out — one nudge per
+// Coordinator session per board per signature change. This mocked tick drives that exact composition.
+test("mocked tick: DEDUPE — one Coordinator session on N threads nudges ONCE per board per signature change", () => {
+  const repo = tmpRepo();
+  const t0 = 3_000_000;
+  const threads = ["node:thread:meta", "node:thread:stage1", "node:thread:stage2"];
+  for (const tid of threads) upsertJob(repo, tid, { ...coordinatorHeartbeatJobSpec(), ts: t0 });
+  const SID = "s-coord";
+  const lastSwept = new Map(); // the tick's in-memory gate map
+  let now = t0 + COORDINATOR_HEARTBEAT_INTERVAL_MS;
+  // The board-wide signature — one live Coordinator, parked — is identical for every thread's job in a tick.
+  const sig = () =>
+    heartbeatSweepSignature(
+      { threads: threads.map((tid) => ({ threadId: tid, lastTs: t0 })), sessions: [{ sid: SID, status: "scheduled" }] },
+      now,
+    );
+
+  const runTick = () => {
+    let nudges = 0;
+    for (const tid of threads) {
+      const job = readJobs(repo, tid)[0];
+      if (!jobDue(job, now)) continue;
+      if (planRoleJobFire("idle", "working") !== "nudge") continue;
+      const gateKey = `board|coord:${SID}`; // ← fix 1a: keyed by the target session, NOT the per-thread job
+      const s = sig();
+      if (lastSwept.get(gateKey) === s) continue; // a sibling already swept this session this signature → no double nudge
+      lastSwept.set(gateKey, s);
+      stampFired(repo, tid, job.id, now);
+      nudges++;
+    }
+    return nudges;
+  };
+
+  assert.equal(runTick(), 1, "three identical heartbeats on one Coordinator session → exactly ONE nudge");
+  now += 15_000; // the siblings never stamped, so they are still due — but the board is unchanged
+  assert.equal(runTick(), 0, "…and the still-due siblings gate out — no second nudge on an unchanged board");
+  fs.rmSync(repo, { recursive: true, force: true });
+});
+
+// ── job CLEANUP: a closed thread's heartbeat is removed (thread-close) ─────────────────────────────
+// A Coordinator seat that stands down (declares `done`) closes its thread; reap-only-on-done reclaims the
+// idle session. The tick REMOVES that thread's heartbeat (not just skips it) so it stops accumulating on
+// the marker and can never fire again — the fix for a done subthread's job that kept firing (esp. when the
+// Coordinator was still live on another thread). A later re-staffing re-creates it (ensureCoordinatorHeartbeat).
+test("mocked tick: CLEANUP — a Coordinator seat that declared `done` removes its heartbeat job", () => {
+  const repo = tmpRepo();
+  const t0 = 4_000_000;
+  const TID2 = "node:thread:closing";
+  upsertJob(repo, TID2, { ...coordinatorHeartbeatJobSpec(), ts: t0 });
+  assert.equal(readJobs(repo, TID2).length, 1, "heartbeat attached on staffing");
+
+  // the production tick's close-cleanup branch: role === Coordinator && seatIntent === "done" → removeJob
+  const closeTick = (seatIntent) => {
+    for (const job of readJobs(repo, TID2)) {
+      if (job.role === COORDINATOR_ROLE && seatIntent === "done") removeJob(repo, TID2, job.id);
+    }
+  };
+
+  closeTick("working");
+  assert.equal(readJobs(repo, TID2).length, 1, "an open (working) seat keeps its heartbeat");
+  closeTick(null);
+  assert.equal(readJobs(repo, TID2).length, 1, "an undeclared seat keeps its heartbeat");
+  closeTick("done");
+  assert.equal(readJobs(repo, TID2).length, 0, "a stood-down (done) seat's heartbeat is removed → stops firing");
+  closeTick("done"); // idempotent — nothing left to remove
+  assert.equal(readJobs(repo, TID2).length, 0, "removal is idempotent");
   fs.rmSync(repo, { recursive: true, force: true });
 });
