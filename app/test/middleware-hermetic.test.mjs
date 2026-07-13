@@ -42,6 +42,7 @@ const bp = await import("../board-persist.js");
 const ledger = await import("../thread-ledger.js");
 const filesRoute = await import("../routes/files.ts");
 const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatch-seam error boundary (BUG-4b)
+const inbox = await import("../routes/inbox.ts"); // computeInbox — the inbox read as a pure computation
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -658,4 +659,108 @@ test("BUG-2: a full-fidelity .ipynb write over 128 KiB no longer 413s (write cap
   const bigTxt = "x".repeat(200_000);
   const txt = await driveFile(repo, { method: "POST", pathParam: "notes/big.txt", body: JSON.stringify({ content: bigTxt }) });
   assert.equal(txt.status, 413, "a >128 KiB .txt write is still too large");
+});
+
+// ── Group I: the inbox read (computeInbox) — default budget + non-consuming recovery (inbox-hardening) ──
+// The inbox read 404s on any non-live session and the always-on scratch board REFUSES to spawn one, so the
+// http-contract net can only probe the 404 there. The behavioral contract — a self-bounding default byte
+// budget, a keep-tail `truncated` flag, and the ?since / ?peek recovery reads that DON'T consume the cursor —
+// is exercised here, against a fake ServerContext carrying a live session + an in-memory thread log. This is
+// the code-level answer to the footgun the harness leaf only WARNED about: `| head -c` consumes the cursor
+// and loses the cut tail; these reads make client-side truncation unnecessary and any loss one-GET recoverable.
+const NO_OPTS = { limit: null, bytes: null, since: null, peek: false };
+// A fake context: one live session `sid` joined to thread `tid`, whose in-memory log is `msgs`. `read` seeds
+// the session's per-thread cursor. Returns the session object + a `persisted` log so a test can assert whether
+// the cursor was advanced (a consuming read persists; a recovery read must not). repoPath points at nothing,
+// so readThreadLog/readPins (real disk reads) return [] — the in-memory `msgs`/no-pins path is what's tested.
+function inboxFake(sid, tid, msgs, read = {}) {
+  const session = { repoPath: path.join(os.tmpdir(), "no-such-inbox-repo"), read: { ...read } };
+  const records = [{ typeName: "node", id: tid, type: "thread", title: "T" }];
+  const persisted = [];
+  ctx.setServerContext({
+    liveSessions: new Map([[sid, session]]),
+    boardIdentity: () => ({ boardId: "b1" }),
+    boardSnapshotRecords: () => records,
+    sessionThreads: () => [tid],
+    threadLog: () => msgs,
+    threadNode: () => ({ title: "T" }),
+    sessionNameForSid: () => null,
+    persistSessionState: (s) => persisted.push(s),
+  });
+  return { session, persisted };
+}
+const msg = (seq, text, kind) => ({ seq, ts: 1_700_000_000_000 + seq, from: "human", text, ...(kind ? { kind } : {}) });
+
+test("computeInbox: 400 on missing session, 404 on a non-live one", () => {
+  inboxFake("s1", "node:thread:t", [msg(1, "hi")]);
+  assert.equal(inbox.computeInbox(null, NO_OPTS).status, 400);
+  assert.equal(inbox.computeInbox("ghost", NO_OPTS).status, 404);
+});
+
+test("computeInbox: a plain read consumes (advances cursor + persists); card-only entries skip but still advance", () => {
+  const tid = "node:thread:t";
+  const { session, persisted } = inboxFake("s1", tid, [msg(1, "one"), msg(2, "intent act", "intent"), msg(3, "three")]);
+  const { status, body } = inbox.computeInbox("s1", NO_OPTS);
+  assert.equal(status, 200);
+  assert.deepEqual(body.channels[0].messages.map((m) => m.seq), [1, 3], "the card-only (kind:intent) entry is not inbox content");
+  assert.equal(body.count, 2);
+  assert.equal(session.read[tid], 3, "cursor advances to the LOG end (incl. the skipped card-only seq), not just the last returned");
+  assert.equal(persisted.length, 1, "a consuming read persists the advanced cursor");
+});
+
+test("computeInbox: ?since replays from an arbitrary seq, overriding the cursor DOWNWARD, and does NOT consume", () => {
+  const tid = "node:thread:t";
+  const msgs = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => msg(n, `m${n}`));
+  const { session, persisted } = inboxFake("s1", tid, msgs, { [tid]: 5 }); // cursor already at 5
+  // A normal read from cursor 5 would yield 6..8; ?since=2 re-serves 3..8 REGARDLESS of the cursor.
+  const { body } = inbox.computeInbox("s1", { ...NO_OPTS, since: 2 });
+  assert.deepEqual(body.channels[0].messages.map((m) => m.seq), [3, 4, 5, 6, 7, 8]);
+  assert.equal(session.read[tid], 5, "a ?since recovery read leaves the cursor untouched");
+  assert.equal(persisted.length, 0, "nothing persisted — a recovery read mutates no state");
+});
+
+test("computeInbox: ?peek serves the unread tail WITHOUT advancing the cursor (a plain re-read then sees it again)", () => {
+  const tid = "node:thread:t";
+  const msgs = [1, 2, 3, 4, 5, 6, 7, 8].map((n) => msg(n, `m${n}`));
+  const { session, persisted } = inboxFake("s1", tid, msgs, { [tid]: 5 });
+  const peek = inbox.computeInbox("s1", { ...NO_OPTS, peek: true });
+  assert.deepEqual(peek.body.channels[0].messages.map((m) => m.seq), [6, 7, 8], "peek shows the current unread tail");
+  assert.equal(session.read[tid], 5, "peek did not advance the cursor");
+  assert.equal(persisted.length, 0);
+  // The very same unread is still there for a subsequent CONSUMING read — peek spent nothing.
+  const real = inbox.computeInbox("s1", NO_OPTS);
+  assert.deepEqual(real.body.channels[0].messages.map((m) => m.seq), [6, 7, 8]);
+  assert.equal(session.read[tid], 8, "the consuming read then advances");
+});
+
+test("computeInbox: the DEFAULT byte budget bounds an unbounded read — keeps the TAIL, flags truncated, no client truncation needed", () => {
+  const tid = "node:thread:t";
+  // Five ~40 KiB messages ⇒ ~200 KiB, over the 128 KiB default. No &bytes passed ⇒ the default must bite.
+  const big = "y".repeat(40 * 1024);
+  const msgs = [1, 2, 3, 4, 5].map((n) => msg(n, `${n}:${big}`));
+  inboxFake("s1", tid, msgs);
+  const { body } = inbox.computeInbox("s1", NO_OPTS);
+  const ch = body.channels[0];
+  assert.ok(ch.truncated && ch.truncated.omitted > 0, "the default budget truncated an over-large backlog");
+  // Kept the TAIL (the most recent), never the head — the CLAUDE.md scroll-to-bottom rule.
+  const keptSeqs = ch.messages.map((m) => m.seq);
+  assert.equal(keptSeqs.at(-1), 5, "the newest message is kept");
+  assert.ok(keptSeqs[0] > 1, "the OLDEST messages are the ones dropped (tail kept)");
+  // The hint points at the ONE-GET recovery (wider &bytes / &since), not the retired leave+rejoin dance.
+  assert.match(ch.truncated.hint, /&bytes=|&since=/);
+  assert.doesNotMatch(ch.truncated.hint, /re-join|history/i);
+});
+
+test("computeInbox: an explicit &bytes overrides the default, and a small backlog under budget is never flagged", () => {
+  const tid = "node:thread:t";
+  const msgs = [msg(1, "aaaa"), msg(2, "bbbb"), msg(3, "cccc")];
+  // Under the default budget ⇒ everything returned, no truncated flag.
+  inboxFake("s1", tid, msgs);
+  const full = inbox.computeInbox("s1", NO_OPTS);
+  assert.equal(full.body.channels[0].truncated, undefined, "a small backlog under the default budget is not flagged");
+  // A tiny explicit &bytes keeps only the tail and flags the omission (always ≥1 message).
+  inboxFake("s1", tid, msgs); // fresh cursor
+  const tiny = inbox.computeInbox("s1", { ...NO_OPTS, bytes: 5 });
+  assert.deepEqual(tiny.body.channels[0].messages.map((m) => m.seq), [3], "the byte budget keeps the newest message");
+  assert.equal(tiny.body.channels[0].truncated.omitted, 2);
 });

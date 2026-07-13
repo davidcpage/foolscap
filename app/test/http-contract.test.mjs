@@ -202,6 +202,28 @@ test("session verbs on an unknown session: input 409/404-class, inbox 404", { sk
   assert.ok([404, 409].includes(input.status)); // not-live is an error, never a silent 200
 });
 
+test("inbox read params (default budget + recovery): every window/recovery param parses to the 404 probe, never a 500", { skip: !up && "no dev server on 5173" }, async () => {
+  // The inbox-hardening contract (default byte budget, ?since replay, ?peek non-consume) needs a LIVE
+  // session to observe its windowing/cursor BEHAVIOR — but the scratch board refuses to spawn one (403,
+  // sessionSpawnRefusal), so that behavior is covered hermetically in middleware-hermetic.test.mjs (a fake
+  // ServerContext with a live session + thread log). What THIS live net owns is the status-code semantics:
+  // the new query params must PARSE on the real handler and short-circuit to the same 404 liveness probe —
+  // a 400 or 500 here would mean a param-parse regression (e.g. nonNegParam or the peek read throwing).
+  const ghost = "00000000-0000-0000-0000-000000000000";
+  const q = [
+    "bytes=100", // explicit budget override
+    "limit=2", // opt-in count cap
+    "since=0", // replay-from-seq recovery (0 is valid — replay all — unlike the >0 windowParam)
+    "since=5&bytes=2000", // combined recovery + budget
+    "peek=1", // non-consuming peek
+    "bytes=-1&limit=abc&since=-3", // garbage: rejected to null (no budget/window), still just the 404
+  ];
+  for (const params of q) {
+    const res = await fetch(`${HOST}/api/inbox?session=${ghost}&${params}`);
+    assert.equal(res.status, 404, `?${params} must parse and reach the 404 liveness probe, never 400/500`);
+  }
+});
+
 test("annotations: create → reply → resolve → re-anchor round-trip, orphan derived at read", { skip: !up && "no dev server on 5173" }, async () => {
   // A clean ledger per run (the scratch dir persists across runs on purpose — stable boardId).
   fs.rmSync(path.join(scratch, ".canvas", "annotations"), { recursive: true, force: true });
