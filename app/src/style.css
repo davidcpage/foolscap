@@ -1621,6 +1621,15 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-row.ses-status-done          { border-left-color: #d4d4d8; }
 .ses-row.ses-status-crashed       { border-left-color: #ef4444; }
 .ses-row.ses-status-ended         { border-left-color: #d4d4d8; }
+/* Threads card lifecycle rail: the same left-border language keyed off the server-derived thread state
+   (thread-state.js), same hexes as the Sessions rail and session-status.ts (kept in step by hand). Declared
+   BEFORE .unseen / .your-turn so those louder per-row signals (indigo unseen-mention, amber your-turn)
+   still win the rail when a row carries both. `waiting` isn't listed — its amber rail rides .your-turn.
+   `chan-status-unstaffed` is a dormant thread NO agent ever staffed: a DASHED/hollow grey rail (after
+   .chan-member.pending) that reads 'placeholder', not the solid grey of a wound-down (staffed) thread. */
+.ses-row.chan-status-active    { border-left-color: #16a34a; }
+.ses-row.chan-status-dormant   { border-left-color: #d4d4d8; }
+.ses-row.chan-status-unstaffed { border-left-color: #d4d4d8; border-left-style: dashed; }
 .ses-row:hover {
   background: #6366f10f;
 }

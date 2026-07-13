@@ -128,9 +128,19 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
     const seats = m.seats ?? {};
     const fromLabel = (sid: string) =>
       sid === "human" ? "you" : sid === "system" ? "system" : (seatForSid(seats, sid) ?? sid.slice(0, 8));
+    const log = threadLog(boardId, m.threadId);
     const { waiting: youWaiting, count: youWaitingCount, preview, more: youWaitingMore } =
-      humanWaiting(threadLog(boardId, m.threadId), readSeenMentions(repoPath, m.threadId));
+      humanWaiting(log, readSeenMentions(repoPath, m.threadId));
     const youWaitingPreview = preview.map((p) => ({ ...p, fromLabel: fromLabel(p.from) }));
+    // Has this thread EVER been staffed by an agent? Distinguishes never-staffed (a freshly-opened,
+    // unassigned thread — a 'placeholder' row) from staffed-but-now-dormant (all its workers exited/done).
+    // Both derive `state: dormant`, so the client can't tell them apart from that alone. A thread is staffed
+    // if any agent (a sid that isn't the human or the system) has either declared a work-intent on the marker
+    // or posted to the log tail — both inputs are already in hand here, so this adds no IO.
+    const isAgentSid = (sid: string | undefined): boolean => !!sid && sid !== "human" && sid !== "system";
+    const everStaffed =
+      Object.values(m.intents ?? {}).some((rec) => isAgentSid(rec.sid)) ||
+      log.some((msg) => isAgentSid(msg.from));
     return {
       threadId: m.threadId,
       chanId: m.threadId,
@@ -154,6 +164,7 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
       // seated member always counts) so a seat-only membership isn't misread as detached.
       members: [...new Set([...threadMembersFromMeta(m), ...Object.values(m.seats ?? {}).map((s) => s.sid).filter((x): x is string => !!x)])],
       state: deriveThreadState(participants),
+      everStaffed,
       participants,
     };
   });
