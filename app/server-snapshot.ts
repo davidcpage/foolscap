@@ -12,7 +12,7 @@ import {
   threadMembersFromMeta,
 } from "./thread-ledger.js";
 import { boardStoreRecords } from "./board-engine.js";
-import type { SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { SnapNode, ThreadMsg } from "./server-types.js";
 
 // ── the snapshot / thread-log / membership resolvers (P5 sub-step 3) ───────────────────────────────
 // The pure READ side of the orchestration engine (the P3-deferred server-snapshot.ts split): resolving a

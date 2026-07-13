@@ -18,7 +18,7 @@ import { sessionHasScheduledWake } from "./standing-jobs.js";
 import { readRole } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, worktreeOnboarding } from "./worktrees.js";
 import { sendJson } from "./server-http.js";
-import type { LiveSession, SessionBand } from "./vite-fs-plugin.js";
+import type { LiveSession, SessionBand } from "./server-types.js";
 
 // ── the session / spawn / host ENGINE (P5 sub-step 2) ───────────────────────────────────────────────────
 // The second ENGINE module of the P5 god-file split (after server-delivery.ts). It owns the live-session

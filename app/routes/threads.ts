@@ -26,7 +26,7 @@ import {
   type PinnedMsg,
 } from "../thread-ledger.js";
 import { handleThreadAsk, handleThreadReply } from "./asks.js";
-import type { ThreadMsg } from "../vite-fs-plugin.js";
+import type { ThreadMsg } from "../server-types.js";
 
 // ── the thread action routes (message / membership / history / intent / level / pin / seen / worktree /
 // job) + the standing-jobs & worktrees reads — god-file split, Phase 3 ──────────────────────────────

@@ -5,10 +5,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { watchRoot } from "./shadow-git.js";
 import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
-import { type SessionHostClient } from "./session-host-client.js";
 import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { connectedEdgeIds } from "./node-cascade.js";
@@ -16,10 +14,11 @@ import { intentLine, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { parseWorktreePorcelain } from "./worktrees.js";
 import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
-import { boardStoreCanvasSnapshot, type BoardEngineEntry } from "./board-engine.js";
+import { boardStoreCanvasSnapshot } from "./board-engine.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, ThreadMsg, WsClient } from "./server-types.js";
 import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
@@ -94,15 +93,6 @@ const DEFAULT_BOARD = boardIdentity(ROOTS.repo!);
 // /api/boards SURVIVE a dev-server re-eval (a plugin edit re-runs this module in the same process) — an
 // open non-default tab would otherwise 400 on its boardId until the browser re-mounted. The default board
 // (the dev repo) is always present.
-export interface BoardInfo {
-  root: string;
-  name: string;
-  repoPath: string;
-  // Mounted with { noSessions: true } (or repo under the OS tmpdir): a scratch/test board on which NO real
-  // `claude` session may ever spawn — explicit or server-fired. The http-contract suite's annotation writes
-  // used to auto-wake a REAL doc worker per test run (real token spend); this is the board-level refusal.
-  noSessions?: boolean;
-}
 const boards: Map<string, BoardInfo> = ((globalThis as { __canvasBoards?: Map<string, BoardInfo> })
   .__canvasBoards ??= new Map());
 if (!boards.has(DEFAULT_BOARD.boardId))
@@ -122,13 +112,6 @@ const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Se
 // LAZY (started when a tab actually mounts), so a long registry doesn't fan out watchers for boards
 // nobody opens. The default board is implicit and never recorded.
 const BOARDS_FILE = path.join(ROOTS.repo!, ".canvas", "boards.json");
-export interface BoardRegistryEntry {
-  boardId: string;
-  name: string;
-  repoPath: string;
-  lastOpened: number; // ms epoch of the latest mount POST
-  noSessions?: boolean; // sticky no-real-sessions flag (BoardInfo.noSessions) — survives a restart
-}
 function readBoardRegistry(): BoardRegistryEntry[] {
   try {
     const parsed = JSON.parse(fs.readFileSync(BOARDS_FILE, "utf8")) as { boards?: BoardRegistryEntry[] };
@@ -203,13 +186,6 @@ function reqBoard(url: URL): (BoardInfo & { boardId: string }) | null {
 // sees whatever an agent or a human created via the CLI, so a new tree appears on its own (and the
 // watcher below re-discovers on `.git/worktrees/` churn). Node ids are already `node:<root>:<path>`, so
 // the extra roots' file cards never collide; the rootId is the slug of the worktree's dir basename.
-export interface RootInfo {
-  id: string; // "repo" for the canonical checkout; slug(basename) for a worktree
-  name: string;
-  path: string; // absolute, realpath'd — the confined dir every read of this root is re-checked against
-  branch: string;
-  head: string;
-}
 function realpath(p: string): string {
   try {
     return fs.realpathSync(p);
@@ -331,16 +307,8 @@ function ensureCanvasExcluded(repoPath: string): void {
 // handleSessions reaches sessionStatus, through the ServerContext; those three stay here (readSessionFile
 // and sessionStatus are shared with the feed/shadow-git/band paths, ensureSessionFeed is the feed engine).
 
-// The lifecycle BAND a session reads, in the SAME categories the session card paints
-// (card-types/session/render.js `frameState`): a live process is `working` (running) or `waiting` (idle,
-// the loud "your turn") — except an idle session that named a peer in a channel @-tag reads `waiting-agent`
-// (blue, "waiting on an agent, not you"); an ended one reads its recorded reason — `done` / `crashed` / a
-// neutral `ended` (terminate or unknown). One server-side source so every view (the sessions list bar, the
-// minimap dot, the heads-up) agrees with the card instead of re-deriving it.
-export type SessionBand =
-  | "working" | "waiting" | "waiting-agent" | "scheduled" | "done" | "crashed" | "ended";
 // endReasonBand / hasScheduledWake / sessionStatus (the ONE whole-session status band) moved to
-// server-sessions.ts (P5 sub-step 3). The SessionBand type stays in the shell (above).
+// server-sessions.ts (P5 sub-step 3); the SessionBand type itself moved to server-types.ts.
 
 // handleSessions (GET /api/sessions) moved to routes/sessions.ts (god-file split, Phase 4). It reaches
 // sessionStatus through the ServerContext (sessionStatus stays here — the band-republish loop calls it too).
@@ -467,97 +435,9 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
 // feedClients) keeps receiving its output, and sendSessionInput finds the live child to write to.
 // Pinning feedsStarted also stops configureServer's startFeeds() from stacking a second git/HN
 // watcher on every reload.
-// One channel's off-log message log (4e): the durable-for-the-process record of a channel's conversation,
-// the source for both the channel:<id> feed (the card's conversation view) and the agent's GET /api/inbox.
-export interface ThreadMsg {
-  seq: number; // monotonic per channel — a session's read cursor is "last seq pulled"
-  ts: number;
-  from: string; // sender session id, or "human" / "system"
-  text: string;
-  // CARD-ONLY entries: the card renders them but inbox/nudge skip them (they wake no one). "ask" is the
-  // §16 Q→A legibility echo; "intent" is the work-intent typed act (threads-as-cards §6) with the declared
-  // intent in `intent` (the machine truth — `text` is just its legible face, see intentLine).
-  kind?: "ask" | "intent";
-  intent?: WorkIntent;
-}
 // A card-only entry never wakes a member and never counts as inbox content — the shared gate for every
 // unread filter (an agent's own bookkeeping must not wake the room). `cardOnly` is shared with
 // thread-waiting.js's human-waiting derivation so the two can't drift on what counts as bookkeeping.
-// §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —
-// the durable log stays broadcast-only). The HTTP response is parked until reply or timeout. Pinned in
-// fsState so the queue survives a hot re-eval; the held `res`/`timer` are process-bound (a restart times
-// them out, which is the correct degradation).
-export interface PendingAsk {
-  askId: string;
-  threadId: string;
-  from: string; // asker sid (its /ask connection is held open)
-  to: string; // answerer sid
-  text: string;
-  ts: number;
-  res: ServerResponse; // the asker's parked connection, resolved on reply/timeout
-  timer: ReturnType<typeof setTimeout>;
-}
-// Permission prompts (permission-prompt-tool): a session's Claude Code CLI hit a tool call outside its
-// allow-list and — instead of headless auto-deny — routed it here via the per-session MCP relay
-// (permission-prompt-mcp.js). The relay's POST is PARKED (the §16 held-response pattern) until a human
-// clicks allow/deny on the session card or the hold times out. Same lifetime rules as PendingAsk: pinned
-// in fsState across a hot re-eval; the held `res`/`timer` are process-bound (a restart fails the relay's
-// fetch, which denies fail-closed with an honest "the human never saw this" message).
-export interface PendingPermission {
-  permId: string;
-  sid: string; // the session whose tool call is blocked (its card renders the prompt)
-  toolName: string; // e.g. "Bash" — the tool the CLI is asking about
-  input: unknown; // the tool's input object, echoed back on allow (updatedInput)
-  ts: number;
-  res: ServerResponse; // the MCP relay's parked connection, resolved on decision/timeout
-  timer: ReturnType<typeof setTimeout>;
-}
-// One tab's WebSocket connection (/api/ws) — the single transport that replaced the tab's standing SSE
-// streams (feeds + bus + one watch per root), because each of those held one of the browser's SIX
-// per-host HTTP/1.1 connection slots: ~3 tabs starved the pool and every further request (the document
-// itself, the template registry's fetches) queued forever with no error. A WebSocket lives in a separate,
-// much larger browser budget, so tabs no longer compete with real request/response traffic.
-export interface WsClient {
-  boardId: string; // fixed at connect (?board=) — bus commands fan out per board
-  watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
-  send(msg: unknown): void;
-}
-export interface CanvasFsState {
-  feedClients: Set<SseClient>;
-  feedValues: Map<string, unknown>;
-  feedsStarted: boolean;
-  liveSessions: Map<string, LiveSession>;
-  sessionWatchers: Map<string, ReturnType<typeof chokidar.watch>>;
-  sessionCleanupHooked: boolean;
-  shuttingDown?: boolean; // set by killAll so the exit handler tells a clean server shutdown from a real crash
-  threadLogs: Map<string, ThreadMsg[]>; // threadId → its message log (pinned so it survives a hot re-eval)
-  pendingAsks?: Map<string, PendingAsk>; // §16 askId → held consultation (lazy-init via getPendingAsks in server-context.ts)
-  pendingPermissions?: Map<string, PendingPermission>; // permId → held permission prompt (lazy-init via getPendingPermissions)
-  wsClients?: Set<WsClient>; // connected /api/ws tabs (lazy-init via getWsClients)
-  // CANVAS_SESSION_HOST mode: the one client to the session-host sidecar. Pinned so an in-process re-eval
-  // reuses the attached socket instead of a second `hello` bouncing off its own busy guard. `null` after a
-  // busy rejection (another dev server holds the slot) → spawns fall back to in-process ownership.
-  hostClient?: SessionHostClient | null;
-  hostAttachStarted?: boolean; // attachSessionHost runs once per process, like the cleanup hook
-  // THE RULE: every cross-request mutable collection that affects behaviour lives on fsState (??= at its
-  // declaration site, like pendingAsks above). An unpinned module-scope map silently empties on a hot
-  // re-eval while the pinned boolean guards stop the code that would refill it — shadowRoots was the
-  // lesson: post-re-eval spawns found no watcher handle and their edits fell to the anonymous `external`
-  // shadow floor with no error anywhere. Pure recompute-on-miss caches (summaryCache, weatherCache,
-  // rootsCache) are the deliberate exception — a re-eval only costs them a recompute.
-  persistTimers?: Map<string, ReturnType<typeof setTimeout>>; // session-marker debounce (timers are process-bound, so handles stay valid across re-evals)
-  emittedMembers?: Map<string, { thread: string; sid: string; ts: number }>; // server-emitted memberships awaiting the snapshot (lazy-init via getEmittedMembers)
-  durableMembers?: Map<string, Set<string>>; // threadId → member sids that survive card/edge removal, marker-backed (lazy-init via getDurableMembers)
-  shadowRoots?: Map<string, ShadowRootHandle>; // boardId\0rootId → live shadow-git watcher (lazy-init via getShadowRoots)
-  busClients?: Map<string, Set<SseClient>>; // SSE compat bus subscribers, per board (lazy-init via getBusClients)
-  lastNotebookOutputs?: Map<string, string>; // boardId\0nodeId → last pushed outputs blob
-  liveKernels?: Map<string, unknown>; // boardId\0nodeId → live Jupyter kernel (server-kernel.ts; typed there to avoid a cycle; lazy-init via `??=`)
-  kernelsReconciled?: boolean; // one-shot flag: the gateway-orphan sweep ran once this server lifetime (server-kernel.ts; survives re-eval on fsState, resets on restart)
-  announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements (lazy-init via getAnnouncedMemberships)
-  pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
-  boardEngines?: Map<string, BoardEngineEntry>; // boardId → the live server-materialized core Store (board-engine.ts, design §9 stage 1); the single event-seq sequencer + append point (stage 2)
-}
-type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
   feedClients: new Set<SseClient>(),
   feedValues: new Map<string, unknown>(),
@@ -713,82 +593,7 @@ function attachWs(server: ViteDevServer): void {
 
 // The live-session feed + spawn/permission consts, collabBrief, ensureSessionFeed/stopSessionFeed (P5
 // sub-step 2) and the persist/publish/status cluster + MAX_SESSION_FEED_BYTES (P5 sub-step 3) all live in
-// server-sessions.ts now. The LiveSession + ContentBlock TYPES stay in the shell below (shared vocabulary).
-
-interface ContentBlock {
-  type: string;
-  text?: string;
-  thinking?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-}
-
-export interface LiveSession {
-  id: string;
-  repoPath: string; // the board's CANONICAL repo — where its `.canvas/` home (markers, threads, memory) lives
-  // The process's working directory. Equals repoPath for an ordinary session; for a WORKTREE session
-  // (`spawn --worktree`) it's the isolated worktree checkout under `.canvas/worktrees/`, while repoPath
-  // stays the canonical board home so markers/threads/memory/boardIdentity all resolve there. seedFromTranscript
-  // keys the transcript dir off cwd (Claude Code stores transcripts per working dir), so a --resume finds them.
-  cwd: string;
-  // The process, behind the SessionProc seam (session-proc.js): local = we spawned and own it (dies with
-  // the dev server), remote = the session-host sidecar owns it (survives a dev-server restart).
-  proc: SessionProc;
-  lines: string[]; // completed transcript-shaped events (codec-ready: {type:"user"|"assistant",message})
-  inflight: ContentBlock[] | null; // the assistant message being built from partial deltas, or null
-  status: "running" | "idle" | "exited";
-  // How the session WOUND DOWN (Phase 2), set the moment we end it and mirrored onto the durable `.canvas/`
-  // marker by recordSessionEnd. Splits the muted exited band into a calm "✓ done" (work declared finished
-  // via /done), a neutral "terminated" (clean /terminate teardown to free a slot), and a loud "crashed"
-  // (the process died on its own — not a /done, /terminate, or clean server shutdown). null while live.
-  endReason?: "done" | "terminated" | "crashed";
-  skills: string[] | null; // slash-invocable skills the harness advertised this session (for /-completion)
-  verb: string | null; // what the live turn is doing now ("Thinking"/"Running"/…) — channel-1 chrome, null when idle
-  usage: { input: number; output: number } | null; // this turn's tokens: input = latest context size, output = accrued
-  // The model actually SERVING this session — folded from the stream (init's requested model, then each
-  // assistant message's authoritative `message.model`, which tracks a server-side refusal fallback, e.g.
-  // fable-5 → opus-4-8; see canvas-workers-fable-fallback-opus memory). Rendered as a chip on the session
-  // card and the sessions list so a silent model demotion is VISIBLE. null until the first frame names it.
-  model: string | null;
-  turnOut: number; // output tokens from this turn's COMPLETED messages; the live output adds the streaming delta on top
-  // Channel delivery (4e): message CONTENT is never injected as user text — it lives in the off-log channel
-  // log and the agent READS it by tool call (GET /api/inbox). The session only tracks, per channel, the
-  // last seq it has read (so a read returns just what's new), plus whether a content-free "you have mail"
-  // nudge is owed (fired idle-immediate / at turn-end, coalesced — §9). `origin` is the host:port this
-  // session was reached on, kept so a nudge fired without a request can still build absolute URLs.
-  read: Record<string, number>; // threadId → last seq this session has pulled
-  nudge: boolean; // a wake nudge is owed (new unread arrived since the last one)
-  // Waiting-on-an-agent (channel @-tag): the peer sid(s) this session named in its last channel post and
-  // is now waiting on. While set AND idle, the card/status reads blue "waiting on an agent" instead of the
-  // loud orange "waiting on a human" (default-loud) — an INFERRED signal (the tag is the evidence, no self-
-  // report). Set/overwritten by the session's own posts; PERSISTS across nudges; cleared only when the
-  // awaited peer replies, the human prompts directly, or the session broadcasts/untags (handleThreadMessage
-  // + sendSessionInput). Not a per-turn flag — it tracks an actual outstanding wait.
-  waitingOn: string[] | null;
-  // Operating-loop legibility (agent-roles.md): `loops` is stamped from the role at spawn for a looping ROLE
-  // (e.g. the Coordinator). It no longer drives a bespoke wake cadence — the heartbeat was migrated onto the
-  // standing-job machinery (see loopTick / coordinator-heartbeat.js) — it survives only so an idle looping
-  // session reads the calm `scheduled` band (sessionStatus) instead of the loud amber "waiting".
-  loops: boolean;
-  origin: string;
-  // Shadow-git attribution (doc §6): an Edit/Write tool_use claims its target path on the shadow watcher;
-  // the matching tool_result commits it attributed. Maps tool_use_id → {shadow-root key, path rel to root}.
-  pendingEdits: Map<string, { key: string; rel: string }>;
-  // Auto-wake worker lifecycle (P2/W5, auto-wake.js): set on a session the SERVER spawned from a durable
-  // record (a doc's comment queue, a dormant thread seat). `autoWakeKey` is its single-flight surface claim
-  // (released on exit); `idleSince` stamps when it last went idle, so the R1 keep-alive reaper winds it down
-  // after the grace window. All undefined on a human- or role-spawned session (they're never auto-reaped).
-  autoWake?: boolean;
-  autoWakeKey?: string;
-  idleSince?: number;
-  // Band-staleness reconciliation (thread mrcmofwf-10): the last whole-session status band publishSession
-  // pushed onto this session's feed. The loopTick safety net compares a freshly recomputed sessionStatus to
-  // this and republishes on drift, catching out-of-band transitions (a standing job / intent / waitingOn that
-  // moves the live band without firing one of the session's own process events). `undefined` = never
-  // published (nothing to reconcile yet); `null` is a real published value (a bandless never-run session).
-  lastBand?: SessionBand | null;
-}
+// server-sessions.ts now. The LiveSession + ContentBlock TYPES moved to server-types.ts (F-S4).
 
 // liveSessions lives on fsState (aliased at the top) so spawned children survive a server reload and
 // stay reachable; sessionCleanupHooked is read/written through fsState so the process-exit kill hook
@@ -1078,14 +883,6 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
 //   GET  /api/inbox ?session=<sid>                            — read this session's unread thread messages (+ pins)
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
 // never has to construct node/edge ids — it works in thread ids + its own sid only.
-
-export interface SnapNode {
-  typeName: "node";
-  id: string;
-  type: string;
-  title: string;
-  text?: string; // a thread node's `text` is its (optional) task brief
-}
 
 // The snapshot/log resolvers (boardSnapshotRecords, nodeSessionId, sessionNodeForSid, threadNode,
 // sessionNameForSid, threadMemberSids) + the backlog-visibility seed (seedCursor/historyKey) moved to

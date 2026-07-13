@@ -18,7 +18,7 @@ import { listWorktrees, removeWorktree, realpath as wtRealpath } from "./worktre
 import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
-import type { LiveSession } from "./vite-fs-plugin.js";
+import type { LiveSession } from "./server-types.js";
 
 // ── the orchestration ENGINE: feeds + heartbeat/standing-jobs + shadow-git committer (P5 sub-step 3) ──
 // The third ENGINE module of the P5 god-file split (after server-delivery.ts and server-sessions.ts). It

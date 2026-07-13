@@ -1,5 +1,5 @@
 import type { IncomingMessage } from "node:http";
-import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, PendingAsk, PendingPermission, RootInfo, SessionBand, SnapNode, ThreadMsg, WsClient } from "./vite-fs-plugin.js";
+import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, PendingAsk, PendingPermission, RootInfo, SessionBand, SnapNode, ThreadMsg, WsClient } from "./server-types.js";
 import type { SseClient } from "./server-http.js";
 import type { WorkIntent } from "./work-intent.js";
 import type { ThreadMetaMarker } from "./thread-ledger.js";

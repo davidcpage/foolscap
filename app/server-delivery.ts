@@ -21,7 +21,7 @@ import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { wakesSeat } from "./notification-levels.js";
 import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
 import type { WorkIntent } from "./work-intent.js";
-import type { LiveSession, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { LiveSession, SnapNode, ThreadMsg } from "./server-types.js";
 
 // ── the channel-delivery / wake engine (P5 sub-step 1) ─────────────────────────────────────────────
 // The first ENGINE module of the P5 god-file split. Where server-context.ts is the DI seam and
