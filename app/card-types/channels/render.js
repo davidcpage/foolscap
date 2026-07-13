@@ -71,6 +71,20 @@ export default {
             const unseenCount = ch.youWaitingCount || 0;
             const yourTurn = ch.state === "waiting";
             const signalling = unseen || yourTurn;
+            // Lifecycle status rail — a coloured LEFT BORDER per row keyed off the server-derived thread state
+            // (thread-state.js), mirroring the Sessions card's `.ses-status-*` rail and reusing its hexes
+            // (session-status.ts): active→green, waiting→amber, dormant→grey. Waiting's amber border already
+            // rides `.your-turn` (below), so we only tag the calm states here. A dormant thread that was NEVER
+            // staffed (no agent ever declared an intent or posted — ch.everStaffed:false) reads as a
+            // 'placeholder', not a wound-down one, so it gets a distinct DASHED/hollow grey rail (after
+            // `.chan-member.pending`) rather than the solid grey of a staffed-but-dormant thread.
+            const statusClass =
+              ch.state === "active"
+                ? "chan-status-active"
+                : ch.state === "dormant"
+                  ? (ch.everStaffed === false ? "chan-status-unstaffed" : "chan-status-dormant")
+                  : ""; // waiting → amber, carried by .your-turn; an older server omits everStaffed → staffed (solid grey)
+            const rowClass = ["ses-row", statusClass, yourTurn ? "your-turn" : "", unseen ? "unseen" : ""].filter(Boolean).join(" ");
             const preview = ch.youWaitingPreview || [];
             const more = ch.youWaitingMore || 0;
             const rowTitle = yourTurn
@@ -80,7 +94,7 @@ export default {
                 : "double-click or drag onto the canvas to open this thread";
             return html`
             <div
-              class="ses-row ${yourTurn ? "your-turn" : ""} ${unseen ? "unseen" : ""}"
+              class="${rowClass}"
               draggable="true"
               data-interactive="1"
               tabindex="0"

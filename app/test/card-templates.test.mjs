@@ -544,7 +544,8 @@ test("channels template renders the two differentiated waiting signals (user wai
     { chanId: "node:thread:bb", title: "Your turn only", text: "brief b", messages: 3, mtime: Date.now() - 9000, state: "waiting", youWaiting: false, youWaitingCount: 0 },
     { chanId: "node:thread:cc", title: "Both", text: "brief c", messages: 9, mtime: Date.now() - 200, state: "waiting",
       youWaiting: true, youWaitingCount: 1, youWaitingMore: 0, youWaitingPreview: [{ seq: 9, from: "s1", fromLabel: "Coordinator", text: "@human blocked" }] },
-    { chanId: "node:thread:dd", title: "All quiet", text: "brief d", messages: 3, mtime: Date.now() - 90_000, state: "dormant", youWaiting: false, youWaitingCount: 0 },
+    { chanId: "node:thread:dd", title: "All quiet", text: "brief d", messages: 3, mtime: Date.now() - 90_000, state: "dormant", everStaffed: true, youWaiting: false, youWaitingCount: 0 },
+    { chanId: "node:thread:ee", title: "Never staffed", text: "brief e", messages: 0, mtime: Date.now() - 500, state: "dormant", everStaffed: false, youWaiting: false, youWaitingCount: 0 },
   ];
   const card = {
     fields: { title: "", text: "", color: "purple" },
@@ -571,6 +572,16 @@ test("channels template renders the two differentiated waiting signals (user wai
   // The 'Both' row carries BOTH signal classes on the one row.
   assert.ok(out.includes('class="ses-row your-turn unseen"'), "a row can carry both signals at once");
 
+  // (c) lifecycle status rail — a coloured LEFT BORDER keyed off ch.state (mirrors the Sessions card's
+  // `.ses-status-*` rail). active→green, waiting→amber (rides .your-turn, no chan-status class), a
+  // staffed-but-dormant thread → solid grey, and a NEVER-staffed dormant thread → a distinct DASHED
+  // 'placeholder' rail (chan-status-unstaffed). The active `Unseen only` row also carries the unseen class.
+  assert.ok(out.includes('class="ses-row chan-status-active unseen"'), "an active thread wears the green status rail");
+  assert.equal((out.match(/chan-status-active/g) || []).length, 1, "exactly the one active thread wears the green rail");
+  assert.equal((out.match(/chan-status-dormant/g) || []).length, 1, "a staffed-but-dormant thread wears the solid grey rail");
+  assert.equal((out.match(/chan-status-unstaffed/g) || []).length, 1, "a never-staffed dormant thread wears the distinct dashed rail");
+  assert.ok(!out.includes("chan-status") || !/ses-row [^"]*your-turn[^"]*chan-status/.test(out), "a waiting row carries no chan-status class — its amber rail rides .your-turn");
+
   // The preview popover lists the pending mentions with their resolved sender label + snippet.
   assert.ok(out.includes("Coordinator") && out.includes("@human decision?"), "preview lists sender label + snippet");
 
@@ -596,6 +607,7 @@ test("channels template renders the two differentiated waiting signals (user wai
     signals: { channelList: [{ chanId: "node:thread:ff", title: "Legacy", text: "", messages: 2, mtime: Date.now() }], channelOpen: () => {} },
   }));
   assert.ok(!legacy.includes("ses-row-unseen") && !legacy.includes("your-turn"), "a thread without the signal fields shows neither");
+  assert.ok(!legacy.includes("chan-status"), "a thread without a state field wears no status rail (older server)");
 });
 
 test("session template applies the jsonl codec: turns, tool calls with results, thinking", async () => {

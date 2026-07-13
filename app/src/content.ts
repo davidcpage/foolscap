@@ -412,6 +412,14 @@ export interface ChannelMeta {
   // re-derivation. Optional: an older server/board that predates the field simply omits it (no highlight).
   youWaiting?: boolean;
   youWaitingCount?: number; // how many mentions await (for the count badge); 0 when not waiting
+  // The server-derived lifecycle band (thread-state.js): a running/working member → active; a member blocked
+  // on the human → waiting; all exited/done → dormant. Drives the row's amber your-turn highlight and the
+  // status left-border rail. Optional — an older server that predates the projection simply omits it.
+  state?: "active" | "waiting" | "dormant";
+  // Has any agent EVER staffed this thread (declared a work-intent or posted to the log)? Distinguishes a
+  // never-staffed dormant thread (a 'placeholder' — dashed rail) from a staffed-but-now-dormant one (solid
+  // grey rail). Server-derived (handleThreads). Optional: an older server omits it → treated as staffed.
+  everStaffed?: boolean;
   // The raw durable member sids on the thread's marker (P5). Source of truth for the client card-reconciler:
   // a session card whose member:open edge points at a thread NOT in this set has been detached, so the card is
   // orphaned and gets auto-closed. Optional — an older server that predates the field simply omits it (the
