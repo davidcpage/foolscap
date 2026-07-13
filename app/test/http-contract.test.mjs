@@ -93,21 +93,38 @@ test("GET /api/canvas works with NO tab live and carries tabs as the liveness si
   assert.ok(body.snapshot);
 });
 
-test("POST /api/command with no tab on the board is 503 {delivered:0}", { skip: !up && "no dev server on 5173" }, async () => {
+test("POST /api/command with no tab commits server-side: ok + authoritative seq + minted id, visible at once", { skip: !up && "no dev server on 5173" }, async () => {
+  // §9 stage 2 RETIRED the 503-on-no-tab: the server itself is the write authority — it validates the
+  // command via core's defaultCommands, durably appends the event (server-minted seq, events.jsonl), and
+  // folds it into the live store. A tab is a VIEW that receives the resulting diff, not a requirement.
+  // Prove the no-tab case specifically: this board has ZERO tabs (the exact case that used to 503), and
+  // the write must still land and be readable the instant the response returns.
+  const before = await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json();
+  assert.equal(before.tabs, 0, "precondition: nobody can render this board — the old 503-on-no-tab case");
   const res = await fetch(
     `${HOST}/api/command?board=${boardId}`,
-    j({ type: "removeNode", actor: "user", payload: { id: "node:none" } }),
+    j({ type: "addNode", actor: "user", payload: { type: "note", title: "headless", x: 10, y: 20 } }),
   );
-  assert.equal(res.status, 503);
-  assert.equal((await res.json()).delivered, 0);
+  assert.equal(res.status, 200);
+  const out = await res.json();
+  assert.equal(out.ok, true);
+  assert.equal(typeof out.seq, "number");
+  assert.ok(out.seq > (before.snapshot.seq ?? 0), "the server minted the board's next authoritative seq");
+  // Bug B/C id-echo, now live end-to-end: the caller omitted payload.id, so the SERVER minted the node id
+  // and echoed it — the created record is addressable without a tab ever existing.
+  assert.match(out.id, /^node:/);
+  // Durable + folded at commit: the record is visible to the agent read (GET /api/canvas, served from the
+  // live server store) immediately, with the response's seq as the board's new watermark.
+  const after = await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json();
+  assert.equal(after.tabs, 0, "still no tab — nothing but the server committed this");
+  assert.equal(after.snapshot.seq, out.seq);
+  assert.ok(after.snapshot.records.some((r) => r.id === out.id), "created record visible in GET /api/canvas");
 });
 
-// NOTE: the end-to-end contract for the Bug B/C id-echo (POST /api/command addNode without an id returns
-// the SERVER-minted node id) is exercised in a self-standing runner (npm run — see the branch handoff),
-// NOT here: this file targets the ALWAYS-ON 5173 server, which serves the main checkout's plugin code and
-// won't carry the fix until it's merged AND the dev server is manually restarted (the documented
-// dev-server-serves-stale-plugin-code footgun). Adding it here would red-fail the merge-on-green gate
-// against the still-stale shared server. The minting LOGIC is covered hermetically in middleware-hermetic.
+// NOTE (historical): before §9 stage 2 merged, the Bug B/C id-echo could not be asserted here (the
+// always-on 5173 server served pre-merge plugin code — the dev-server-serves-stale-plugin-code footgun).
+// Stage 2 is merged and live, so the command test above now carries the id-echo contract end-to-end;
+// the minting LOGIC remains covered hermetically in middleware-hermetic.
 
 test("thread append lazy-seeds from the on-disk ledger — never mints seq 1 onto a real tail", { skip: !up && "no dev server on 5173" }, async () => {
   // Per-run id: the server's in-memory thread log is pinned for the process, so re-using one id
@@ -121,8 +138,15 @@ test("thread append lazy-seeds from the on-disk ledger — never mints seq 1 ont
     path.join(dir, encodeURIComponent(threadId) + ".jsonl"),
     JSON.stringify({ seq: 400, ts: 1, from: "human", text: "old tail" }) + "\n",
   );
+  // Mint the save's seq from the board's CURRENT live seq, never a hardcoded number: since stage 2 the
+  // command test above commits server-side and advances the board's one authoritative counter, and the
+  // live store only folds a snapshot save that is strictly AHEAD of its watermark (seq > watermark is
+  // the "carries state no event delivered" signal). A stale/equal seq is correctly ignored — so a
+  // hardcoded seq would silently fail to land the thread node and 404 the append below.
+  const curSeq = (await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json()).snapshot.seq ?? 0;
   const snapUrl = `${HOST}/api/board/persist/snapshot?board=${boardId}`;
-  await fetch(snapUrl, j({ snapshot: { seq: 7, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Contract" }] } }));
+  const saved = await fetch(snapUrl, j({ snapshot: { seq: curSeq + 1, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Contract" }] } }));
+  assert.equal(saved.status, 200, "the thread-node save must land ahead of the live watermark");
   const res = await fetch(
     `${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`,
     j({ from: "human", text: "fresh" }),
