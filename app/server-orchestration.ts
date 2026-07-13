@@ -17,7 +17,7 @@ import { readWatchers } from "./doc-watch.js";
 import { listWorktrees, removeWorktree, realpath as wtRealpath } from "./worktrees.js";
 import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
-import { CARD_TYPES_DIR } from "./routes/card-types.js";
+import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./vite-fs-plugin.js";
 
 // ── the orchestration ENGINE: feeds + heartbeat/standing-jobs + shadow-git committer (P5 sub-step 3) ──

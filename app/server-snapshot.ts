@@ -12,7 +12,6 @@ import {
   threadMembersFromMeta,
 } from "./thread-ledger.js";
 import { boardStoreRecords } from "./board-engine.js";
-import { publishThreadFeed } from "./server-delivery.js";
 import type { SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 
 // ── the snapshot / thread-log / membership resolvers (P5 sub-step 3) ───────────────────────────────
@@ -60,7 +59,7 @@ export function threadLog(boardId: string, threadId: string): ThreadMsg[] {
 // safe to seed per board; a log already in memory (a hot re-eval kept it pinned) is left alone — disk and
 // memory agree, and we don't want to clobber a live tail with a stale read.
 export function seedThreadLogs(repoPath: string): void {
-  const { fsState, boardIdentity } = getServerContext();
+  const { fsState, boardIdentity, publishThreadFeed } = getServerContext();
   const threadLogs = fsState.threadLogs;
   const durableMembers = getDurableMembers(fsState);
   for (const meta of listThreads(repoPath)) {

@@ -17,7 +17,7 @@ import { idleBand, shouldRepublishBand } from "./session-band-republish.js";
 import { sessionHasScheduledWake } from "./standing-jobs.js";
 import { readRole } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, worktreeOnboarding } from "./worktrees.js";
-import { settlePermission, PERMISSION_HOLD_MS } from "./routes/permissions.js";
+import { sendJson } from "./server-http.js";
 import type { LiveSession, SessionBand } from "./vite-fs-plugin.js";
 
 // ── the session / spawn / host ENGINE (P5 sub-step 2) ───────────────────────────────────────────────────
@@ -71,8 +71,10 @@ const BASELINE_ALLOWED_TOOLS = [
 // the blocked turn is blocked on them regardless); the CLI-side MCP tool timeout must outlast it, so
 // it's set a minute above via MCP_TOOL_TIMEOUT on the spawn env (sidecar pass-through — an OLD sidecar
 // ignores env and the CLI's default tool timeout applies: prompts then die early but still fail closed).
-// PERMISSION_HOLD_MS now lives in routes/permissions.ts (with the permission handlers) and is imported at
-// the top of this file — the spawn path below reads it to size MCP_TOOL_TIMEOUT a minute above the hold.
+// PERMISSION_HOLD_MS lives here (with settlePermission — the session-teardown path denies held prompts, so
+// this engine owns them); the permission route handlers (routes/permissions.ts) import both back, and the
+// spawn path below reads the hold to size MCP_TOOL_TIMEOUT a minute above it.
+export const PERMISSION_HOLD_MS = 10 * 60_000;
 const PERMISSION_TOOL = "mcp__canvas__permission_prompt"; // mcp__<server>__<tool> under --mcp-config's "canvas"
 
 // Which Claude model a spawned session runs. Without an explicit `--model`, `claude -p` inherits
@@ -210,7 +212,7 @@ function collabBrief(boardId: string, sessionId: string, origin: string): string
 // (sessionWatchers lives on fsState — aliased at the top — so it survives a server reload.)
 
 export function ensureSessionFeed(dir: string, id: string, repoPath: string): void {
-  const { liveSessions, fsState, readSessionFile, publishFeed } = getServerContext();
+  const { liveSessions, fsState, publishFeed } = getServerContext();
   const { sessionWatchers } = fsState;
   // A registry-OWNED, still-LIVE session (slice 2: we spawned the process) publishes session:<id> from
   // the live PROCESS stream (finer, token-level) — don't also tail its .jsonl, or two publishers fight on
@@ -379,7 +381,6 @@ function foldSessionEvent(s: LiveSession, e: any): void {
 // static fields.text). The registry "materialising"/pinning the transcript for the live tail
 // (session-timelines.md §5). Same shape foldSessionEvent stores: one {type,message} string per turn.
 function seedFromTranscript(s: LiveSession): void {
-  const { readSessionFile, sessionsDir } = getServerContext();
   // Claude Code stores transcripts per PROCESS working dir, so key off cwd (the worktree for a --worktree
   // session), not the canonical board root — else a worktree session's transcript wouldn't be found.
   const r = readSessionFile(sessionsDir(s.cwd), s.id);
@@ -499,7 +500,7 @@ export function ensureLiveSession(
   cwd: string = repoPath, // the process working dir — a worktree checkout for `spawn --worktree`, else the board root
   model: string | null = null, // explicit per-spawn model; null → role `model:` frontmatter → DEFAULT_SESSION_MODEL
 ): LiveSession {
-  const { liveSessions, fsState, boardIdentity, publishSession } = getServerContext();
+  const { liveSessions, fsState, boardIdentity } = getServerContext();
   const existing = liveSessions.get(id);
   if (existing && existing.status !== "exited") return existing;
 
@@ -678,7 +679,7 @@ export async function attachSessionHost(): Promise<void> {
 // (persistSessionState). Hooks attach FIRST, buffering, so a turn completing during the seed isn't lost
 // (a rare duplicate of the newest turn is cosmetic and self-heals on the next resume).
 function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
-  const { liveSessions, publishSession } = getServerContext();
+  const { liveSessions } = getServerContext();
   if (liveSessions.has(info.id)) return; // pinned across a re-eval — already ours
   // The sidecar hands back the process cwd; for a worktree session that's the worktree, so derive the
   // canonical board root (where the marker/threads/memory live) before reading the marker.
@@ -714,7 +715,7 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
 // and stamp how the process ended. Takes a getter because the hooks are wired before the LiveSession
 // literal exists (they only fire async, after it does). Shared by spawn (local or remote) and adoption.
 function wireSessionHooks(get: () => LiveSession): ProcHooks {
-  const { publishSession, fsState } = getServerContext();
+  const { fsState } = getServerContext();
   let pub: ReturnType<typeof setTimeout> | null = null;
   return {
     onLine(line) {
@@ -753,7 +754,7 @@ function wireSessionHooks(get: () => LiveSession): ProcHooks {
 // Write a user prompt into a live session's stdin as a stream-json message. The prompt is echoed into
 // the buffer right away (Claude does not echo stdin on stdout) so the card shows it without waiting.
 export function sendSessionInput(id: string, text: string, opts?: { keepWaitingOn?: boolean }): boolean {
-  const { liveSessions, publishSession } = getServerContext();
+  const { liveSessions } = getServerContext();
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
   s.lines.push(JSON.stringify({ type: "user", message: { role: "user", content: text } }));
@@ -782,7 +783,7 @@ export function sendSessionInput(id: string, text: string, opts?: { keepWaitingO
 // only, so this is not per-tick spam; sessionStatus short-circuits to "working" for running sessions (no
 // disk read), so the listThreads read is hit only for the handful of idle sessions.
 export function reconcileSessionBands(): void {
-  const { liveSessions, sessionStatus, publishSession } = getServerContext();
+  const { liveSessions } = getServerContext();
   for (const s of liveSessions.values()) {
     if (shouldRepublishBand(s.lastBand, sessionStatus(s.repoPath, s.id))) publishSession(s);
   }
@@ -1015,6 +1016,26 @@ export function autoWakeReapTick(): void {
   }
 }
 
+// Resolve a held --permission-prompt-tool prompt (a card decision, a shell /decision, or a hold timeout):
+// answer the parked relay connection, drop the entry, and repaint the blocked session's card. A no-op if the
+// id is already gone (double-settle, close-after-decide). The permission ROUTE handlers (routes/permissions.ts)
+// import this — the engine owns it because session teardown (denySessionPermissions below) is a caller and
+// nothing about it is HTTP-routing.
+export function settlePermission(permId: string, payload: Record<string, unknown>): void {
+  const pending = getPendingPermissions(getServerContext().fsState);
+  const p = pending.get(permId);
+  if (!p) return;
+  clearTimeout(p.timer);
+  pending.delete(permId);
+  try {
+    sendJson(p.res, 200, payload);
+  } catch {
+    /* relay disconnected — the CLI already gave up on this prompt; nothing left to answer */
+  }
+  const s = getServerContext().liveSessions.get(p.sid);
+  if (s) publishSession(s);
+}
+
 // Deny every prompt a session still holds — the teardown path (terminate/done/exit). The human can no
 // longer meaningfully answer, and a relay still waiting should hear an honest reason, not a hangup.
 function denySessionPermissions(sid: string, message: string): void {
@@ -1027,7 +1048,7 @@ function denySessionPermissions(sid: string, message: string): void {
 // handler reads s.endReason to decide it wasn't a crash), kill the child, free the cap slot, republish so
 // the card flips to its exited band immediately. Returns false if the session isn't live (→ 409).
 export function endSession(id: string, endReason: "done" | "terminated"): boolean {
-  const { liveSessions, publishSession } = getServerContext();
+  const { liveSessions } = getServerContext();
   const s = liveSessions.get(id);
   if (!s || s.status === "exited") return false;
   denySessionPermissions(id, `the session was ${endReason} before a human decided`);

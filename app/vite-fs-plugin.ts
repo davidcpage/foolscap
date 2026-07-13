@@ -22,15 +22,15 @@ import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus } from "./server-sessions.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
-import { cardTypeRoutes, handleCardTypeAsset, CARD_TYPES_DIR } from "./routes/card-types.js";
+import { cardTypeRoutes, handleCardTypeAsset } from "./routes/card-types.js";
 import { roleRoutes } from "./routes/roles.js";
-import { permissionRoutes, settlePermission, PERMISSION_HOLD_MS } from "./routes/permissions.js";
+import { permissionRoutes } from "./routes/permissions.js";
 import { boardRoutes } from "./routes/boards.js";
 import { boardPersistRoutes } from "./routes/board-persist.js";
 import { fileRootRoutes } from "./routes/files.js";
@@ -42,7 +42,7 @@ import { threadRoutes } from "./routes/threads.js";
 import { sessionLifecycleRoutes, sessionReadRoutes } from "./routes/sessions.js";
 import { kernelRoutes } from "./routes/kernel.js";
 import { shutdownKernel } from "./server-kernel.js";
-import { isInternalPath, openRootWatcher } from "./server-fs.js";
+import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -844,10 +844,10 @@ export interface LiveSession {
 // rides the session's feed (`permissions`) so the card paints buttons + the loud waiting band, and
 // /api/sessions' status derives "waiting" from it (sessionStatus) so the minimap/list/stack agree.
 
-// settlePermission + the three /api/permission* handlers moved to routes/permissions.ts (god-file split,
-// Phase 1); settlePermission is imported at the top of this file so the teardown path below can call it.
-// They reach the shared pending-prompt registry (fsState.pendingPermissions), liveSessions, and
-// publishSession through the ServerContext.
+// The three /api/permission* handlers live in routes/permissions.ts (god-file split, Phase 1); settlePermission
+// + PERMISSION_HOLD_MS live in the session engine (server-sessions.ts) and are imported at the top of this file
+// so the teardown path below can call settlePermission. They reach the shared pending-prompt registry
+// (fsState.pendingPermissions), liveSessions, and publishSession through the ServerContext.
 
 // denySessionPermissions (teardown deny-all) moved to server-sessions.ts (P5 sub-step 2).
 
