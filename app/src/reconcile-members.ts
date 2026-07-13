@@ -11,13 +11,12 @@
 // the first orphan sighting just stamps `firstSeenOrphan`; only a later pass — with a roster refreshed in
 // the meantime — past the window removes. A card confirmed member again (or gone) clears its stamp, so the
 // strike never goes stale. Genuinely detached cards still auto-close, one grace window later.
-export const RECONCILE_ORPHAN_GRACE_MS = 30_000;
+// Shared node:live:/node:session: parse. Imported from the dependency-free ./node-id leaf (NOT loader) so
+// this module stays DOM-free and hermetically node-testable; the `.js` specifier lets the test's resolve
+// hook map it to the .ts twin.
+import { sidOfNode } from "./node-id.js";
 
-// A session-shaped node id's sid, or null (mirrors loader's node:live:/node:session: convention).
-const sidOfNode = (node: string): string | null => {
-  const sid = node.replace(/^node:(?:live|session):/, "");
-  return sid === node ? null : sid;
-};
+export const RECONCILE_ORPHAN_GRACE_MS = 30_000;
 
 /**
  * `edges`: the board's member:open edges (from = session node id, to = thread node id).

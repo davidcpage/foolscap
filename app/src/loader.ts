@@ -16,6 +16,10 @@ import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
 import { MEMBER_OPEN, THREAD_CARD_H, THREAD_CARD_W } from "./threads";
 import { detachedMemberCards } from "./reconcile-members";
+// The `node:<root>:<path>` id scheme lives in the dependency-free ./node-id leaf (so hermetic, DOM-free
+// consumers can share it); loader re-exports it as the app-facing home.
+import { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode } from "./node-id";
+export { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode };
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
@@ -77,12 +81,6 @@ const IMAGE_DIR = ".canvas/images";
 const COL_GAP = 36;
 const ORIGIN_X = 48;
 const ORIGIN_Y = 48;
-
-// Node id derived from (root, path) so it's STABLE and idempotent: re-loading or a change event addresses
-// the same card without any path→id bookkeeping, and the two datasets never collide.
-function fileNodeId(root: RootId, p: string): Id<"node"> {
-  return `node:${root}:${p}` as Id<"node">;
-}
 
 // The PARENT folder of a root-relative path ("a/b/c" → "a/b", "a" → "" = the root listing). Paths are
 // POSIX-style — the server emits path.relative joined with "/", and the root directory is keyed by "".
@@ -868,7 +866,7 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
   // either a live-summoned worker card (`node:live:<sid>`, dropped by the server on spawn) or a prior
   // reopen (`node:session:<sid>`). The two ids differ, so a naive re-add litters a SECOND, unconnected
   // card (the exact "reopen produced a duplicate" bug). Fly to whichever exists instead.
-  for (const existing of [`node:live:${sid}`, `node:session:${sid}`] as Id<"node">[]) {
+  for (const existing of [liveNodeId(sid), sessionNodeId(sid)]) {
     if (m.editor.store.get<"node">(existing)) {
       redrawMemberEdges(m, existing, sid, threads); // idempotent — heal a card opened before this fix too
       m.selection.set([existing]);
@@ -876,7 +874,7 @@ export async function openSession(m: InteractionManager, id?: string, at?: Pos):
       return;
     }
   }
-  const nodeId = `node:session:${sid}` as Id<"node">;
+  const nodeId = sessionNodeId(sid);
   // Placement (P2 reopen-at-offset): an explicit drop point (`at`) always wins. Otherwise, if the session
   // has a stored offset relative to its PRIMARY thread AND that thread's card is currently on the board,
   // reopen the card at primaryThreadCardPos + offset — so a closed session comes back exactly where it sat
@@ -1244,7 +1242,7 @@ export async function spawnLiveSession(m: InteractionManager, at?: Pos, roleId?:
     type: "addNode",
     actor: "system",
     payload: {
-      id: `node:live:${id}` as Id<"node">,
+      id: liveNodeId(id),
       type: "session",
       title: id, // the session id: the template keys its `session` feed + `sessionInput` off it
       text: "",

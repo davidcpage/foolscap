@@ -215,27 +215,6 @@ export function primaryThreadForSession(
   return best;
 }
 
-// The PRIMARY thread of EVERY durable member, board-wide: { [sid]: primaryThreadId }. Computed purely from
-// the thread markers' `members[sid].joinedAt` (no snapshot needed — durable membership is the authority for
-// primacy), with the same min-joinedAt / smaller-threadId tie-break as primaryThreadForSession. The client's
-// move-with-thread reactor reads this to move a multi-thread session ONLY with its primary; it rides the
-// /api/threads response (refreshed on the threads feed, i.e. whenever a membership changes). Best-effort.
-export function allSessionAnchors(repoPath: string): Record<string, string> {
-  const best = new Map<string, { threadId: string; joinedAt: number }>();
-  for (const meta of listThreads(repoPath)) {
-    const members = (meta.members ?? {}) as Record<string, { joinedAt?: number }>;
-    for (const [sid, rec] of Object.entries(members)) {
-      const joinedAt = typeof rec?.joinedAt === "number" ? rec.joinedAt : Infinity;
-      const cur = best.get(sid);
-      if (!cur || joinedAt < cur.joinedAt || (joinedAt === cur.joinedAt && meta.threadId < cur.threadId))
-        best.set(sid, { threadId: meta.threadId, joinedAt });
-    }
-  }
-  const out: Record<string, string> = {};
-  for (const [sid, { threadId }] of best) out[sid] = threadId;
-  return out;
-}
-
 // The session's PRIMARY thread id + its stored relative offset {dx,dy}, for the reopen-at-offset placement
 // (loader.ts openSession). `offset` is null when the primary membership carries no offset yet (a never-moved
 // card whose spawn placement hasn't been captured, or a session with no memberships) — the client then falls

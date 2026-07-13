@@ -431,16 +431,6 @@ test("primaryThreadForSession breaks a joinedAt tie on the smaller threadId (sta
   assert.equal(snap.primaryThreadForSession(repo, records, "sid-a"), "node:thread:aaa", "smaller id wins the tie");
 });
 
-test("allSessionAnchors maps every durable member to its primary thread, board-wide (marker-only)", () => {
-  const repo = tmpRepo();
-  ledger.addThreadMember(repo, "node:thread:t1", "sid-a", 100); // sid-a primary
-  ledger.addThreadMember(repo, "node:thread:t2", "sid-a", 200); // sid-a secondary
-  ledger.addThreadMember(repo, "node:thread:t2", "sid-b", 50); // sid-b only here
-  const anchors = snap.allSessionAnchors(repo);
-  assert.equal(anchors["sid-a"], "node:thread:t1", "earliest join is primary");
-  assert.equal(anchors["sid-b"], "node:thread:t2");
-});
-
 test("sessionAnchor returns the primary thread + its stored offset (null offset until captured)", () => {
   const repo = tmpRepo();
   ctx.setServerContext({ fsState: {} });
