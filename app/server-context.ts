@@ -41,10 +41,12 @@ export interface ServerContext {
   // State-dependent EFFECTS the extracted route handlers call (Phase 1: roles/permissions/boards/board-
   // persist). These are operations, categorically identical to the resolvers above — the handler reaches
   // shared cross-request state (the feed bus, the live-session registry, the board registry, the feeds
-  // subsystem, the membership dedup) THROUGH them without importing the god-file. Their DEFINITIONS stay
-  // in vite-fs-plugin.ts (moving publishFeed/publishSession — 26/19 callers — is a later phase); this seam
-  // only exposes the operation, injected once via setServerContext at load. Expose operations, never raw
-  // state maps, wherever the operation is the safer surface.
+  // subsystem, the membership dedup) THROUGH them without importing the defining module. Their DEFINITIONS
+  // now live in the extracted engine modules (publishFeed → server-orchestration; publishSession →
+  // server-sessions; boardIdentity/readBoardRegistry/recordBoardOpened/ensureCanvasExcluded → server-boards;
+  // startBoardFeeds/announceNewMemberships → server-orchestration/server-delivery); this seam only exposes
+  // the operation, injected once via setServerContext at load. Expose operations, never raw state maps,
+  // wherever the operation is the safer surface.
   publishFeed: (feed: string, value: unknown) => void; // push a named off-log event to every feed subscriber
   publishSession: (s: LiveSession) => void; // re-render a live session's card feed (band, permissions, tail)
   boardIdentity: (repoPath: string) => { boardId: string; name: string; repoPath: string }; // realpath→stable id
@@ -61,7 +63,7 @@ export interface ServerContext {
   // Auto-wake on annotation activity (P2/W5, doc-annotations): a qualifying comment/answer on a watched doc
   // nudges an already-servicing worker or server-spawns a fresh doc worker. A cross-cutting EFFECT (it reads
   // liveSessions and drives the spawn/auto-wake-surface subsystem), so — exactly like publishSession — its
-  // definition stays in vite-fs-plugin.ts and the annotations route (routes/annotations.ts) reaches it here.
+  // definition lives in server-orchestration.ts and the annotations route (routes/annotations.ts) reaches it here.
   maybeWakeDocWorker: (
     boardId: string,
     repoPath: string,
@@ -70,9 +72,9 @@ export interface ServerContext {
     eventKind: "note" | "answer" | "suggestion",
   ) => void;
   // Threads / inbox / asks (Phase 3). The extracted thread/inbox/ask route modules call heavily into the
-  // channel-delivery / wake / spawn engine — which is Phase-5 territory and stays in the shell. So, exactly
+  // channel-delivery / wake / spawn engine (server-delivery/server-snapshot/server-sessions). So, exactly
   // like publishSession/maybeWakeDocWorker, these expose the ENGINE OPERATIONS the routes need (definitions
-  // stay in vite-fs-plugin.ts, injected once via setServerContext); each is cross-cutting (engine callers
+  // live in those engine modules, injected once via setServerContext); each is cross-cutting (engine callers
   // outside the routes). Snapshot/log resolvers first (they read boards / the emitted+durable membership
   // bridge / threadLogs), then the delivery/wake/persist/spawn effects. The pure record/history helpers
   // (threadNode/sessionNodeForSid/sessionNameForSid/seedCursor/historyKey) are on the context — not sunk
@@ -118,11 +120,11 @@ export interface ServerContext {
     origin: string,
   ) => import("../core/src/log.js").IntentEvent | null;
   forgetDurableMember: (repoPath: string | undefined, threadId: string, sid: string) => void;
-  // Engine ops the extracted channel-delivery/wake module (server-delivery.ts, P5 sub-step 1) reaches back
-  // into. Their DEFINITIONS still live in the shell (session/spawn = sub-step 2; heartbeat + membership
-  // registry + snapshot resolvers = sub-step 3), so — exactly like the effects above — the seam injects the
-  // operation and the moved delivery functions call it via getServerContext(); the defs move in a later
-  // sub-step and just repoint. MAX_THREAD_MSGS rides here as a value the same way MAX_LIVE_SESSIONS does.
+  // Engine ops the extracted channel-delivery/wake module (server-delivery.ts) reaches back into. Their
+  // DEFINITIONS live in the engine modules (session/spawn → server-sessions; heartbeat → server-orchestration;
+  // membership registry + snapshot resolvers → server-snapshot), so — exactly like the effects above — the
+  // seam injects the operation and the delivery functions call it via getServerContext(). MAX_THREAD_MSGS
+  // rides here as a value the same way MAX_LIVE_SESSIONS does.
   maybeRespawnDormantSeat: (
     boardId: string,
     threadId: string,
@@ -148,9 +150,9 @@ export interface ServerContext {
     firstPrompt: string;
   }) => string | null;
   // Sessions routes (Phase 4). The read/list + lifecycle/spawn handlers (routes/sessions.ts) drive the
-  // session-host spawn/process ENGINE and the live-session feed/registry machinery — Phase-5 territory that
-  // stays in the shell. So, exactly like serverSpawnWorker above, these expose the ENGINE operations the
-  // routes need (definitions stay in vite-fs-plugin.ts, injected once via setServerContext); each is shared
+  // session-host spawn/process ENGINE and the live-session feed/registry machinery (server-sessions.ts). So,
+  // exactly like serverSpawnWorker above, these expose the ENGINE operations the routes need (definitions
+  // live in server-sessions.ts, injected once via setServerContext); each is shared
   // (a caller outside the route set — serverSpawnWorker, the idle reaper, the feed startup, the shadow-git /
   // adoption paths), so none could sink into the route module. Resolvers/consts first, then the effects.
   sessionsDir: (repoPath: string) => string; // a board's Claude-Code transcripts dir (projectsDirForCwd)

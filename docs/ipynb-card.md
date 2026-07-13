@@ -1,8 +1,11 @@
-# The read-only Jupyter (`.ipynb`) card
+# The Jupyter (`.ipynb`) card
 
-A small card-type (`app/card-types/ipynb/`) for **exploring** a repo's Jupyter notebooks on the canvas —
-the use case that motivated it is browsing `.ipynb` files ahead of a possible translation to our reactive
-[Notebook 2.0 format](notebook-card.md). It is deliberately minimal, not a second notebook engine.
+A small card-type (`app/card-types/ipynb/`) for **exploring and running** a repo's Jupyter notebooks on the
+canvas — the use case that motivated it is browsing `.ipynb` files ahead of a possible translation to our
+reactive [Notebook 2.0 format](notebook-card.md). It began read-only; a per-cell **Run** now drives a
+server-side Jupyter kernel (Path B — the kernel broker + write-back; the executable design lives in
+[`notebook-card.md`](notebook-card.md) §2 Path B). It is deliberately minimal — a file-backed view that can
+execute cells, **not** a second reactive notebook engine (the two substrates stay separate by design).
 
 ## What it is
 

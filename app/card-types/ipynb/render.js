@@ -1,8 +1,9 @@
-// card-types/ipynb/render.js — a READ-ONLY Jupyter notebook (.ipynb) card interior, loaded at runtime
+// card-types/ipynb/render.js — a Jupyter notebook (.ipynb) card interior, loaded at runtime
 // (card-types-as-data.md §7). It is the file card's cousin: the SOURCE is a `.ipynb` file read off-log
-// through `fileContent` (content.ts), and the card is a VIEW over it — this template only PARSES and
-// DISPLAYS. It never executes anything: there is no kernel, no REPL, no editing (that is deliberately
-// out of scope, parked as a future thread — see the brief). A `.ipynb` is JSON, so we JSON.parse the
+// through `fileContent` (content.ts), and the card is a VIEW over it — this template PARSES and DISPLAYS
+// each cell AND (Path B) can EXECUTE code cells: a per-cell Run button drives the server-side Jupyter
+// kernel through the /api/kernel broker, and outputs are written back through the notebook codec (editing
+// the cell SOURCE is still out of scope). A `.ipynb` is JSON, so we JSON.parse the
 // content and render each cell: markdown via the shared prose codec, code via the shared highlighter,
 // and outputs by output_type.
 //

@@ -66,50 +66,6 @@ import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js"
 const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Set<string> })
   .__canvasBoardFeeds ??= new Set());
 
-// sessionsDir (a board's Claude-Code transcripts dir) moved to server-sessions.ts (P5 sub-step 3).
-
-// sessionTranscriptDir (the per-session transcripts-dir resolver) moved to routes/sessions.ts (god-file
-// split, Phase 4) — only the session read/resume routes called it. It reaches sessionsDir through the
-// ServerContext (sessionsDir stays here: the sessions-feed startup + the live-tail seed still call it).
-
-// boardRootForCwd (worktree-cwd → canonical board root) moved to server-sessions.ts (P5 sub-step 2).
-
-// /api/boards (list + mount) now lives in routes/boards.ts (god-file split, Phase 1); boardJson moved
-// there with it. The mount orchestration reaches boardIdentity/readBoardRegistry/recordBoardOpened/
-// ensureCanvasExcluded/startBoardFeeds through the ServerContext (wired at setServerContext below).
-
-// The board MOUNT handler (POST /api/boards) moved to routes/boards.ts with the list handler above.
-
-// ── the durable board store (external-repo boards step 4: records live with the repo) ─────────────
-// handleBoardPersistWrite + the /api/board/persist route (GET/DELETE/POST event|snapshot|import) now live
-// in routes/board-persist.ts (god-file split, Phase 1). The /event echo mints the authoritative seq on the
-// single server-side append point (design §10, retiring the old second-writer tripwire) and the
-// membership-diff onboarding (announceNewMemberships) is reached through the ServerContext; the
-// board-persist.js file store is imported directly there.
-
-// MAX_SESSION_BYTES moved to server-sessions.ts (P5 sub-step 3); handleNotebookOutputsPush imports it.
-
-// The filesystem-serving / confinement helpers (EXCLUDE_DIRS, isInternalPath, TEXT_EXT, IMAGE_EXT/MIME,
-// MAX_ASSET_BYTES, safeResolve, fileVersion, openRootWatcher) now live in the stateless server-fs.ts seam
-// (alongside MAX_BYTES/readText in server-http.ts) so the extracted file/asset/watch/annotation route modules
-// share one definition. Only isInternalPath (the shadow-git ignore predicate) and openRootWatcher (the WS
-// file-watch) still have callers HERE, so those two are imported back at the top of this file.
-
-// readSessionFile (one transcript's tail-capped read) moved to server-sessions.ts (P5 sub-step 3).
-
-// handleSession + sessionSummary/summaryCache moved to routes/sessions.ts (god-file split, Phase 4) — only
-// the session read/list routes call them. handleSession reaches readSessionFile + ensureSessionFeed, and
-// handleSessions reaches sessionStatus, through the ServerContext; those three stay here (readSessionFile
-// and sessionStatus are shared with the feed/shadow-git/band paths, ensureSessionFeed is the feed engine).
-
-// endReasonBand / hasScheduledWake / sessionStatus (the ONE whole-session status band) moved to
-// server-sessions.ts (P5 sub-step 3); the SessionBand type itself moved to server-types.ts.
-
-// handleSessions (GET /api/sessions) moved to routes/sessions.ts (god-file split, Phase 4). It reaches
-// sessionStatus through the ServerContext (sessionStatus stays here — the band-republish loop calls it too).
-
-// startSessionsFeed moved to server-orchestration.ts (P5 sub-step 3).
-
 // The PARTICIPANTS a thread's state derives from (§8 step 3): the union of the current member:open
 // roster (snapshot edges + the emitted-membership registry) and the seats' current occupants — seats
 // are the DURABLE participants, so a thread whose card (and edges) were removed, or a board whose tab
@@ -204,13 +160,6 @@ function handleThreads(res: ServerResponse, boardId: string, repoPath: string): 
   sendJson(res, 200, { threads, channels: threads });
 }
 
-// /api/roles (list + create) now lives in routes/roles.ts (god-file split, Phase 1); the create path
-// reaches publishFeed through the ServerContext to nudge an open picker.
-
-// startThreadsFeed moved to server-orchestration.ts (P5 sub-step 3).
-
-// startRolesFeed moved to server-orchestration.ts (P5 sub-step 3).
-
 // ── feeds (demo §10: "the clock with a fetch in it") ────────────────────────────────────────────
 // A tiny server-side feed registry, multiplexed onto ONE SSE stream (/api/feeds). Each feed is a
 // named source that publishes its latest value; the client turns each name into an off-log signal
@@ -278,8 +227,8 @@ for (const s of liveSessions.values()) {
   }
 }
 
-// publishFeed (the off-log feed-bus write) moved to server-orchestration.ts (P5 sub-step 3). handleFeeds (below)
-// + attachWs stay in the shell (SSE/WS transport) and read fsState.feedClients/feedValues directly.
+// handleFeeds (below) + attachWs are the shell's SSE/WS transport — they read fsState.feedClients/
+// feedValues directly (the publishFeed write side lives in server-orchestration.ts).
 
 function handleFeeds(req: IncomingMessage, res: ServerResponse): void {
   openSse(req, res, feedClients);
@@ -384,58 +333,9 @@ function attachWs(server: ViteDevServer): void {
   });
 }
 
-// startGitHeadFeed (the repo-HEAD commit feed) moved to server-orchestration.ts (P5 sub-step 3).
-
-// The live-session feed + spawn/permission consts, collabBrief, ensureSessionFeed/stopSessionFeed (P5
-// sub-step 2) and the persist/publish/status cluster + MAX_SESSION_FEED_BYTES (P5 sub-step 3) all live in
-// server-sessions.ts now. The LiveSession + ContentBlock TYPES moved to server-types.ts (F-S4).
-
 // liveSessions lives on fsState (aliased at the top) so spawned children survive a server reload and
 // stay reachable; sessionCleanupHooked is read/written through fsState so the process-exit kill hook
 // is installed exactly once across reloads, not stacked.
-
-// persistSessionState / permissionsOf / publishSession / republishThreadSeatOccupants moved to
-// server-sessions.ts (P5 sub-step 3 — folded into the session engine, alongside sessionStatus/readSessionFile).
-
-// The session-engine stdout-fold helpers (ctxOf/toolVerb/foldSessionEvent/seedFromTranscript/workerBrief),
-// ensureLiveSession, the session-host client (REMOTE_SESSIONS/attachSessionHost/adoptSession/wireSessionHooks),
-// and sendSessionInput moved to server-sessions.ts (P5 sub-step 2).
-
-// The channel thread-log (threadLog/seedThreadLogs/MAX_THREAD_MSGS) + the emitted/durable membership
-// registry (sidFromSessionNode/liveEmittedMembers/trackEmittedMembership/recordDurableMember/
-// forgetDurableMember) + sessionThreads moved to server-snapshot.ts (P5 sub-step 3).
-
-// The operating-loop heartbeat (LOOP_TICK_MS/loopTick/startLoopHeartbeat) moved to server-orchestration.ts
-// (P5 sub-step 3). loopTick drives autoWakeReapTick + standingJobsTick + reconcileSessionBands; startBoardFeeds imports startLoopHeartbeat.
-
-// sendSessionInterrupt moved to server-sessions.ts (P5 sub-step 2).
-
-// originOf (+ lastKnownOrigin, the server-fired-spawn origin seed) moved to server-orchestration.ts (P5 sub-step 3).
-
-// The spawn-cap consts (MAX_LIVE_SESSIONS) + liveSessionCount/placeWorkerCard/resolveSpawnCwd moved to server-sessions.ts (P5 sub-step 2).
-
-// handleSessionSpawn (POST /api/session/spawn) moved to routes/sessions.ts (god-file split, Phase 4). It
-// reaches the spawn primitives it shares with serverSpawnWorker below — liveSessionCount / MAX_LIVE_SESSIONS
-// / resolveSpawnCwd / placeWorkerCard / ensureLiveSession / sendSessionInput — plus the snapshot/thread
-// resolvers, through the ServerContext; those definitions stay here (Phase-5 engine territory).
-
-// serverSpawnWorker (the server-spawn-from-a-durable-record primitive) moved to server-sessions.ts (P5 sub-step 2).
-
-// docWorkerBrief/dormantWakeBrief + maybeWakeDocWorker (doc-wake) + maybeRespawnDormantSeat (dormant-seat
-// respawn) moved to server-orchestration.ts (P5 sub-step 3); both wake ops stay ctx ops for the routes/delivery.
-
-// autoWakeReapTick (the idle-worker keep-alive reaper) moved to server-sessions.ts (P5 sub-step 2); loopTick calls it via the import.
-
-// standingJobNudge + ensureCoordinatorHeartbeat + standingJobsTick (the standing-jobs firing loop) moved to
-// server-orchestration.ts (P5 sub-step 3). ensureCoordinatorHeartbeat stays a ctx op (server-delivery calls it).
-
-// handleSessionInput / handleSessionResume / handleSessionInterrupt / handleSessionTerminate /
-// handleSessionDone (POST /api/session/<id>/{input,resume,interrupt,terminate,done}) moved to
-// routes/sessions.ts (god-file split, Phase 4). They reach the process/teardown engine — sendSessionInput,
-// sendSessionInterrupt, ensureLiveSession, endSession (below), readSessionFile, originOf — through the
-// ServerContext; those definitions stay here (Phase-5 session-host territory).
-
-// endSession (the shared /terminate + /done teardown) moved to server-sessions.ts (P5 sub-step 2).
 
 // ── Permission prompts: the relay's held POST + the card's decision buttons ──────────────────────────
 // The server half of --permission-prompt-tool (see PERMISSION_HOLD_MS at the top): the per-session MCP
@@ -448,14 +348,6 @@ function attachWs(server: ViteDevServer): void {
 // + PERMISSION_HOLD_MS live in the session engine (server-sessions.ts) and are imported at the top of this file
 // so the teardown path below can call settlePermission. They reach the shared pending-prompt registry
 // (fsState.pendingPermissions), liveSessions, and publishSession through the ServerContext.
-
-// denySessionPermissions (teardown deny-all) moved to server-sessions.ts (P5 sub-step 2).
-
-// The HN feed (startHnFeed) + the usage feed (startUsageFeed + readClaudeOAuthToken/claudeUserAgent/
-// USAGE_POLL_MS) moved to server-orchestration.ts (P5 sub-step 3); startFeeds imports startHnFeed/startUsageFeed.
-
-// /api/weather (Open-Meteo, keyed by a free-text location) now lives in routes/weather.ts — a fully
-// self-contained extraction (god-file split, Phase 1); its route is spread into GLOBAL_ROUTES below.
 
 // The repo-scoped feeds for one board (git HEAD + the sessions-list ping), started once per board: at
 // startup for the default board, and on mount for the rest (handleBoardMount). Idempotent via
@@ -478,9 +370,6 @@ function startWorktreesFeed(boardId: string, repoPath: string): void {
     .on("unlinkDir", ping);
 }
 
-// ── shadow-git committer moved to server-orchestration.ts (P5 sub-step 3): shadowRoots/SHADOW_SETTLE_MS/
-// shadowIgnored/EDIT_TOOL_PATH/shadowTargetFor/foldShadowEdits/syncShadowRoots. The ShadowRootHandle type
-// stays in the shell (it types CanvasFsState.shadowRoots); startWorktreesFeed/startBoardFeeds import syncShadowRoots.
 
 function startBoardFeeds(boardId: string, repoPath: string): void {
   if (boardFeedsStarted.has(boardId)) return;
@@ -510,8 +399,6 @@ function startFeeds(): void {
   startCardTypesFeed();
   startBoardFeeds(DEFAULT_BOARD.boardId, DEFAULT_BOARD.repoPath);
 }
-
-// startCardTypesFeed (the template-edit watch feed) moved to server-orchestration.ts (P5 sub-step 3).
 
 // ── agent bus (demo §10 step 4: the MCP server's dress rehearsal) ───────────────────────────────
 // In-band agent interaction over plain HTTP. An agent POSTs a Command to /api/command; the server
@@ -679,12 +566,6 @@ function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: stri
 // join/leave/invite are server-fulfilled by EMITTING the addEdge/removeEdge over the bus, so the agent
 // never has to construct node/edge ids — it works in thread ids + its own sid only.
 
-// The snapshot/log resolvers (boardSnapshotRecords, nodeSessionId, sessionNodeForSid, threadNode,
-// sessionNameForSid, threadMemberSids) + the backlog-visibility seed (seedCursor/historyKey) moved to
-// server-snapshot.ts (P5 sub-step 3). pendingHistoryMode is reached via fsState (routes/threads.ts).
-
-// clearBlockedIntents + resumeRunning (the idle→running self-freshen) moved to server-sessions.ts (P5 sub-step 2).
-
 // Wire the ServerContext seam ONCE at module load (before configureServer runs). The references handed in
 // are the same globalThis-pinned singletons the rest of this file holds, so a route handler lifted into a
 // `routes/*.ts` module in a later phase reaches identical state via getServerContext() — no fork across a
@@ -760,8 +641,8 @@ setServerContext({
   endSession,
   ensureSessionFeed,
   // Engine op the extracted server-sessions.ts calls back into: foldSessionEvent folds an assistant tool_use /
-  // user tool_result into the shadow-git committer. Its def is the shadow-git cluster (P5 sub-step 3), so it
-  // stays in the shell for now and the seam injects it, exactly like the delivery ops above.
+  // user tool_result into the shadow-git committer. Its def lives in server-orchestration.ts (with the
+  // shadow-git cluster); the seam injects it here, exactly like the delivery ops above.
   foldShadowEdits,
 });
 
@@ -776,9 +657,9 @@ setServerContext({
 // the ladder's `&& req.method === "POST"` arms did; a route without one matches any verb and branches on
 // the method inside its handler (the ladder's `if (req.method === "POST") … else …` arms).
 // The matcher combinators (exact/oneOf/prefix/re) + the three staged route shapes (GlobalRoute/BoardRoute/
-// RootRoute) now live in routes/router.ts so an extracted route module declares its registrations in the
-// same vocabulary; imported at the top of this file. Extracted concerns (Phase 1: weather, card-types)
-// export a route array that is SPREAD into the stage table at the arm-order position their inline entry held.
+// RootRoute) live in routes/router.ts (imported at the top) so an extracted route module declares its
+// registrations in the same vocabulary; each exports a route array SPREAD into the stage table at the
+// arm-order position its inline entry held.
 
 // The dispatch seam's error boundary (BUG-4b). A route's `run` is typed `void` but most handlers are async;
 // a synchronous throw OR a rejected promise used to escape the dispatcher as an UNHANDLED rejection — never a
