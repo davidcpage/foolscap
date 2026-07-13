@@ -11,7 +11,7 @@ import {
   setReopenSet,
   threadMembersFromMeta,
 } from "./thread-ledger.js";
-import { readBoardSnapshot } from "./board-persist.js";
+import { boardStoreRecords } from "./board-engine.js";
 import { publishThreadFeed } from "./server-delivery.js";
 import type { SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 
@@ -83,8 +83,8 @@ export function seedThreadLogs(repoPath: string): void {
   // joined BEFORE this became marker-backed (its marker has no `members` yet) is still adopted as durable
   // on boot. Without this, such a member counts only while its edge lives, and a card delete would drop it
   // — the migration gap for memberships that predate the fix. Idempotent; writes the marker as it adopts.
-  const snap = readBoardSnapshot(repoPath) as { records?: Array<Record<string, unknown>> } | null;
-  for (const r of snap?.records ?? [])
+  const records = boardStoreRecords(boardIdentity(repoPath).boardId, repoPath) ?? [];
+  for (const r of records)
     if (r.typeName === RECORD_TYPE.edge && String(r.type) === EDGE_TYPE.memberOpen) {
       const sid = sidFromSessionNode(String(r.from));
       if (sid) recordDurableMember(repoPath, String(r.to), sid, Date.now());
@@ -327,17 +327,16 @@ export function captureReopenSets(boardId: string, records: Array<Record<string,
   }
 }
 
-// The records of a board's DURABLE snapshot (`.canvas/board/snapshot.json` — the same one hydrate
-// serves), or null if the board has never saved one. Used for all server-side node/edge resolution
-// (thread membership, session-card lookup, spawn positioning); it no longer needs a live tab, only a
-// board that has persisted at least once. Lags a just-committed change by the ~400ms save debounce —
-// the same window the old tab-push had.
+// The records of a board's live server-materialized store (board-engine, §9 stage 1 — hydrated from
+// snapshot.json + the events.jsonl tail and kept current as events land), or null if the board has
+// nothing persisted yet. Used for all server-side node/edge resolution (thread membership, session-card
+// lookup, spawn positioning); it no longer needs a live tab, and no longer lags by the ~400ms snapshot
+// debounce — a read reflects the event tail the cache hasn't absorbed.
 export function boardSnapshotRecords(boardId: string): Array<Record<string, unknown>> | null {
   const { boards } = getServerContext();
   const b = boards.get(boardId);
   if (!b) return null;
-  const snap = readBoardSnapshot(b.repoPath) as { records?: Array<Record<string, unknown>> } | null;
-  return snap?.records ?? null;
+  return boardStoreRecords(boardId, b.repoPath);
 }
 
 // A session card carries its session id as the node title (loader.ts: node id node:session:<sid> /

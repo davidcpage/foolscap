@@ -16,6 +16,7 @@ import { intentLine, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
 import { parseWorktreePorcelain } from "./worktrees.js";
 import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
+import { boardStoreCanvasSnapshot, type BoardEngineEntry } from "./board-engine.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
@@ -566,6 +567,7 @@ export interface CanvasFsState {
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
   lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
   pendingBusReplay?: Map<string, PendingBusCommand[]>; // boardId → creation commands that reached no live tab, replayed on the next ws-attach (Bug A/C persist-gap)
+  boardEngines?: Map<string, BoardEngineEntry>; // boardId → the live server-materialized core Store (board-engine.ts, design §9 stage 1)
 }
 type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
@@ -1020,10 +1022,14 @@ function handleCanvasGet(res: ServerResponse, boardId: string): void {
   const { events, snapshot } = readBoardPersist(b.repoPath);
   if (!snapshot && events.length === 0)
     return sendJson(res, 404, { error: "no board state persisted yet" });
+  // Records served from the live server-materialized store (board-engine, §9 stage 1): fresher than the
+  // debounced snapshot.json cache — it already reflects the event tail. version/seq ride for shape-compat;
+  // `live` is non-null past the 404 guard, the fallbacks are belt-and-braces.
+  const live = boardStoreCanvasSnapshot(boardId, b.repoPath);
   sendJson(res, 200, {
     ts: boardPersistMtime(b.repoPath),
     tabs: tabCountFor(boardId),
-    snapshot: snapshot ?? { records: [], version: 0 },
+    snapshot: live ?? snapshot ?? { records: [], version: 0 },
     recentIntent: describeBoardEvents(events),
   });
 }
