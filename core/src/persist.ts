@@ -125,6 +125,13 @@ export class Persistence implements IntentLog {
   since(seq: number): IntentEvent[] {
     return this.mem.since(seq);
   }
+  /** Adopt a seq the server assigned (design §10): once the server is the single append point it mints
+   *  the authoritative seq for every event — this tab's own gestures (returned by the durable append)
+   *  and peer/agent commits (carried on the inbound diff). Advancing the mirror's watermark keeps the
+   *  next locally-minted seq above the server's and the debounced snapshot stamping an honest watermark. */
+  adoptSeq(seq: number): void {
+    this.mem.adopt(seq);
+  }
   all(): IntentEvent[] {
     return this.mem.all();
   }

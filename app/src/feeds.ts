@@ -1,4 +1,4 @@
-import type { Subscribable } from "./lib";
+import type { RecordsDiff, Subscribable } from "./lib";
 import { activeBoardId } from "./board";
 
 // Off-log FEED signals — the clock's pattern generalized (demo §10: each feed is "the clock with a
@@ -29,31 +29,34 @@ export interface HnStory {
   score: number;
 }
 
-// Server frames, multiplexed by `ch`: a feed value, a bus command for this tab's board, or a file
-// event for a subscribed root.
-export interface BusCommand {
-  type: string;
-  payload?: Record<string, unknown>;
-  actor?: string;
-}
+// Server frames, multiplexed by `ch`: a feed value, a committed board DIFF for this tab's board (design
+// §9 stage 2 — the server commits a bus command and pushes the resulting diff + its authoritative seq,
+// not the command), or a file event for a subscribed root.
 interface ServerFrame {
   ch: "feed" | "bus" | "watch";
   feed?: string;
   value?: unknown;
-  cmd?: BusCommand;
+  diff?: RecordsDiff;
+  seq?: number;
   root?: string;
   ev?: { type: string; path: string };
+}
+/** A committed diff pushed over the bus: the record changes to apply as a "remote" change + the server's
+ *  authoritative seq for the tab's Persistence mirror to adopt (§10). */
+export interface BusDiff {
+  diff: RecordsDiff;
+  seq: number;
 }
 
 const values = new Map<string, unknown>();
 const subs = new Map<string, Set<() => void>>();
-const busSubs = new Set<(cmd: BusCommand) => void>();
-// Bus commands that arrived before a consumer registered. The socket opens on the FIRST subscription of
+const busSubs = new Set<(diff: RecordsDiff, seq: number) => void>();
+// Bus diffs that arrived before a consumer registered. The socket opens on the FIRST subscription of
 // ANY kind (a feed card during render), but connectAgentBus — the one bus consumer — registers later, in
-// a post-mount effect. Without this queue a command in that gap is dropped, which is exactly when the
-// server replays a no-tab board's buffered spawn cards / created nodes on attach (Bug A/C). Queue when
-// there's no consumer; drained to the first busSub. Bounded (generous) against an unbounded no-consumer run.
-const pendingBus: BusCommand[] = [];
+// a post-mount effect. Without this queue a diff in that gap is dropped, which is exactly when a peer/agent
+// commits while this tab is still booting. Queue when there's no consumer; drained to the first busSub.
+// Bounded (generous) against an unbounded no-consumer run.
+const pendingBus: BusDiff[] = [];
 const MAX_PENDING_BUS = 1000;
 const watchSubs = new Map<string, Set<(ev: { type: string; path: string }) => void>>();
 let ws: WebSocket | null = null;
@@ -83,11 +86,12 @@ function ensureConnected(): void {
     if (frame.ch === "feed" && frame.feed != null) {
       values.set(frame.feed, frame.value);
       for (const fn of subs.get(frame.feed) ?? []) fn();
-    } else if (frame.ch === "bus" && frame.cmd) {
+    } else if (frame.ch === "bus" && frame.diff && typeof frame.seq === "number") {
+      const busDiff: BusDiff = { diff: frame.diff, seq: frame.seq };
       if (busSubs.size === 0) {
-        pendingBus.push(frame.cmd); // no consumer yet — hold it (see pendingBus above)
+        pendingBus.push(busDiff); // no consumer yet — hold it (see pendingBus above)
         if (pendingBus.length > MAX_PENDING_BUS) pendingBus.shift();
-      } else for (const fn of busSubs) fn(frame.cmd);
+      } else for (const fn of busSubs) fn(busDiff.diff, busDiff.seq);
     } else if (frame.ch === "watch" && frame.root != null && frame.ev) {
       for (const fn of watchSubs.get(frame.root) ?? []) fn(frame.ev);
     }
@@ -107,17 +111,18 @@ function ensureConnected(): void {
   };
 }
 
-// The agent-bus command stream (agentBus.ts is the one consumer): every Command an agent POSTs to
-// /api/command for this tab's board arrives here, to be run through editor.commit.
-export function onBusCommand(fn: (cmd: BusCommand) => void): () => void {
+// The agent-bus diff stream (agentBus.ts is the one consumer): the server commits every command an agent
+// POSTs to /api/command for this tab's board and pushes the resulting diff + authoritative seq here, to be
+// applied via store.applyDiffAsChange(diff, "remote") — never re-committed (design §9 stage 2).
+export function onBusDiff(fn: (diff: RecordsDiff, seq: number) => void): () => void {
   const firstConsumer = busSubs.size === 0;
   busSubs.add(fn);
   ensureConnected();
-  // Drain anything that arrived before this first consumer (a server replay-on-attach, a peer's edit
-  // during boot) so it isn't lost — the raison d'être of pendingBus above.
+  // Drain anything that arrived before this first consumer (a peer's edit during boot) so it isn't lost —
+  // the raison d'être of pendingBus above.
   if (firstConsumer && pendingBus.length) {
     const queued = pendingBus.splice(0, pendingBus.length);
-    for (const cmd of queued) for (const g of busSubs) g(cmd);
+    for (const d of queued) for (const g of busSubs) g(d.diff, d.seq);
   }
   return () => busSubs.delete(fn);
 }

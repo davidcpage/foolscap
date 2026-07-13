@@ -3,7 +3,6 @@ import { sendJson, readBody } from "../server-http.js";
 import { getServerContext } from "../server-context.js";
 import { prefix, type GlobalRoute } from "./router.js";
 import {
-  appendBoardEvent,
   clearBoardPersist,
   compactBoardEvents,
   importBoardPersist,
@@ -11,16 +10,16 @@ import {
   readBoardSnapshot,
   writeBoardSnapshot,
 } from "../board-persist.js";
-import { dropBoardEngine, foldBoardEvent, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
+import { appendTabEvent, dropBoardEngine, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) — Phase 1 split ─
 // The browser's EventStore/SnapshotStore (core's persistence seam) are HTTP clients over these endpoints
 // (app/src/remote-store.ts); board-persist.js owns the files under `<repo>/.canvas/board/`. IndexedDB is
 // retired as the durable tier — a board opened in any browser/profile/machine hydrates from the repo's own
 // `.canvas/`, and `import` adopts a board's pre-existing IndexedDB state once. Writes THROW on failure and
-// 500 here — the client store retries; a swallowed event is data loss. The second-writer tripwire + the
-// membership-diff onboarding reach shared state (fsState.lastEventSeq, announceNewMemberships) through the
-// ServerContext, so the handler moves out while its cross-request state stays in the god-file.
+// 500 here — the client store retries; a swallowed event is data loss. §9 stage 2: the /event echo mints
+// the authoritative seq on the single server-side append point (board-engine.appendTabEvent) and the
+// membership-diff onboarding (announceNewMemberships) reaches shared state through the ServerContext.
 async function handleBoardPersistWrite(
   req: IncomingMessage,
   res: ServerResponse,
@@ -40,28 +39,15 @@ async function handleBoardPersistWrite(
       if (typeof body.event !== "object" || body.event === null)
         return sendJson(res, 400, { error: "missing event" });
       const ev = body.event as Record<string, unknown>;
-      // Second-writer tripwire: tabs mint their own seq (core/src/log.ts), so the log is single-
-      // sequencer only while ONE tab writes. A non-monotonic append means a second writer (another
-      // tab, a leaked headless probe) is interleaving — the append still lands (refusing would lose
-      // a real gesture), but the collision must be LOUD, not discovered at hydrate. Seeded from the
-      // snapshot watermark on the first append after boot, so a stale writer trips even then.
-      const lastEventSeq = (ctx.fsState.lastEventSeq ??= new Map<string, number>());
-      if (typeof ev.seq === "number") {
-        const stored = readBoardSnapshot(repoPath) as { seq?: unknown } | null;
-        const last = lastEventSeq.get(boardId) ?? (stored && typeof stored.seq === "number" ? stored.seq : undefined);
-        if (last !== undefined && ev.seq <= last)
-          console.warn(
-            `[boards] event seq collision on ${boardId}: got ${ev.seq} after ${last} — ` +
-              `a second writer is appending (another tab or a leaked probe); the log now holds conflicting seqs`,
-          );
-        if (last === undefined || ev.seq > last) lastEventSeq.set(boardId, ev.seq);
-      }
-      appendBoardEvent(repoPath, ev);
-      // §9 stage 1: fold the just-appended event into the live server-materialized store (read authority),
-      // so every server-side read reflects it without waiting on the debounced snapshot.json cache. Purely
-      // OBSERVES the append — the write above is unchanged; a fold error self-heals (drops → rehydrate).
-      foldBoardEvent(boardId, repoPath, ev);
-      return sendJson(res, 200, { ok: true });
+      // §9 stage 2 / §10 seq handover: the server is the single APPEND POINT. It assigns the board's
+      // next authoritative seq (ignoring the tab's provisional one), durably appends the tab-originated
+      // (human gesture) event with it, folds the diff into the live server store (read authority), and
+      // RETURNS the seq for the tab's in-memory mirror to adopt. This retires the old second-writer
+      // tripwire: a bus commit and a human gesture can no longer be handed the same seq, because both
+      // now mint from this one server-side counter. (Bus commands never reach here — they commit via
+      // /api/command; only tab-local human gestures still echo through this route in stages 1–2.)
+      const seq = appendTabEvent(boardId, repoPath, ev);
+      return sendJson(res, 200, { ok: true, seq });
     }
     if (kind === "snapshot") {
       if (typeof body.snapshot !== "object" || body.snapshot === null)

@@ -116,7 +116,7 @@ export interface ServerContext {
     boardId: string,
     cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
     origin: string,
-  ) => number;
+  ) => import("../core/src/log.js").IntentEvent | null;
   forgetDurableMember: (repoPath: string | undefined, threadId: string, sid: string) => void;
   // Engine ops the extracted channel-delivery/wake module (server-delivery.ts, P5 sub-step 1) reaches back
   // into. Their DEFINITIONS still live in the shell (session/spawn = sub-step 2; heartbeat + membership

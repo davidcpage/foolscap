@@ -205,3 +205,38 @@ test("hydrate emits nothing on channel 2, so it doesn't pollute undo on reload",
   const undo = new UndoManager(store2);
   assert.equal(undo.canUndo, false);
 });
+
+// ── stage-2 tab semantics (design §9 stage 2 / §10): a server-committed bus diff ingested over the wire ──
+// The server now owns command authority: the tab receives a committed DIFF + the server's authoritative
+// seq (not the command) and applies it via applyDiffAsChange(diff,"remote") + persistence.adoptSeq(seq)
+// (agentBus.ts). This proves the three properties that keeps: not re-logged (one event per command, minted
+// at the server), not undoable by a human ⌘Z (source "remote"), and the seq is adopted so the tab's next
+// locally-minted gesture can't collide with a bus seq.
+test("stage-2: a remote (server bus) diff is applied but NOT re-logged, NOT undoable, and its seq is adopted", () => {
+  const { editor, persistence } = makeApp();
+  const undo = new UndoManager(editor.store);
+
+  // The tab's own human gesture: logged locally (seq 1), undoable.
+  editor.commit({ type: "addNode", actor: "human", payload: { id: "node:a", title: "A" } });
+  assert.equal(persistence.all().length, 1, "the human gesture is in the tab's log");
+
+  // A server BUS command the tab never sees as a command — only its diff arrives, carrying the server's
+  // authoritative seq (the server is now at seq 4 after other bus commits this tab didn't log).
+  const nodeB: NodeRecord = { typeName: "node", id: "node:b", type: "note", title: "B", text: "", color: "blue" };
+  const busDiff = { added: { "node:b": nodeB }, updated: {}, removed: {} };
+  editor.store.applyDiffAsChange(busDiff, "remote");
+  persistence.adoptSeq(4);
+
+  assert.ok(editor.store.get("node:b"), "the remote (bus) diff is applied to the store");
+  assert.equal(persistence.all().length, 1, "a remote diff is NOT re-logged by the tab (the server already appended it)");
+
+  // Seq adoption (§10): the tab's NEXT locally-minted seq sits ABOVE the adopted server seq (4), so a human
+  // gesture echoed to the server can't be handed a seq a bus command already used.
+  const ev = editor.commit({ type: "setTitle", actor: "human", payload: { id: "node:b", title: "B2" } });
+  assert.equal(ev.seq, 5, "the next gesture mints seq 5, above the adopted server watermark of 4");
+
+  // A human ⌘Z pops the human gestures, never the remote change.
+  undo.undo(); // reverts setTitle B2 → B
+  assert.equal(editor.store.get<"node">("node:b")?.title, "B", "undo reverted the human setTitle");
+  assert.ok(editor.store.get("node:b"), "the remote-added node itself survives undo");
+});

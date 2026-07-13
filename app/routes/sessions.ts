@@ -258,11 +258,10 @@ async function handleSessionSpawn(
   // Optionally drop the session's canvas card (and, with `channel`, its member:open edge) HERE on the
   // server, so the curl/wrapper caller doesn't addNode + addEdge by hand. The win is POSITIONING (the server
   // reads the channel card's position from the last snapshot and places the worker beside it, vs an agent
-  // guessing coordinates badly) AND robustness: dispatchBusCommand records the member:open in the
-  // immediate-membership registry, so a task the Coordinator posts right after this reliably wakes the worker even
-  // before the snapshot round-trips. `carded` reports whether a live tab applied it NOW — `false` no longer
-  // means the card was LOST: dispatchBusCommand buffers the card+edge for replay on the next tab attach
-  // (Bug A persist-gap fix), so `carded:false` means "deferred until a tab connects", not "gone".
+  // guessing coordinates badly) AND robustness: §9 stage 2 commits the card + member:open edge durably
+  // server-side (dispatchBusCommand → commitBoardCommand), so a task the Coordinator posts right after this
+  // reliably resolves the worker's membership even with no live tab and before any snapshot round-trip.
+  // `carded` now means simply "created" (always true when card params are given) — never "deferred/lost".
   // Browser-initiated spawns omit these params and keep placing their own card. `card:true` = a standalone card.
   let carded = false;
   if (threadId || body.card === true) {
@@ -272,7 +271,9 @@ async function handleSessionSpawn(
       id: node, type: "session", title: id, color: roleColour ?? "blue", ...placeWorkerCard(records, threadId),
     };
     if (roleName) nodePayload.name = `${roleName}.${id.slice(0, 8)}`;
-    carded = dispatchBusCommand(boardId, { type: "addNode", actor: "system", payload: nodePayload }, origin) > 0;
+    // §9 stage 2: the card (+ member:open edge) is committed + made durable server-side here — no live tab
+    // required, so it's always created (`carded` now means "created", never "deferred until a tab attaches").
+    carded = !!dispatchBusCommand(boardId, { type: "addNode", actor: "system", payload: nodePayload }, origin);
     if (threadId)
       dispatchBusCommand(
         boardId,

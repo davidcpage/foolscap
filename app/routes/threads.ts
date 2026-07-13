@@ -344,11 +344,12 @@ async function handleThreadMembership(
   const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
   const type = action === "join" ? "member:open" : "member:pending";
   const cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
-  const delivered = dispatchBusCommand(boardId, cmd, origin);
-  if (delivered === 0) return sendJson(res, 503, { error: "no tab of this board is live to apply it", delivered: 0 });
-  // T3b: a join doesn't return until its member:open edge is in the saved snapshot (waitForEdgePersisted),
-  // so the caller can message/ask straight away without racing the ~400ms persist. `persisted:false` means
-  // the block timed out (the emitted-membership bridge still covers membership); leave/invite don't wait.
+  // §9 stage 2: the edge is committed + made durable server-side here (no live tab required — the old
+  // 503-on-no-tab is retired). commitBoardCommand folds it into the live store synchronously, so the
+  // member:open edge is visible to server reads (threadNode / waitForEdgePersisted) the instant this returns.
+  dispatchBusCommand(boardId, cmd, origin);
+  // T3b: a join doesn't return until its member:open edge is visible in the live store (waitForEdgePersisted),
+  // so the caller can message/ask straight away. Now durable at commit, this resolves on the first poll.
   const persisted = action === "join" ? await waitForEdgePersisted(boardId, String(cmd.payload.id), JOIN_PERSIST_TIMEOUT_MS) : undefined;
   sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid, ...(persisted === undefined ? {} : { persisted }) });
 }

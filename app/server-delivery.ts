@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { RECORD_TYPE, EDGE_TYPE, MEMBER_EDGE_PREFIX } from "../core/src/records.js";
+import type { IntentEvent } from "../core/src/log.js";
+import { defaultCommands } from "../core/src/commands.js";
 import { getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
-import { bufferBusReplay, takeBusReplay, MAX_PENDING_BUS_REPLAY } from "./bus-replay-buffer.js";
+import { commitBoardCommand } from "./board-engine.js";
 import {
   appendThreadLine,
   fillSeat,
@@ -19,7 +21,7 @@ import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { wakesSeat } from "./notification-levels.js";
 import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
 import type { WorkIntent } from "./work-intent.js";
-import type { LiveSession, PendingBusCommand, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
+import type { LiveSession, SnapNode, ThreadMsg } from "./vite-fs-plugin.js";
 
 // ── the channel-delivery / wake engine (P5 sub-step 1) ─────────────────────────────────────────────
 // The first ENGINE module of the P5 god-file split. Where server-context.ts is the DI seam and
@@ -311,66 +313,78 @@ export function ensureCommandId(
   return String(payload.id);
 }
 
-// Broadcast a command to a board's tabs (the board lives in the browser, so a mutation is an addEdge/
-// removeEdge the tab applies) and fire the membership-announce side-effect. Returns the tab count it
-// reached — 0 means no tab of this board is live, so the command went nowhere. Shared by the generic bus
-// (handleCommand) and the channel join/leave/invite endpoints, so a UI-drawn join and an agent's POST
-// /join both announce identically.
+// Thread cards need a legible default size: core's generic 200×120 addNode fallback renders a thread card
+// (head + log + composer) unreadably cramped. Every tab-side creation path passes these explicitly
+// (src/threads.ts THREAD_CARD_W/H); before stage 2 the tab's bus consumer (agentBus.ts) injected them on
+// inbound commands. Now that the SERVER commits the command, it must stamp the default here — explicit w/h
+// in the payload still wins. Kept in sync with src/threads.ts (a renderer constant, duplicated not shared:
+// this module has no browser imports).
+const THREAD_CARD_W = 460;
+const THREAD_CARD_H = 420;
+function withServerCommandDefaults(cmd: { type: string; payload?: Record<string, unknown> }): void {
+  if (cmd.type === "addNode" && cmd.payload?.type === "thread") {
+    if (cmd.payload.w == null) cmd.payload.w = THREAD_CARD_W;
+    if (cmd.payload.h == null) cmd.payload.h = THREAD_CARD_H;
+  }
+}
+
+// COMMIT a bus command server-side (design §9 stage 2) and broadcast its DIFF to the board's tabs. The
+// server is the single append point: commitBoardCommand validates via core's defaultCommands, appends ONE
+// seq'd IntentEvent durably, and folds the change into the live store — so the mutation is durable and
+// visible to every server read the instant this returns, with or without a live tab. What crosses the wire
+// to tabs is the resulting DIFF (applied as a "remote" change, never re-committed → one event per command),
+// not the command. Returns the committed IntentEvent (its `diff` + authoritative `seq`), or null if the
+// command was rejected (unknown type / no repo). Shared by the generic bus (handleCommand) and the channel
+// join/leave/invite + spawn endpoints, so an agent POST and a server-placed card commit identically.
 export function dispatchBusCommand(
   boardId: string,
   cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
   origin: string,
-): number {
-  const { fsState, trackEmittedMembership } = getServerContext();
+): IntentEvent | null {
+  const { fsState, trackEmittedMembership, boards } = getServerContext();
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) {
+    console.warn(`[bus] no repo for board ${boardId} — command "${cmd.type}" dropped`);
+    return null;
+  }
+  // The Editor's validation IS the bus's validation. Pre-check the type against the known handlers so an
+  // unknown command is a clean reject (null → 400) rather than a thrown 500 — and so a genuine durable-write
+  // failure inside commitBoardCommand still propagates (→ 500, the client retries), never masked as a reject.
+  if (!Object.hasOwn(defaultCommands, cmd.type)) {
+    console.warn(`[bus] unknown command "${cmd.type}" on ${boardId} — rejected`);
+    return null;
+  }
+  withServerCommandDefaults(cmd);
+  const event = commitBoardCommand(boardId, repoPath, {
+    type: cmd.type,
+    payload: cmd.payload ?? {},
+    actor: cmd.actor ?? "system",
+  });
+  broadcastBusDiff(boardId, event.diff, event.seq);
+  // The board DID change — durably, server-side — so onboarding fires unconditionally now (no longer gated
+  // on a live tab: a headless join/spawn must still wake its member). Non-member commands early-return
+  // inside these. The snapshot-diff trigger (announceNewMemberships) still covers a human-drawn join and
+  // dedups against this via the announcedMemberships Set, so the two paths remain idempotent.
+  trackEmittedMembership(cmd); // front-run the snapshot so a post right after a spawn/join wakes the new member
+  maybeAnnounceMembership(boardId, cmd, origin);
+  return event;
+}
+
+// Push a committed diff to a board's tabs over the existing bus (WS for the app's tabs; the SSE set is the
+// compat path). A tab applies it with store.applyDiffAsChange(diff, "remote") — a channel-2 remote change,
+// never re-committed or re-echoed. The `seq` rides along so the tab's Persistence mirror can adopt the
+// server's authoritative watermark (design §10). Returns the tab count reached (informational only — a
+// bus command is already durable regardless of who's listening).
+function broadcastBusDiff(boardId: string, diff: unknown, seq: number): number {
+  const { fsState } = getServerContext();
   const busClients = getBusClients(fsState);
   const wsClients = getWsClients(fsState);
   const clients = busClients.get(boardId); // SSE compat path — the app's tabs ride /api/ws now
   const sockets = [...wsClients].filter((c) => c.boardId === boardId);
-  const delivered = (clients?.size ?? 0) + sockets.length;
-  const frame = `data: ${JSON.stringify(cmd)}\n\n`;
+  const frame = `data: ${JSON.stringify({ diff, seq })}\n\n`;
   if (clients) for (const c of clients) c.res.write(frame);
-  for (const c of sockets) c.send({ ch: "bus", cmd });
-  // Persist-gap guard (Bug A summon card/edge loss + Bug C headless-created node invisible): the bus is a
-  // broadcast relay — it never writes the durable store GET /api/canvas serves; only a tab's debounced
-  // Persistence save does. So a CREATION command (addNode/addEdge) that reached no live tab is lost forever
-  // unless we hold it for replay. A remove for the same id prunes any buffered create (even when a tab WAS
-  // live for the remove) so a create-then-delete with no persisting tab in between nets to nothing.
-  if (cmd.type === "removeNode" || cmd.type === "removeEdge") bufferOrPruneBusCommand(boardId, cmd);
-  else if (delivered === 0) bufferOrPruneBusCommand(boardId, cmd);
-  // Only announce if a tab actually applied it — a command that reached no tab (delivered=0) didn't change
-  // the board, so announcing a join/invite that never landed would be a phantom (and double-fire on retry).
-  // A buffered member:open edge self-heals its onboarding via the snapshot-diff path (announceNewMemberships)
-  // once the replay tab persists it — the same path a human-drawn join takes.
-  if (delivered > 0) {
-    trackEmittedMembership(cmd); // front-run the snapshot so a post right after a spawn/join wakes the new member
-    maybeAnnounceMembership(boardId, cmd, origin);
-  }
-  return delivered;
-}
-
-// ── the spawn/create persist-gap buffer (Bug A + Bug C) ─────────────────────────────────────────────
-// The buffer ALGEBRA (which commands to hold, prune-on-remove, the cap) is the pure, hermetically-tested
-// module bus-replay-buffer.js (like node-cascade.js); here we own only the fsState wiring. The per-board
-// buffer Map lives on fsState so it survives a hot re-eval (THE RULE).
-function bufferOrPruneBusCommand(
-  boardId: string,
-  cmd: { type: string; payload?: Record<string, unknown>; actor?: string },
-): void {
-  const { fsState } = getServerContext();
-  const pending = (fsState.pendingBusReplay ??= new Map<string, PendingBusCommand[]>());
-  const { dropped } = bufferBusReplay(pending, boardId, cmd);
-  if (dropped > 0)
-    console.warn(
-      `[bus] pending-replay buffer for ${boardId} exceeded ${MAX_PENDING_BUS_REPLAY}; dropped ${dropped} oldest ` +
-        `command(s) — no live tab has attached to persist them`,
-    );
-}
-
-// Drain (and CLEAR) a board's buffered creation commands — the ws-attach handler replays these to the
-// freshly-attached tab right after feedValues. First attacher wins: clearing stops a second tab re-applying
-// a duplicate addNode (it hydrates the now-persisted records instead).
-export function drainPendingBusReplay(boardId: string): PendingBusCommand[] {
-  return takeBusReplay(getServerContext().fsState.pendingBusReplay, boardId) as PendingBusCommand[];
+  for (const c of sockets) c.send({ ch: "bus", diff, seq });
+  return (clients?.size ?? 0) + sockets.length;
 }
 
 // Onboarding's SECOND trigger. The first is dispatchBusCommand, which fires for an agent-initiated POST

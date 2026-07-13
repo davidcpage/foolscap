@@ -964,20 +964,18 @@ export function serverSpawnWorker(opts: {
     ...placeWorkerCard(records, opts.anchorNodeId),
   };
   if (role?.name) nodePayload.name = `${role.name}.${id.slice(0, 8)}`;
-  const carded = dispatchBusCommand(opts.boardId, { type: "addNode", actor: "system", payload: nodePayload }, opts.origin) > 0;
+  // §9 stage 2: the card (+ member:open edge) commits durably server-side here — no live tab required.
+  const carded = !!dispatchBusCommand(opts.boardId, { type: "addNode", actor: "system", payload: nodePayload }, opts.origin);
   if (opts.threadId)
     dispatchBusCommand(
       opts.boardId,
       { type: "addEdge", actor: "system", payload: { id: `edge:member:${id}:${opts.threadId}`, from: node, to: opts.threadId, type: "member:open" } },
       opts.origin,
     );
-  // Honest reporting (Bug A): the process is live regardless, but if NO tab was connected the card+edge
-  // reached no one. They are no longer LOST — dispatchBusCommand buffered them for replay on the next tab
-  // attach — but say so, so a summon with no live tab isn't mistaken for a fully-carded one.
   if (!carded)
     console.warn(
-      `[auto-wake] no live tab on ${opts.boardId} when spawning ${id} (${opts.claimKey}) — session card + ` +
-        `member:open edge BUFFERED for replay on the next tab attach (not lost); the session process is live.`,
+      `[auto-wake] failed to commit the session card for ${id} (${opts.claimKey}) on ${opts.boardId} ` +
+        `(unknown board / rejected command); the session process is live regardless.`,
     );
   sendSessionInput(id, opts.firstPrompt);
   return id;
