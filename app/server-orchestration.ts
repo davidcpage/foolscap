@@ -4,7 +4,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import type { IncomingMessage } from "node:http";
 import chokidar from "chokidar";
-import { getServerContext, getWsClients } from "./server-context.js";
+import { getServerContext, getShadowRoots, getWsClients } from "./server-context.js";
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands } from "./server-sessions.js";
@@ -17,8 +17,8 @@ import { readWatchers } from "./doc-watch.js";
 import { listWorktrees, removeWorktree, realpath as wtRealpath } from "./worktrees.js";
 import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
-import { CARD_TYPES_DIR } from "./routes/card-types.js";
-import type { LiveSession } from "./vite-fs-plugin.js";
+import { CARD_TYPES_DIR } from "./server-fs.js";
+import type { LiveSession } from "./server-types.js";
 
 // ── the orchestration ENGINE: feeds + heartbeat/standing-jobs + shadow-git committer (P5 sub-step 3) ──
 // The third ENGINE module of the P5 god-file split (after server-delivery.ts and server-sessions.ts). It
@@ -37,8 +37,6 @@ import type { LiveSession } from "./vite-fs-plugin.js";
 // the WS transport, and the inline route handlers stay in the shell (routing/identity infra); they reach the
 // feed SOURCES + shadow committer + heartbeat here by importing them, and reach board/root resolution back the
 // other way via getServerContext() (all still ctx ops), so there is no runtime import cycle.
-
-type ShadowRootHandle = ReturnType<typeof watchRoot>;
 
 export function publishFeed(feed: string, value: unknown): void {
   const { fsState } = getServerContext();
@@ -661,7 +659,7 @@ const EDIT_TOOL_PATH: Record<string, string> = {
 // to that root, and the live watcher handle. null when no active committer owns the path.
 function shadowTargetFor(s: LiveSession, filePath: string): { key: string; rel: string; handle: ReturnType<typeof watchRoot> } | null {
   const { boardIdentity, boardRoots, fsState } = getServerContext();
-  const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const shadowRoots = getShadowRoots(fsState);
   const abs = path.resolve(s.repoPath, filePath); // tools usually emit absolute paths; resolve relatives off cwd
   const boardId = boardIdentity(s.repoPath).boardId;
   let best: { id: string; path: string } | null = null;
@@ -683,7 +681,7 @@ function shadowTargetFor(s: LiveSession, filePath: string): { key: string; rel: 
 }
 
 export function foldShadowEdits(s: LiveSession, e: { type?: string; message?: { content?: unknown } }): void {
-  const shadowRoots = (getServerContext().fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const shadowRoots = getShadowRoots(getServerContext().fsState);
   const content = e.message?.content;
   if (!Array.isArray(content)) return;
   if (e.type === "assistant") {
@@ -717,7 +715,7 @@ export function foldShadowEdits(s: LiveSession, e: { type?: string; message?: { 
 
 export function syncShadowRoots(boardId: string, repoPath: string): void {
   const { boardRoots, fsState } = getServerContext();
-  const shadowRoots = (fsState.shadowRoots ??= new Map<string, ShadowRootHandle>());
+  const shadowRoots = getShadowRoots(fsState);
   const roots = boardRoots(boardId);
   const live = new Set(roots.map((r) => boardId + "\0" + r.id));
   for (const r of roots) {

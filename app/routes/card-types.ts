@@ -1,21 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ServerResponse } from "node:http";
 import { sendJson, readText } from "../server-http.js";
+import { CARD_TYPES_DIR } from "../server-fs.js";
 import { exact, type GlobalRoute } from "./router.js";
 
 // ── card types (card-types-as-data.md §3/§7: type definitions are data in the folder) ──────────
-// The type registry's server half, lifted out of the god-file (Phase 1). The route handlers live here;
-// the WATCH feed (startCardTypesFeed) stays in vite-fs-plugin.ts for now — it's stateful (rides the feed
-// bus) and a later phase's concern — so this module OWNS the folder path and exports it for the feed and
-// the HMR guard to import. The extraction leans only on stateless helpers (sendJson + readText from
+// The type registry's server half, lifted out of the god-file (Phase 1). The route handlers live here; the
+// WATCH feed (server-orchestration.ts) and the HMR guard (the god-file) are the other consumers. The folder
+// path itself (CARD_TYPES_DIR) lives in server-fs.ts with the other stateless fs primitives, so an engine
+// consumer imports it from a sibling engine/helper rather than from this route module (the wrong-direction
+// edge the split removed). The extraction leans only on stateless helpers (sendJson + readText from
 // server-http.ts): no shared cross-request state, so no ServerContext dependency.
-//
-// `here` resolves relative to THIS module (app/routes/), so the card-types dir is one level up — the same
-// app/card-types folder the god-file's `path.resolve(here, "card-types")` named from app/.
-const here = path.dirname(fileURLToPath(import.meta.url));
-export const CARD_TYPES_DIR = path.resolve(here, "..", "card-types");
 
 // List card-types/*/ (type.yaml + the render.js the browser will import()). A missing folder is an empty
 // registry, not an error. type.yaml is read via the shared preview-bounded readText (a config file is tiny).

@@ -1,5 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { BoardInfo } from "../vite-fs-plugin.js";
+import type { BoardInfo } from "../server-types.js";
 
 // ── the shared route-table vocabulary (god-file split, Phase 1) ────────────────────────────────────
 // The matcher combinators + the three staged route shapes, lifted out of vite-fs-plugin.ts so a route

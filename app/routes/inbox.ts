@@ -4,7 +4,7 @@ import { getServerContext } from "../server-context.js";
 import { exact, type GlobalRoute } from "./router.js";
 import { cardOnly } from "../thread-waiting.js";
 import { readThreadLog, readPins } from "../thread-ledger.js";
-import type { ThreadMsg } from "../vite-fs-plugin.js";
+import type { ThreadMsg } from "../server-types.js";
 
 // ── the inbox read tool (GET /api/inbox) — god-file split, Phase 3 ──────────────────────────────────
 // The read side of channel messaging: an agent GETs this with Bash so unread thread messages land in TOOL

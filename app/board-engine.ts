@@ -6,16 +6,19 @@ import type { Command, IntentEvent } from "../core/src/log.js";
 import { appendBoardEvent, readBoardPersist } from "./board-persist.js";
 import { getServerContext } from "./server-context.js";
 
-// ── the server-materialized board store (board-engine, design §9 stage 1) ───────────────────────────
+// ── the server-materialized board store (board-engine, design §9 stages 1+2) ────────────────────────
 // The server hosts a LIVE core Store per board — hydrated exactly as a tab does (snapshot.json +
 // events.jsonl tail fold via core's hydrate path) and kept current by folding each event that lands at
 // POST /api/board/persist/event. Every server-side read (handleCanvasGet + the server-snapshot.ts
 // resolvers) is served from this store instead of re-reading the debounced snapshot.json cache, so a
 // read reflects the event tail the cache hasn't absorbed yet — the freshness win of design §5.
 //
-// READ AUTHORITY ONLY (stage 1): the write path is untouched. events.jsonl / snapshot.json are still
-// written exactly as before; this module only OBSERVES the event append (after appendBoardEvent) to keep
-// its mirror live, the same way the snapshot branch OBSERVES a save to run its membership/offset hooks.
+// READ AUTHORITY (stage 1) + WRITE AUTHORITY (stage 2, below): the server hosts the authoritative store.
+// Stage 1 keeps the mirror live by OBSERVING each event append (foldBoardEvent, after appendBoardEvent),
+// the same way the snapshot branch OBSERVES a save to run its membership/offset hooks. Stage 2
+// (commitBoardCommand / recordTabEvent) makes the server the single APPEND POINT — /api/command commits
+// server-side into this store and mints the authoritative seq, so a read reflects a bus mutation the
+// instant its response returns (no live tab, no replay buffer). See the WRITE AUTHORITY section below.
 //
 // THE RULE: the store map is pinned on fsState (globalThis) so a Vite plugin-graph re-eval doesn't
 // orphan it. On any doubt after a reload — or if an incremental fold ever throws — we rehydrate from the

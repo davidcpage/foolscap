@@ -1,7 +1,17 @@
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import chokidar from "chokidar";
 import { contentVersion } from "./cas-guard.js";
+
+// The card-type definitions folder (app/card-types/*/). A stateless filesystem location, so it lives here
+// with the other fs primitives rather than in a route module: both the card-types route (routes/card-types.ts,
+// which reads the type.yaml + render.js under it) and the card-types WATCH feed (server-orchestration.ts, an
+// engine) need it, and an engine importing it from a route was the wrong-direction edge the split removed.
+// `here` resolves relative to THIS module (app/), so the folder is one level down — the same app/card-types
+// the god-file's `path.resolve(here, "card-types")` named from app/.
+const here = path.dirname(fileURLToPath(import.meta.url));
+export const CARD_TYPES_DIR = path.resolve(here, "card-types");
 
 // ── the filesystem-serving / confinement helpers ────────────────────────────────────────────────
 // The third stateless seam of the god-file split (after server-http.ts's HTTP plumbing and

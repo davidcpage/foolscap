@@ -2,39 +2,18 @@ import crypto from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
 import { getPendingPermissions, getServerContext } from "../server-context.js";
+import { settlePermission, PERMISSION_HOLD_MS } from "../server-sessions.js";
 import { exact, re, type GlobalRoute } from "./router.js";
 
 // ── permissions (--permission-prompt-tool: the held tool-call prompts) — god-file split, Phase 1 ────
 // The server half of --permission-prompt-tool: the MCP relay's held POST parks here, the card's decision
 // buttons (or a shell twin via /api/permissions) resolve it, and a hold timeout denies-by-default. The
 // held prompts live in the shared registry `fsState.pendingPermissions`, reached via the getPendingPermissions
-// (fsState) lazy accessor (server-context.ts) — initialized in place on first read, no shell load-order dependency. The concern-owned
-// `settlePermission` moved here with its handlers (3 callers, all permission/teardown-scoped); the god-
-// file's teardown path (denySessionPermissions) imports it back. The cross-cutting `publishSession` +
-// `liveSessions` stay in the god-file and are reached through the context. PERMISSION_HOLD_MS lives here
-// now too — its natural home — and the god-file's spawn path imports it to size the relay's MCP timeout.
-
-// The default hold before an unanswered prompt is denied. Long enough that a human who stepped away can
-// still answer; the relay's MCP_TOOL_TIMEOUT is set to exceed this (see the spawn path in the god-file).
-export const PERMISSION_HOLD_MS = 10 * 60_000;
-
-// Resolve a held prompt (decision or timeout): answer the parked relay connection, drop the entry, and
-// repaint the blocked session's card. A no-op if the id is already gone (double-settle, close-after-decide).
-export function settlePermission(permId: string, payload: Record<string, unknown>): void {
-  const ctx = getServerContext();
-  const pending = getPendingPermissions(ctx.fsState);
-  const p = pending.get(permId);
-  if (!p) return;
-  clearTimeout(p.timer);
-  pending.delete(permId);
-  try {
-    sendJson(p.res, 200, payload);
-  } catch {
-    /* relay disconnected — the CLI already gave up on this prompt; nothing left to answer */
-  }
-  const s = ctx.liveSessions.get(p.sid);
-  if (s) ctx.publishSession(s);
-}
+// (fsState) lazy accessor (server-context.ts) — initialized in place on first read, no shell load-order
+// dependency. `settlePermission` + `PERMISSION_HOLD_MS` live in the session engine (server-sessions.ts) and
+// are imported back here: the session-teardown path denies a session's held prompts, so the engine owns them,
+// and this route module — a consumer — depends on the engine rather than the reverse (the wrong-direction
+// edge the split removed). The cross-cutting `publishSession` + `liveSessions` are reached through the context.
 
 // POST /api/permission/request { session, toolName, input, toolUseId? } — the MCP relay's held call.
 // Only a LIVE registry session may hold a prompt (404 otherwise — the relay turns that into its own
