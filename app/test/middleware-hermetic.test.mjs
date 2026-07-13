@@ -43,6 +43,7 @@ const ledger = await import("../thread-ledger.js");
 const filesRoute = await import("../routes/files.ts");
 const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatch-seam error boundary (BUG-4b)
 const inbox = await import("../routes/inbox.ts"); // computeInbox — the inbox read as a pure computation
+const casGuard = await import("../cas-guard.js"); // senderCursorAfterPost — the post-cursor invariant
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -763,4 +764,25 @@ test("computeInbox: an explicit &bytes overrides the default, and a small backlo
   const tiny = inbox.computeInbox("s1", { ...NO_OPTS, bytes: 5 });
   assert.deepEqual(tiny.body.channels[0].messages.map((m) => m.seq), [3], "the byte budget keeps the newest message");
   assert.equal(tiny.body.channels[0].truncated.omitted, 2);
+});
+
+test("dropped-delivery regression: posting while a message from ANOTHER is unread must not swallow it (read tier)", () => {
+  // The exact live repro (meta seq 66): session A read up to seq 1; seq 2 (from B, untagged) arrived; then A
+  // posts seq 3. The old code jumped A's cursor to 3 on its own post, silently marking seq 2 read though A
+  // never saw it. Model the handler's two composed pieces (senderCursorAfterPost + the inbox read) end-to-end.
+  const tid = "node:thread:t";
+  const log = [msg(1, "from B", undefined), { seq: 2, ts: 2, from: "sess-B", text: "interleaved, untagged" }];
+  const { session } = inboxFake("s1", tid, log, { [tid]: 1 }); // A caught up only through seq 1
+  // A posts seq 3 — append it and advance A's cursor exactly as handleThreadMessage does.
+  log.push({ seq: 3, ts: 3, from: "s1", text: "A's own post" });
+  session.read[tid] = casGuard.senderCursorAfterPost(session.read[tid] ?? 0, 3);
+  assert.equal(session.read[tid], 1, "cursor HELD at 1 (not jumped to 3) because seq 2 was unread");
+  // A's next inbox read still serves the interleaved seq 2 (and re-serves its own seq 3 once — the tradeoff).
+  const seqs = inbox.computeInbox("s1", NO_OPTS).body.channels[0].messages.map((m) => m.seq);
+  assert.ok(seqs.includes(2), "the interleaved message from B survives — never silently dropped");
+  assert.deepEqual(seqs, [2, 3], "seq 2 (B) + seq 3 (own, re-served once); nothing lost");
+  // Contrast: had A been caught up (cursor at 2) when it posted, the cursor advances cleanly to 3 (no echo).
+  session.read[tid] = casGuard.senderCursorAfterPost(2, 3);
+  assert.equal(session.read[tid], 3);
+  assert.equal(inbox.computeInbox("s1", NO_OPTS).body.channels.length, 0, "caught-up sender sees no echo of its own post");
 });

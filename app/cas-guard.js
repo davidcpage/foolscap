@@ -47,6 +47,29 @@ export function unreadMentions({ log, cursor, from, members }) {
   );
 }
 
+/**
+ * Where a SESSION sender's read cursor lands AFTER it posts its own message — the write half of the same
+ * read-cursor invariant W11 guards on the read half. A post appends the sender's own message at `ownSeq`
+ * (always the log's new max, seq = prevMax + 1). Marking the sender as having "seen its own message" must
+ * NOT silently mark as read anything that arrived from OTHERS between the sender's last read and this post
+ * (a live repro: an untagged interleaved message, durably appended, was swallowed because the cursor jumped
+ * straight to the sender's own seq). So advance to `ownSeq` ONLY when the sender was fully caught up — its
+ * cursor sat at `ownSeq - 1`, i.e. nothing unread preceded its post. Otherwise HOLD the cursor: the
+ * interleaved unread (and the sender's own post) are served on its next read. Structural, not norm-enforced —
+ * the cursor can never leap past an unread from another, by construction.
+ *
+ * Tradeoff (deliberate, simple > clever): when the sender was NOT caught up, its own just-posted message is
+ * re-served to it once on the next read (harmless echo) — far cheaper than silently dropping a peer's message.
+ *
+ * @param {number} currentCursor  the sender's read cursor before the post (last seq it pulled; 0 if none)
+ * @param {number} ownSeq         the seq assigned to the sender's just-appended message
+ * @returns {number}  the cursor to store: `ownSeq` if caught up, else `currentCursor` unchanged
+ */
+export function senderCursorAfterPost(currentCursor, ownSeq) {
+  const at = typeof currentCursor === "number" ? currentCursor : 0;
+  return at === ownSeq - 1 ? ownSeq : at;
+}
+
 // ── W12 — doc-edit optimistic-concurrency guard ──────────────────────────────────────────────────
 
 /**
