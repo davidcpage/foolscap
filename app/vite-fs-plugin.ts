@@ -2,9 +2,6 @@ import type { Plugin, ViteDevServer } from "vite";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import fs from "node:fs";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
-import crypto from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
 import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
@@ -12,13 +9,13 @@ import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { connectedEdgeIds } from "./node-cascade.js";
 import { intentLine, type WorkIntent } from "./work-intent.js";
 import { deriveThreadState } from "./thread-state.js";
-import { parseWorktreePorcelain } from "./worktrees.js";
 import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
 import { boardStoreCanvasSnapshot } from "./board-engine.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
-import type { BoardInfo, BoardRegistryEntry, CanvasFsState, LiveSession, RootInfo, ThreadMsg, WsClient } from "./server-types.js";
+import type { CanvasFsState, LiveSession, ThreadMsg, WsClient } from "./server-types.js";
+import { boardIdentity, boardRoots, boards, DEFAULT_BOARD, ensureCanvasExcluded, invalidateBoardRoots, readBoardRegistry, recordBoardOpened, reqBoard, rootDir } from "./server-boards.js";
 import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
@@ -58,108 +55,16 @@ import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js"
 // `root` is an ALLOW-LISTED id (never a caller-supplied path), and every file read is re-checked to be
 // inside that root — the middleware runs with the dev server's full fs privileges, so both guards matter.
 
-const here = path.dirname(fileURLToPath(import.meta.url));
+// The board registry / identity / ROOTS engine (boardIdentity, the boards map + its durable registry,
+// reqBoard, boardRoots/rootDir, ensureCanvasExcluded, and the boot-remount/prune side effects) moved to
+// server-boards.ts (F-S3). Every external consumer reaches it through the ServerContext; the shell imports
+// the pieces it still uses directly (boards, DEFAULT_BOARD, reqBoard, boardRoots, rootDir, boardIdentity) at
+// the top of this file.
 
-// The one allow-listed root: the canvas repo itself, derived from the dev-server location so it tracks
-// whatever machine this runs on (no hardcoded user path). Folders are added per-canvas now (the Add-files
-// menu picks a SUBDIR of this root, server-validated by safeResolve) rather than a fixed dataset enum.
-const ROOTS: Record<string, string> = {
-  repo: path.resolve(here, ".."),
-};
-
-// Board identity (Phase 1 of multi-canvas). A board is a target repo plus a STABLE id derived from that
-// repo's realpath — port-independent and restart-stable, so persistence keyed on it survives the dev
-// server bouncing to a different port. `<slug(basename)>-<sha256(realpath)[:8]>` stays human-legible for
-// debugging while the hash keeps two same-named repos apart. The browser fetches this via /api/boards and
-// keys its IndexedDB + camera on the boardId. Phase 2 makes the set of boards dynamic (mount on demand,
-// unify with ROOTS); for now there is exactly one — the dev repo — flagged `default`.
-function slug(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "board";
-}
-function boardIdentity(repoPath: string): { boardId: string; name: string; repoPath: string } {
-  let real = repoPath;
-  try {
-    real = fs.realpathSync(repoPath);
-  } catch {
-    /* unresolvable (deleted/permission) — hash the path as given so the id is still stable */
-  }
-  const hash = crypto.createHash("sha256").update(real).digest("hex").slice(0, 8);
-  const name = path.basename(real);
-  return { boardId: `${slug(name)}-${hash}`, name, repoPath: real };
-}
-
-const DEFAULT_BOARD = boardIdentity(ROOTS.repo!);
-// boardId → its served root + metadata. Pinned on globalThis (like fsState below) so mounts made through
-// /api/boards SURVIVE a dev-server re-eval (a plugin edit re-runs this module in the same process) — an
-// open non-default tab would otherwise 400 on its boardId until the browser re-mounted. The default board
-// (the dev repo) is always present.
-const boards: Map<string, BoardInfo> = ((globalThis as { __canvasBoards?: Map<string, BoardInfo> })
-  .__canvasBoards ??= new Map());
-if (!boards.has(DEFAULT_BOARD.boardId))
-  boards.set(DEFAULT_BOARD.boardId, { root: ROOTS.repo!, name: DEFAULT_BOARD.name, repoPath: DEFAULT_BOARD.repoPath });
 // boardIds whose repo-scoped feeds (githead + sessions-list) are already running — also pinned, since the
 // surviving watchers from before a re-eval keep publishing (they close over the pinned feedClients/Values).
 const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Set<string> })
   .__canvasBoardFeeds ??= new Set());
-
-// ── durable board registry (multi-canvas: mounted boards survive a server restart) ────────────────
-// The in-memory `boards` map dies with the process, which used to mean every non-default board was
-// forgotten on restart: a tab had to re-mount via ?repo=, and until it did that board's ?board= requests
-// 400'd (sidecar-surviving sessions included). The registry is the durable twin: one JSON file in the DEV
-// repo's `.canvas/` (the server's own home — git-ignored, shadow-versioned like the rest of canvas-home)
-// recording every repo ever mounted, with a lastOpened stamp for the picker's recency sort. On boot each
-// remembered path that still exists is re-registered — map entry only; the per-board feeds/watchers stay
-// LAZY (started when a tab actually mounts), so a long registry doesn't fan out watchers for boards
-// nobody opens. The default board is implicit and never recorded.
-const BOARDS_FILE = path.join(ROOTS.repo!, ".canvas", "boards.json");
-function readBoardRegistry(): BoardRegistryEntry[] {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(BOARDS_FILE, "utf8")) as { boards?: BoardRegistryEntry[] };
-    return Array.isArray(parsed.boards) ? parsed.boards : [];
-  } catch {
-    return []; // absent/corrupt → empty registry (the next mount rewrites it)
-  }
-}
-// Upsert on every mount POST — read-modify-write against the FILE, not a cached copy (the module hot
-// re-evals; cheap correctness beats a stale mirror at this call rate).
-function recordBoardOpened(boardId: string, name: string, repoPath: string, noSessions?: boolean): void {
-  const all = readBoardRegistry();
-  const prev = all.find((e) => e.boardId === boardId);
-  const entries = all.filter((e) => e.boardId !== boardId);
-  // noSessions is STICKY: once a board is flagged, a later mount POST without the flag must not quietly
-  // re-arm real spawns on it (the flagging mount was the deliberate act; unflag by editing the registry).
-  entries.push({ boardId, name, repoPath, lastOpened: Date.now(), ...(noSessions || prev?.noSessions ? { noSessions: true } : {}) });
-  try {
-    fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
-    fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: entries }, null, 2) + "\n");
-  } catch (e) {
-    console.error("[boards] registry write failed:", e instanceof Error ? e.message : e);
-  }
-}
-// Boot remount: re-register every remembered board whose repo still exists. Entries for vanished paths
-// are KEPT in the file (a repo on an unmounted volume isn't gone forever) but not served this run.
-for (const e of readBoardRegistry()) {
-  if (boards.has(e.boardId)) continue;
-  try {
-    if (!fs.statSync(e.repoPath).isDirectory()) continue;
-  } catch {
-    continue;
-  }
-  boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath, ...(e.noSessions ? { noSessions: true } : {}) });
-}
-// …and the reverse: PRUNE pinned entries the registry no longer records (the file is the durable
-// truth — deleting an entry there is how a scratch/test board is retired without bouncing the whole
-// process; the pinned map otherwise outlives every re-eval by design). A pruned board's requests 400
-// until a tab re-mounts it via ?repo= (board.ts navigation self-heals exactly that way). Its feeds, if
-// started, keep idling until a real restart — harmless, and not worth a teardown path here.
-{
-  const registered = new Set(readBoardRegistry().map((e) => e.boardId));
-  for (const id of [...boards.keys()])
-    if (id !== DEFAULT_BOARD.boardId && !registered.has(id)) {
-      boards.delete(id);
-      console.log(`[boards] pruned ${id} (no longer in the registry)`);
-    }
-}
 
 // sessionsDir (a board's Claude-Code transcripts dir) moved to server-sessions.ts (P5 sub-step 3).
 
@@ -169,119 +74,9 @@ for (const e of readBoardRegistry()) {
 
 // boardRootForCwd (worktree-cwd → canonical board root) moved to server-sessions.ts (P5 sub-step 2).
 
-// Resolve the board a request targets (?board=<id>, default board if omitted), or null if unknown.
-function reqBoard(url: URL): (BoardInfo & { boardId: string }) | null {
-  const id = url.searchParams.get("board") ?? DEFAULT_BOARD.boardId;
-  const b = boards.get(id);
-  return b ? { boardId: id, ...b } : null;
-}
-
 // /api/boards (list + mount) now lives in routes/boards.ts (god-file split, Phase 1); boardJson moved
 // there with it. The mount orchestration reaches boardIdentity/readBoardRegistry/recordBoardOpened/
 // ensureCanvasExcluded/startBoardFeeds through the ServerContext (wired at setServerContext below).
-
-// ── worktrees as ROOTS (worktree-activity slice B) ────────────────────────────────────────────────
-// A board is a workspace that can serve MORE THAN ONE root: its canonical checkout (rootId "repo") plus
-// every linked git worktree of that repo. Worktrees are DISCOVERED, never mounted: `git worktree list`
-// sees whatever an agent or a human created via the CLI, so a new tree appears on its own (and the
-// watcher below re-discovers on `.git/worktrees/` churn). Node ids are already `node:<root>:<path>`, so
-// the extra roots' file cards never collide; the rootId is the slug of the worktree's dir basename.
-function realpath(p: string): string {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return p; // unresolvable — compare/serve the path as given
-  }
-}
-function listWorktrees(canonicalPath: string): RootInfo[] {
-  let out: string;
-  try {
-    out = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: canonicalPath, encoding: "utf8" });
-  } catch {
-    return []; // not a git repo / git absent — no worktrees, just the canonical root
-  }
-  const raw = parseWorktreePorcelain(out); // shared with worktreeExists (worktrees.js) — one format parser
-  // EXCLUDE this board's OWN checkout — it's already the canonical "repo" root (added by boardRoots). It
-  // isn't necessarily the first entry: `git worktree list` always prints the MAIN checkout first, so a
-  // board rooted at a LINKED worktree must drop the matching entry by realpath, not by position. Every
-  // other entry (the main checkout included, seen from a worktree board) becomes a sibling root.
-  const canon = realpath(canonicalPath);
-  // Agent worktrees (`spawn --worktree`) live under the board's own `.canvas/worktrees/` home. They are
-  // ISOLATED workspaces, not sibling checkouts to browse, so they must NOT become board roots (that would
-  // flood the file tree with one full tree per live agent). Drop anything under this board's `.canvas/`.
-  const canvasHome = realpath(path.join(canonicalPath, ".canvas")) + path.sep;
-  return raw
-    .map((r) => ({ real: realpath(r.path), branch: r.branch, head: r.head }))
-    .filter((r) => r.real !== canon && !r.real.startsWith(canvasHome))
-    .map((r) => {
-      let id = slug(path.basename(r.real));
-      if (id === "repo") id = "repo-wt"; // never shadow the canonical id (a worktree dir literally named "repo")
-      return { id, name: path.basename(r.real), path: r.real, branch: r.branch, head: r.head };
-    });
-}
-
-// Roots per board (canonical first). `git worktree list` is AUTHORITATIVE for both add and remove, so the
-// cache is only a short-lived memo to avoid spawning git on every file read — it REVALIDATES past a small
-// TTL and, when the set actually changed, pings `roots:<board>` so open boards refetch and their file-tree
-// card drops/adds the root live. This self-heals even when the filesystem watcher misses an event — which
-// is exactly what bit us: removing the last worktree deletes `.git/worktrees/` out from under chokidar, so
-// the watcher never fired and a removed worktree stayed stuck in the card. The watcher (startWorktreesFeed)
-// is now just a best-effort prompt push on top of this guarantee. Pinned on globalThis like `boards`; a
-// fresh global KEY (not the old `__canvasRoots`) so a server restart discards the old-shaped cache.
-interface RootsCacheEntry {
-  roots: RootInfo[];
-  at: number;
-}
-const rootsCache: Map<string, RootsCacheEntry> = ((globalThis as { __canvasRootsCache?: Map<string, RootsCacheEntry> })
-  .__canvasRootsCache ??= new Map());
-const ROOTS_TTL_MS = 2000;
-// Membership identity — id+path, NOT head/branch: a commit inside a worktree shouldn't force a refetch,
-// only a worktree appearing or disappearing should.
-function rootsChanged(a: RootInfo[], b: RootInfo[]): boolean {
-  return a.length !== b.length || a.some((r, i) => r.id !== b[i].id || r.path !== b[i].path);
-}
-function boardRoots(boardId: string): RootInfo[] {
-  const cached = rootsCache.get(boardId);
-  if (cached && Date.now() - cached.at < ROOTS_TTL_MS) return cached.roots;
-  const b = boards.get(boardId);
-  if (!b) return cached?.roots ?? [];
-  const roots: RootInfo[] = [{ id: "repo", name: b.name, path: b.root, branch: "", head: "" }, ...listWorktrees(b.repoPath)];
-  rootsCache.set(boardId, { roots, at: Date.now() });
-  if (cached && rootsChanged(cached.roots, roots)) publishFeed("roots:" + boardId, { ts: Date.now() });
-  return roots;
-}
-// Resolve a caller's rootId to its absolute dir, confined to this board's known roots — NEVER a
-// caller-supplied path (same guarantee as the single `board.root` before). Missing/"" → canonical.
-function rootDir(boardId: string, rootId: string | null): string | null {
-  const r = boardRoots(boardId).find((x) => x.id === (rootId || "repo"));
-  return r ? r.path : null;
-}
-
-// Mounting seeds `.canvas/` into the target repo (roles, threads, session markers — canvas-home), which
-// an EXTERNAL repo's .gitignore won't cover: its `git status` gets noisy and the canvas-home force-add
-// gates assume the dir is ignored. Fix it at the mount, in `.git/info/exclude` — the repo-local ignore
-// file git keeps OUTSIDE the working tree, so the repo's tracked files are never touched. check-ignore
-// first: exit 0 = already ignored (the dev repo's own case) → no-op; exit 1 = not ignored → append;
-// anything else (128 = not a git repo at all) → nothing to do. Best-effort throughout — a repo we can't
-// write to just keeps its noisy status.
-function ensureCanvasExcluded(repoPath: string): void {
-  try {
-    execFileSync("git", ["check-ignore", "-q", ".canvas/"], { cwd: repoPath, stdio: "ignore" });
-    return; // already ignored
-  } catch (e) {
-    if ((e as { status?: unknown }).status !== 1) return; // not "unignored" — not a git repo, or git absent
-  }
-  try {
-    // --git-path resolves the right location even for a worktree checkout (info/ lives in the common dir).
-    const rel = execFileSync("git", ["rev-parse", "--git-path", "info/exclude"], { cwd: repoPath, encoding: "utf8" }).trim();
-    const excludeFile = path.resolve(repoPath, rel);
-    fs.mkdirSync(path.dirname(excludeFile), { recursive: true });
-    fs.appendFileSync(excludeFile, "\n# foolscap: the canvas home (auto-added on board mount)\n.canvas/\n");
-    console.log(`[boards] excluded .canvas/ via ${excludeFile}`);
-  } catch (e) {
-    console.error("[boards] could not exclude .canvas/:", e instanceof Error ? e.message : e);
-  }
-}
 
 // The board MOUNT handler (POST /api/boards) moved to routes/boards.ts with the list handler above.
 
@@ -673,7 +468,7 @@ function attachWs(server: ViteDevServer): void {
 function startWorktreesFeed(boardId: string, repoPath: string): void {
   const dir = path.join(repoPath, ".git", "worktrees");
   const ping = (): void => {
-    rootsCache.delete(boardId);
+    invalidateBoardRoots(boardId);
     syncShadowRoots(boardId, repoPath); // provision/teardown shadow committers as worktrees appear/vanish
     publishFeed("roots:" + boardId, { ts: Date.now() });
   };
