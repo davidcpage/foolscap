@@ -4,7 +4,7 @@ import { sendJson, readBody } from "../server-http.js";
 import { getPendingHistoryMode, getServerContext } from "../server-context.js";
 import { re, type GlobalRoute } from "./router.js";
 import { classifyMentionSpawn, resolveTags } from "../thread-tags.js";
-import { unreadMentions } from "../cas-guard.js";
+import { unreadMentions, senderCursorAfterPost } from "../cas-guard.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "../work-intent.js";
 import { isNotificationLevel, NOTIFICATION_LEVELS } from "../notification-levels.js";
 import { listRoles } from "../role-ledger.js";
@@ -137,7 +137,8 @@ async function handleThreadMessage(
   }
 
   // Record it in the channel's off-log log (the conversation's home + the card's feed source) — NOT into
-  // anyone's stdin. The sender has "seen" its own message, so advance its cursor; the NAMED others are woken.
+  // anyone's stdin. The sender has "seen" its own message (cursor advance below, guarded); the NAMED others
+  // are woken.
   // HONEST ACCEPT (BUG-6): appendThreadMsg persists to the fsync'd ledger BEFORE it publishes the feed and
   // throws if it can't be made durable — so a 200 here MEANS the post is on disk and survives a restart. A
   // durable-append failure returns 500 (nothing published, no one woken) rather than a dishonest 200 that
@@ -155,7 +156,12 @@ async function handleThreadMessage(
   const { wakeAll, human, members: tagged, unknown } = resolveTags(body.text, memberEntries);
   const ss = liveSessions.get(from);
   if (ss) {
-    ss.read[threadId] = msg.seq;
+    // The sender has "seen" its own message — but advancing to msg.seq must NOT skip anything that arrived
+    // from OTHERS since the sender's last read (a durably-appended interleaved message would be silently
+    // swallowed). senderCursorAfterPost advances only when the sender was caught up (cursor == msg.seq-1),
+    // else holds the cursor so the interleaved unread is served next read (W11's read-cursor invariant, write
+    // half). The W11 CAS guard above only blocks unread @-MENTIONS; untagged interleaved messages reach here.
+    ss.read[threadId] = senderCursorAfterPost(ss.read[threadId] ?? 0, msg.seq);
     // Blue "waiting on an agent": the sender named a specific peer (not @all, not the human) and will idle
     // after this turn waiting on them. Inferred from the tag — no self-report. Each of the sender's posts
     // OVERWRITES this: tagging a peer sets it; a broadcast / human-directed / untagged post clears it (the

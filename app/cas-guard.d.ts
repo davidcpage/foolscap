@@ -19,6 +19,10 @@ export function unreadMentions(args: {
   members?: CasMembers;
 }): CasMessage[];
 
+/** W11 (write half) — the sender's read cursor after posting its own message: advances to `ownSeq` only when
+ *  the sender was caught up (cursor == ownSeq-1), else HOLDS the cursor so an interleaved unread isn't skipped. */
+export function senderCursorAfterPost(currentCursor: number | undefined, ownSeq: number): number;
+
 /** W12 — the content version stamp for a doc's bytes (a 16-hex content hash), or null for absent content. */
 export function contentVersion(content: string | Buffer | null | undefined): string | null;
 

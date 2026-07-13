@@ -1,5 +1,5 @@
 import type { ServerResponse } from "node:http";
-import { sendJson, windowParam } from "../server-http.js";
+import { sendJson, windowParam, nonNegParam, DEFAULT_INBOX_BYTES } from "../server-http.js";
 import { getServerContext } from "../server-context.js";
 import { exact, type GlobalRoute } from "./router.js";
 import { cardOnly } from "../thread-waiting.js";
@@ -69,16 +69,34 @@ function windowTail(fresh: ThreadMsg[], limit: number | null, bytes: number | nu
   return { kept, omitted: fresh.length - kept.length };
 }
 
-// GET /api/inbox?session=<sid> — the read tool. Returns this session's UNREAD channel messages (across all
-// channels it's joined to), grouped by channel, and advances its read cursors. The agent fetches this with
-// Bash, so the messages land in TOOL OUTPUT, never as a user turn — the whole point of 4e. Content lives
-// only in the off-log channel log; this is the read side of it.
-function handleInboxRead(res: ServerResponse, sid: string | null, limit: number | null, bytes: number | null): void {
+// The read shape (query params → behavior). All optional; the DEFAULT (nothing passed) is a consuming read
+// of the whole unread tail, self-bounded to DEFAULT_INBOX_BYTES so no caller ever needs a client-side
+// `| head -c` (which consumes the cursor and loses the cut tail — the footgun this hardening retires).
+export interface InboxOpts {
+  limit: number | null; // opt-in max message COUNT (kept from the tail)
+  bytes: number | null; // opt-in byte budget, OVERRIDING the default (kept from the tail)
+  since: number | null; // RECOVERY: replay from this per-channel seq, ignoring the cursor; NON-consuming
+  peek: boolean; // RECOVERY: read the current unread tail WITHOUT advancing the cursor
+}
+
+// GET /api/inbox?session=<sid> — the read tool, as a pure computation over the ServerContext (no `res`, so it
+// is unit-testable against a fake context with a live session + thread log). Returns this session's UNREAD
+// channel messages (across all channels it's joined to), grouped by channel. On a CONSUMING read it advances
+// the session's per-thread cursors; on a RECOVERY read (?since or ?peek) it leaves them untouched, so a lost
+// read is re-fetchable in ONE GET with no leave+rejoin dance. The agent fetches this with Bash, so the
+// messages land in TOOL OUTPUT, never as a user turn — the whole point of 4e.
+export function computeInbox(sid: string | null, opts: InboxOpts): { status: number; body: unknown } {
   const { liveSessions, boardIdentity, boardSnapshotRecords, sessionThreads, threadLog, threadNode, persistSessionState } =
     getServerContext();
-  if (!sid) return sendJson(res, 400, { error: "missing ?session=" });
+  if (!sid) return { status: 400, body: { error: "missing ?session=" } };
   const s = liveSessions.get(sid);
-  if (!s) return sendJson(res, 404, { error: "no such live session" });
+  if (!s) return { status: 404, body: { error: "no such live session" } };
+  // A recovery read never mutates state: ?since replays from an arbitrary seq (so consuming it would clobber
+  // the real cursor); ?peek previews the current tail without spending it. Either ⇒ the cursor is untouched.
+  const consuming = opts.since == null && !opts.peek;
+  // The ONE byte bound on this read (CLAUDE.md size-caps): the caller's explicit &bytes, else the generous
+  // default. Always applied — every inbox read is self-bounded, so client-side truncation is never needed.
+  const bytesBudget = opts.bytes != null ? opts.bytes : DEFAULT_INBOX_BYTES;
   const boardId = boardIdentity(s.repoPath).boardId;
   const records = boardSnapshotRecords(boardId);
   // `pinned` is the thread's HEAD CONTEXT (R-PIN): re-read on EVERY wake ahead of the recent tail, so the
@@ -96,20 +114,22 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
   if (records) {
     for (const threadId of sessionThreads(records, sid)) {
       let log = threadLog(boardId, threadId);
-      const since = s.read[threadId] ?? 0;
-      if (log.length && log[0]!.seq > since + 1) {
+      // The per-channel floor: a ?since replay overrides the stored cursor DOWNWARD (re-serve messages the
+      // cursor has already passed); otherwise it's the cursor (the normal unread frontier).
+      const floor = opts.since != null ? opts.since : s.read[threadId] ?? 0;
+      if (log.length && log[0]!.seq > floor + 1) {
         // The in-memory tail (MAX_THREAD_MSGS — a feed-republish bound, not a read cap) starts past this
-        // member's cursor: the older unread live only on disk. Serve THIS read from the full ledger
-        // instead of re-dropping content a memory bound already paid for (CLAUDE.md truncation rule —
-        // only the caller's own opt-in ?limit/?bytes window may cut, and it surfaces `truncated`).
+        // floor: older messages live only on disk. Serve THIS read from the full ledger instead of
+        // re-dropping content a memory bound already paid for (CLAUDE.md truncation rule — only the caller's
+        // own &limit/&bytes window may cut, and it surfaces `truncated`). Also the ?since=0 replay-all path.
         const full = readThreadLog(s.repoPath, threadId);
         if (full.length) log = full;
       }
-      const fresh = log.filter((mng) => mng.seq > since && !cardOnly(mng)); // ask-echoes / intent acts are card-only
-      // Opt-in window: keep the recent TAIL within the requested caps; the omitted are OLDER (the cursor
-      // still advances to the end below, so they're marked read — recoverable by re-joining history:"full",
-      // which re-seeds the cursor to 0). Surfaced as `truncated`, never silently dropped (CLAUDE.md).
-      const { kept, omitted } = windowTail(fresh, limit, bytes);
+      const fresh = log.filter((mng) => mng.seq > floor && !cardOnly(mng)); // ask-echoes / intent acts are card-only
+      // Keep the recent TAIL within the byte budget (+ opt-in count). The omitted are OLDER; on a consuming
+      // read the cursor advances past them (below), so recover them in ONE GET with a larger &bytes= or a
+      // &since=<seq> replay (non-consuming) — never a leave+rejoin. Surfaced as `truncated`, never dropped.
+      const { kept, omitted } = windowTail(fresh, opts.limit, bytesBudget);
       if (kept.length) {
         const out: OutChan = {
           channel: threadId,
@@ -117,19 +137,27 @@ function handleInboxRead(res: ServerResponse, sid: string | null, limit: number 
           messages: kept.map((m) => ({ seq: m.seq, t: fmtTs(m.ts), from: inboxHandle(records, m.from), text: m.text })),
         };
         if (omitted > 0)
-          out.truncated = { omitted, hint: `${omitted} older message(s) windowed out; re-join with history:"full" to replay all` };
+          out.truncated = {
+            omitted,
+            hint: `${omitted} older message(s) omitted by the ${bytesBudget}-byte budget; re-read with a larger &bytes= (one GET), or &since=${floor} to replay this range (non-consuming). Never pipe through | head -c.`,
+          };
         // Head context: attach the pins so a woken agent re-reads the task/done-condition/framing (R-PIN).
         const pins = readPins(s.repoPath, threadId);
         if (pins.length)
           out.pinned = pins.map((p) => ({ seq: p.seq, t: fmtTs(p.ts), from: inboxHandle(records, p.from), text: p.text }));
         channels.push(out);
       }
-      if (log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
+      if (consuming && log.length) s.read[threadId] = log[log.length - 1]!.seq; // mark all read (incl. skipped card-only entries)
     }
-    persistSessionState(s);
+    if (consuming) persistSessionState(s); // a recovery read (?since/?peek) mutates nothing — nothing to persist
   }
   const count = channels.reduce((n, c) => n + c.messages.length, 0);
-  sendJson(res, 200, { channels, count });
+  return { status: 200, body: { channels, count } };
+}
+
+function handleInboxRead(res: ServerResponse, sid: string | null, opts: InboxOpts): void {
+  const { status, body } = computeInbox(sid, opts);
+  sendJson(res, status, body);
 }
 
 // The channel-message read tool (session id is a global UUID, so no ?board= needed).
@@ -137,6 +165,12 @@ export const inboxRoutes: GlobalRoute[] = [
   {
     method: "GET",
     match: exact("/api/inbox"),
-    run: (_req, res, url) => handleInboxRead(res, url.searchParams.get("session"), windowParam(url, "limit"), windowParam(url, "bytes")),
+    run: (_req, res, url) =>
+      handleInboxRead(res, url.searchParams.get("session"), {
+        limit: windowParam(url, "limit"),
+        bytes: windowParam(url, "bytes"),
+        since: nonNegParam(url, "since"),
+        peek: url.searchParams.get("peek") === "1" || url.searchParams.get("peek") === "true",
+      }),
   },
 ];

@@ -104,3 +104,21 @@ export function windowParam(url: URL, key: string): number | null {
   const n = Number(raw);
   return Number.isInteger(n) && n > 0 ? n : null;
 }
+
+// Parse a NON-NEGATIVE-integer param (?since=); null when absent/invalid. Unlike windowParam, 0 is a valid
+// value (?since=0 ⇒ replay from the very start of a channel), so this admits n >= 0 rather than n > 0.
+export function nonNegParam(url: URL, key: string): number | null {
+  const raw = url.searchParams.get(key);
+  if (raw == null) return null;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
+// The DEFAULT byte budget the inbox read (GET /api/inbox) bounds itself to when the caller passes no explicit
+// &bytes. This is the ONE place the inbox payload is byte-bounded (CLAUDE.md size-caps doctrine: bound at the
+// byte read, keep the TAIL, surface `truncated`) — so an agent NEVER needs a client-side `| head -c` (which
+// consumes the read cursor and permanently loses the cut tail). Set to the same 128 KiB "err large" tier as
+// MAX_BYTES: a normal worker's unread backlog is far under it (no truncation), while a pathological multi-MB
+// backlog is bounded instead of blowing up the reader. A caller wanting a tighter window passes &bytes=; a
+// caller who lost content re-reads with &since=<seq> (non-consuming replay) — neither needs client truncation.
+export const DEFAULT_INBOX_BYTES = 128 * 1024;

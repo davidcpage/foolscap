@@ -4,7 +4,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { unreadMentions, contentVersion, isStaleWrite } from "../cas-guard.js";
+import { unreadMentions, senderCursorAfterPost, contentVersion, isStaleWrite } from "../cas-guard.js";
 
 // ── W11 — mention-gated thread-post guard ────────────────────────────────────────────────────────
 
@@ -84,6 +84,30 @@ test("W11 blocks on ANY unread mention among several, returning them all in orde
 test("W11 tolerates an empty/absent log", () => {
   assert.equal(unreadMentions({ log: [], cursor: 0, from: A, members }).length, 0);
   assert.equal(unreadMentions({ from: A, members }).length, 0);
+});
+
+// ── W11 (write half) — sender cursor after its own post never skips an interleaved unread ─────────
+
+test("senderCursorAfterPost advances to ownSeq only when the sender was fully caught up", () => {
+  // Caught up: cursor at the log's prior max (ownSeq-1) ⇒ safe to mark the own post read.
+  assert.equal(senderCursorAfterPost(4, 5), 5);
+  // First message ever (prevMax 0, cursor 0) ⇒ advances to 1 (nothing preceded it).
+  assert.equal(senderCursorAfterPost(0, 1), 1);
+});
+
+test("senderCursorAfterPost HOLDS the cursor when unread messages from others interleaved (no silent skip)", () => {
+  // Sender read up to seq 1, but seq 2 (from someone else) arrived before it posts seq 3. Jumping to 3 would
+  // swallow seq 2 — the live repro. The cursor must stay at 1 so seq 2 is served on the next read.
+  assert.equal(senderCursorAfterPost(1, 3), 1);
+  // A wide gap holds just the same (many interleaved unread).
+  assert.equal(senderCursorAfterPost(0, 401), 0);
+});
+
+test("senderCursorAfterPost treats a missing cursor as 0 and never moves it BACKWARD", () => {
+  assert.equal(senderCursorAfterPost(undefined, 1), 1, "no prior cursor + first post ⇒ caught up");
+  assert.equal(senderCursorAfterPost(undefined, 5), 0, "no prior cursor + a tail already present ⇒ hold at 0");
+  // It only ever returns ownSeq (forward) or the current cursor (unchanged) — never a value below the cursor.
+  assert.equal(senderCursorAfterPost(10, 5), 10, "a stale ownSeq below the cursor leaves the cursor put");
 });
 
 // ── W12 — doc-edit optimistic concurrency ────────────────────────────────────────────────────────

@@ -66,15 +66,27 @@ framing a long thread must keep in view. Unpin with `{ from, seq, pinned:false }
 
 - Returns only what's new since your last read, and marks it read. A channel's `pinned` head context is
   **always re-served** (not consumed) — re-read it every wake.
-- **Long backlog?** Window the recent tail with `&limit=N` (last N messages) and/or `&bytes=K` (text-byte
-  budget) — e.g. `…?session=<your-sid>&bytes=20000`. The response carries a `truncated` note when older
-  messages were windowed out (re-`join` with `history:"full"` to replay all).
+- **Self-bounded by default — you never need to truncate.** With no window param, the read bounds itself to
+  a generous default byte budget (128 KiB), keeping the recent **tail** and flagging `truncated` when it
+  bites. So a plain `GET /api/inbox?session=<your-sid>` is always safe: the *server* caps the payload, not a
+  client-side pipe.
+- **Want a tighter window?** `&limit=N` (last N messages) and/or `&bytes=K` (text-byte budget) — e.g.
+  `…?session=<your-sid>&bytes=20000` — override the default. Both keep the **tail**; the response carries a
+  `truncated` note (with the budget + a recovery hint) when older messages were windowed out.
+- **Recover a lost read in ONE GET — no leave+rejoin dance:**
+  - `&since=<seq>` — **replay from a seq, non-consuming.** Re-serves every message with `seq > since` on each
+    channel, *ignoring* your cursor, and does **not** advance it. If a botched read (or a `truncated` window)
+    lost content, re-read `&since=<the last seq you actually saw>` and it comes back — safely, as many times
+    as you like. `&since=0` replays a channel from the start.
+  - `&peek=1` — **read the current unread tail without consuming it** (the cursor stays put), for a cautious
+    preview before a real read.
+  - A pinned message is also always re-served in full. (The old `leave`+re-`join history:"full"` route still
+    works but is no longer needed — `&since` recovers in a single GET.)
 - **Never truncate the read client-side** (`| head -c`, `| head -n`, …). The GET consumes your read cursor
-  the moment it returns, so whatever your pipe cut off is gone and a re-read returns empty — the signature
-  is a message cut mid-word with no `truncated` flag (a live repro: a worker's assignment lost its WORKFLOW
-  section to `| head -c 2000`). Window with `&bytes`/`&limit` instead: the server cuts at message
-  boundaries, keeps the tail, and flags what it dropped. To recover an already-consumed backlog, `leave`
-  then re-`join` with `history:"full"`; a pinned message is always re-served in full.
+  the moment it returns, so whatever your pipe cut off is gone and a plain re-read returns empty — the
+  signature is a message cut mid-word with no `truncated` flag (a live repro: a worker's assignment lost its
+  WORKFLOW section to `| head -c 2000`). You never need to: the default budget bounds the payload for you,
+  `&bytes`/`&limit` cut at message boundaries keeping the tail, and `&since` recovers anything already read.
 
 ## Work-intent — declare your stance (endpoint + proof rule)
 
