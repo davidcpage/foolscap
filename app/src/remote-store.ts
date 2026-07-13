@@ -80,6 +80,11 @@ export async function importBoardPersist(
 }
 
 export class RemoteEventStore implements EventStore {
+  // Set after construction (once Persistence exists) to adopt the server's authoritative seq: since §9
+  // stage 2 the server is the single append point and REASSIGNS the seq of every tab-echoed event (design
+  // §10), so this tab bumps its mirror's watermark to what the server actually assigned — keeping its next
+  // locally-minted seq above the server's and its snapshot watermark honest.
+  onServerSeq?: (seq: number) => void;
   // loadAll serves the boot payload rather than re-fetching: hydrate() runs once, right after the
   // boot fetch, and every later event is one this tab itself appended (already in the mem mirror).
   constructor(
@@ -92,12 +97,20 @@ export class RemoteEventStore implements EventStore {
   async append(e: IntentEvent): Promise<void> {
     // keepalive: an event is small (one gesture's diff) and this lets the LAST append of a closing
     // tab finish against the 64KB keepalive budget — the snapshot save is too big to get the same.
-    await requestRetry(persistUrl(this.boardId, "/event"), {
+    const res = await requestRetry(persistUrl(this.boardId, "/event"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ event: e }),
       keepalive: true,
     });
+    // Adopt the server-assigned seq (§10). Best-effort: a body without a numeric seq (an older server, or
+    // a keepalive response the tab is shutting down through) simply skips the adopt — never fatal.
+    try {
+      const { seq } = (await res.json()) as { seq?: number };
+      if (typeof seq === "number") this.onServerSeq?.(seq);
+    } catch {
+      /* no parseable seq — leave the mirror watermark as-is */
+    }
   }
   async clear(): Promise<void> {
     // The endpoint drops the WHOLE board store (events + snapshot) — a reset is all-or-nothing.

@@ -114,11 +114,15 @@ async function createEngine(boardId: string, isDefault: boolean): Promise<Engine
       boot = await fetchBoardPersist(boardId);
     }
   }
+  const eventStore = new RemoteEventStore(boardId, boot.events);
   const persistence = new Persistence({
-    events: new RemoteEventStore(boardId, boot.events),
+    events: eventStore,
     snapshots: new RemoteSnapshotStore(boardId, boot.snapshot),
     onError: (e) => console.error("[persistence]", e),
   });
+  // §10 seq handover: adopt the seq the server assigns to each tab-echoed (human gesture) event, so this
+  // tab's mirror watermark tracks the single server-side sequencer (bus commits advance it invisibly here).
+  eventStore.onServerSeq = (seq) => persistence.adoptSeq(seq);
   const editor = new Editor({ log: persistence });
   registerFileCommands(editor); // the file-tree card's rename/move re-key (loader.renameFileNodes)
   await persistence.hydrate(editor.store);
@@ -606,9 +610,9 @@ function Board({ m, undo, persistence }: Engine) {
     return () => m.stop();
   }, [m]);
 
-  // The agent bus: inbound commands (POST /api/command → SSE → editor.commit) and the debounced
-  // outbound snapshot push that makes GET /api/canvas the agent's read side.
-  useEffect(() => connectAgentBus(m), [m]);
+  // The agent bus: inbound server-committed DIFFs (POST /api/command → server commit → WS diff →
+  // store.applyDiffAsChange(diff,"remote")), with the server's authoritative seq adopted into persistence.
+  useEffect(() => connectAgentBus(m, persistence), [m, persistence]);
 
   // Delete the selected cards (actor "user", so it's undoable). Edges touching a removed node go first,
   // so no wire ever dangles — the same edges-before-nodes order clearBoard uses.

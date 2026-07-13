@@ -21,7 +21,7 @@ import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
 import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
 import { getWsClients, setServerContext } from "./server-context.js";
-import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, drainPendingBusReplay, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
+import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus } from "./server-sessions.js";
 import { allSessionAnchors, boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
@@ -311,8 +311,9 @@ function ensureCanvasExcluded(repoPath: string): void {
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) ─────────────
 // handleBoardPersistWrite + the /api/board/persist route (GET/DELETE/POST event|snapshot|import) now live
-// in routes/board-persist.ts (god-file split, Phase 1). The second-writer tripwire (fsState.lastEventSeq)
-// and the membership-diff onboarding (announceNewMemberships) are reached through the ServerContext; the
+// in routes/board-persist.ts (god-file split, Phase 1). The /event echo mints the authoritative seq on the
+// single server-side append point (design §10, retiring the old second-writer tripwire) and the
+// membership-diff onboarding (announceNewMemberships) is reached through the ServerContext; the
 // board-persist.js file store is imported directly there.
 
 // MAX_SESSION_BYTES moved to server-sessions.ts (P5 sub-step 3); handleNotebookOutputsPush imports it.
@@ -524,14 +525,6 @@ export interface WsClient {
   watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
   send(msg: unknown): void;
 }
-// A bus command held for later replay: the same shape dispatchBusCommand broadcasts. Buffered per board
-// when a creation command (addNode/addEdge) reached no live tab (Bug A/C persist-gap), replayed on the
-// next ws-attach so a tab applies + PERSISTS it into the durable store (what GET /api/canvas serves).
-export interface PendingBusCommand {
-  type: string;
-  payload?: Record<string, unknown>;
-  actor?: string;
-}
 export interface CanvasFsState {
   feedClients: Set<SseClient>;
   feedValues: Map<string, unknown>;
@@ -565,9 +558,7 @@ export interface CanvasFsState {
   kernelsReconciled?: boolean; // one-shot flag: the gateway-orphan sweep ran once this server lifetime (server-kernel.ts; survives re-eval on fsState, resets on restart)
   announcedMemberships?: Set<string>; // edgeId|phase dedup for onboarding announcements
   pendingHistoryMode?: Map<string, "full" | "future">; // threadId|sid → backlog visibility for a not-yet-onboarded member (lazy-init via getPendingHistoryMode)
-  lastEventSeq?: Map<string, number>; // boardId → highest event seq appended (the second-writer tripwire)
-  pendingBusReplay?: Map<string, PendingBusCommand[]>; // boardId → creation commands that reached no live tab, replayed on the next ws-attach (Bug A/C persist-gap)
-  boardEngines?: Map<string, BoardEngineEntry>; // boardId → the live server-materialized core Store (board-engine.ts, design §9 stage 1)
+  boardEngines?: Map<string, BoardEngineEntry>; // boardId → the live server-materialized core Store (board-engine.ts, design §9 stage 1); the single event-seq sequencer + append point (stage 2)
 }
 type ShadowRootHandle = ReturnType<typeof watchRoot>;
 const fsState: CanvasFsState = ((globalThis as { __canvasFsState?: CanvasFsState }).__canvasFsState ??= {
@@ -661,24 +652,22 @@ function attachWs(server: ViteDevServer): void {
       };
       getWsClients(fsState).add(client);
       {
-        // The durable store assumes ONE writer tab per board (tabs mint their own event seq and race
-        // the debounced snapshot save). A second connection is an ordinary event now (picker, probes),
-        // so say it loudly the moment it happens — the ua is what tells a leaked headless probe from
-        // a second real browser.
+        // §9 stage 2: the server is now the single event-seq sequencer (bus commits + the /event echo both
+        // mint from its one counter), so extra tabs no longer collide on seqs. They DO still each write the
+        // debounced snapshot.json (a cache — the 409 stale-guard keeps it monotonic), so a second connection
+        // stays worth logging; the ua tells a leaked headless probe from a second real browser.
         const tabs = tabCountFor(b.boardId);
         if (tabs > 1)
           console.warn(
-            `[boards] ${tabs} tabs now live on ${b.boardId} — concurrent writers can mint colliding event seqs ` +
-              `and race snapshot saves. ua: ${req.headers["user-agent"] ?? "?"}`,
+            `[boards] ${tabs} tabs now live on ${b.boardId} — multiple tabs still race the debounced snapshot ` +
+              `save (cache only; event seqs are server-sequenced). ua: ${req.headers["user-agent"] ?? "?"}`,
           );
       }
       for (const [feed, value] of feedValues) client.send({ ch: "feed", feed, value }); // replay, like handleFeeds
-      // Persist-gap replay (Bug A/C): creation commands (a summon's session card + member:open edge, a
-      // headless /api/command addNode) that reached NO live tab were buffered — the bus is a broadcast
-      // relay and the durable store GET /api/canvas serves is written only by a tab's Persistence save.
-      // Hand them to THIS freshly-attached tab so it applies + persists them; first attacher drains the
-      // buffer (a second tab hydrates the now-persisted records rather than re-applying a duplicate).
-      for (const cmd of drainPendingBusReplay(b.boardId)) client.send({ ch: "bus", cmd });
+      // §9 stage 2: the persist-gap replay buffer is retired. A bus command is now committed + made durable
+      // server-side at /api/command (with or without a live tab), so a freshly-attached tab hydrates every
+      // created node/edge from the durable store via its boot GET /api/board/persist — there is nothing left
+      // to hand-replay on attach.
       const ping = setInterval(() => {
         if (ws.readyState === ws.OPEN) ws.ping();
       }, 25000);
@@ -1005,10 +994,14 @@ async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId:
   // to uses it rather than minting its own) and returns it to echo in the response. null for non-create
   // commands, which carry no created id.
   const createdId = ensureCommandId(cmd as { type?: string; payload?: unknown });
-  // Broadcast to the board's tabs (+ fire the membership announce if it's a member:* edge). delivered=0
-  // tells the agent no tab for THIS board is listening — the command went nowhere.
-  const delivered = dispatchBusCommand(boardId, cmd as { type: string; payload?: Record<string, unknown>; actor?: string }, origin);
-  sendJson(res, delivered > 0 ? 200 : 503, { ok: delivered > 0, delivered, board: boardId, ...(createdId ? { id: createdId } : {}) });
+  // §9 stage 2: COMMIT the command server-side (durable + folded into the live store + diff broadcast to
+  // tabs) and echo the created id + the authoritative seq. No live tab is required any more — the mutation
+  // is durable and visible to GET /api/canvas the instant this returns (the old 503-on-no-tab is retired).
+  // A durable-write failure throws out to the route error boundary (→ 500, the client retries); an unknown
+  // command type is a clean reject (null → 400).
+  const event = dispatchBusCommand(boardId, cmd as { type: string; payload?: Record<string, unknown>; actor?: string }, origin);
+  if (!event) return sendJson(res, 400, { error: `unknown command type: ${cmd.type}`, board: boardId });
+  sendJson(res, 200, { ok: true, board: boardId, seq: event.seq, ...(createdId ? { id: createdId } : {}) });
 }
 
 // The agents' board read, served from the DURABLE store (unification: the browser used to push a

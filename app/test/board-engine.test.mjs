@@ -183,6 +183,68 @@ test("reconcile: an ordinary debounced save (seq <= watermark) does NOT discard 
   assert.deepEqual(byId(engine.boardStoreRecords(BOARD, repo)), byId(live), "no change on an at-watermark save");
 });
 
+// ── STAGE 2: command authority server-side (write authority, design §9 stage 2 / §10) ────────────────
+// commitBoardCommand is the single append point for a bus command; appendTabEvent is the tab-echo path
+// that reassigns the authoritative seq. Together they prove this thread's headline: a headless commit is
+// durable + visible before the call returns, exactly one IntentEvent per command, and no seq can collide.
+
+test("commit: a headless addNode with ZERO tabs is durable + live-store visible + ONE server-minted event", () => {
+  const repo = tmpRepo();
+  wire(repo);
+  assert.equal(engine.boardStoreRecords(BOARD, repo), null, "fresh board reads null");
+
+  const ev = engine.commitBoardCommand(BOARD, repo, { type: "addNode", payload: { id: "node:h", type: "note" }, actor: "claude" });
+
+  // The committed event: server-minted seq 1, carrying the diff addNode materialized (node + layout pair).
+  assert.equal(ev.seq, 1, "server minted seq 1");
+  assert.ok(ev.diff.added["node:h"] && ev.diff.added["layout:node:h"], "diff adds the node + its layout");
+  // DURABLE at commit, no tab: exactly one line in events.jsonl.
+  const persisted = bp.readBoardPersist(repo);
+  assert.equal(persisted.events.length, 1, "exactly one IntentEvent appended");
+  assert.equal(persisted.events[0].seq, 1, "the durable event carries the server seq");
+  // VISIBLE to server reads immediately (the design headline): the live store + the /api/canvas payload.
+  assert.ok(byId(engine.boardStoreRecords(BOARD, repo)).some((r) => r.id === "node:h"), "node visible in the live store");
+  assert.equal(engine.boardStoreCanvasSnapshot(BOARD, repo).seq, 1, "canvas watermark advanced to the commit seq");
+});
+
+test("commit: one IntentEvent per command — two commits append two events with seqs 1,2 (no double-append)", () => {
+  const repo = tmpRepo();
+  wire(repo);
+  const a = engine.commitBoardCommand(BOARD, repo, { type: "addNode", payload: { id: "node:h", type: "note" }, actor: "claude" });
+  const b = engine.commitBoardCommand(BOARD, repo, { type: "setColor", payload: { id: "node:h", color: "red" }, actor: "claude" });
+  assert.deepEqual([a.seq, b.seq], [1, 2], "seqs are consecutive and server-minted");
+  const events = bp.readBoardPersist(repo).events;
+  assert.equal(events.length, 2, "exactly two events — one per command, no tab re-echo doubling them");
+  assert.equal(engine.boardStoreRecords(BOARD, repo).find((r) => r.id === "node:h").color, "red", "the second commit's effect is live");
+});
+
+test("commit: an unknown command type throws and leaves the store + files untouched", () => {
+  const repo = tmpRepo();
+  wire(repo);
+  assert.throws(() => engine.commitBoardCommand(BOARD, repo, { type: "frobnicate", payload: {}, actor: "claude" }), /no handler/);
+  assert.equal(bp.readBoardPersist(repo).events.length, 0, "nothing appended on a validation reject");
+  assert.equal(engine.boardStoreRecords(BOARD, repo), null, "store never left the unpersisted (null) state");
+});
+
+test("seq handover (§10): appendTabEvent REASSIGNS the server seq — a bus commit + a tab echo never collide", () => {
+  const repo = tmpRepo();
+  wire(repo);
+  // A bus command commits server-side at seq 1.
+  const bus = engine.commitBoardCommand(BOARD, repo, { type: "addNode", payload: { id: "node:a", type: "note" }, actor: "claude" });
+  assert.equal(bus.seq, 1, "bus commit → seq 1");
+  // A tab echoes a human gesture carrying a STALE provisional seq 1 (its mirror hadn't seen the bus commit).
+  // The server ignores it and assigns the next authoritative seq (2), folding the diff into the live store.
+  const tabSeq = engine.appendTabEvent(BOARD, repo, { type: "addNode", payload: {}, actor: "human", id: "e-tab", ts: 9, seq: 1, parent: 1, diff: diffAdd(B) });
+  assert.equal(tabSeq, 2, "the tab's provisional seq 1 is reassigned to the authoritative 2 — no collision");
+  // A second bus command continues the single sequence at 3.
+  const bus2 = engine.commitBoardCommand(BOARD, repo, { type: "setColor", payload: { id: "node:a", color: "red" }, actor: "claude" });
+  assert.equal(bus2.seq, 3, "the one server counter continues across both paths");
+  const seqs = bp.readBoardPersist(repo).events.map((e) => e.seq);
+  assert.deepEqual(seqs, [1, 2, 3], "the durable log holds a single, gapless, non-colliding seq sequence");
+  // The tab-echoed record (B) folded into the live store too.
+  assert.ok(engine.boardStoreRecords(BOARD, repo).some((r) => r.id === "node:B"), "the tab gesture folded into the live store");
+});
+
 // ── 4. null contract preserved: a brand-new (unpersisted) board reads null, not [] ───────────────────
 test("boardStoreRecords is null for an unpersisted board, an array once anything is folded", async () => {
   const repo = tmpRepo(); // no .canvas/board files yet

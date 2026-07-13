@@ -37,6 +37,8 @@ const ctx = await import("../server-context.ts");
 const orch = await import("../server-orchestration.ts");
 const sess = await import("../server-sessions.ts");
 const delivery = await import("../server-delivery.ts");
+const engine = await import("../board-engine.ts");
+const bp = await import("../board-persist.js");
 const ledger = await import("../thread-ledger.js");
 const filesRoute = await import("../routes/files.ts");
 const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatch-seam error boundary (BUG-4b)
@@ -196,22 +198,38 @@ test("getBusClients lazily inits the per-board SSE map in place and is idempoten
   assert.equal(ctx.getBusClients(st), bus, "a second read returns the SAME instance, not a fresh map");
 });
 
-test("dispatchBusCommand runs on a BARE fsState with no busClients (former busClients! crash site, BUG-4a)", () => {
-  // Pre-BUG-4a this threw `Cannot read properties of undefined (reading 'get')` at `fsState.busClients!` —
-  // the exact crash-class the lazy accessors were built to remove, in the most-called delivery function.
+test("dispatchBusCommand COMMITS server-side with zero tabs and is durable + live-store visible (§9 stage 2)", () => {
+  // Stage 2: the bus command is no longer a broadcast-relay-or-buffer — the server COMMITS it into the live
+  // store and appends it durably at commit time, with or without a tab. (Still crash-safe on a bare fsState:
+  // getBusClients/getWsClients lazily create their maps — the former BUG-4a `busClients!` crash site.)
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "mw-dispatch-"));
   let tracked = 0;
-  const fake = { fsState: {}, trackEmittedMembership: () => tracked++ };
+  const fake = {
+    fsState: {},
+    boards: new Map([["board-x", { boardId: "board-x", repoPath: repo }]]),
+    trackEmittedMembership: () => tracked++,
+  };
   ctx.setServerContext(fake);
-  let delivered;
+  let event;
   assert.doesNotThrow(() => {
-    delivered = delivery.dispatchBusCommand("board-x", { type: "addNode", payload: { id: "node:z", type: "note" } }, "test");
+    event = delivery.dispatchBusCommand("board-x", { type: "addNode", payload: { id: "node:z", type: "note" } }, "test");
   });
-  assert.equal(delivered, 0, "no live tab of this board → delivered 0");
+  // The committed event: one IntentEvent, server-minted seq 1, carrying the diff that added the node.
+  assert.ok(event && event.seq === 1, "returns the committed IntentEvent with the authoritative seq");
+  assert.ok(event.diff.added["node:z"], "the diff adds the node");
+  // DURABLE at commit with zero tabs: one event on disk, and the node in the live server store.
+  const persisted = bp.readBoardPersist(repo);
+  assert.equal(persisted.events.length, 1, "exactly one IntentEvent appended to events.jsonl");
+  assert.equal(persisted.events[0].seq, 1, "the durable event carries the server-minted seq");
+  assert.ok(
+    engine.boardStoreRecords("board-x", repo).some((r) => r.id === "node:z"),
+    "the node is visible in the live server store immediately (no tab, no debounce)",
+  );
+  // Crash-safety preserved + membership side-effects now fire unconditionally (the board DID change).
   assert.ok(fake.fsState.busClients instanceof Map, "getBusClients lazily created the per-board map on the bare fsState");
-  assert.equal(tracked, 0, "delivered=0 means no membership announce/track fired");
-  // The un-delivered create was held for replay (persist-gap buffer), also on a lazily-inited map — no crash.
-  assert.ok(fake.fsState.pendingBusReplay instanceof Map);
-  assert.deepEqual(delivery.drainPendingBusReplay("board-x").map((c) => c.payload.id), ["node:z"]);
+  assert.equal(tracked, 1, "trackEmittedMembership fires on every commit now (no longer gated on a live tab)");
+  // The persist-gap replay buffer is retired — nothing is buffered.
+  assert.equal(fake.fsState.pendingBusReplay, undefined, "no pending-replay buffer (retired in stage 2)");
 });
 
 // ── runRoute: the dispatch-seam error boundary (BUG-4b) ──────────────────────────────────────────────

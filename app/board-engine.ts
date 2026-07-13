@@ -1,7 +1,9 @@
-import { Store } from "../core/src/store.js";
+import { Store, type ChangeSource } from "../core/src/store.js";
 import { applyDiff, isEmptyDiff, type RecordsDiff } from "../core/src/diff.js";
-import type { AnyRecord } from "../core/src/records.js";
-import { readBoardPersist } from "./board-persist.js";
+import { uid, type AnyRecord } from "../core/src/records.js";
+import { defaultCommands, type CommandHandler } from "../core/src/commands.js";
+import type { Command, IntentEvent } from "../core/src/log.js";
+import { appendBoardEvent, readBoardPersist } from "./board-persist.js";
 import { getServerContext } from "./server-context.js";
 
 // ── the server-materialized board store (board-engine, design §9 stage 1) ───────────────────────────
@@ -176,4 +178,82 @@ export function boardStoreCanvasSnapshot(
   if (!entry.hasPersist) return null;
   const s = entry.store.getSnapshot();
   return { records: s.records as unknown as Array<Record<string, unknown>>, version: s.version, seq: entry.watermark };
+}
+
+// ── WRITE AUTHORITY (design §9 stage 2) ──────────────────────────────────────────────────────────────
+// The server is the single APPEND POINT for a board: it commits bus commands into a server-side Editor
+// over the live store, mints the authoritative seq (from the entry watermark — the board's one counter,
+// already advanced by both bus commits below and the tab-echo fold), and durably appends the IntentEvent
+// at commit time. Reads (GET /api/canvas, threadNode, …) therefore reflect a bus mutation the instant
+// its HTTP response returns — no tab, no replay buffer, no debounce race. The resulting DIFF (not the
+// command) is what the caller broadcasts to tabs; a tab applies it as a "remote" change and never
+// re-commits or re-echoes it, so exactly ONE IntentEvent exists per command (§8 channel discipline).
+
+// The actor → ChangeSource mapping (a faithful copy of Editor's private actorToSource): a human/user
+// commit is "user", an ingested peer/agent commit is "remote", everything else is "agent". It rides
+// channel 2 so undo/persistence/wake can filter — an agent's server-side commit is source "agent", so a
+// tab's ⌘Z never pops it, exactly as before.
+function actorToSource(actor: string): ChangeSource {
+  return actor === "human" || actor === "user" ? "user" : actor === "remote" ? "remote" : "agent";
+}
+
+/**
+ * Commit one bus command server-side (a faithful inline of core's Editor.commit — the server needs no
+ * gesture machinery, and core/src/editor.ts's parameter-property syntax isn't loadable under the app's
+ * strip-only `node --test` runner): validate against core's defaultCommands, run the handler in ONE store
+ * transaction (→ one diff on channel 2), mint the board's next authoritative seq, durably append ONE
+ * IntentEvent carrying that diff, and advance the watermark. The transaction already folded the change
+ * into the live store, so the mutation is visible to every server read the instant this returns. The
+ * returned event carries the diff (to broadcast to tabs) and the seq (to echo to the caller + adopt).
+ *
+ * Ordering + failure: the store mutates (transact) BEFORE the durable append. So if the append throws, the
+ * store is one commit ahead of the files — drop it, so the next read rehydrates from the (authoritative)
+ * files that never got the event, and rethrow for the caller to 500. An unknown command type throws before
+ * any mutation, so there is nothing to heal (the caller reports it as a validation reject).
+ */
+export function commitBoardCommand(boardId: string, repoPath: string, cmd: Command): IntentEvent {
+  const entry = getBoardEngine(boardId, repoPath);
+  const handler = (defaultCommands as Record<string, CommandHandler>)[cmd.type];
+  if (!handler) throw new Error(`board-engine: no handler for command "${cmd.type}"`);
+  const parent = entry.store.version;
+  const diff = entry.store.transact(() => handler(entry.store, cmd.payload), actorToSource(cmd.actor));
+  const seq = entry.watermark + 1;
+  const event: IntentEvent = { id: `evt:${uid()}`, ts: Date.now(), parent, seq, type: cmd.type, payload: cmd.payload, actor: cmd.actor, diff };
+  try {
+    appendBoardEvent(repoPath, event as unknown as Record<string, unknown>); // durable at commit — THROWS on IO failure
+  } catch (err) {
+    dropBoardEngine(boardId); // store is one commit ahead of the files — rehydrate from the files on next read
+    throw err;
+  }
+  entry.watermark = seq;
+  entry.hasPersist = true;
+  return event;
+}
+
+/**
+ * Record a tab-originated (human gesture) event on the single append point (design §10 seq handover):
+ * the tab minted a provisional seq locally, but the server is now the authority — REASSIGN the board's
+ * next authoritative seq (entry.watermark + 1), durably append with it, fold the diff into the live
+ * store, and return the seq for the tab to adopt. This closes the tripwire's dual-sequencer hazard: a
+ * bus commit and a human gesture can no longer be handed the same seq. On a fold error, drop the store
+ * (the durable append already landed — the next read rehydrates from the files).
+ */
+export function appendTabEvent(
+  boardId: string,
+  repoPath: string,
+  ev: StoredEvent & Record<string, unknown>,
+): number {
+  const entry = getBoardEngine(boardId, repoPath);
+  const seq = entry.watermark + 1;
+  const stamped = { ...ev, seq };
+  appendBoardEvent(repoPath, stamped); // durable first — THROWS on failure (caller 500s, nothing folded)
+  entry.watermark = seq;
+  entry.hasPersist = true;
+  try {
+    if (ev.diff) entry.store.applyDiffAsChange(ev.diff, "remote");
+  } catch (err) {
+    console.warn(`[board-engine] tab-event fold failed for ${boardId}; dropping store to rehydrate:`, err);
+    dropBoardEngine(boardId);
+  }
+  return seq;
 }

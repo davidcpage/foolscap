@@ -61,6 +61,14 @@ export class MemoryIntentLog implements IntentLog {
     return event;
   }
 
+  /** Advance the watermark to a seq assigned elsewhere (the server, once it is the single append
+   *  point — design §10 seq handover). A no-op if we're already at/ahead of it. Keeps this tab's
+   *  next locally-minted seq above the server's authoritative one, and its snapshot save stamping a
+   *  watermark that reflects the events the server has appended (so compaction keeps its clock). */
+  adopt(seq: number): void {
+    this._lastSeq = Math.max(this._lastSeq, seq);
+  }
+
   since(seq: number): IntentEvent[] {
     return this.events.filter((e) => e.seq > seq);
   }
