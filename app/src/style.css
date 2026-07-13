@@ -3351,7 +3351,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-msg-timespace {
   display: inline-block;
-  width: 46px; /* ~ the "HH:MM:SS" timestamp width + a little gap, so the last line's text clears the float */
+  width: 100px; /* ~ the "#<seq> · HH:MM:SS" label width + a little gap, so the last line's text clears the float */
   height: 1px;
 }
 /* Fallback when the body ends in a LIST (a spacer inside a list is awkward): the timestamp gets its own

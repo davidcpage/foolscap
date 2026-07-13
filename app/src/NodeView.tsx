@@ -1029,7 +1029,7 @@ function ThreadView({
                   </button>
                   {/* The timestamp is placed by renderMessageBody: floated into the last paragraph's tail
                       (WhatsApp inline meta), or a below-line row when the body ends in a list. */}
-                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m, formatEventTime(mm.ts))}</div>
+                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m, `#${mm.seq} · ${formatEventTime(mm.ts)}`)}</div>
                 </div>,
               );
             }
