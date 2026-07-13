@@ -10,6 +10,7 @@ import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./
 import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
+import { unionPillMembers, type PillMember } from "./pill-members";
 import { consumePendingJump, openCanvasLink, openDocLink, openSession, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
 import { HUD_GAP, HUD_SNAP, type HudChrome } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
@@ -727,26 +728,14 @@ function ThreadView({
     };
   }, []);
 
-  // Pills come from TWO sources unioned by sid. (1) The local member:* EDGES — a member with an open
-  // session card on this board; `open` reflects the edge type. (2) The server's DURABLE roster off the feed
-  // — members whose membership + seat survive server-side even after their session card (and its edge) was
-  // select-deleted (a display-only close). A durable member with NO edge here is exactly that deleted-card
-  // case: it gets a CLOSED pill (open:false, no edgeId) that stays clickable → openSession reopens it (P4
-  // pill-open). Without this union the pill would vanish on delete and P4's reopen-by-pill would be dead.
-  // `invited` splits the two open:false cases apart: a non-`member:open` EDGE is a pending invite (not yet
-  // joined server-side), whereas a cardless roster member is a CLOSED member (joined, its card deleted) —
-  // reopenable, not invited. The render keys "(invited)"/styling off this so a deleted-card pill doesn't
-  // masquerade as an un-joined invite.
-  const edgeMembers = edges.map((e) => {
+  // Pills = the local member:* EDGES (open reflects the edge type; a non-member:open edge is a pending
+  // invite) unioned with the server's DURABLE roster off the feed (unionPillMembers — see ./pill-members).
+  const edgeMembers: PillMember[] = edges.map((e) => {
     const n = store.get<"node">(e.from);
     const open = e.type === MEMBER_OPEN;
     return { edgeId: e.id as string | null, sid: n?.title ?? "?", name: n?.name ?? null, open, invited: !open };
   });
-  const edgeSids = new Set(edgeMembers.map((mm) => mm.sid));
-  const cardlessMembers = (feed?.members ?? [])
-    .filter((r) => !edgeSids.has(r.sid))
-    .map((r) => ({ edgeId: null as string | null, sid: r.sid, name: r.name, open: false, invited: false }));
-  const members = [...edgeMembers, ...cardlessMembers].sort((a, b) => Number(b.open) - Number(a.open));
+  const members = unionPillMembers(edgeMembers, feed?.members ?? []);
   // Only OPEN members can be tagged/woken (a pending invite isn't a member server-side), so tags resolve and
   // highlight against these entries — by sid OR role name, exactly the set the server (thread-tags.js) wakes.
   const openMembers = members.filter((mem) => mem.open);

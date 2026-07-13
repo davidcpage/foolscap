@@ -401,6 +401,31 @@ test("pins ride the marker beside seats/intents without clobbering them", () => 
   assert.equal(meta.pins.length, 1, "pins land alongside");
 });
 
+// F-H5 residue: the thread HUD's two durable pieces — the Coordinator SEAT and the PINNED head context —
+// must survive together across a cold re-read (a restart) AND across each other's writes (a re-fill must not
+// resurrect an unpinned pin; a pin/unpin must not disturb the seat). readThreadMeta/readPins re-read the
+// durable marker each call, so a fresh read IS the cold-restart read.
+test("HUD seat/pin round-trip: seat + pins co-persist through a re-fill and an unpin (F-H5)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:hud-roundtrip";
+  fillSeat(repo, id, "Coordinator", "sid-a", 100);
+  pinMessage(repo, id, msg(2, "task statement"), "sid-a", 150);
+  pinMessage(repo, id, msg(5, "Done when: tests green"), "human", 160);
+  // Cold re-read: seat occupant + both pin SNAPSHOTS (incl. text) survive together.
+  let meta = readThreadMeta(repo, id);
+  assert.equal(seatForSid(meta.seats, "sid-a"), "Coordinator", "the seat occupant survives the round-trip");
+  assert.deepEqual(readPins(repo, id).map((p) => p.seq), [2, 5], "both pins survive, seq-sorted");
+  assert.equal(readPins(repo, id)[1].text, "Done when: tests green", "the pin snapshot text is durable");
+  // A respawn re-fills the SAME seat; an unpin removes one pin. Neither write clobbers the other's slot.
+  assert.equal(fillSeat(repo, id, "Coordinator", "sid-b", 300).refilled, true, "a new occupant is a re-fill");
+  unpinMessage(repo, id, 2);
+  meta = readThreadMeta(repo, id);
+  assert.equal(seatForSid(meta.seats, "sid-b"), "Coordinator", "the re-filled occupant is durable");
+  assert.equal(seatForSid(meta.seats, "sid-a"), null, "the parked occupant no longer holds the seat");
+  assert.equal(meta.seats.Coordinator.fills, 2, "the seat's fill-count/createdAt round-trip across the re-fill");
+  assert.deepEqual(readPins(repo, id).map((p) => p.seq), [5], "the unpin is durable — the seat write didn't resurrect it");
+});
+
 test("seenMentions (user waiting-state): union add, sorted, idempotent, marker-coexisting", () => {
   const repo = tmpRepo();
   const id = "node:thread:seen";
