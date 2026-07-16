@@ -4,9 +4,11 @@
 // A channel post can NAME members with `@<tag>`. A tag gates the WAKE (the content-free nudge), not the
 // content: every post is still logged for every member to read on their own cursor — naming someone only
 // decides who gets INTERRUPTED. With no tag, nobody is woken (the post is ambient background); `@all`
-// (also everyone/channel/here) wakes the whole room on purpose; `@human`/`@user` addresses the board owner
-// (who reads the card, so there's no stdin to wake — it's a surfacing hint, and it keeps the SENDER's
-// status orange "waiting on a human" rather than blue "waiting on an agent").
+// (also everyone/channel/here) wakes the whole room on purpose; `@you` addresses the board owner — the
+// OFFICIAL human tag (their pill and session cards render as "you"), with `@human`/`@user` kept as legacy
+// aliases that still count (existing logs + agent habits keep working). Addressing the human is a surfacing
+// hint (who reads the card, so there's no stdin to wake) and keeps the SENDER's status orange "waiting on a
+// human" rather than blue "waiting on an agent". (Multi-user `@user-id` is a future extension, not here yet.)
 //
 // A member tag is a PREFIX of the member's session id — the canvas never makes a human type a full hash
 // (the channel card's member pill drops the shortest unambiguous prefix, e.g. `@a9`, into the post box).
@@ -19,7 +21,9 @@
 // mechanism, no special-case role lookup. The dot is in the token grammar so `Name.sid` is one tag.
 
 const ALL_TOKENS = new Set(["all", "everyone", "channel", "here"]);
-const HUMAN_TOKENS = new Set(["human", "user"]);
+// `you` is the OFFICIAL human tag (the board owner's pill + session cards render "you"); `human`/`user` are
+// legacy aliases, kept so existing thread logs and agent habits keep lighting the human-waiting badge.
+const HUMAN_TOKENS = new Set(["you", "human", "user"]);
 
 // The canonical tag-token grammar, defined ONCE so the resolver (server) and the highlighter (client, which
 // imports this module) can never drift apart — divergence here is exactly the @Coordinator-doesn't-light-up bug.

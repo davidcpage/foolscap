@@ -2,7 +2,8 @@
 // Plain ESM, runs under node --test; imported by vite-fs-plugin.ts to compute the human's unseen-mention
 // signal on the thread feed + the threads-list rail.
 //
-// WHAT COUNTS AS WAITING (the human's product call): an @you/@human MENTION the human has not yet VIEWED.
+// WHAT COUNTS AS WAITING (the human's product call): an @you MENTION the human has not yet VIEWED (`@you`
+// is the official human tag; `@human`/`@user` are honored legacy aliases — see thread-tags.js HUMAN_TOKENS).
 // This REPLACES the earlier clear-on-reply model (a mention newer than the human's last post). The human
 // asked for per-VIEWED-message clearing: a mention clears only when the human actually scrolls it into the
 // thread-log viewport (while the card is focused), not when they reply, and not merely by focusing the card.
