@@ -909,7 +909,16 @@ export function ensureLiveSession(
       }
     : {
         provider: "claude", cmd: resolveClaudeCommand(), args, cwd,
-        env: { MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000) },
+        // CANVAS_SESSION_ID + CANVAS_BOARD ride the child's shell env so `scripts/canvas` verbs default
+        // --from to this session's own sid (never the literal "human") and --board to this session's own
+        // board (never a stale hardcoded guess) with no flags. Closes the two `canvas msg` footguns where
+        // an agent silently impersonated the human / posted to the wrong board. (CANVAS_SESSION_ID also
+        // rides the permission-MCP subserver env above; this puts it on the session shell too.)
+        env: {
+          MCP_TOOL_TIMEOUT: String(PERMISSION_HOLD_MS + 60_000),
+          CANVAS_SESSION_ID: id,
+          CANVAS_BOARD: boardIdentity(repoPath).boardId,
+        },
       };
   const proc =
     REMOTE_SESSIONS && fsState.hostClient
