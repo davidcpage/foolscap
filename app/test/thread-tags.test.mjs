@@ -33,11 +33,14 @@ test("@all / @everyone / @channel / @here flag a whole-room wake", () => {
   }
 });
 
-test("@human / @user address the board owner, not a session", () => {
-  const r = resolveTags("@human your turn", MEMBERS);
-  assert.equal(r.human, true);
-  assert.deepEqual(r.members, []);
-  assert.equal(r.wakeAll, false);
+test("@you (official) / @human / @user all address the board owner, not a session", () => {
+  // @you is the official human tag; @human and @user are honored legacy aliases (thread-tags.js HUMAN_TOKENS).
+  for (const tok of ["you", "human", "user"]) {
+    const r = resolveTags(`@${tok} your turn`, MEMBERS);
+    assert.equal(r.human, true, `@${tok} addresses the board owner`);
+    assert.deepEqual(r.members, [], `@${tok} wakes no session`);
+    assert.equal(r.wakeAll, false);
+  }
 });
 
 test("an ambiguous prefix wakes every member it matches (safe over-notify)", () => {
@@ -151,7 +154,7 @@ test("a role tag matching nothing is prose, not an error", () => {
 // single token resolve?" (keyword OR sid/name prefix); matchTagSpans returns the highlight ranges in `text`.
 
 test("tagHit: keyword, sid prefix, and role-name prefix all hit; prose misses", () => {
-  for (const kw of ["all", "everyone", "channel", "here", "human", "user"]) {
+  for (const kw of ["all", "everyone", "channel", "here", "you", "human", "user"]) {
     assert.equal(tagHit(kw, NAMED), true, `@${kw} is a keyword`);
   }
   assert.equal(tagHit("Oracle", NAMED), true, "role name prefix");

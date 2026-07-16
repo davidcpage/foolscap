@@ -27,8 +27,13 @@ test("an @human mention that has not been viewed → waiting", () => {
   });
 });
 
-test("@user is an alias for @human", () => {
+test("@you is the official human tag → waiting", () => {
+  assert.equal(humanWaiting(log({ from: "a9", text: "@you decision needed" })).waiting, true);
+});
+
+test("@user and @human are honored legacy aliases for @you", () => {
   assert.equal(humanWaiting(log({ from: "a9", text: "ping @user" })).waiting, true);
+  assert.equal(humanWaiting(log({ from: "a9", text: "ping @human" })).waiting, true);
 });
 
 test("a plain message (no @human) does not wait", () => {
@@ -39,7 +44,7 @@ test("a plain message (no @human) does not wait", () => {
   assert.deepEqual(r, { waiting: false, count: 0, seqs: [], preview: [], more: 0 });
 });
 
-test("@all is NOT a human mention (only @human/@user)", () => {
+test("@all is NOT a human mention (only @you/@human/@user)", () => {
   assert.equal(humanWaiting(log({ from: "a9", text: "heads up @all" })).waiting, false);
 });
 

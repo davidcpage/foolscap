@@ -598,8 +598,9 @@ function ThreadView({
   // machinery the session/githead cards use). This card is its legible home — the whole point of 4e.
   const feed = useSignal(feedSignal<{ messages: ThreadMsg[]; truncated?: boolean; pins?: PinnedMsg[]; youWaiting?: boolean; youWaitingCount?: number; youWaitingSeqs?: number[]; members?: { sid: string; name: string | null; status?: string | null }[] }>("thread:" + id));
   const msgs = feed?.messages ?? [];
-  // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you/@human
-  // mention seqs the human has not yet VIEWED (thread-waiting.js × the durable seenMentions set). This no
+  // The board owner's unseen-mention signal (user waiting-state + you-pill): server-derived — the @you
+  // mention seqs the human has not yet VIEWED (@you is the official human tag; @human/@user are honored
+  // legacy aliases — thread-tags.js HUMAN_TOKENS × the durable seenMentions set). This no
   // longer paints the "you" pill (that is PRESENCE-only now — grey/green by card focus, below). It drives the
   // focus-clears-all effect: whenever the card is focused, ALL these seqs are marked seen at once (POST /seen
   // → they drop out). The rail (threads-list card) shows the count + the preview popover + the cross-card
@@ -868,7 +869,7 @@ function ThreadView({
   const markMentionsSeen = useCallback(() => {
     const seqs = (youWaitingKey ? youWaitingKey.split(",") : []).map(Number).filter((n) => n >= 1);
     if (seqs.length === 0) return;
-    void fetch(`/api/thread/${encodeURIComponent(id)}/seen`, {
+    void fetch(`/api/thread/${encodeURIComponent(id)}/seen?board=${activeBoardId()}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ from: "human", seqs }),

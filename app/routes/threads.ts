@@ -618,7 +618,7 @@ async function handleThreadSeen(
   // node 404'd every seen-POST for an off-canvas thread, so a rail-badged thread never cleared on open — only
   // a later deselect/reselect worked, once the client's addNode had persisted. Marking mentions seen is a
   // durable ledger op that doesn't need the node.
-  if (!readThreadMeta(repoPath, threadId)) return sendJson(res, 404, { error: "thread not found" });
+  if (!readThreadMeta(repoPath, threadId)) return sendJson(res, 404, { error: "thread not found", boardId });
   // Consent mirrors handleThreadPin: a SESSION sender must be a member (checked against the live snapshot when
   // one exists); the human at the card is not a session node and always may. An absent/node-less snapshot
   // therefore never blocks the human — the only caller the rail badge depends on.
