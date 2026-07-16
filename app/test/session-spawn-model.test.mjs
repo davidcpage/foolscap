@@ -26,7 +26,7 @@ registerHooks({
   },
 });
 
-const { buildSessionArgs, resolveSessionModel, resolveClaudeCommand, projectCodexHistory, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
+const { buildSessionArgs, resolveSessionModel, resolveSessionEffort, isValidEffort, EFFORT_LEVELS, resolveClaudeCommand, projectCodexHistory, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
 const { readRole } = await import("../role-ledger.js");
 
 test("Claude executable discovery honors the explicit GUI-safe override", () => {
@@ -139,4 +139,60 @@ test("bundled pm role resolves with model claude-fable-5; generalist has none", 
   } finally {
     fs.rmSync(tmpRepo, { recursive: true, force: true });
   }
+});
+
+// ── Reasoning effort: the --effort flag rides only when explicitly resolved ─────────────────────────
+test("buildSessionArgs adds --effort when set, omits it entirely when null/absent", () => {
+  const withEffort = buildSessionArgs({ ...baseOpts, model: "claude-opus-4-8", effort: "xhigh" });
+  assert.equal(flagValue(withEffort, "--effort"), "xhigh");
+  // Null / absent effort → no flag at all (the CLI applies its own default effort).
+  assert.ok(!buildSessionArgs({ ...baseOpts, model: "claude-opus-4-8", effort: null }).includes("--effort"));
+  assert.ok(!buildSessionArgs({ ...baseOpts, model: "claude-opus-4-8" }).includes("--effort"));
+});
+
+test("isValidEffort accepts exactly the contract levels; EFFORT_LEVELS is that set", () => {
+  assert.deepEqual([...EFFORT_LEVELS], ["low", "medium", "high", "xhigh", "max"]);
+  for (const lvl of EFFORT_LEVELS) assert.equal(isValidEffort(lvl), true);
+  for (const bad of ["minimal", "ultra", "MAX", "", null, undefined, 3]) assert.equal(isValidEffort(bad), false);
+});
+
+test("resolveSessionEffort: explicit param beats role `effort:` beats null (unset)", () => {
+  const role = { effort: "high" };
+  assert.equal(resolveSessionEffort("low", role), "low");
+  assert.equal(resolveSessionEffort(null, role), "high");
+  assert.equal(resolveSessionEffort("", role), "high"); // empty param is "not given"
+  assert.equal(resolveSessionEffort(null, { effort: null }), null);
+  assert.equal(resolveSessionEffort(null, null), null);
+  assert.equal(resolveSessionEffort("bogus", null), null); // an invalid level resolves to unset, never leaks
+});
+
+test("a role's `effort:` frontmatter flows from role.md text into the spawn argv", () => {
+  const role = parseRoleFile("---\nname: Deep\neffort: max\n---\n\nthink hard", "deep");
+  const args = buildSessionArgs({ ...baseOpts, model: "claude-opus-4-8", effort: resolveSessionEffort(null, role) });
+  assert.equal(flagValue(args, "--effort"), "max");
+});
+
+// ── Provider-aware model resolution: role/default model is IGNORED on a provider mismatch ───────────
+test("resolveSessionModel is provider-aware: Claude keeps its default, Codex has none", () => {
+  // Claude (default provider): explicit > role > DEFAULT_SESSION_MODEL, exactly as before.
+  assert.equal(resolveSessionModel("claude-sonnet-5", null, "claude"), "claude-sonnet-5");
+  assert.equal(resolveSessionModel(null, { model: "claude-fable-5" }, "claude"), "claude-fable-5");
+  assert.equal(resolveSessionModel(null, null, "claude"), DEFAULT_SESSION_MODEL);
+  // Codex: NO hardcoded default — absent stays absent (null); the app-server picks the plan default.
+  assert.equal(resolveSessionModel(null, null, "codex"), null);
+});
+
+test("resolveSessionModel ignores a role/default model that doesn't match the target provider", () => {
+  // A Claude role model is dropped on a Codex spawn (never send claude-* to codex) — falls through to null.
+  assert.equal(resolveSessionModel(null, { model: "claude-fable-5" }, "codex"), null);
+  // A Codex role model is dropped on a Claude spawn — falls through to the Claude default.
+  assert.equal(resolveSessionModel(null, { model: "gpt-5.6-codex" }, "claude"), DEFAULT_SESSION_MODEL);
+  // An EXPLICIT model is trusted as-is regardless of shape (the picker only offers the provider's models).
+  assert.equal(resolveSessionModel("gpt-5.6-codex", null, "codex"), "gpt-5.6-codex");
+  assert.equal(resolveSessionModel("claude-haiku-4-5-20251001", { model: "gpt-x" }, "claude"), "claude-haiku-4-5-20251001");
+});
+
+test("default resolveSessionModel provider is claude (back-compat with the two-arg call sites)", () => {
+  assert.equal(resolveSessionModel(null, null), DEFAULT_SESSION_MODEL);
+  assert.equal(resolveSessionModel(null, { model: "claude-fable-5" }), "claude-fable-5");
 });

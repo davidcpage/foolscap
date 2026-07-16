@@ -9,9 +9,10 @@ export function renderRoleFile(role: {
   colour?: string | null;
   loops?: boolean;
   model?: string | null;
+  effort?: string | null;
   charter?: string;
 }): string;
 export function parseRoleFile(
   text: string,
   roleId: string,
-): { roleId: string; name: string; colour: string | null; loops: boolean; model: string | null; charter: string };
+): { roleId: string; name: string; colour: string | null; loops: boolean; model: string | null; effort: string | null; charter: string };

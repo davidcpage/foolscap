@@ -23,32 +23,38 @@ export function roleIdFor(name) {
 }
 
 /**
- * Serialise { name, colour?, charter?, loops?, model? } to role.md text. Omits the colour line when there
- * is no colour, the `loops` line unless it's true (an operating-loop role woken on the server heartbeat —
- * agent-roles.md; the absent default is a plain reactive role), and the `model` line when there is none
- * (the spawner's default model applies — server-sessions.ts resolveSessionModel).
+ * Serialise { name, colour?, charter?, loops?, model?, effort? } to role.md text. Omits the colour line
+ * when there is no colour, the `loops` line unless it's true (an operating-loop role woken on the server
+ * heartbeat — agent-roles.md; the absent default is a plain reactive role), the `model` line when there is
+ * none (the spawner's default model applies — server-sessions.ts resolveSessionModel), and the `effort`
+ * line when there is none (the provider default reasoning effort applies — no `--effort`/`reasoningEffort`
+ * sent). `model` and `effort` are provider-aware at spawn: a role's Claude `model:` is ignored on a Codex
+ * spawn (and vice versa); `effort:` is a bare level (low|medium|high|xhigh|max) valid on both providers.
  */
-export function renderRoleFile({ name, colour, charter, loops, model }) {
+export function renderRoleFile({ name, colour, charter, loops, model, effort }) {
   const fm = [`name: ${name}`];
   if (colour) fm.push(`colour: ${colour}`);
   if (loops) fm.push(`loops: true`);
   if (model) fm.push(`model: ${model}`);
+  if (effort) fm.push(`effort: ${effort}`);
   return `---\n${fm.join("\n")}\n---\n\n${(charter ?? "").trim()}\n`;
 }
 
 /**
- * Parse role.md text to { roleId, name, colour, charter, loops, model }. `roleId` is taken as given (the
- * caller knows it from the directory / file path); `name` falls back to roleId when the frontmatter omits
- * it; `colour` is null when absent; `loops` is true only for `loops: true` (the role's sessions run an
- * operating loop driven by the server heartbeat); `model` is the Claude model id this role's sessions
- * default to (null when absent — the spawner's default applies); `charter` is the body after the
- * frontmatter (or the whole file when there is no fence).
+ * Parse role.md text to { roleId, name, colour, charter, loops, model, effort }. `roleId` is taken as given
+ * (the caller knows it from the directory / file path); `name` falls back to roleId when the frontmatter
+ * omits it; `colour` is null when absent; `loops` is true only for `loops: true` (the role's sessions run an
+ * operating loop driven by the server heartbeat); `model` is the model id this role's sessions default to
+ * (null when absent — the spawner's default applies; ignored at spawn on a provider mismatch); `effort` is
+ * the reasoning-effort level this role's sessions default to (null when absent — the provider default
+ * applies); `charter` is the body after the frontmatter (or the whole file when there is no fence).
  */
 export function parseRoleFile(text, roleId) {
   let name = roleId;
   let colour = null;
   let loops = false;
   let model = null;
+  let effort = null;
   let charter = text;
   const m = /^---\n([\s\S]*?)\n---\n?/.exec(text);
   if (m) {
@@ -61,8 +67,9 @@ export function parseRoleFile(text, roleId) {
       else if (k === "colour" && v) colour = v;
       else if (k === "loops") loops = /^(true|yes|1)$/i.test(v);
       else if (k === "model" && v) model = v;
+      else if (k === "effort" && v) effort = v;
     }
     charter = text.slice(m[0].length);
   }
-  return { roleId, name, colour, loops, model, charter: charter.trim() };
+  return { roleId, name, colour, loops, model, effort, charter: charter.trim() };
 }
