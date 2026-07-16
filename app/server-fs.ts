@@ -32,8 +32,14 @@ export const CARD_TYPES_DIR = path.resolve(here, "card-types");
 // by ALSO filtering on isInternalPath (Rule B) — so it shows exactly what the content endpoint will serve,
 // hiding only the two off-limits `.canvas` subtrees (`board`, the churny record store; `roots`, the shadow
 // git-dirs / feedback-loop hazard). No dead rows that 404 on open.
+// `.venv`/`venv`: Python virtualenvs run to ~10k files each, and chokidar v4 (no fsevents) holds one open
+// kqueue fd PER WATCHED FILE — an external repo mounted as a board with a `.venv` blew past macOS OPEN_MAX
+// and every posix_spawn failed EBADF (2026-07-15; same failure mode as the `.canvas/worktrees` fix,
+// 2026-07-11). Name-match like the rest of this set — no pyvenv.cfg stat — because isInternalPath is a pure
+// string predicate over (possibly relative) paths; the cost is hiding a source dir literally named `venv`,
+// which convention reserves for virtualenvs anyway.
 export const EXCLUDE_DIRS = new Set([
-  "node_modules", ".git", "dist", "build", ".vite", ".cache", "coverage",
+  "node_modules", ".git", "dist", "build", ".vite", ".cache", "coverage", ".venv", "venv",
 ]);
 
 // Rule B (docs/canvas-home.md §3/§5): is this path INTERNAL to the watchers + content endpoints? Excluded if
