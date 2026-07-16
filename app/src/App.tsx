@@ -56,6 +56,10 @@ import {
   fetchRoles,
   addRolesCard,
   watchDataset,
+  PROVIDER_MODELS,
+  EFFORT_LEVELS,
+  type EffortLevel,
+  modelLabel,
   type Pos,
   type Role,
   type WatchEvent,
@@ -994,12 +998,24 @@ function NewSessionItem({
   const [open, setOpen] = useState(false);
   const [roles, setRoles] = useState<Role[] | null>(null); // null = not yet fetched
   const [provider, setProvider] = useState<SessionProvider>("claude");
+  // Explicit model + effort overrides. null = "Default" (send nothing; the server resolves explicit >
+  // role > provider default) — that null state is what keeps a role's own default model meaningful, so a
+  // role button spawns at the role's model UNLESS the user pins one here.
+  const [model, setModel] = useState<string | null>(null);
+  const [effort, setEffort] = useState<EffortLevel | null>(null);
   const toggle = () => {
     const next = !open;
     setOpen(next);
     if (next && roles === null) void fetchRoles().then(setRoles);
   };
-  const spawn = (roleId?: string) => run(() => void spawnLiveSession(m, at, roleId, provider));
+  // A claude model id is meaningless for codex (and vice versa), so reset the explicit model when the
+  // provider flips; the picked model must belong to the current provider's list. Effort is provider-neutral.
+  const pickProvider = (p: SessionProvider) => {
+    setProvider(p);
+    setModel(null);
+  };
+  const spawn = (roleId?: string) =>
+    run(() => void spawnLiveSession(m, at, roleId, provider, model ?? undefined, effort ?? undefined));
   return (
     <div className="menu-roles">
       <button className="menu-expand" aria-expanded={open} onClick={toggle}>
@@ -1012,17 +1028,58 @@ function NewSessionItem({
             <button
               className={`menu-provideropt${provider === "claude" ? " active" : ""}`}
               aria-pressed={provider === "claude"}
-              onClick={() => setProvider("claude")}
+              onClick={() => pickProvider("claude")}
             >
               Claude
             </button>
             <button
               className={`menu-provideropt${provider === "codex" ? " active" : ""}`}
               aria-pressed={provider === "codex"}
-              onClick={() => setProvider("codex")}
+              onClick={() => pickProvider("codex")}
             >
               Codex
             </button>
+          </div>
+          {/* Model row — switches with the provider. "Default" (null) lets the server/role resolve it. */}
+          <div className="menu-optrow" role="group" aria-label="Model">
+            <button
+              className={`menu-opt${model === null ? " active" : ""}`}
+              aria-pressed={model === null}
+              onClick={() => setModel(null)}
+            >
+              Default
+            </button>
+            {PROVIDER_MODELS[provider].map((mm) => (
+              <button
+                key={mm.id}
+                className={`menu-opt${model === mm.id ? " active" : ""}`}
+                aria-pressed={model === mm.id}
+                title={mm.id}
+                onClick={() => setModel(mm.id)}
+              >
+                {mm.label}
+              </button>
+            ))}
+          </div>
+          {/* Effort row — "Default" sends no effort field; the five levels map to --effort / codex override. */}
+          <div className="menu-optrow" role="group" aria-label="Reasoning effort">
+            <button
+              className={`menu-opt${effort === null ? " active" : ""}`}
+              aria-pressed={effort === null}
+              onClick={() => setEffort(null)}
+            >
+              Default
+            </button>
+            {EFFORT_LEVELS.map((lvl) => (
+              <button
+                key={lvl}
+                className={`menu-opt${effort === lvl ? " active" : ""}`}
+                aria-pressed={effort === lvl}
+                onClick={() => setEffort(lvl)}
+              >
+                {lvl === "medium" ? "med" : lvl}
+              </button>
+            ))}
           </div>
           <button className="menu-roleopt" onClick={() => spawn()}>
             <span className="menu-roleswatch menu-roleswatch-none" />
@@ -1033,6 +1090,14 @@ function NewSessionItem({
             <button key={r.roleId} className="menu-roleopt" onClick={() => spawn(r.roleId)}>
               <span className={`menu-roleswatch c-${r.colour ?? "blue"}`} style={swatchStyle(r.colour)} />
               {r.name}
+              {/* The role's own default model (from /api/roles) as a quiet suffix — shown only when the
+                  user hasn't pinned an explicit model that would override it. */}
+              {r.model && model === null && (
+                <span className="menu-roledefault" title={`role default: ${r.model}`}>
+                  {modelLabel(r.model)}
+                  {r.effort ? ` ·${r.effort}` : ""}
+                </span>
+              )}
             </button>
           ))}
         </div>

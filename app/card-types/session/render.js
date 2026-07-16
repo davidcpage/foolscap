@@ -13,6 +13,33 @@
 import { html, nothing, render as litRender } from "/vendor/lit-html.js";
 import { renderMd } from "/vendor/markdown.js";
 
+// The serving-model chip: friendly name + a subtle metal tint by tier, with an effort suffix shown ONLY
+// when effort was explicitly set. This is INLINED here (not imported) because a card-type render.js may
+// import only /vendor/* (card-templates.test.mjs enforces the capability boundary) — the same map lives
+// in card-types/sessions/render.js; keep the two in lockstep with loader.ts's PROVIDER_MODELS ids.
+// Unknown ids keep the base grey chip with the id stripped of its `claude-` prefix — never blank.
+const MODEL_DISPLAY = {
+  "claude-fable-5": ["Fable", "gold"],
+  "claude-opus-4-8": ["Opus", "silver"],
+  "claude-sonnet-5": ["Sonnet", "bronze"],
+  "gpt-5.6-sol": ["Sol", "gold"],
+  "gpt-5.6-terra": ["Terra", "silver"],
+  "gpt-5.6-luna": ["Luna", "bronze"],
+};
+function modelChip(model, effort) {
+  if (typeof model !== "string" || !model) return null;
+  let label, tier;
+  if (MODEL_DISPLAY[model]) [label, tier] = MODEL_DISPLAY[model];
+  else if (/^claude-haiku/.test(model)) [label, tier] = ["Haiku", "plain"];
+  else [label, tier] = [model.replace(/^claude-/, ""), "plain"];
+  const eff = typeof effort === "string" && effort ? effort : null;
+  return html`<span
+    class="ses-model ses-model-${tier}"
+    title=${`model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
+    >${label}${eff ? html`<span class="ses-model-effort"> ·${eff}</span>` : ""}</span
+  >`;
+}
+
 // NO turn-count cap. Memory is bounded ONCE, upstream, by the BYTE caps on what reaches this codec
 // (MAX_SESSION_BYTES for a static/file-tail transcript, MAX_SESSION_FEED_BYTES for a live one — both
 // in vite-fs-plugin.ts, both keep the TAIL and flag `truncated`). A second cap here on the number of
@@ -697,10 +724,11 @@ export default {
     // The model actually serving the session, server-folded from the stream (it tracks a refusal
     // fallback, e.g. a fable-5 spawn silently served by opus-4-8 — the chip is how you SEE that).
     // Shown whenever the feed names one, exited included: which model did the work stays informative.
+    // model/effort now persist onto the durable marker (W1), so the chip survives Done + a restart —
+    // the file-tail feed re-emits them for a historical/ended session, not just the live registry.
     const model = live && typeof live.model === "string" ? live.model : null;
-    const modelPill = model
-      ? html`<span class="ses-model" title=${`model: ${model}`}>${model.replace(/^claude-/, "")}</span>`
-      : "";
+    const effort = live && typeof live.effort === "string" ? live.effort : null;
+    const modelPill = modelChip(model, effort) ?? "";
 
     // The INPUT half (agent-sessions §3; session-timelines §4): send a prompt into the live session
     // through the granted `sessionInput` capability — a session-internal POST, never the canvas log.

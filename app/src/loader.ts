@@ -1205,6 +1205,11 @@ export interface Role {
   roleId: string;
   name: string;
   colour?: string; // a NOTE_COLORS key or a CSS colour — the picker treats it as a swatch background
+  // The role's DEFAULT model + effort (server-resolved: explicit spawn param > role frontmatter >
+  // provider default). Surfaced by /api/roles so the picker can show a role's default as a suffix; the
+  // model is a canonical id (e.g. "claude-opus-4-8") — modelLabel() maps it to a friendly name.
+  model?: string;
+  effort?: EffortLevel;
 }
 
 // The roles available to spawn under (GET /api/roles). Returns [] on any failure (endpoint not yet live,
@@ -1222,11 +1227,65 @@ export async function fetchRoles(): Promise<Role[]> {
 
 export type SessionProvider = "claude" | "codex";
 
-export function sessionSpawnBody(roleId?: string, provider: SessionProvider = "claude"): {
+// Reasoning-effort levels the New-session menu can pin (claude --effort / codex reasoning override). ABSENT
+// means "provider default" — the spawn omits the field entirely (there is no "auto"/"default" value on the
+// wire; the contract with W1 is: no `effort` key = default). "medium" is spelled in full on the wire even
+// though the menu abbreviates it to "med".
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+export interface ModelChoice {
+  id: string; // canonical model id sent to the server / matched by the pill display map
+  label: string; // friendly menu + pill label
+}
+
+// The models the New-session menu offers per provider. Claude ids are the canonical `--model` strings;
+// Codex ids were VERIFIED against the installed binary (codex-cli 0.144.2 — `strings` on the ChatGPT.app
+// codex): Sol/Terra/Luna are real gpt-5.6 slugs. Kept as a small data table so a new model is a one-line
+// add and the pill display map (card-types/*/render.js) stays in lockstep with these ids.
+export const PROVIDER_MODELS: Record<SessionProvider, ModelChoice[]> = {
+  claude: [
+    { id: "claude-fable-5", label: "Fable" },
+    { id: "claude-opus-4-8", label: "Opus" },
+    { id: "claude-sonnet-5", label: "Sonnet" },
+    { id: "claude-haiku-4-5-20251001", label: "Haiku" },
+  ],
+  codex: [
+    { id: "gpt-5.6-sol", label: "Sol" },
+    { id: "gpt-5.6-terra", label: "Terra" },
+    { id: "gpt-5.6-luna", label: "Luna" },
+  ],
+};
+
+// A model id → friendly label, for the role-default suffix in the menu. Falls back to the id with the
+// `claude-` prefix stripped (same as the pill's unknown-id path) so an unmapped id still reads sanely.
+export function modelLabel(id: string): string {
+  for (const list of Object.values(PROVIDER_MODELS)) {
+    const hit = list.find((mm) => mm.id === id);
+    if (hit) return hit.label;
+  }
+  return id.replace(/^claude-/, "");
+}
+
+export function sessionSpawnBody(
+  roleId?: string,
+  provider: SessionProvider = "claude",
+  model?: string,
+  effort?: EffortLevel,
+): {
   roleId?: string;
   provider: SessionProvider;
+  model?: string;
+  effort?: EffortLevel;
 } {
-  return { ...(roleId ? { roleId } : {}), provider };
+  return {
+    ...(roleId ? { roleId } : {}),
+    provider,
+    // OMIT model/effort when unset: an absent key means "let the server resolve (explicit > role > default)".
+    // This is what keeps role defaults meaningful — send an explicit model only when the user picked one.
+    ...(model ? { model } : {}),
+    ...(effort ? { effort } : {}),
+  };
 }
 
 export async function spawnLiveSession(
@@ -1234,14 +1293,17 @@ export async function spawnLiveSession(
   at?: Pos,
   roleId?: string,
   provider: SessionProvider = "claude",
+  model?: string,
+  effort?: EffortLevel,
 ): Promise<void> {
   // When spawning UNDER a role, the server reads that role's role.md, appends the charter to the system
   // prompt, stamps roleId/roleName on the session marker, and returns the role's display name so the card
-  // can carry a friendly handle. A bare spawn (no roleId) behaves exactly as before.
+  // can carry a friendly handle. A bare spawn (no roleId) behaves exactly as before. `model`/`effort` ride
+  // the body only when explicitly picked (sessionSpawnBody omits them otherwise).
   const res = await fetch(`/api/session/spawn?board=${activeBoardId()}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(sessionSpawnBody(roleId, provider)),
+    body: JSON.stringify(sessionSpawnBody(roleId, provider, model, effort)),
   });
   if (!res.ok) return; // provider executable unavailable, or the spawn failed — leave the board unchanged
   const { id, roleName } = (await res.json()) as { id: string; roleName?: string };

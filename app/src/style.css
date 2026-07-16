@@ -2264,6 +2264,31 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   border-radius: 4px;
   padding: 0 4px;
 }
+/* Metal tints by model tier (session-card head + sessions-list row): a SUBTLE tint + border on the same
+   9px chip — gold (top tier: Fable / Sol), silver (Opus / Terra), bronze (Sonnet / Luna), plain grey
+   (Haiku + any unmapped id, unchanged from the base). Deliberately quiet — the chip stays an identifier,
+   not a badge. */
+.ses-model-gold {
+  color: #8a6d1a;
+  border-color: #e6d08a;
+  background: #fbf6e6;
+}
+.ses-model-silver {
+  color: #55606e;
+  border-color: #cbd1d9;
+  background: #f3f5f7;
+}
+.ses-model-bronze {
+  color: #8a5a37;
+  border-color: #e0c1a6;
+  background: #f8efe7;
+}
+/* .ses-model-plain keeps the base grey — no override needed. */
+/* Effort suffix inside the chip (e.g. "Fable ·xhigh") — shown only when effort was explicitly set,
+   dimmed a touch so the model name stays primary. */
+.ses-model-effort {
+  opacity: 0.72;
+}
 /* Touched-files activity strip (worktree-activity slice A): a subtle, collapsed disclosure beneath the
    head — recency-decaying dots + a count; click to expand the path list. Monochrome for now; the dots
    split into per-worktree hues once multi-root discovery lands (slice C). */
@@ -3825,6 +3850,40 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   padding: 4px 8px;
   font-size: 11px;
   color: #a1a1aa;
+}
+/* Model + effort rows under the provider toggle: a compact wrapped row of small chips reusing the
+   provideropt visual register. A variable count (5 Claude / 4 Codex models, 6 effort options) wraps
+   rather than forcing a fixed grid. */
+.menu-optrow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  padding: 0 5px 5px 1px;
+}
+.menu-list .menu-opt {
+  justify-content: center;
+  min-height: 22px;
+  padding: 2px 7px;
+  border: 1px solid #e4e4e7;
+  border-radius: 5px;
+  color: #71717a;
+  background: #fff;
+  font-size: 11px;
+}
+.menu-list .menu-opt.active {
+  border-color: #a5b4fc;
+  color: #3730a3;
+  background: #eef2ff;
+  font-weight: 600;
+}
+/* A role's default-model suffix — quiet, right-aligned after the role name. */
+.menu-roledefault {
+  margin-left: auto;
+  padding-left: 8px;
+  font-size: 10px;
+  color: #a1a1aa;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: nowrap;
 }
 
 /* The "New file" create form (NewFileItem) — a title input, an editable path field, and a Create button,
