@@ -156,6 +156,11 @@ export interface LiveSession {
   // fable-5 → opus-4-8; see canvas-workers-fable-fallback-opus memory). Rendered as a chip on the session
   // card and the sessions list so a silent model demotion is VISIBLE. null until the first frame names it.
   model: string | null;
+  // The reasoning effort this session was spawned at (spawn param > role `effort:` > provider default),
+  // one of EFFORT_LEVELS or null when the provider default applies. Unlike `model` it does NOT change
+  // mid-session (there's no server-side effort fallback), so it's set once at spawn and rides the feed +
+  // the durable marker so the pill's effort suffix survives Done.
+  effort: string | null;
   turnOut: number; // output tokens from this turn's COMPLETED messages; the live output adds the streaming delta on top
   // Channel delivery (4e): message CONTENT is never injected as user text — it lives in the off-log channel
   // log and the agent READS it by tool call (GET /api/inbox). The session only tracks, per channel, the

@@ -18,7 +18,7 @@ import type { CanvasFsState, LiveSession, ThreadMsg, WsClient } from "./server-t
 import { boardIdentity, boardRoots, boards, DEFAULT_BOARD, ensureCanvasExcluded, invalidateBoardRoots, readBoardRegistry, recordBoardOpened, reqBoard, rootDir } from "./server-boards.js";
 import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
@@ -394,12 +394,18 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
     /* best-effort — the watcher tolerates a missing dir, this just makes the watch immediate */
   }
   startSessionsFeed(boardId, sessionsDir(repoPath), markersDir);
-  startWorktreesFeed(boardId, repoPath);
   migrateChannelLedger(repoPath); // one-time §8 step 2 rename: `.canvas/channels/` → `.canvas/threads/`
   seedThreadLogs(repoPath); // restore thread conversations from `.canvas/threads/` (cold-restart fix)
   startThreadsFeed(boardId, repoPath); // live-push the list rail as threads gain activity
   startRolesFeed(boardId, repoPath); // live-push the roles-list rail as roles are created/edited
-  syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
+  // No shadow machinery on a scratch/test board (tmpdir or noSessions): a tmpdir repo is not a git repo, so
+  // the shadow committer and its worktrees watcher just spew `[shadow] … add failed: fatal: not a git
+  // repository` / bare `fatal: not a git repository` from git probes against a throwaway tree. Skip both at
+  // the source (real boards are unaffected). The rest of the feeds are cheap and harmless on a scratch board.
+  if (!isScratchBoard(boardId)) {
+    startWorktreesFeed(boardId, repoPath); // .git/worktrees watcher → re-sync shadow roots as trees appear/vanish
+    syncShadowRoots(boardId, repoPath); // shadow-git committer per root + boot-reconcile (step 1)
+  }
   startLoopHeartbeat(); // global, idempotent — wakes looping-role (Coordinator) sessions to sweep for stalls
 }
 

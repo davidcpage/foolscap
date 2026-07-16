@@ -274,6 +274,18 @@ function ensureHudCard(m: InteractionManager, id: string): void {
   seatHudCard(m, id as Id<"node">, resolveHudPosition(spec, viewportW), fresh);
 }
 
+// HUD on/off is a view preference, persisted in the sanctioned board-scoped localStorage tier (like the
+// camera pose and hidden-sessions), never the durable log. Only the persistent hudMode is stored — hudEdit
+// (the transient Alt-hold edit mode) never is. Storage access swallows failure: a lost toggle is cosmetic.
+const hudModeKey = (boardId: string): string => `foolscap:hud-mode:${boardId}`;
+function readHudMode(): 0 | 1 {
+  try {
+    return localStorage.getItem(hudModeKey(activeBoardId())) === "1" ? 1 : 0;
+  } catch {
+    return 0; // unreadable storage — default to HUD off, matching a fresh board
+  }
+}
+
 // The async shell: it owns engine construction (hydration is async) and renders the board once ready.
 // A ref guards against React StrictMode's dev-only double-invoke kicking off two engines.
 export function App() {
@@ -326,10 +338,20 @@ function Board({ m, undo, persistence }: Engine) {
   //    fully inert. Editing needs the cards visible, so entering edit force-shows a hidden HUD and restores
   //    it on release — keeping the TAP the sole PERSISTENT visibility control (a hold never leaves the HUD
   //    in a new visibility state on its own).
-  const [hudMode, setHudMode] = useState<0 | 1>(0);
+  const [hudMode, setHudMode] = useState<0 | 1>(readHudMode);
   const [hudEdit, setHudEdit] = useState(false);
-  const hudModeRef = useRef<0 | 1>(0);
+  const hudModeRef = useRef<0 | 1>(hudMode);
   hudModeRef.current = hudMode;
+  // Persist HUD visibility across a hard refresh — write back on every change (every setHudMode path,
+  // including the tap toggle and the reveal-menu action, flows through this one effect). hudEdit is never
+  // persisted. The edit-mode force-show/restore round-trips 1→0, so the stored value settles correctly.
+  useEffect(() => {
+    try {
+      localStorage.setItem(hudModeKey(activeBoardId()), String(hudMode));
+    } catch {
+      // unwritable storage — the HUD stays where the user left it this session, harmless
+    }
+  }, [hudMode]);
   useEffect(() => {
     let altDown = false; // Alt physically held right now
     let tap = false; // Alt down with nothing else since → still a tap candidate

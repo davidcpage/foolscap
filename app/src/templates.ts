@@ -218,8 +218,10 @@ export function mountTemplate(
 // Build the capability object for one card: content fields off the node's channel-1 handle, plus
 // the declared off-log signals. All reads route through tracked(), so render-time access = subscription.
 // The directory card's expand-set (open-folder `treeState`), kept by node id so it survives the card's
-// unmount→remount when the HUD is toggled closed and reopened (a per-mount closure reset it each time). Value
-// only — never persisted to the log or reload (session-local view state, file-trees-on-canvas.md §9).
+// unmount→remount when the HUD is toggled closed and reopened (a per-mount closure reset it each time).
+// This map is the in-memory tier; it's backed by board-scoped localStorage (see the `treeState` case in
+// buildCard) so the expand-set ALSO survives a hard reload — still view state, never the log / node props
+// (file-trees-on-canvas.md §9), just persisted in the sanctioned localStorage tier like the camera pose.
 const TREE_STATE = new Map<string, unknown>();
 
 export function buildCard(
@@ -426,9 +428,37 @@ export function buildCard(
     // its DOM — so only `value` is shared across mounts, not the notify set.
     if (name === "treeState") {
       const key = host ? host.id : "";
+      // The expand-set is backed by board-scoped localStorage (the sanctioned view-state tier — same as
+      // the camera pose in session.ts and hidden-sessions in content.ts, and NOT the node props / intent
+      // log, which this file forbids for view state). The Set is serialised as a JSON array under
+      // `foolscap:tree-state:<boardId>:<nodeId>`; loaded LAZILY the first time this mount is read (when
+      // TREE_STATE has no in-memory value — e.g. right after a hard reload) and written back on every set.
+      // All storage access swallows failure: a lost expand-set is cosmetic, never a data-loss event.
+      const storeKey = (): string => `foolscap:tree-state:${activeBoardId()}:${key}`;
+      let loaded = false; // this mount has already consulted localStorage (present or absent)
+      const loadStored = (): unknown => {
+        // The stored Set, or undefined if nothing is persisted — undefined lets the card apply its
+        // default (top-level roots expanded); an explicitly-stored empty Set stays a Set and wins.
+        try {
+          const raw = localStorage.getItem(storeKey());
+          if (raw == null) return undefined;
+          return new Set(JSON.parse(raw) as string[]);
+        } catch {
+          return undefined; // unreadable / corrupt — behave as nothing stored
+        }
+      };
       const watchers = new Set<() => void>();
       const sub: Subscribable<unknown> = {
-        get: () => TREE_STATE.get(key),
+        get: () => {
+          if (TREE_STATE.has(key)) return TREE_STATE.get(key);
+          if (!loaded) {
+            loaded = true;
+            const stored = loadStored();
+            if (stored !== undefined) TREE_STATE.set(key, stored);
+            return stored;
+          }
+          return undefined;
+        },
         subscribe(fn) {
           watchers.add(fn);
           return () => watchers.delete(fn);
@@ -438,6 +468,11 @@ export function buildCard(
         get: (): unknown => tracked(sub),
         set: (next: unknown): void => {
           TREE_STATE.set(key, next);
+          try {
+            localStorage.setItem(storeKey(), JSON.stringify([...(next as Set<unknown>)]));
+          } catch {
+            // unwritable storage (private mode / quota) — the toggle stays in-memory this session
+          }
           for (const fn of watchers) fn();
         },
       };

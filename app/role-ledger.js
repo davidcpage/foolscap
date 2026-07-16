@@ -107,21 +107,22 @@ export function readRole(repoPath, roleId) {
  * a bundled default is allowed — that is exactly how a board OVERRIDES a shipped role. Returns the created
  * { roleId, name, colour, charter }.
  */
-export function createRole(repoPath, { name, charter, colour, loops, model } = {}) {
+export function createRole(repoPath, { name, charter, colour, loops, model, effort } = {}) {
   if (!isValidRoleName(name)) throw new Error("invalid role name (use letters, digits, hyphens)");
   const roleId = roleIdFor(name);
   if (fs.existsSync(rolePath(repoPath, roleId))) throw new Error(`role "${roleId}" already exists`);
   fs.mkdirSync(roleDir(repoPath, roleId), { recursive: true });
-  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter, loops, model }));
-  return { roleId, name, colour: colour ?? null, loops: !!loops, model: model ?? null, charter: (charter ?? "").trim() };
+  fs.writeFileSync(rolePath(repoPath, roleId), renderRoleFile({ name, colour, charter, loops, model, effort }));
+  return { roleId, name, colour: colour ?? null, loops: !!loops, model: model ?? null, effort: effort ?? null, charter: (charter ?? "").trim() };
 }
 
 /**
  * List every role available on this board, by name — the source for the role-picker on "new session".
  * Merges the two layers: bundled defaults first, then board overrides win on an id collision (and add
- * board-only roles). Each entry is { roleId, name, colour, loops } — the charter is read only when a role
- * is actually instantiated. `loops` rides the list so the heartbeat / picker can tell a looping role at a
- * glance.
+ * board-only roles). Each entry is { roleId, name, colour, loops, model, effort } — the charter is read only
+ * when a role is actually instantiated. `loops` rides the list so the heartbeat / picker can tell a looping
+ * role at a glance; `model` + `effort` ride it so the New-session picker can show each role's default model
+ * and reasoning effort (they were dropped from this projection before the model-choice controls).
  */
 export function listRoles(repoPath) {
   const byId = new Map();
@@ -134,6 +135,8 @@ export function listRoles(repoPath) {
     if (r && r.name) byId.set(r.roleId, r);
   }
   return [...byId.values()]
-    .map(({ roleId, name, colour, loops }) => ({ roleId, name, colour, loops: !!loops }))
+    .map(({ roleId, name, colour, loops, model, effort }) => ({
+      roleId, name, colour, loops: !!loops, model: model ?? null, effort: effort ?? null,
+    }))
     .sort((a, b) => a.name.localeCompare(b.name));
 }

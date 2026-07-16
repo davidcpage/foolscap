@@ -31,6 +31,7 @@ export interface CodexSpawnSpec {
   provider: "codex";
   cwd: string;
   model?: string;
+  reasoningEffort?: string; // the app-server's native thread-start reasoning-effort field (low|medium|high|xhigh|max)
   developerInstructions?: string;
   resumeProviderId?: string;
 }
