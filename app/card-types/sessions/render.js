@@ -11,6 +11,33 @@ import { html } from "/vendor/lit-html.js";
 // host needs (openSession resolves the rest); the drop point sets the position.
 const MIME = "application/x-canvas-session";
 
+// Serving-model chip: friendly name + subtle metal tint by tier, effort suffix only when explicitly set.
+// INLINED (card-type render.js may import only /vendor/*, per card-templates.test.mjs) — kept in lockstep
+// with the identical map in card-types/session/render.js and loader.ts's PROVIDER_MODELS ids. Unknown ids
+// keep the base grey chip with `claude-` stripped — never blank. /api/sessions carries model/effort for
+// ended sessions too (W1), so the row chip persists after Done.
+const MODEL_DISPLAY = {
+  "claude-fable-5": ["Fable", "gold"],
+  "claude-opus-4-8": ["Opus", "silver"],
+  "claude-sonnet-5": ["Sonnet", "bronze"],
+  "gpt-5.6-sol": ["Sol", "gold"],
+  "gpt-5.6-terra": ["Terra", "silver"],
+  "gpt-5.6-luna": ["Luna", "bronze"],
+};
+function modelChip(model, effort) {
+  if (typeof model !== "string" || !model) return null;
+  let label, tier;
+  if (MODEL_DISPLAY[model]) [label, tier] = MODEL_DISPLAY[model];
+  else if (/^claude-haiku/.test(model)) [label, tier] = ["Haiku", "plain"];
+  else [label, tier] = [model.replace(/^claude-/, ""), "plain"];
+  const eff = typeof effort === "string" && effort ? effort : null;
+  return html`<span
+    class="ses-model ses-model-${tier}"
+    title=${`model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
+    >${label}${eff ? html`<span class="ses-model-effort"> ·${eff}</span>` : ""}</span
+  >`;
+}
+
 function dragStart(e, id) {
   e.dataTransfer.setData(MIME, JSON.stringify({ id }));
   e.dataTransfer.effectAllowed = "copy";
@@ -96,8 +123,9 @@ export default {
       <div class="dir-body">
         ${!sessions ? html`<div class="dir-empty">loading…</div>` : ""}
         ${sessions && count === 0 ? html`<div class="dir-empty">no sessions on disk</div>` : ""}
-        ${(sessions ?? []).map(
-          (s) => html`
+        ${(sessions ?? []).map((s) => {
+          const chip = modelChip(s.model, s.effort);
+          return html`
             <div
               class="ses-row ${s.status ? `ses-status-${s.status}` : ""}"
               draggable="true"
@@ -115,13 +143,13 @@ export default {
                 <span class="ses-row-title ${s.title ? "" : "ses-row-mono"}">${s.title || s.id.slice(0, 8)}</span>
               </span>
               <span class="ses-row-meta">
-                ${s.model /* serving model, known for live sessions only — tracks a refusal fallback */
-                  ? html`<span class="ses-model" title=${`model: ${s.model}`}>${s.model.replace(/^claude-/, "")}</span> · `
+                ${chip /* serving model + effort; persists for ended sessions (W1 records it on the marker) */
+                  ? html`${chip} · `
                   : ""}${s.turns ? `${s.turns} turn${s.turns === 1 ? "" : "s"} · ` : ""}${timeAgo(s.mtime)} · ${historyLabel(s)}
               </span>
             </div>
-          `,
-        )}
+          `;
+        })}
       </div>
     `;
   },

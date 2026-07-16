@@ -1653,6 +1653,66 @@ test("session template renders provider-neutral plan and error projections", asy
   assert.ok(out.includes("turn failed safely"));
 });
 
+// Model + effort chip (thread "Model choice controls", W2). The serving-model chip shows a FRIENDLY name
+// (not the raw id), a subtle metal tint by tier (gold/silver/bronze/plain grey), and an effort suffix ONLY
+// when effort was explicitly set. Crucially it must render for an ENDED/Done session too — the payload
+// carries model/effort off the durable marker (W1), fixing the pill-disappears-on-Done bug.
+test("session card model chip: friendly name + metal tint + effort suffix, and it PERSISTS on an ended session", async () => {
+  const mod = await loadTemplate("session");
+  const turn = JSON.stringify({ type: "assistant", message: { role: "assistant", content: "done" } });
+  const chipOut = (session) =>
+    flatten(mod.render({ fields: { title: "abcd1234", text: "", color: "blue" }, signals: { session } }));
+
+  // Live Fable at explicit xhigh → gold tint, friendly "Fable" (not the raw id), and the effort suffix.
+  let out = chipOut({ content: turn, truncated: false, status: "idle", model: "claude-fable-5", effort: "xhigh" });
+  assert.ok(out.includes("ses-model-gold"), "Fable → gold tint");
+  assert.ok(out.includes("Fable"), "friendly model name shows (the raw id stays in the title tooltip)");
+  assert.ok(out.includes("title=") && out.includes("model: claude-fable-5"), "the raw id is preserved in the tooltip");
+  assert.ok(out.includes("·xhigh"), "explicit effort shows as a suffix");
+  assert.ok(out.includes("ses-model-effort"), "effort rides its own dimmable span");
+
+  // Opus, no effort → silver, no suffix.
+  out = chipOut({ content: turn, truncated: false, status: "running", model: "claude-opus-4-8" });
+  assert.ok(out.includes("ses-model-silver") && out.includes("Opus"), "Opus → silver");
+  assert.ok(!out.includes("ses-model-effort"), "no effort set → no suffix");
+
+  // Codex Sol → gold (the tier ramp mirrors Claude), friendly name + its own effort suffix.
+  out = chipOut({ content: turn, truncated: false, status: "idle", provider: "codex", model: "gpt-5.6-sol", effort: "high" });
+  assert.ok(out.includes("ses-model-gold") && out.includes("Sol"), "Codex Sol → gold");
+  assert.ok(out.includes("·high"), "Codex effort suffix too");
+
+  // ENDED session (no live status, ended:true — the file-tail feed rebuilt from the durable marker): the
+  // chip MUST still render (the disappearing-pill bug this thread exists to kill). Sonnet → bronze.
+  out = chipOut({ content: turn, truncated: false, ended: true, model: "claude-sonnet-5", effort: "medium" });
+  assert.ok(out.includes("ses-model-bronze") && out.includes("Sonnet"), "chip survives Done → bronze Sonnet");
+  assert.ok(out.includes("·medium"), "…with its effort suffix intact");
+
+  // Haiku → plain grey; an UNKNOWN id also stays plain grey with the stripped id — never blank.
+  out = chipOut({ content: turn, truncated: false, status: "idle", model: "claude-haiku-4-5-20251001" });
+  assert.ok(out.includes("ses-model-plain") && out.includes("Haiku"), "Haiku → plain grey, friendly name");
+  out = chipOut({ content: turn, truncated: false, status: "idle", model: "some-future-model" });
+  assert.ok(out.includes("ses-model-plain") && out.includes("some-future-model"), "unknown id → grey, stripped id, never blank");
+
+  // No model on the feed → no chip at all (unchanged from before this feature).
+  out = chipOut({ content: turn, truncated: false, status: "idle" });
+  assert.ok(!out.includes("ses-model"), "no model on the feed → no chip");
+});
+
+test("sessions-list model chip: friendly name + metal tint + effort, for ended rows too", async () => {
+  const mod = await loadTemplate("sessions");
+  const rows = [
+    { id: "aaaa1111", mtime: Date.now(), bytes: 100, turns: 3, model: "claude-fable-5", effort: "max" },
+    { id: "bbbb2222", mtime: Date.now(), bytes: 100, turns: 1, provider: "codex", model: "gpt-5.6-luna" },
+    { id: "cccc3333", mtime: Date.now(), bytes: 100, turns: 0, model: "no-such-model" },
+    { id: "dddd4444", mtime: Date.now(), bytes: 100, turns: 0 }, // no model → no chip
+  ];
+  const out = flatten(mod.render({ fields: { title: "", text: "", color: "blue" }, signals: { sessionList: rows } }));
+  assert.ok(out.includes("ses-model-gold") && out.includes("Fable"), "Fable row → gold, friendly name");
+  assert.ok(out.includes("·max"), "explicit effort suffix on the row");
+  assert.ok(out.includes("ses-model-bronze") && out.includes("Luna"), "Codex Luna → bronze (tier ramp)");
+  assert.ok(out.includes("ses-model-plain") && out.includes("no-such-model"), "unknown id → grey stripped id, never blank");
+});
+
 // Drift lock (card side, thread mrcmofwf-10): the card's CLIENT idle fallback — used only for a bandless
 // slice-1/historical feed with no server `band` — must rank the idle states in the SAME order as the server
 // (vite-fs-plugin.ts sessionStatus: scheduled > waitingOn > waiting). The old fallback ranked waitingOn
