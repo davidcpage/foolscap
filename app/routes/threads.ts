@@ -18,6 +18,7 @@ import {
   readThreadLog,
   readThreadMeta,
   releaseSeat,
+  roleMentionRoute,
   seatForSid,
   setThreadLevel,
   threadMembersFromMeta,
@@ -205,7 +206,9 @@ async function handleThreadMessage(
       wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin });
       // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role
       // COLD-SPAWNS a fresh session into the thread — the mention itself is the summons (role/seat-based only).
-      spawnMentionedWorkers(boardId, threadId, unknown, origin);
+      // `from` (the poster) rides along for the AUTHOR GUARD: a departing seat-holder's own @Role must never
+      // revive-or-spawn itself (mirrors the wake path's exceptSid).
+      spawnMentionedWorkers(boardId, threadId, unknown, origin, from);
     } catch (e) {
       console.error("[thread] deferred wake/spawn failed for", threadId, e);
     }
@@ -220,15 +223,28 @@ async function handleThreadMessage(
 // discard, no regression). (A seatless reserved-keyword path once cold-spawned a plain worker per mention; it
 // was REMOVED as a footgun — naming the token in prose triggered a runaway spawn cascade.) The worker is
 // seeded from the thread's FULL backlog, so the triggering message replays on its first inbox read: it wakes
-// onto the task. NOT the dormant-seat path — an existing seat (live or dormant) resolves to a MEMBER and rides
-// maybeRespawnDormantSeat; this is first-contact only. Returns the spawns for the response (legibility/tests).
+// onto the task.
+//
+// SEAT GUARD (accidental-respawn fix): a token that already resolved to a member (a live seated role) never
+// reaches here — resolveTags put it in `members` and it rode the wake/respawn path. But a seated role whose
+// occupant card is UNRESOLVABLE in the snapshot at parse time (e.g. a departing Coordinator whose card is
+// already gone) fails name-resolution and falls to `unknown`, landing here — where the old code blindly
+// cold-spawned a SECOND occupant onto a seat that already exists. So before spawning, consult the role's SEAT
+// (the handle IS the role name — fillSeat keys on `role.name`, the same string classifyMentionSpawn returns):
+// if a seat exists, DON'T cold-spawn — route to it exactly as the wake path does (nudge the live occupant,
+// else revive the dormant seat via maybeRespawnDormantSeat). Cold-spawn remains for a genuinely UNSEATED role
+// (first contact) only. `authorSid` is the poster: never revive-or-spawn the poster's OWN seat (the AUTHOR
+// GUARD, mirroring wakeThreadMembers' exceptSid — the departing seat-holder's wind-down @Role summoning itself
+// is the exact live-repro'd bug). Returns the spawns for the response (legibility/tests).
 function spawnMentionedWorkers(
   boardId: string,
   threadId: string,
   unknownTags: string[],
   origin: string,
+  authorSid: string,
 ): Array<{ token: string; sid: string; role: string | null }> {
-  const { boards, boardSnapshotRecords, threadNode, serverSpawnWorker } = getServerContext();
+  const { boards, boardSnapshotRecords, threadNode, serverSpawnWorker, liveSessions, flushNudge, maybeRespawnDormantSeat } =
+    getServerContext();
   const spawned: Array<{ token: string; sid: string; role: string | null }> = [];
   if (!unknownTags?.length) return spawned;
   const repoPath = boards.get(boardId)?.repoPath;
@@ -236,11 +252,29 @@ function spawnMentionedWorkers(
   const roles = listRoles(repoPath);
   const records = boardSnapshotRecords(boardId);
   const title = (records ? threadNode(records, threadId) : null)?.title || threadId;
+  const meta = readThreadMeta(repoPath, threadId); // seats live here — the SEAT GUARD reads them
+  const isLive = (sid: string): boolean => { const s = liveSessions.get(sid); return !!s && s.status !== "exited"; };
   for (const tok of unknownTags) {
     const hit = classifyMentionSpawn(tok, roles);
     if (!hit) continue; // not a known role — leave as inert prose (no regression)
-    // A role summons into its named seat, single-flight per seat so a duplicate tag in the same burst doesn't
-    // race a second worker onto it.
+    // SEAT GUARD (+ AUTHOR GUARD): route the mention against the role's DURABLE seat before spawning. The
+    // pure decision lives in roleMentionRoute (thread-ledger) so it's unit-testable without a live server.
+    const route = roleMentionRoute(meta, hit.name, { authorSid, isLive });
+    if (route.action === "skip") continue; // the poster holds this seat — no self-nudge, no self-revive
+    if (route.action === "nudge") {
+      const occ = liveSessions.get(route.occupant);
+      if (occ && occ.status !== "exited") {
+        occ.nudge = true; // live occupant: the same content-free nudge an @-tag gives a live seat
+        if (occ.status === "idle") flushNudge(occ);
+      }
+      continue; // seated + live — never cold-spawns a second occupant
+    }
+    if (route.action === "revive") {
+      maybeRespawnDormantSeat(boardId, threadId, route.occupant, origin, meta); // dormant seat: reconstitute it
+      continue; // seated + dormant — reconstitute the SAME seat, never a second one
+    }
+    // route.action === "spawn" — FIRST CONTACT (no seat for this role yet): cold-spawn into its (new) seat,
+    // single-flight per seat so a duplicate tag in the same burst doesn't race a second worker onto it.
     const claimKey = seatSurfaceKey(threadId, hit.name);
     if (isSurfaceClaimed(claimKey)) continue;
     const sid = serverSpawnWorker({

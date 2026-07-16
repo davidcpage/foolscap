@@ -37,6 +37,7 @@ import {
   setReopenSet,
   readReopenSet,
   untaggedSeatNudgeTarget,
+  roleMentionRoute,
 } from "../thread-ledger.js";
 
 function tmpRepo() {
@@ -651,4 +652,45 @@ test("untaggedSeatNudgeTarget: a thread with no Coordinator seat → null (only 
 test("untaggedSeatNudgeTarget: tolerates a null/empty meta → null", () => {
   assert.equal(untaggedSeatNudgeTarget(null, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive }), null);
   assert.equal(untaggedSeatNudgeTarget({}, "Coordinator", { broadcast: false, mentioned: new Set(), exceptSid: "poster", isLive: alwaysLive }), null);
+});
+
+// ── roleMentionRoute (accidental-respawn fix: an @Role mention that fell to the cold-spawn path must consult
+// the durable seat BEFORE minting a second occupant — thread "Accidental thread respawn") ──────────────────
+// (a) a seated role whose occupant is LIVE → nudge, never a second spawn; (b) the AUTHOR holds the seat →
+// skip (no self-revive/spawn, regardless of liveness); (c) a genuinely UNSEATED role → spawn (first contact).
+test("roleMentionRoute (a): a seated role with a LIVE occupant → nudge, not spawn", () => {
+  const got = roleMentionRoute(coordMeta, "Coordinator", { authorSid: "worker-9", isLive: alwaysLive });
+  assert.deepEqual(got, { action: "nudge", occupant: "coord-1" }, "live seat is a wake target, never a duplicate");
+});
+
+test("roleMentionRoute (a'): a seated role whose occupant has EXITED → revive the SAME seat, not spawn", () => {
+  const got = roleMentionRoute(coordMeta, "Coordinator", { authorSid: "worker-9", isLive: neverLive });
+  assert.deepEqual(got, { action: "revive", occupant: "coord-1" }, "dormant seat reconstitutes in place");
+});
+
+test("roleMentionRoute (b): the AUTHOR holds the seat → skip (the departing occupant's self-mention)", () => {
+  // The live-repro'd bug: a wind-down @Coordinator posted BY the Coordinator itself must not resurrect it.
+  const live = roleMentionRoute(coordMeta, "Coordinator", { authorSid: "coord-1", isLive: alwaysLive });
+  assert.deepEqual(live, { action: "skip", occupant: "coord-1" }, "self-mention of own seat → no-op");
+  // …and never a revive/spawn even when the author's own session has already exited (the exact bug's timing).
+  const gone = roleMentionRoute(coordMeta, "Coordinator", { authorSid: "coord-1", isLive: neverLive });
+  assert.deepEqual(gone, { action: "skip", occupant: "coord-1" }, "author guard wins over liveness → never self-revive");
+});
+
+test("roleMentionRoute (c): a genuinely UNSEATED role → spawn (first contact preserved)", () => {
+  const got = roleMentionRoute(coordMeta, "Reviewer", { authorSid: "worker-9", isLive: alwaysLive });
+  assert.deepEqual(got, { action: "spawn" }, "no seat for the role → cold-spawn still fires");
+  // …and a board with no seats at all is likewise first-contact.
+  assert.deepEqual(roleMentionRoute(null, "Coordinator", { authorSid: "x", isLive: alwaysLive }), { action: "spawn" });
+  assert.deepEqual(roleMentionRoute({}, "Coordinator", { authorSid: "x", isLive: alwaysLive }), { action: "spawn" });
+});
+
+test("roleMentionRoute: handle match is case-insensitive → drift degrades to a wake, not a duplicate spawn", () => {
+  const got = roleMentionRoute(coordMeta, "coordinator", { authorSid: "worker-9", isLive: alwaysLive });
+  assert.deepEqual(got, { action: "nudge", occupant: "coord-1" });
+});
+
+test("roleMentionRoute: omitting isLive treats the occupant as live (caller vetted liveness) → nudge", () => {
+  const got = roleMentionRoute(coordMeta, "Coordinator", { authorSid: "worker-9" });
+  assert.deepEqual(got, { action: "nudge", occupant: "coord-1" }, "no predicate → assume live, mirror fillSeat's convention");
 });

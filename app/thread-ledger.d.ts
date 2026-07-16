@@ -111,6 +111,13 @@ export function untaggedSeatNudgeTarget(
   role: string,
   opts: { broadcast: boolean; mentioned?: Set<string>; exceptSid?: string; isLive?: (sid: string) => boolean },
 ): string | null;
+export function roleMentionRoute(
+  meta: ThreadMetaMarker | null | undefined,
+  role: string,
+  opts?: { authorSid?: string; isLive?: (sid: string) => boolean },
+):
+  | { action: "spawn" }
+  | { action: "skip" | "nudge" | "revive"; occupant: string };
 export function setThreadLevel(
   repoPath: string,
   threadId: string,
