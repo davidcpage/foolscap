@@ -69,17 +69,36 @@ trusting one:
 
 ## Running & operating the app (dev-ops)
 
-- **Run:** `npm run dev` (in `app/`) — Vite + the fs middleware, always on **port 5173** (`strictPort`; a
-  second `npm run dev` fails loudly rather than silently binding 5174 — IndexedDB is per-origin, so a port
-  slide makes boards look empty). If it won't start, free the port (`lsof -ti tcp:5173`); don't override it.
+- **Run:** `npm run dev` (in `app/`) runs the **supervisor** (`app/dev-supervisor.js`) — a tiny long-lived
+  owner that launches Vite + the fs middleware (always **port 5173**, `strictPort`; a second `npm run dev`
+  fails loudly rather than binding 5174 — IndexedDB is per-origin, so a port slide makes boards look empty).
+  If it won't start, free the port (`lsof -ti tcp:5173`); don't override it.
+- **One Ctrl-C reaps the whole stack.** The supervisor owns Vite as a process-group child and, on its own
+  SIGINT/SIGTERM (or `npm run dev:stop`), tears down in order — Vite, then the sidecars — so there are no
+  orphaned processes to hunt. It does **not** spawn the sidecars: they keep their auto-start-on-first-attach
+  path (below); the supervisor just *tracks + reaps* them via their existing stop verbs. Caveat: a `kill -9`
+  of the *supervisor* can't be trapped — its children reparent to launchd and keep running (macOS has no
+  subreaper; accepted, use Ctrl-C / `dev:stop`, not `kill -9`).
 - **Sessions run in a sidecar** (`app/session-host.js`, socket in tmpdir keyed by checkout, log
   `app/.session-host.log`), auto-started on first attach. The dev server is a *client*: restarting it
   re-attaches and **adopts** running sessions rather than killing them (history from the transcript,
-  running/idle from the busy bit). **Stop everything** with `npm run session-host:stop` (children end
-  clean; a `kill -9` reads as "crashed"). Ctrl-C on the dev server does NOT reap leaked sessions. A
-  long-running sidecar keeps its OLD code across upgrades — `--stop` warns and tells you to kill the pid.
-- **Opt out** with `npm run dev:local` (`CANVAS_SESSION_HOST=0`): in-process children, killed on server
-  exit. A local-mode server won't adopt the sidecar's sessions — don't mix modes.
+  running/idle from the busy bit). A long-running sidecar keeps its OLD code across upgrades — a protocol
+  bump fails loudly, a non-protocol change runs stale until you restart it.
+- **Targeted restart** (supervisor verbs): `npm run dev:restart-server` bounces **only** the Vite child —
+  the sidecars and every live agent session survive (they're owned by the untouched session-host) and the
+  fresh Vite re-attaches + re-adopts them. `npm run dev:restart-jupyter` drops the gateway (kernels
+  relaunch on demand). There is deliberately **no session-host restart** — the host owns the child stdin
+  pipes in-process, so bouncing it kills every live session; that IS "stop everything" (`dev:stop`), not a
+  targeted bounce. `dev-supervisor.js status` reports the current Vite pid + socket. Note the supervisor's
+  full-process restart is heavier than Vite's own same-pid re-eval (edit a plugin/config file → Vite
+  re-evaluates the module in-process, `globalThis` state adopted, sidecars untouched) — **that stays the
+  primary iterate loop**; `restart-server` is for a wedged server or a change Vite can't hot-eval.
+- **Bare / opt-out paths (no supervisor):** `npm run dev:bare` runs Vite directly (the pre-supervisor
+  path — sidecars still auto-start and adopt, but Ctrl-C leaves them running; reap with
+  `npm run session-host:stop` / `jupyter-host:stop`). `npm run dev:local` (`CANVAS_SESSION_HOST=0`): sessions
+  run **in-process** and die with the server; a local-mode server won't adopt the sidecar's sessions — don't
+  mix modes. Contract tests / CI reach a session-host through the same auto-start path, so they need no
+  supervisor.
 - **Board records persist server-side** in `<repo>/.canvas/board/` (`events.jsonl` + `snapshot.json`), so a
   board hydrates the same in any browser and travels with the repo. IndexedDB is a read-once adoption
   source, not a durable tier — don't curl-write a board's persist endpoints (it blocks that adoption).
@@ -101,6 +120,10 @@ harness leaves, not here):
 - `app/annotations.js` (+ `.canvas/annotations/`) + `app/anchors.js` — doc annotations (standoff, W3C
   quote anchors); `app/src/NodeView.tsx` + `app/src/annotations.ts` — the annotation card UI (host chrome).
 - `app/role-format.js` / `app/role-ledger.js` (+ `app/default-roles/`) — role charters (frontmatter + body).
+- `app/dev-supervisor.js` — the thin dev-stack lifecycle owner behind `npm run dev`: owns Vite as a
+  process-group child, tracks + reaps the sidecars on its own exit (their existing stop verbs), and serves
+  `restart-server` / `restart-jupyter` / `stop` / `status` over a checkout-keyed tmpdir control socket. No
+  session-host restart verb (bouncing it kills live sessions). See the dev-ops section above.
 - `app/jupyter-host.js` (+ `jupyter-host-protocol.js`) — the Jupyter kernel-gateway sidecar (launch-on-demand,
   tmpdir rendezvous, `--stop`); `app/server-kernel.ts` + `app/routes/kernel.ts` — the `/api/kernel/*` broker
   (kernel-per-notebook on `fsState.liveKernels`, IOPub→nbformat, id-keyed CAS write-back through the codec's
