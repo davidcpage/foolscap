@@ -882,3 +882,93 @@ test("isScratchBoard is true for a tmpdir repo OR the noSessions flag, false for
     fs.rmSync(realBoard, { recursive: true, force: true });
   }
 });
+
+// ── Group H: /api/ws phantom-tab over-count (heartbeat reaper + tabCountFor dedupe) ─────────────────
+// Fix for the "[boards] N tabs now live" over-count on board switch: a board switch is a full-page nav,
+// so the old page's socket may linger half-open (its close frame lost) filed under the same board id.
+// The reaper terminates a socket that missed its ping; tabCountFor dedupes overlap by a stable per-tab id.
+
+test("installWsHeartbeat terminates a socket that missed its ping, pings a live one", () => {
+  // A fake ws recording ping/terminate and letting the test fire "pong". The reaper's setInterval never
+  // fires under node:test's fake-free clock in-band, so we grab the tick body by stubbing setInterval.
+  const calls = { ping: 0, terminate: 0 };
+  let pongCb = null;
+  const ws = {
+    readyState: 1,
+    OPEN: 1,
+    on(ev, cb) {
+      if (ev === "pong") pongCb = cb;
+    },
+    ping() {
+      calls.ping++;
+    },
+    terminate() {
+      calls.terminate++;
+    },
+  };
+  const realSetInterval = globalThis.setInterval;
+  let tick = null;
+  globalThis.setInterval = (fn) => {
+    tick = fn;
+    return 0;
+  };
+  try {
+    plugin.installWsHeartbeat(ws, 25000);
+  } finally {
+    globalThis.setInterval = realSetInterval;
+  }
+  assert.ok(typeof tick === "function", "the reaper armed an interval");
+  assert.ok(typeof pongCb === "function", "the reaper registered a pong handler");
+
+  // First tick: socket was alive (initial arm) → it pings, does NOT terminate, and arms isAlive=false.
+  tick();
+  assert.equal(calls.ping, 1, "a live socket is pinged");
+  assert.equal(calls.terminate, 0, "a live socket is not terminated");
+
+  // No pong arrives → next tick sees the missed ping and terminates (which, in prod, fires ws.on(close)).
+  tick();
+  assert.equal(calls.terminate, 1, "a socket that missed its ping is terminated");
+
+  // A socket that DOES pong between ticks is kept alive and pinged again, never terminated.
+  calls.ping = 0;
+  calls.terminate = 0;
+  pongCb(); // pong received → re-armed
+  tick();
+  assert.equal(calls.terminate, 0, "a ponging socket is not terminated");
+  assert.equal(calls.ping, 1, "a ponging socket is pinged again");
+});
+
+test("tabCountFor dedupes WS clients by stable tab id; untagged legacy sockets count individually", () => {
+  const st = globalThis.__canvasFsState;
+  const wsSet = ctx.getWsClients(st);
+  const busMap = ctx.getBusClients(st);
+  wsSet.clear();
+  busMap.clear();
+  const mk = (boardId, tab) => ({ boardId, tab, watches: new Map(), send() {} });
+
+  // Two sockets from ONE browser tab (board-switch overlap: old page's socket lingers) share a tab id.
+  wsSet.add(mk("board-a", "T1"));
+  wsSet.add(mk("board-a", "T1"));
+  assert.equal(plugin.tabCountFor("board-a"), 1, "same tab id counts once (no phantom over-count)");
+
+  // A genuinely second browser tab has its own sessionStorage id → counts separately.
+  wsSet.add(mk("board-a", "T2"));
+  assert.equal(plugin.tabCountFor("board-a"), 2, "a distinct tab id adds one");
+
+  // Untagged/legacy sockets (no ?tab=) each count individually — no dedupe, the pre-existing behaviour.
+  wsSet.add(mk("board-a", undefined));
+  wsSet.add(mk("board-a", undefined));
+  assert.equal(plugin.tabCountFor("board-a"), 4, "two untagged sockets add two");
+
+  // Other boards don't leak into the census.
+  wsSet.add(mk("board-b", "T3"));
+  assert.equal(plugin.tabCountFor("board-a"), 4, "another board's socket is not counted");
+  assert.equal(plugin.tabCountFor("board-b"), 1);
+
+  // SSE busClients keep counting per-connection, added on top of the WS census.
+  busMap.set("board-a", new Set([{ res: {} }, { res: {} }]));
+  assert.equal(plugin.tabCountFor("board-a"), 6, "SSE compat clients add on top of the deduped WS count");
+
+  wsSet.clear();
+  busMap.clear();
+});

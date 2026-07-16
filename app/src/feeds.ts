@@ -72,13 +72,33 @@ export function onFeedsReconnect(fn: () => void): () => void {
   return () => reconnectListeners.delete(fn);
 }
 
+// A stable per-tab id sent to the server as ?tab= so tabCountFor dedupes the brief board-switch overlap
+// (a board switch is a full-page nav — location.assign — so the old page's socket may linger until the
+// server's heartbeat reaper takes it, while the new page's socket is already up). sessionStorage is
+// per-tab and survives a same-tab navigation, so both sockets carry the SAME id → counted as one tab; a
+// genuinely second tab gets its own sessionStorage → its own id → counted separately. Falls back to a
+// fresh random on any storage failure (private-mode quotas) — a fallback tab just isn't deduped, which is
+// the pre-existing behaviour, never an over-count crash.
+let cachedTabId: string | null = null;
+function tabId(): string {
+  if (cachedTabId) return cachedTabId;
+  const fresh = crypto.randomUUID();
+  try {
+    let id = sessionStorage.getItem("canvas.tabId");
+    if (!id) sessionStorage.setItem("canvas.tabId", (id = fresh));
+    return (cachedTabId = id);
+  } catch {
+    return (cachedTabId = fresh);
+  }
+}
+
 // One socket for the page's life, opened on first subscription. WebSocket doesn't auto-reconnect the
 // way EventSource did, so a close schedules a retry (same 2s cadence the SSE `retry:` advertised); the
 // server replays feed values on connect, and onopen re-sends the active watch subscriptions.
 function ensureConnected(): void {
   if (ws) return;
   const sock = new WebSocket(
-    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws?board=${activeBoardId()}`,
+    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/ws?board=${activeBoardId()}&tab=${tabId()}`,
   );
   ws = sock;
   sock.onmessage = (ev) => {
