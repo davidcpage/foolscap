@@ -187,14 +187,29 @@ async function handleThreadMessage(
       publishSession(w);
     }
   }
-  // @-tags decide the wake set, now gated by each member's seat level (P1/W4): `@all` is a room broadcast
-  // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an untagged
-  // post is ambient (neither — wakes no one).
-  const notified = wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin: originOf(req) });
-  // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role
-  // COLD-SPAWNS a fresh session into the thread — the mention itself is the summons (role/seat-based only).
-  const spawned = spawnMentionedWorkers(boardId, threadId, unknown, originOf(req));
-  sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length, notified, spawned });
+  // RESPOND-THEN-WAKE (thread "Long sending delays on threads"): the message is durably appended above, so
+  // the sender's 200 no longer needs to wait on the @-mention wake fan-out. The dormant-seat respawn
+  // (wakeThreadMembers) and the @Role cold-spawn (spawnMentionedWorkers) each spin up a process — ~1s of
+  // work that used to sit INSIDE the response, delaying the composer's "sending…". Answer first, then wake:
+  // sendJson flushes the 200, and setImmediate runs the fan-out on the NEXT tick (so the flush isn't blocked
+  // by the synchronous spawn setup). Fire-and-forget — a wake/spawn failure can never un-accept the message.
+  // The `notified`/`spawned` counts are dropped from the response (nothing consumes them: the CLI keys on
+  // `ok`/`delivered`, and no contract test asserts them); the wake is now off the response's critical path.
+  sendJson(res, 200, { ok: true, channel: threadId, from, seq: msg.seq, members: members.length });
+  const origin = originOf(req);
+  setImmediate(() => {
+    try {
+      // @-tags decide the wake set, gated by each member's seat level (P1/W4): `@all` is a room broadcast
+      // (wakes level-`all` seats), a member tag is a mention (wakes that seat regardless of level), an
+      // untagged post is ambient (neither — wakes no one).
+      wakeThreadMembers(boardId, threadId, from, { broadcast: wakeAll, mentioned: new Set(tagged), origin });
+      // §step5 (threads-as-cards roadmap): an @-tag that resolved to NO member but NAMES a known role
+      // COLD-SPAWNS a fresh session into the thread — the mention itself is the summons (role/seat-based only).
+      spawnMentionedWorkers(boardId, threadId, unknown, origin);
+    } catch (e) {
+      console.error("[thread] deferred wake/spawn failed for", threadId, e);
+    }
+  });
 }
 
 // §step5 (threads-as-cards roadmap: @Role mention → cold-spawn). Each UNKNOWN @-tag (one resolveTags left

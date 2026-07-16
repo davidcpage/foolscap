@@ -3484,6 +3484,10 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   border-radius: 10px 10px 2px 10px;
   background: #e7f6ec;
 }
+/* An optimistic ("posted, not yet echoed by the feed") bubble — thread "Long sending delays on threads".
+   Slightly dimmed so it reads as in-flight, but positioned/coloured exactly like a settled `me` bubble so
+   the feed echo swaps in with no visual jump. Its "sending…" meta (rendered inline) carries the state. */
+.chan-msg.me.pending-echo { opacity: 0.62; }
 /* R-PIN: a per-message pin toggle, faint until the bubble is hovered so the log stays quiet; a top-right
    hover affordance (out of the text flow, so it doesn't compete with the floated timestamp). A pinned
    message shows its 📌 lit + the left gutter bar below. */

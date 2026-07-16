@@ -135,24 +135,51 @@ export function leaveThread(editor: Editor, edgeId: string): void {
 // Post a message to a thread through the server fan-out endpoint. `from` is the sender's session id, or a
 // non-session marker like "human" when the board owner posts from the thread card. Returns a thin ok/error
 // so the post box can surface a 403 (not a member) / 404 honestly.
-export async function postToThread(threadId: string, from: string, text: string): Promise<{ ok: boolean; error?: string }> {
-  try {
-    const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/message?board=${activeBoardId()}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from, text }),
-    });
-    const body = (await res.json().catch(() => ({}))) as { error?: string };
-    if (res.ok) return { ok: true };
-    // The membership/thread checks read the last browser-pushed snapshot, which lags a fresh edit by the
-    // ~500ms push debounce. So a post right after creating/joining can momentarily 409 (no snapshot yet) or
-    // 403 (the join edge hasn't round-tripped) — transient, worth a retry hint rather than the raw status.
-    if (res.status === 409) return { ok: false, error: "board still syncing — try again in a moment" };
-    if (res.status === 403) return { ok: false, error: body.error ?? "not a member (or membership still syncing)" };
-    return { ok: false, error: body.error ?? `HTTP ${res.status}` };
-  } catch (e) {
-    return { ok: false, error: String(e) };
+//
+// A server-file merge restarts the Vite dev server mid-request, so a POST can hang against a dead socket
+// until the OS gives up (~tens of seconds). We bound each attempt with an AbortController timeout and retry
+// ONCE on a timeout / network drop / 5xx (the restart-shaped failures), so a bounce that lands between the
+// two attempts still gets the message through instead of stranding the composer on "sending…". A 4xx
+// (403/409 membership-sync races) is deterministic per attempt — surfaced immediately, not retried.
+const POST_TIMEOUT_MS = 8000;
+export async function postToThread(
+  threadId: string,
+  from: string,
+  text: string,
+  opts: { timeoutMs?: number; retries?: number } = {},
+): Promise<{ ok: boolean; error?: string }> {
+  const timeoutMs = opts.timeoutMs ?? POST_TIMEOUT_MS;
+  const retries = opts.retries ?? 1;
+  let lastError = "failed";
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/message?board=${activeBoardId()}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from, text }),
+        signal: ctrl.signal,
+      });
+      const body = (await res.json().catch(() => ({}))) as { error?: string };
+      if (res.ok) return { ok: true };
+      // The membership/thread checks read the last browser-pushed snapshot, which lags a fresh edit by the
+      // ~500ms push debounce. So a post right after creating/joining can momentarily 409 (no snapshot yet) or
+      // 403 (the join edge hasn't round-tripped) — transient, worth a retry hint rather than the raw status.
+      // These are deterministic per attempt (a retry wouldn't help within our window), so return them now.
+      if (res.status === 409) return { ok: false, error: "board still syncing — try again in a moment" };
+      if (res.status === 403) return { ok: false, error: body.error ?? "not a member (or membership still syncing)" };
+      lastError = body.error ?? `HTTP ${res.status}`;
+      if (res.status < 500) return { ok: false, error: lastError }; // other 4xx: deterministic, don't retry
+      // 5xx (e.g. a durable-append hiccup during a restart) → fall through to the retry.
+    } catch (e) {
+      // AbortError (our timeout) or a network drop — the restart-shaped failures worth one retry.
+      lastError = ctrl.signal.aborted ? "timed out" : String(e);
+    } finally {
+      clearTimeout(timer);
+    }
   }
+  return { ok: false, error: lastError };
 }
 
 // Pin (or unpin) a thread message as HEAD CONTEXT (R-PIN): a pinned message is re-read on every wake and
