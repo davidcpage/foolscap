@@ -1,8 +1,35 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
 export const CLAUDE_USAGE_POLL_MS = 180_000;
 export const CLAUDE_USAGE_MAX_BACKOFF_MS = 15 * 60_000;
+
+/**
+ * A stable, non-reversible fingerprint of the OAuth token — so the poller can tell "same failing
+ * token as last time" from "the keychain rotated" WITHOUT ever holding or logging the token itself.
+ * null in ⇒ null out (no token).
+ */
+export function tokenFingerprint(token) {
+  if (token == null || token === "") return null;
+  return crypto.createHash("sha256").update(String(token)).digest("hex");
+}
+
+/**
+ * Should the Claude usage poll SKIP its upstream fetch this tick? A `gate` is set when the last poll
+ * hit a blocking condition — a 401 (dead token; `until: Infinity`, held until the token changes) or a
+ * 429 (rate-limited; `until` = the capped retry deadline). We skip while the SAME token is still within
+ * the block window; the instant the keychain token changes (fingerprint differs) OR the deadline passes
+ * we fetch again. This is what turns a designed-in sleep into an interruptible one: the caller re-checks
+ * at base cadence, and a token refresh mid-401/mid-429 fires a prompt retry instead of waiting it out.
+ * @param {{hash: (string|null), until: number}|null} gate
+ * @param {string|null} currentHash  fingerprint of the token read this tick
+ */
+export function shouldSkipUsagePoll(gate, currentHash, now = Date.now()) {
+  if (!gate) return false;
+  if (gate.hash !== currentHash) return false; // token rotated → retry immediately
+  return now < gate.until; // same token, still inside the hold window
+}
 
 /** Retry-After accepts either delay-seconds or an HTTP date. Return a non-negative delay in ms. */
 export function retryAfterMs(value, now = Date.now()) {
@@ -14,10 +41,16 @@ export function retryAfterMs(value, now = Date.now()) {
   return Number.isFinite(date) ? Math.max(0, date - now) : null;
 }
 
-/** Exponential 429 backoff, never polling before a valid Retry-After deadline. */
+/**
+ * Exponential 429 backoff, never polling before a valid Retry-After deadline — but a server can hand us
+ * an abusive Retry-After (Anthropic returns 3600s after a hammering loop), which would freeze the card
+ * for an hour. Cap the HONORED Retry-After at CLAUDE_USAGE_MAX_BACKOFF_MS so the total wait stays bounded;
+ * pairing this with the interruptible poll (shouldSkipUsagePoll) means a token refresh still cuts it short.
+ */
 export function claudeRateLimitDelay(previousBackoff, retryAfter, base = CLAUDE_USAGE_POLL_MS) {
   const backoff = Math.min(previousBackoff ? previousBackoff * 2 : base, CLAUDE_USAGE_MAX_BACKOFF_MS);
-  return { backoff, delay: Math.max(base + backoff, retryAfter ?? 0) };
+  const honoredRetry = retryAfter == null ? 0 : Math.min(retryAfter, CLAUDE_USAGE_MAX_BACKOFF_MS);
+  return { backoff, delay: Math.max(base + backoff, honoredRetry) };
 }
 
 export function mergeUsageProvider(envelope, provider, value) {

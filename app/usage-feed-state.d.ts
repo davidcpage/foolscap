@@ -7,6 +7,12 @@ export function claudeRateLimitDelay(
   retryAfter: number | null,
   base?: number,
 ): { backoff: number; delay: number };
+export function tokenFingerprint(token: string | null | undefined): string | null;
+export function shouldSkipUsagePoll(
+  gate: { hash: string | null; until: number } | null,
+  currentHash: string | null,
+  now?: number,
+): boolean;
 export function mergeUsageProvider(
   envelope: { schema?: number; providers?: Record<string, unknown> } | null | undefined,
   provider: string,

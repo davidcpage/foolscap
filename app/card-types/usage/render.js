@@ -55,6 +55,15 @@ function resetLabel(iso) {
   return `Resets ${when} (${tz})`;
 }
 
+// "11:10" — the wall-clock (local) time a scheduled rate-limit retry will fire, from an ms timestamp.
+// Used in the staleness pill so a designed-in sleep reads as "retrying at 11:10", not a dead card.
+function retryClock(ts) {
+  const raw = typeof ts === "number" && ts < 10_000_000_000 ? ts * 1000 : ts;
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
 // A labelled bar with a right-aligned value caption — the shared shape for the plan windows and the
 // extra-usage row. `value` is the text to the right of the bar (e.g. "14% used", "£0.00 / £20.00").
 function gaugeBar(label, pct, value, sub) {
@@ -138,9 +147,14 @@ function claudePlanSection(usage) {
   }
 
   // Showing last-good windows through a transient error → a small honest staleness pill, not a blank.
+  // When rate-limited with a scheduled retry, show WHEN it retries so a designed-in sleep doesn't read
+  // as a dead card; fall back to "last reading" only if we somehow lack a retry time.
+  const retryTime = usage.error === "rate-limited" && usage.retryAt ? retryClock(usage.retryAt) : "";
   const trouble =
     usage.error === "rate-limited"
-      ? "rate-limited · last reading"
+      ? retryTime
+        ? `rate-limited · retrying ${retryTime}`
+        : "rate-limited · last reading"
       : usage.error
         ? `stale · ${usage.error}`
         : null;
