@@ -58,7 +58,9 @@ declare `done`, and wind down; the next real event (an `@Coordinator` mention, a
 reconstitutes a fresh occupant from the record. Two cautions: never hand off with open work in flight (a
 dormant seat hears no untagged post and no heartbeat), and while genuinely blocked on the human, staying
 parked is fine — the heartbeat backs off on `blocked:human` — but if you do hand off there, say in the note
-that an `@Coordinator` tag is what revives the seat (an untagged reply won't).
+that an `@Coordinator` tag is what revives the seat (an untagged reply won't). **Keep that role mention
+BACKTICKED** in the posted text (`` `@Coordinator` ``, not a bare `@Coordinator`): a live handle in prose is
+a wake, and a bare self-mention in your own wind-down post is exactly what used to cold-spawn a replacement.
 
 ### Can't derive (role footguns)
 

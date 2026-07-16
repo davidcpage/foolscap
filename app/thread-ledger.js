@@ -327,6 +327,36 @@ export function untaggedSeatNudgeTarget(meta, role, { broadcast, mentioned, exce
   return sid;
 }
 
+/**
+ * Route an UNKNOWN @Role mention (one classifyMentionSpawn recognised as a known role) against the thread's
+ * DURABLE seat map, so the cold-spawn path can never race a seat that already exists (thread "Accidental
+ * thread respawn"): the durable marker outlives the occupant's session CARD, so a mention that failed
+ * member-resolution off a card-less snapshot — e.g. a departing Coordinator's own wind-down post naming
+ * "@Coordinator" — must still find the seat here rather than summoning a duplicate. Returns one of:
+ *   • { action: "spawn" }                — no such seat: genuine first contact, the caller cold-spawns.
+ *   • { action: "skip",   occupant }    — the AUTHOR holds the seat (the wind-down self-mention): no
+ *     self-nudge and NEVER a spawn/revive, regardless of liveness — a stale `from` naming its own seat
+ *     must not resurrect it.
+ *   • { action: "nudge",  occupant }    — the seat's occupant is LIVE: the mention is a wake, not a summons.
+ *   • { action: "revive", occupant }    — the seat exists but its occupant has exited: reconstitute the
+ *     seat (maybeRespawnDormantSeat), the same @-mention override the stale-sid fallback applies.
+ * Handle matching is case-insensitive (seats are keyed by the bare role name; classifyMentionSpawn hands
+ * back the roster's display name — same source today, but drift must degrade to a wake, not a duplicate).
+ * Pure: `isLive: sid => bool` supplies process liveness (mirrors untaggedSeatNudgeTarget); omitting it
+ * treats the occupant as live (the caller has vetted liveness itself, fillSeat's convention).
+ */
+export function roleMentionRoute(meta, role, { authorSid, isLive } = {}) {
+  const want = String(role).toLowerCase();
+  let occupant = null;
+  for (const [handle, s] of Object.entries(meta?.seats ?? {})) {
+    if (handle.toLowerCase() === want && s?.sid) { occupant = s.sid; break; }
+  }
+  if (!occupant) return { action: "spawn" };
+  if (occupant === authorSid) return { action: "skip", occupant };
+  if (typeof isLive === "function" && !isLive(occupant)) return { action: "revive", occupant };
+  return { action: "nudge", occupant };
+}
+
 // ── durable membership (delete-card-keep-session) ──────────────────────────────────────────────────
 // A thread's DURABLE member set: the sids that JOINED (a `member:open` edge) and have not explicitly LEFT.
 // The member:open EDGE is the canvas VIEW of a membership and dies with the session's card (removeNode
