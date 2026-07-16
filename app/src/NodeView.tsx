@@ -2,7 +2,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { layoutId, resizeBox, MIN_SIZE, type Corner, type Id, type InteractionManager, type LayoutRecord, type NodeRecord } from "./lib";
 import { useSignal } from "./reactive";
 import { nowSignal } from "./clock";
-import { feedSignal, shortSha, timeAgo, type GitHead, type HnStory } from "./feeds";
+import { feedSignal, feedsConnected, onFeedsReconnect, shortSha, timeAgo, type GitHead, type HnStory } from "./feeds";
 import { activeBoardId } from "./board";
 import { formatEventTime, logSignal } from "./provenance";
 import { summarizeDiff } from "./lib";
@@ -666,6 +666,16 @@ function ThreadView({
   // transports here (window event / consumePendingJump on mount), consumed by an effect that scrolls to the
   // seq once its element renders (jumpToSeq). null when there's nothing to jump to.
   const [jumpTarget, setJumpTarget] = useState<number | null>(null);
+  // Optimistically-rendered posts awaiting their WS feed echo (thread "Long sending delays on threads"):
+  // when a server-file merge restarts the dev server mid-send, the socket that carries the feed echo dies,
+  // so the posted message — which ONLY renders from that echo — would otherwise not appear until the HMR
+  // full reload seconds later (the scary indefinite "sending…"). On a POST 200 we push the text here and
+  // render it as a normal right-aligned "me" bubble immediately; the reconcile effect below drops it the
+  // moment the real feed message arrives (matched by text + a seq newer than the send-time baseline), so a
+  // reconnect replaces it seamlessly with no duplicate. `cid` is a stable local key; `baselineSeq` is the
+  // last feed seq at send time, so an echo is a human message strictly newer than everything already shown.
+  const [pending, setPending] = useState<{ cid: number; text: string; baselineSeq: number }[]>([]);
+  const pendingCid = useRef(0);
   // Guards the composer against a double-send: while a post is in flight `sending` is true, which disables
   // the Send button and short-circuits a second send() (a transient bus delay let a repeat click through).
   const [sending, setSending] = useState(false);
@@ -681,7 +691,31 @@ function ThreadView({
   useEffect(() => {
     const el = logRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
-  }, [msgs.length]);
+  }, [msgs.length, pending.length]); // pending.length: keep the optimistic bubble in view too
+  // Reconcile optimistic posts with the real feed: when the WS echo of a pending post arrives (a human
+  // message newer than its send-time baseline, same text), drop the local bubble so the feed message takes
+  // over — no duplicate. Greedy per echo so two identical pending lines each consume a distinct echo seq.
+  // Runs on BOTH a feed change (the echo arriving) AND a pending change (a new send) — the latter covers a
+  // feed frame that lands DURING the POST await, before the bubble is even added. The `changed` guard makes
+  // the setPending re-run terminate (each pass only ever shrinks the list), so there's no render loop.
+  useEffect(() => {
+    if (pending.length === 0) return;
+    const echoes = visible.filter((mm) => mm.from === "human");
+    const claimed = new Set<number>();
+    let changed = false;
+    const next = pending.filter((p) => {
+      const echo = echoes.find((mm) => mm.seq > p.baselineSeq && mm.text === p.text && !claimed.has(mm.seq));
+      if (echo) { claimed.add(echo.seq); changed = true; return false; }
+      return true;
+    });
+    if (!changed) return;
+    setPending(next);
+    // The echo landing means the feed is live again — clear a lingering "reconnecting…" note.
+    if (next.length === 0) setStatus((s) => (s === "posted — reconnecting…" ? "posted" : s));
+  }, [visible, pending]);
+  // The socket came back after a drop: the feed will replay and echo any still-pending posts (the reconcile
+  // effect drops their bubbles). Soften a lingering "reconnecting…" note now that we're reconnected.
+  useEffect(() => onFeedsReconnect(() => setStatus((s) => (s === "posted — reconnecting…" ? "posted" : s))), []);
   // Re-seed the local edit fields when the record changes underneath us (an agent edited the description).
   useEffect(() => setDescription(node.text), [node.text]);
   useEffect(() => setTitle(node.title), [node.title]);
@@ -786,14 +820,23 @@ function ThreadView({
     if (!t || sending) return; // an in-flight post ignores a repeat send — no double-post on a slow bus
     setSending(true);
     setStatus("sending…");
-    // Optimistically clear the composer so the send reads as registered the instant it's fired; the message
-    // itself appears from the live feed on success. On failure we restore the text (unless the human has
-    // already started a new one) so a transient error never silently eats what they typed.
+    // The last feed seq at send time: the echo of THIS post is a human message strictly newer than this, so
+    // the reconcile effect can tell our echo apart from an identical earlier line.
+    const baselineSeq = msgs.length ? msgs[msgs.length - 1].seq : 0;
+    // Optimistically clear the composer so the send reads as registered the instant it's fired. On failure we
+    // restore the text (unless the human has already started a new one) so a transient error never silently
+    // eats what they typed.
     setPost("");
     if (postInputRef.current) postInputRef.current.style.height = "auto"; // collapse the grown textarea
     const r = await postToThread(id, "human", t);
-    if (r.ok) setStatus("posted");
-    else {
+    if (r.ok) {
+      // The post is durably accepted. Render it locally NOW instead of waiting on the feed echo — if the WS
+      // socket is down (a dev-server restart just dropped it) that echo won't arrive until reconnect, and we
+      // refuse to leave the human staring at "sending…". The reconcile effect removes this bubble when the
+      // real feed message lands. Status is honest about which case we're in.
+      setPending((cur) => [...cur, { cid: ++pendingCid.current, text: t, baselineSeq }]);
+      setStatus(feedsConnected() ? "posted" : "posted — reconnecting…");
+    } else {
       setPost((p) => p || t);
       setStatus(r.error ?? "failed");
     }
@@ -980,7 +1023,7 @@ function ThreadView({
         {feed?.truncated && (
           <span className="chan-empty">…earlier messages dropped (showing the most recent {msgs.length})</span>
         )}
-        {visible.length === 0 ? (
+        {visible.length === 0 && pending.length === 0 ? (
           <span className="chan-empty">no messages yet</span>
         ) : (
           // Walk the log, folding each RUN of consecutive system notices (joins/leaves) into one dim, centered
@@ -1037,6 +1080,14 @@ function ThreadView({
             return out;
           })()
         )}
+        {/* Optimistic bubbles for posts accepted (POST 200) but not yet echoed by the feed — see `pending`.
+            Styled as normal right-aligned "me" bubbles so a reconnect swaps in the real feed message with no
+            visual jump; a faint "sending…" meta marks them as in-flight until the echo replaces them. */}
+        {pending.map((p) => (
+          <div key={`pending-${p.cid}`} className="chan-msg me pending-echo" aria-live="polite">
+            <div className="chan-msg-text" data-text>{renderMessageBody(p.text, openEntries, m, "sending…")}</div>
+          </div>
+        ))}
       </div>
       <div className="chan-members">
         {/* The board owner, always present as a static roster anchor (Thread card UI batch 8): the human is

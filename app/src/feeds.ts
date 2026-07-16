@@ -72,6 +72,15 @@ export function onFeedsReconnect(fn: () => void): () => void {
   return () => reconnectListeners.delete(fn);
 }
 
+// Is the shared feed socket currently OPEN? A thread post relies on the WS feed echo to render its bubble,
+// so the composer checks this at send time: an open socket means the echo is coming; a closed one (a
+// dev-server restart just dropped it) means we must show an honest "posted — reconnecting…" instead of a
+// bubble that would otherwise only appear on reconnect. A one-shot read, not reactive — pair it with
+// onFeedsReconnect to learn when the socket returns.
+export function feedsConnected(): boolean {
+  return ws != null && ws.readyState === WebSocket.OPEN;
+}
+
 // A stable per-tab id sent to the server as ?tab= so tabCountFor dedupes the brief board-switch overlap
 // (a board switch is a full-page nav — location.assign — so the old page's socket may linger until the
 // server's heartbeat reaper takes it, while the new page's socket is already up). sessionStorage is
