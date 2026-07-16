@@ -64,6 +64,16 @@ export async function fetchBoardPersist(boardId: string): Promise<BoardPersistSt
   return (await res.json()) as BoardPersistState;
 }
 
+/** The FULL intent log — every event, including the pre-watermark prefix the boot fetch omits. Fetched
+ *  lazily AFTER first paint to seed the provenance mirror (App.tsx → seedProvenanceHistory); the boot
+ *  fetch above ships only the post-watermark tail, so this is what makes the provenance card's history and
+ *  the who-touched-this actor badges complete. Not on the render-blocking boot path — a slow/failed fetch
+ *  never delays first paint. */
+export async function fetchBoardLog(boardId: string): Promise<IntentEvent[]> {
+  const res = await requestRetry(persistUrl(boardId, "/log"), { method: "GET" });
+  return ((await res.json()) as { events: IntentEvent[] }).events;
+}
+
 /** One-time adoption of a board's IndexedDB state. `imported:false` = the server already had state
  *  (another tab won the race, or this board predates nothing) — re-fetch and trust the server. */
 export async function importBoardPersist(

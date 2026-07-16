@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import zlib from "node:zlib";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 // ── shared HTTP plumbing for the dev-server middleware ────────────────────────────────────────────
@@ -15,10 +16,28 @@ export interface SseClient {
   res: ServerResponse;
 }
 
-export function sendJson(res: ServerResponse, status: number, body: unknown): void {
+// Below this the gzip framing (headers + a CPU pass) costs more than the bytes it would save, so a
+// small JSON response is sent uncompressed. The wins are the big payloads (the board persist boot +
+// lazy-log reads); a tiny ack has nothing to gzip.
+const GZIP_MIN_BYTES = 1400;
+
+// Pass `req` to opt this response into transparent gzip when the client's Accept-Encoding allows it and
+// the body clears GZIP_MIN_BYTES. Omitting `req` sends plain JSON exactly as before — every existing
+// caller is unchanged; wire `req` through on the routes whose payloads are large/compressible (the
+// board persist reads). gzipSync is fine here: it runs on already-bounded, infrequent (boot/lazy) reads,
+// not a hot per-frame path.
+export function sendJson(res: ServerResponse, status: number, body: unknown, req?: IncomingMessage): void {
+  const json = JSON.stringify(body);
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json");
-  res.end(JSON.stringify(body));
+  const accept = req?.headers["accept-encoding"];
+  if (typeof accept === "string" && /\bgzip\b/.test(accept) && Buffer.byteLength(json) >= GZIP_MIN_BYTES) {
+    res.setHeader("Content-Encoding", "gzip");
+    res.setHeader("Vary", "Accept-Encoding");
+    res.end(zlib.gzipSync(json));
+    return;
+  }
+  res.end(json);
 }
 
 export function readBody(req: IncomingMessage): Promise<string> {

@@ -25,5 +25,20 @@ export const COMPACT_KEEP_TAIL: number;
 export const COMPACT_MIN_DROP: number;
 export function compactBoardEvents(
   repoPath: string,
-  opts?: { keepTail?: number; minDrop?: number },
+  opts?: {
+    keepTail?: number;
+    minDrop?: number;
+    /** Pre-read log/snapshot the boot GET already parsed, shared so the log is read+parsed once per load. */
+    events?: PersistedEvent[];
+    snapshot?: PersistedBoardSnapshot | null;
+  },
 ): { dropped: number };
+/** The boot read: `{ snapshot, events }` where `events` is ONLY the post-watermark tail (the set hydrate
+ *  replays), derived from a single parse of the log. `full:true` when a legacy no-seq snapshot forces the
+ *  whole log; `dropped` = events compaction removed on this read. */
+export function readBoardBoot(repoPath: string): {
+  snapshot: PersistedBoardSnapshot | null;
+  events: PersistedEvent[];
+  dropped: number;
+  full: boolean;
+};

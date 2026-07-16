@@ -40,7 +40,14 @@ function snapshotFile(repoPath) {
  * line, and the standard jsonl tolerance (skip it) loses at most the event that never fully landed.
  */
 export function readBoardPersist(repoPath) {
-  let events = [];
+  return { events: readBoardEvents(repoPath), snapshot: readBoardSnapshot(repoPath) }; // snapshot shares the memoized parse
+}
+
+/** Just the event log, read+parsed ONCE from events.jsonl (empty on a fresh board). Split out from
+ *  readBoardPersist so the boot GET can parse the log a single time and share that array with both
+ *  compaction and the post-watermark tail it ships — no second read/parse of the same file per load. */
+function readBoardEvents(repoPath) {
+  const events = [];
   try {
     const raw = fs.readFileSync(eventsFile(repoPath), "utf8");
     for (const line of raw.split("\n")) {
@@ -52,9 +59,9 @@ export function readBoardPersist(repoPath) {
       }
     }
   } catch {
-    events = []; // no file yet — a fresh board
+    /* no file yet — a fresh board */
   }
-  return { events, snapshot: readBoardSnapshot(repoPath) }; // shares the memoized parse
+  return events;
 }
 
 /** Does this board have ANY persisted state? (Gates the one-time IndexedDB import.) */
@@ -205,23 +212,66 @@ export const COMPACT_KEEP_TAIL = 2000;
  *  board GET (once per page load), and a rewrite per reload for a handful of lines is churn. */
 export const COMPACT_MIN_DROP = 500;
 
+// The snapshot watermark this repo was last compacted at (per process). Everything droppable is ≤ the
+// watermark, so if the watermark hasn't ADVANCED since the last compaction there is nothing new to
+// drop — a repeat board GET can skip the whole pass. Keyed by repoPath; first GET per process always
+// runs (the map miss).
+const lastCompactWatermark = new Map();
+
 /**
  * Drop events the snapshot has fully absorbed, beyond a generous tail: an event goes only when its
  * seq ≤ watermark − keepTail (events with no numeric seq predate the watermark scheme — never
  * droppable safely, always kept). Atomic (tmp + rename), and safe against a concurrent append: every
  * fs op here is sync, so the whole read→rewrite runs in one event-loop turn — no POST can interleave.
  * Returns `{ dropped }` (0 = nothing done, including the no-snapshot and below-minDrop cases).
+ *
+ * The caller MAY pass a pre-read `events`/`snapshot` (the boot GET already parsed both) so the log is
+ * read+parsed ONCE per load rather than again here. And when the watermark hasn't moved since this
+ * repo was last compacted, the whole pass is skipped — nothing new is droppable.
  */
-export function compactBoardEvents(repoPath, { keepTail = COMPACT_KEEP_TAIL, minDrop = COMPACT_MIN_DROP } = {}) {
-  const { events, snapshot } = readBoardPersist(repoPath);
+export function compactBoardEvents(
+  repoPath,
+  { keepTail = COMPACT_KEEP_TAIL, minDrop = COMPACT_MIN_DROP, events, snapshot } = {},
+) {
+  if (events === undefined) events = readBoardEvents(repoPath);
+  if (snapshot === undefined) snapshot = readBoardSnapshot(repoPath);
   const watermark = snapshot && typeof snapshot.seq === "number" ? snapshot.seq : undefined;
   if (watermark === undefined) return { dropped: 0 };
+  // Watermark hasn't advanced since we last compacted this repo → nothing new absorbed, nothing new to
+  // drop. Skip the filter+rewrite entirely (the repeat-GET churn (b) targets).
+  if (lastCompactWatermark.get(repoPath) === watermark) return { dropped: 0 };
   const cut = watermark - keepTail;
   const keep = events.filter((e) => !(typeof e.seq === "number" && e.seq <= cut));
   const dropped = events.length - keep.length;
-  if (dropped < minDrop) return { dropped: 0 };
+  if (dropped < minDrop) {
+    lastCompactWatermark.set(repoPath, watermark); // caught up at this watermark — don't re-scan until it moves
+    return { dropped: 0 };
+  }
   const tmp = eventsFile(repoPath) + ".tmp";
   fs.writeFileSync(tmp, keep.map((e) => JSON.stringify(e) + "\n").join(""));
   fs.renameSync(tmp, eventsFile(repoPath));
+  lastCompactWatermark.set(repoPath, watermark);
   return { dropped };
+}
+
+/**
+ * The BOOT read (once per page load): everything the client needs to hydrate + paint, derived from a
+ * SINGLE parse of events.jsonl. Returns `{ snapshot, events }` where `events` is only the POST-watermark
+ * TAIL (seq > snapshot.seq) — the events the snapshot has NOT yet absorbed, i.e. the exact set hydrate
+ * replays (core/src/persist.ts). The full absorbed log is NOT shipped here: it contributes nothing to
+ * hydration and only bloats the blank-screen boot fetch (it grows unbounded with board history). The
+ * provenance mirror fetches the full log lazily after first paint (GET /api/board/persist/log).
+ *
+ * A snapshot with no numeric `seq` (legacy, pre-watermark) can't define a tail safely, so the whole log
+ * is shipped — the same fallback hydrate uses (parent ≡ order). `full:true` flags that case.
+ * Compaction shares this same parsed array (no second read) and is skipped when the watermark is stale.
+ */
+export function readBoardBoot(repoPath) {
+  const events = readBoardEvents(repoPath); // the ONE parse of the log this load
+  const snapshot = readBoardSnapshot(repoPath); // memoized — a stat, not a parse, on a hit
+  const { dropped } = compactBoardEvents(repoPath, { events, snapshot });
+  const watermark = snapshot && typeof snapshot.seq === "number" ? snapshot.seq : undefined;
+  const full = watermark === undefined;
+  const tail = full ? events : events.filter((e) => typeof e.seq === "number" && e.seq > watermark);
+  return { snapshot, events: tail, dropped, full };
 }

@@ -153,6 +153,14 @@ export class Persistence implements IntentLog {
     // backends being append-only.
     const all = loaded.map((e) => this.mem.append(e));
 
+    // Adopt the snapshot's watermark into the mirror. The durable log may carry ONLY the post-watermark
+    // tail (the app's boot payload ships just that — the absorbed prefix hydrates nothing and is fetched
+    // lazily for provenance), so the mirror can be empty or start above 0. Without this, lastSeq would be
+    // the last tail event's seq — or 0 when the tail is empty — and the next debounced snapshot would stamp
+    // a watermark BELOW the real one, rolling it backwards (the remote store rejects that as a stale 409).
+    // A no-op when the tail already carries a higher seq (adopt takes the max).
+    if (snap?.seq !== undefined) this.mem.adopt(snap.seq);
+
     const records = new Map<string, AnyRecord>();
     if (snap) for (const r of snap.records) records.set(r.id, r);
 
