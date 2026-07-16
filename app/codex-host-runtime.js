@@ -83,11 +83,17 @@ export async function createCodexHostRuntime({ cwd, onEvent, onRequest, onClose,
 
     return {
       pid: server.pid,
-      account: { type: account.type, email: account.email ?? null, planType: account.planType },
+      // The ChatGPT account EMAIL is deliberately NOT exposed here. Both surfaces this runtime feeds are
+      // shared/durable — provider-bound rides the session feed, usage() rides the every-tab usage feed and
+      // is persisted into the shadow-git-versioned plan-usage cache — so an email here fans a billing
+      // identity out to every agent and into repo history. That contradicts foldCodexEvent's own "email
+      // deliberately not copied into the repo marker" intent (review finding 4). planType is kept: it's
+      // non-identifying and the usage card shows it. The auth guard keys off account.type, never the email.
+      account: { type: account.type, planType: account.planType },
       usage: () => ({
         provider: "codex",
         billing: "chatgpt-plan",
-        account: { type: account.type, email: account.email ?? null, planType: account.planType },
+        account: { type: account.type, planType: account.planType },
         ...(rateLimitState ?? {}),
         error: usageError,
         fetchedAt: usageFetchedAt,

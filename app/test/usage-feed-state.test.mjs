@@ -6,8 +6,10 @@ import path from "node:path";
 import {
   claudeRateLimitDelay,
   mergeUsageProvider,
+  purgeCachedEmail,
   readUsageCache,
   retryAfterMs,
+  scrubUsageEmail,
   usageCachePath,
   writeUsageCache,
 } from "../usage-feed-state.js";
@@ -37,4 +39,45 @@ test("provider-explicit last-good usage survives a dev-server process restart ca
   assert.equal(writeUsageCache(file, value), true);
   assert.deepEqual(readUsageCache(file), value);
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+});
+
+test("account email never persists to (or republishes from) the usage cache; planType is kept (finding 4)", () => {
+  const withEmail = mergeUsageProvider(null, "codex", {
+    provider: "codex", billing: "chatgpt-plan",
+    account: { type: "chatgpt", email: "person@example.test", planType: "team" },
+    rateLimits: { primary: { usedPercent: 8 } }, error: null,
+  });
+  // scrubUsageEmail drops only the email, keeps the rest, and returns the SAME ref when nothing changed.
+  const scrubbed = scrubUsageEmail(withEmail);
+  assert.deepEqual(scrubbed.providers.codex.account, { type: "chatgpt", planType: "team" });
+  assert.equal(scrubbed.providers.codex.rateLimits.primary.usedPercent, 8, "non-account fields untouched");
+  assert.equal(scrubUsageEmail(scrubbed), scrubbed, "no email present → same reference (cheap no-op)");
+
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "usage-scrub-"));
+  const file = usageCachePath(repo);
+  // writeUsageCache strips email on the way to disk; readUsageCache never republishes one.
+  assert.equal(writeUsageCache(file, withEmail), true);
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).providers.codex.account.email, undefined);
+  assert.equal(readUsageCache(file).providers.codex.account.planType, "team");
+});
+
+test("purgeCachedEmail clears an email a prior build persisted, and no-ops a clean file (finding 4)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "usage-purge-"));
+  const file = usageCachePath(repo);
+  // Simulate a cache an OLD build wrote WITH an email (bypass writeUsageCache's scrub with a raw write).
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const dirty = mergeUsageProvider(null, "codex", {
+    provider: "codex", account: { type: "chatgpt", email: "leak@example.test", planType: "pro" },
+  });
+  fs.writeFileSync(file, JSON.stringify(dirty) + "\n");
+
+  assert.equal(purgeCachedEmail(file), true, "rewrote because an email was present");
+  const onDisk = JSON.parse(fs.readFileSync(file, "utf8"));
+  assert.equal(onDisk.providers.codex.account.email, undefined, "email gone from the versioned file");
+  assert.equal(onDisk.providers.codex.account.planType, "pro", "planType retained");
+
+  const mtimeBefore = fs.statSync(file).mtimeMs;
+  assert.equal(purgeCachedEmail(file), false, "second call is a no-op — nothing to purge");
+  assert.equal(fs.statSync(file).mtimeMs, mtimeBefore, "clean file left untouched (no spurious rewrite)");
+  assert.equal(purgeCachedEmail(usageCachePath(fs.mkdtempSync(path.join(os.tmpdir(), "u-")))), false, "absent file → false");
 });

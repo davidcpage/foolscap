@@ -51,9 +51,10 @@ test("Codex host runtime requires ChatGPT auth and applies the confined first-sl
     onClose() {},
     spawnServer: () => server,
   });
-  assert.deepEqual(runtime.account, {
-    type: "chatgpt", email: "person@example.test", planType: "business",
-  });
+  // The account EMAIL is scrubbed from both exposed shapes (finding 4): it's a billing identity and both
+  // reach shared/durable surfaces (provider-bound line, usage feed + persisted cache). planType is kept.
+  assert.deepEqual(runtime.account, { type: "chatgpt", planType: "business" });
+  assert.deepEqual(runtime.usage().account, { type: "chatgpt", planType: "business" });
   assert.equal(runtime.usage().billing, "chatgpt-plan");
   assert.equal(runtime.usage().rateLimits.primary.usedPercent, 12);
   await runtime.start("canvas-a", { cwd: "/repo/worktree", model: "gpt-test", developerInstructions: "brief" });

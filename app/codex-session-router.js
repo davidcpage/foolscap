@@ -123,9 +123,16 @@ export function createCodexSessionRouter({ client, onEvent = () => {}, onRequest
     async release(sid) {
       const state = byCanvas.get(sid);
       if (!state) return false;
-      await client.request("thread/unsubscribe", { threadId: state.threadId });
-      byCanvas.delete(sid);
-      byThread.delete(state.threadId);
+      // Drop the local routing entries in a finally: a rejected thread/unsubscribe (app-server hiccup) must
+      // NOT leave byCanvas/byThread pinned, or a later respawn of this sid throws "already bound" until the
+      // sidecar restarts. The provider-side subscription is torn down with the app-server anyway; the local
+      // maps are what a respawn checks. The rejection still propagates to the caller (which logs/ignores it).
+      try {
+        await client.request("thread/unsubscribe", { threadId: state.threadId });
+      } finally {
+        byCanvas.delete(sid);
+        byThread.delete(state.threadId);
+      }
       return true;
     },
     get(sid) {

@@ -13,5 +13,7 @@ export function mergeUsageProvider(
   value: unknown,
 ): { schema: 2; providers: Record<string, unknown> };
 export function usageCachePath(repoPath: string): string;
+export function scrubUsageEmail<T>(value: T): T;
 export function readUsageCache(file: string): { schema: 2; providers: Record<string, unknown> } | null;
 export function writeUsageCache(file: string, value: unknown): boolean;
+export function purgeCachedEmail(file: string): boolean;

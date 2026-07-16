@@ -190,7 +190,12 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
       providerSessionId: null,
     };
     codexSessions.set(id, entry);
-    try {
+    // The bind is async (getCodexRuntime + thread/start round-trip), but the client sends the first prompt
+    // RIGHT AFTER the spawn reply (handleSessionSpawn), and writes have no queue of their own. Seed the
+    // entry's per-sid serialization chain (`tail`) with the spawn promise so the first write waits for the
+    // bind instead of racing it into router.prompt's "unknown canvas session" (findings 1, 7). Set it
+    // SYNCHRONOUSLY (before the first await) so a write that arrives mid-spawn finds a tail to chain onto.
+    const spawning = (async () => {
       const runtime = await getCodexRuntime();
       entry.pid = runtime.pid;
       const spec = { cwd, model: msg.model, developerInstructions: msg.developerInstructions };
@@ -207,8 +212,13 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
         const history = await runtime.read(id);
         codexLine(id, "canvas/history", history);
       }
+      return bound;
+    })();
+    entry.tail = spawning;
+    try {
+      const bound = await spawning;
       log(`spawn ${id} provider=codex thread=${bound.threadId} cwd=${cwd}`);
-      return { ok: true, pid: runtime.pid, provider: "codex", providerSessionId: bound.threadId };
+      return { ok: true, pid: entry.pid, provider: "codex", providerSessionId: bound.threadId };
     } catch (err) {
       codexSessions.delete(id);
       log(`spawn ${id} provider=codex failed: ${String(err)}`);
@@ -255,31 +265,55 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
     return "";
   };
 
-  const writeCodex = (id, entry, data) => {
-    void getCodexRuntime().then(async (runtime) => {
-      try {
-        if (isUserWrite(data)) {
-          const text = userText(data);
-          if (!text) throw new Error("Codex prompt contained no text");
-          const inputRequest = [...codexRequests.values()].find((r) => r.sid === id && r.request.kind === "input");
-          if (inputRequest) {
-            settleCodexRequest(inputRequest.requestId, { text });
-            return;
-          }
-          const wasBusy = entry.busy;
-          entry.busy = true;
-          if (wasBusy) await runtime.steer(id, text);
-          else await runtime.prompt(id, text);
+  const applyCodexWrite = async (id, entry, data) => {
+    // Resolve the runtime here (not eagerly) so a startup failure lands in THIS try — an unhandled
+    // rejection off `getCodexRuntime()` would otherwise crash the shared sidecar, taking every CLAUDE
+    // child with it (finding 2). Every provider path — usage/read-history/kill — already guards this; the
+    // write path was the one that didn't.
+    let runtime;
+    try {
+      runtime = await getCodexRuntime();
+    } catch (err) {
+      entry.busy = false;
+      codexLine(id, "canvas/error", { message: String(err) });
+      return;
+    }
+    try {
+      if (isUserWrite(data)) {
+        const text = userText(data);
+        if (!text) throw new Error("Codex prompt contained no text");
+        const inputRequest = [...codexRequests.values()].find((r) => r.sid === id && r.request.kind === "input");
+        if (inputRequest) {
+          settleCodexRequest(inputRequest.requestId, { text });
           return;
         }
-        const parsed = JSON.parse(data);
-        if (parsed?.type === "control_request" && parsed?.request?.subtype === "interrupt")
-          await runtime.interrupt(id);
-      } catch (err) {
-        entry.busy = false;
-        codexLine(id, "canvas/error", { message: String(err) });
+        // wasBusy is read AFTER the prior write on this sid has settled (writes are serialized on
+        // entry.tail below), so activeTurnId has settled too: steer-vs-prompt no longer races the turn
+        // lifecycle (finding 7). A first prompt whose bind is still in flight has already been awaited by
+        // the tail seeding, so `prompt` finds the session bound (finding 1).
+        const wasBusy = entry.busy;
+        entry.busy = true;
+        if (wasBusy) await runtime.steer(id, text);
+        else await runtime.prompt(id, text);
+        return;
       }
-    });
+      const parsed = JSON.parse(data);
+      if (parsed?.type === "control_request" && parsed?.request?.subtype === "interrupt")
+        await runtime.interrupt(id);
+    } catch (err) {
+      entry.busy = false;
+      codexLine(id, "canvas/error", { message: String(err) });
+    }
+  };
+
+  const writeCodex = (id, entry, data) => {
+    // Serialize per-sid: chain each write onto the entry's tail (seeded with the spawn/bind promise) so a
+    // write waits for the bind and for prior writes to settle. applyCodexWrite never rejects (it converts
+    // every failure to a canvas/error line), so the chain stays a resolved promise — no unhandled
+    // rejection can escape it. `.then(run, run)` runs this write even if the prior link rejected (a failed
+    // spawn deletes the session separately; the write then errors cleanly as "unknown canvas session").
+    const run = () => applyCodexWrite(id, entry, data);
+    entry.tail = (entry.tail ?? Promise.resolve()).then(run, run);
   };
 
   const handle = (conn, msg) => {
@@ -321,6 +355,12 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
         return msg.req != null ? reply({ ok: true }) : undefined;
       }
       case "usage": {
+        // PROBE mode (the server's usage poller): report usage only if a Codex runtime is ALREADY up — do
+        // NOT instantiate one. Booting app-server + refreshing the OpenAI token every 60s for a user who
+        // never touches Codex is the spawn→fail→respawn churn finding 5 flags; probing leaves a codex-less
+        // box quiet. A real request (a spawned session) still boots the runtime; a non-probe usage call
+        // (none today) keeps the old instantiate-on-demand behaviour.
+        if (msg.probe && !codexRuntimePromise) return reply({ ok: true, usage: null });
         void getCodexRuntime().then(
           (runtime) => reply({ ok: true, usage: runtime.usage() }),
           (err) => reply({ ok: false, error: String(err) }),
