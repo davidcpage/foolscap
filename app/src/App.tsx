@@ -914,6 +914,9 @@ function Board({ m, undo, persistence }: Engine) {
         <div className="empty-hint">right-click anywhere to add a widget</div>
       )}
 
+      {/* The board-switcher pill — standing viewport chrome (ignores the Alt-tap HUD toggle). */}
+      <BoardPill />
+
       {/* The live fs-watch indicator — an ephemeral corner chip that fades in, holds, then fades out and
           self-dismisses (see the auto-fade effect). `key={seq}` restarts the animation on each new event. */}
       {lastEvent && (
@@ -1242,6 +1245,84 @@ function BoardsItem() {
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+// The board-switcher pill — standing VIEWPORT CHROME (not a HUD card, so it ignores the Alt-tap HUD toggle
+// and isn't in the HUD checkbox list). It rests as a slim pill at the bottom-left showing the current
+// board's name (+ a "dev" tag on the default board). Hover — or click, for touch/keyboard, which pins it
+// open until a click-outside — expands it IN PLACE into a spreadsheet-style tab row: the current board's
+// tab stays put and highlighted, the other mounted boards slide in to its right (default-first then
+// most-recently-opened, the order listBoards() already yields), and a `+` tab runs the same Open-repo
+// prompt as the menu's BoardsItem. Clicking another board's tab navigates via boardHref (a ?repo= reload,
+// one tab = one board). The board list is lazy-fetched on each expand, since mounts change between opens.
+function BoardPill() {
+  const [hover, setHover] = useState(false);
+  const [pinned, setPinned] = useState(false); // click keeps it open past mouseleave (touch/keyboard)
+  const [boards, setBoards] = useState<BoardListing[] | null>(null); // null = not yet fetched this expand
+  const rootRef = useRef<HTMLDivElement>(null);
+  const expanded = hover || pinned;
+  const current = activeBoardId();
+
+  // Refetch the mount list every time the strip expands — mounts change between opens (mirrors BoardsItem).
+  useEffect(() => {
+    if (expanded) void listBoards().then(setBoards);
+  }, [expanded]);
+
+  // A click pins the strip open; a click outside un-pins it (so touch/keyboard users can dismiss it).
+  useEffect(() => {
+    if (!pinned) return;
+    const onDown = (e: MouseEvent) => {
+      if (!rootRef.current?.contains(e.target as Node)) setPinned(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [pinned]);
+
+  const openRepo = () => {
+    const p = window.prompt("Absolute path of the repo to open as a board:");
+    if (p?.trim()) location.assign(`${location.pathname}?repo=${encodeURIComponent(p.trim())}`);
+  };
+
+  const others = (boards ?? []).filter((b) => b.boardId !== current);
+  return (
+    <div
+      ref={rootRef}
+      className="board-strip"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <div className="board-tabs">
+        {/* The current board's tab — always shown, highlighted, inert (you can't switch to where you are).
+            A click toggles the pinned-open state so the row survives mouseleave. */}
+        <button
+          className="board-tab board-tab-current"
+          title={`Current board — ${activeBoard().name}`}
+          onClick={() => setPinned((p) => !p)}
+        >
+          <span className="board-tab-name">{activeBoard().name}</span>
+          {activeBoard().isDefault && <span className="board-tab-tag">dev</span>}
+        </button>
+        {expanded && boards === null && <span className="board-tab board-tab-loading">…</span>}
+        {expanded &&
+          others.map((b) => (
+            <button
+              key={b.boardId}
+              className="board-tab"
+              title={b.repoPath}
+              onClick={() => location.assign(boardHref(b))}
+            >
+              <span className="board-tab-name">{b.name}</span>
+              {b.isDefault && <span className="board-tab-tag">dev</span>}
+            </button>
+          ))}
+        {expanded && (
+          <button className="board-tab board-tab-add" title="Open a repo as a board" onClick={openRepo}>
+            +
+          </button>
+        )}
+      </div>
     </div>
   );
 }
