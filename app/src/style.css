@@ -1759,28 +1759,27 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-/* The role chip (agent-roles.md) — a small tinted pill carrying the role name a session was spawned under.
-   Colour-keyed like the sticky/minimap swatches; an unknown/raw colour falls through to the neutral base. */
+/* The role label (agent-roles.md) — the role name a session was spawned under, rendered as coloured TEXT
+   (no filled pill) so it reads quietly beside the running-sessions count and the status indicator.
+   Colour-keyed like the sticky/minimap swatches, but tuned darker for readable text on the light row;
+   an unknown/raw colour falls through to the neutral base. */
 .ses-row-role {
   flex: none;
   max-width: 40%;
-  padding: 0 6px;
   font-size: 10px;
   font-weight: 600;
   line-height: 16px;
-  color: #1f2937;
-  background: #e4e4e7;
-  border-radius: 8px;
+  color: #52525b;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.ses-row-role.c-yellow { background: #fff0b8; }
-.ses-row-role.c-pink   { background: #ffd6e0; }
-.ses-row-role.c-blue   { background: #d6ecff; }
-.ses-row-role.c-green  { background: #cdf0cb; }
-.ses-row-role.c-orange { background: #ffe4c2; }
-.ses-row-role.c-purple { background: #e8d9ff; }
+.ses-row-role.c-yellow { color: #a16207; }
+.ses-row-role.c-pink   { color: #db2777; }
+.ses-row-role.c-blue   { color: #2563eb; }
+.ses-row-role.c-green  { color: #16a34a; }
+.ses-row-role.c-orange { color: #ea580c; }
+.ses-row-role.c-purple { color: #9333ea; }
 .ses-row-mono {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
