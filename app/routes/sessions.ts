@@ -40,7 +40,7 @@ function sessionTranscriptDir(repoPath: string, id: string): string {
 }
 
 async function handleSession(res: ServerResponse, dir: string, id: string | null, repoPath: string, boardId: string): Promise<void> {
-  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionAnchor, publishFeed, fsState } = getServerContext();
+  const { readSessionFile, ensureSessionFeed, boardSnapshotRecords, sessionAnchor, publishFeed, fsState, liveSessions } = getServerContext();
   let chosen = id;
   if (!chosen) chosen = listSessions(dir, repoPath)[0]?.id ?? null;
   if (!chosen) return sendJson(res, 404, { error: "no sessions found" });
@@ -54,6 +54,13 @@ async function handleSession(res: ServerResponse, dir: string, id: string | null
   const providerSessionId = isCodex && typeof marker?.providerSessionId === "string"
     ? marker.providerSessionId
     : null;
+  // A live process owns session:<id> and publishes it from the (finer) live stream. Opening the card of a
+  // STILL-LIVE Codex session must NOT stamp an `ended:true` thread/read projection over that feed — two
+  // publishers fighting flips the card to the ended band and forks the transcript (finding 3). This is the
+  // same guard the Claude file-tail path has (ensureSessionFeed / server-sessions.ts). The history is still
+  // read and returned in the response body for the initial paint; we just skip the clobbering publish.
+  const owned = liveSessions.get(chosen);
+  const liveOwned = !!owned && owned.status !== "exited";
   let r = readSessionFile(tdir, chosen);
   if (isCodex && providerSessionId) {
     if (!fsState.hostClient?.connected)
@@ -72,14 +79,15 @@ async function handleSession(res: ServerResponse, dir: string, id: string | null
         truncated = true;
       }
       r = { content, truncated };
-      publishFeed("session:" + chosen, {
-        ...r,
-        ended: true,
-        provider: "codex",
-        providerSessionId,
-        endReason: marker?.endReason,
-        error: projected.error ?? undefined,
-      });
+      if (!liveOwned)
+        publishFeed("session:" + chosen, {
+          ...r,
+          ended: true,
+          provider: "codex",
+          providerSessionId,
+          endReason: marker?.endReason,
+          error: projected.error ?? undefined,
+        });
     } catch (err) {
       return sendJson(res, 502, { error: "failed to read Codex history", detail: String(err) });
     }

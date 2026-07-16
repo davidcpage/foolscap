@@ -172,10 +172,12 @@ export async function connectSessionHost({ socketPath, hostScript, clientPid }) 
       conn.write(JSON.stringify({ op: "answer-request", id, requestId, answer }) + "\n");
       return true;
     },
-    async codexUsage() {
-      const r = await request({ op: "usage" });
+    async codexUsage({ probe = false } = {}) {
+      // probe:true asks the host to report usage only if a Codex runtime is already up (never instantiate
+      // one) — the poller uses this. Returns null when probing found no live runtime.
+      const r = await request({ op: "usage", probe });
       if (!r.ok) throw new Error(r.error || "Codex usage unavailable");
-      return r.usage;
+      return r.usage ?? null;
     },
     async codexHistory(providerSessionId) {
       const r = await request({ op: "read-history", providerSessionId });

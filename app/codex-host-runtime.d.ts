@@ -1,6 +1,7 @@
 export interface CodexHostAccount {
   type: "chatgpt";
-  email: string | null;
+  // No email: it's a billing identity and both consumers of this shape (provider-bound line, usage feed +
+  // persisted cache) are shared/durable surfaces (finding 4). planType is non-identifying and kept.
   planType: string;
 }
 
@@ -10,7 +11,7 @@ export interface CodexHostRuntime {
   usage(): {
     provider: "codex";
     billing: "chatgpt-plan";
-    account: { type: string; email: string | null; planType: string };
+    account: { type: string; planType: string };
     rateLimits?: Record<string, unknown>;
     rateLimitsByLimitId?: Record<string, Record<string, unknown>> | null;
     rateLimitResetCredits?: Record<string, unknown> | null;

@@ -29,7 +29,8 @@ export interface SessionHostClient {
   spawnSession(id: string, spec: import("./session-proc.js").SpawnSpec): void;
   writeSession(id: string, data: string): boolean;
   answerRequest(id: string, requestId: string, answer: unknown): boolean;
-  codexUsage(): Promise<Record<string, unknown>>;
+  /** probe:true reports usage only if a Codex runtime is already up (never instantiates); null if none. */
+  codexUsage(opts?: { probe?: boolean }): Promise<Record<string, unknown> | null>;
   codexHistory(providerSessionId: string): Promise<Record<string, unknown>>;
   killSession(id: string): void;
   list(): Promise<{ sessions: HostSessionInfo[]; exits: HostExitRecord[] }>;

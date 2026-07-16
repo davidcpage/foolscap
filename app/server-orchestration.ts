@@ -20,9 +20,11 @@ import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./server-types.js";
 import {
+  CLAUDE_USAGE_MAX_BACKOFF_MS,
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
   mergeUsageProvider,
+  purgeCachedEmail,
   readUsageCache,
   retryAfterMs,
   usageCachePath,
@@ -232,6 +234,9 @@ export function startUsageFeed(): void {
   const { feedValues } = context.fsState;
   const repoPath = context.boards.get(context.defaultBoardId)?.repoPath;
   const cacheFile = repoPath ? usageCachePath(repoPath) : null;
+  // Privacy migration (finding 4): purge an account email a prior build persisted into the versioned cache
+  // BEFORE anything reads/republishes it. Only rewrites if an email was actually present.
+  if (cacheFile) purgeCachedEmail(cacheFile);
   const cached = cacheFile ? readUsageCache(cacheFile) : null;
   if (cached && !feedValues.has("usage")) publishFeed("usage", cached);
   const envelope = () => (feedValues.get("usage") as any) ?? { schema: 2, providers: {} };
@@ -293,20 +298,33 @@ export function startUsageFeed(): void {
     setTimeout(pollClaude, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
   };
 
+  const CODEX_USAGE_POLL_MS = 60_000;
+  let codexBackoff = 0; // exponential backoff after a live-runtime usage failure, cleared on success
   const pollCodex = async () => {
-    let nextDelay = 60_000;
+    let nextDelay = CODEX_USAGE_POLL_MS;
     const client = getServerContext().fsState.hostClient;
     if (!client) {
       // attachSessionHost starts just after feeds; retry promptly without re-polling Anthropic.
       nextDelay = 2_000;
     } else {
       try {
-        const value = await client.codexUsage();
-        publishProvider("codex", value as Record<string, unknown>, true);
+        // PROBE, don't instantiate (finding 5): report Codex usage only when a runtime is already up
+        // (someone spawned a Codex session this boot). A codex-less box then never boots app-server /
+        // refreshes the OpenAI token from this poll. null ⇒ no live runtime → leave the last-known value
+        // and just re-poll at the base cadence; nothing to publish or persist.
+        const value = await client.codexUsage({ probe: true });
+        if (value) {
+          codexBackoff = 0;
+          publishProvider("codex", value as Record<string, unknown>, true);
+        }
       } catch (err) {
+        // A live runtime that fails to report: back off exponentially (mirroring the Claude poll's floor)
+        // so a wedged app-server isn't hammered every 60s.
+        codexBackoff = Math.min(codexBackoff ? codexBackoff * 2 : CODEX_USAGE_POLL_MS, CLAUDE_USAGE_MAX_BACKOFF_MS);
+        nextDelay = CODEX_USAGE_POLL_MS + codexBackoff;
         publishProvider("codex", {
           ...provider("codex"), provider: "codex", billing: "chatgpt-plan",
-          error: err instanceof Error ? err.message : String(err), fetchedAt: Date.now(),
+          error: err instanceof Error ? err.message : String(err), retryAt: Date.now() + nextDelay, fetchedAt: Date.now(),
         });
       }
     }

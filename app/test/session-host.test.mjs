@@ -392,3 +392,117 @@ test("a stale socket file is reclaimed; a LIVE host's socket is not", async () =
   await assert.rejects(() => createHost({ socketPath, logPath }), /another session host is live/);
   await host.shutdown();
 });
+
+// A Codex runtime whose start()/bind is slow, so a write sent right after spawn genuinely races the
+// in-flight bind — the exact sequence handleSessionSpawn produces (spawn, then the first prompt, no wait).
+function slowBindFactory({ startGate, keepTurnOpen = false }) {
+  const prompts = [];
+  const steers = [];
+  const factory = async ({ onEvent }) => ({
+    pid: 4242,
+    account: { type: "chatgpt", planType: "team" },
+    usage() { return { provider: "codex", billing: "chatgpt-plan" }; },
+    async start(sid) {
+      if (startGate) await startGate;
+      return { threadId: `thread-${sid}` };
+    },
+    async resume(sid, threadId) { return { threadId }; },
+    async prompt(sid, text) {
+      prompts.push([sid, text]);
+      onEvent(sid, { method: "turn/started", params: { threadId: `thread-${sid}`, turn: { id: `turn-${sid}` } } });
+      if (!keepTurnOpen)
+        onEvent(sid, { method: "turn/completed", params: { threadId: `thread-${sid}`, turn: { id: `turn-${sid}`, status: "completed" } } });
+    },
+    async steer(sid, text) { steers.push([sid, text]); },
+    async interrupt() {},
+    async read() { return { thread: { turns: [] } }; },
+    async readThread() { return { thread: { turns: [] } }; },
+    async release() { return true; },
+    close() {},
+  });
+  return { factory, prompts, steers };
+}
+
+test("Codex spawn-with-immediate-prompt: the first prompt waits for the async bind, not lost to it (findings 1,7)", async () => {
+  const { socketPath, logPath } = tmpSock();
+  let releaseBind;
+  const startGate = new Promise((r) => { releaseBind = r; });
+  const { factory, prompts } = slowBindFactory({ startGate });
+  const host = await createHost({ socketPath, logPath, codexRuntimeFactory: factory });
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+    // Spawn and write BACK-TO-BACK without awaiting the spawn reply — the write reaches the host while the
+    // bind is still in flight (the pre-fix path threw "unknown canvas session" and swallowed the prompt).
+    const spawn = c.request({ op: "spawn", id: "cx", provider: "codex", cwd: "/tmp/x" });
+    c.send({ op: "write", id: "cx", data: userMsg("first prompt") });
+    await sleep(60);
+    assert.deepEqual(prompts, [], "the prompt is queued behind the in-flight bind, not attempted early");
+    releaseBind();
+    assert.equal((await spawn).ok, true);
+    await c.waitEvent((e) => e.op === "line" && e.id === "cx" && e.line.includes("turn/completed"));
+    assert.deepEqual(prompts, [["cx", "first prompt"]], "the queued prompt ran exactly once, after the bind");
+    assert.ok(
+      !c.events.some((e) => e.op === "line" && e.id === "cx" && e.line.includes("canvas/error")),
+      "no 'unknown canvas session' error — the prompt was not swallowed",
+    );
+    await c.close();
+  } finally {
+    releaseBind(); // in case an assertion threw before we released it
+    await host.shutdown();
+  }
+});
+
+test("Codex writes on one sid serialize: a second write steers the open turn, no lost message (finding 7)", async () => {
+  const { socketPath, logPath } = tmpSock();
+  const { factory, prompts, steers } = slowBindFactory({ keepTurnOpen: true });
+  const host = await createHost({ socketPath, logPath, codexRuntimeFactory: factory });
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+    await c.request({ op: "spawn", id: "cx", provider: "codex", cwd: "/tmp/x" });
+    // Two writes with no gap: serialized, the first opens a turn (prompt), the second steers it. Without
+    // serialization the second reads a not-yet-settled activeTurnId and steer throws "no active turn".
+    c.send({ op: "write", id: "cx", data: userMsg("one") });
+    c.send({ op: "write", id: "cx", data: userMsg("two") });
+    await sleep(120);
+    assert.deepEqual(prompts, [["cx", "one"]], "first write opened the turn");
+    assert.deepEqual(steers, [["cx", "two"]], "second write steered the same turn, not dropped");
+    assert.ok(
+      !c.events.some((e) => e.op === "line" && e.id === "cx" && e.line.includes("canvas/error")),
+      "no 'no active turn' error from a steer racing the prompt",
+    );
+    await c.close();
+  } finally {
+    await host.shutdown();
+  }
+});
+
+test("Codex runtime startup failure with a write pending does not crash the shared sidecar (finding 2)", async () => {
+  const { socketPath, logPath } = tmpSock();
+  let calls = 0;
+  const codexRuntimeFactory = async () => { calls++; throw new Error("codex not installed"); };
+  const host = await createHost({ socketPath, logPath, codexRuntimeFactory });
+  const unhandled = [];
+  const onUnhandled = (err) => unhandled.push(err);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+    // Spawn (which will fail as the runtime can't start) with a write racing right behind it. The pre-fix
+    // writeCodex `void getCodexRuntime().then(...)` had no rejection handler → an unhandled rejection that
+    // Node's default handler turns into a process exit, taking every CLAUDE child with it.
+    const spawn = c.request({ op: "spawn", id: "cx", provider: "codex", cwd: "/tmp/x" });
+    c.send({ op: "write", id: "cx", data: userMsg("hello") });
+    assert.equal((await spawn).ok, false, "the spawn itself reports the startup failure");
+    await sleep(150);
+    // The host is still alive and answering — and no unhandled rejection escaped the write path.
+    assert.equal((await c.request({ op: "list" })).sessions.length, 0);
+    assert.ok(calls >= 1, "the runtime factory was actually exercised");
+    assert.deepEqual(unhandled, [], "the write path handled the runtime-startup rejection — no sidecar crash");
+    await c.close();
+  } finally {
+    process.removeListener("unhandledRejection", onUnhandled);
+    await host.shutdown();
+  }
+});
