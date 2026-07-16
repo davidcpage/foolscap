@@ -3982,20 +3982,54 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #52525b;
 }
 
-/* The board-switcher pill — standing viewport chrome at the bottom-left. Rests as the current board's tab;
-   expands rightward on hover/click into a spreadsheet-style tab row (one tab per mounted board + a `+`).
-   NOT a HUD card, so it never hides with the Alt-tap HUD toggle. Light glassy styling mirrors .event-chip. */
+/* The board switcher — standing viewport chrome at the bottom-left. Rests as a minimal drawer handle flush
+   against the left edge; a CLICK (never hover) expands it rightward into a spreadsheet-style tab row (one
+   tab per mounted board + a `+`). NOT a HUD card, so it never hides with the Alt-tap HUD toggle. Light
+   glassy styling mirrors .event-chip. */
 .board-strip {
   position: absolute;
   bottom: 12px;
-  left: 12px;
+  left: 0; /* the handle is flush against the screen edge; the row expands to its right */
   z-index: 12; /* above the fs-watch event-chip (10), which is nudged up to bottom:48px to clear this */
-  pointer-events: none; /* only the tabs themselves catch clicks; empty space falls through to the canvas */
+  pointer-events: none; /* only the handle/tabs catch clicks; empty space falls through to the canvas */
 }
 .board-tabs {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   gap: 3px;
+}
+/* The resting affordance: a small edge handle, low-contrast until hovered, brightening when hovered/open.
+   Rounded on the right only (its left side is flush with the viewport edge). The chevron rotates when open. */
+.board-handle {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 28px;
+  padding: 0;
+  background: #ffffff66;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000012;
+  border-left: none;
+  border-radius: 0 8px 8px 0;
+  color: #b4b4bb;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+.board-handle:hover,
+.board-handle-open {
+  background: #ffffffe6;
+  color: #52525b;
+}
+.board-handle svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 140ms ease;
+}
+.board-handle-open svg {
+  transform: rotate(180deg);
 }
 .board-tab {
   pointer-events: auto;

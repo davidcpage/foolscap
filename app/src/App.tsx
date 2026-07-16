@@ -1276,27 +1276,32 @@ function BoardsItem() {
 // prompt as the menu's BoardsItem. Clicking another board's tab navigates via boardHref (a ?repo= reload,
 // one tab = one board). The board list is lazy-fetched on each expand, since mounts change between opens.
 function BoardPill() {
-  const [hover, setHover] = useState(false);
-  const [pinned, setPinned] = useState(false); // click keeps it open past mouseleave (touch/keyboard)
-  const [boards, setBoards] = useState<BoardListing[] | null>(null); // null = not yet fetched this expand
+  const [open, setOpen] = useState(false); // click toggles the tab row; hover never opens it
+  const [boards, setBoards] = useState<BoardListing[] | null>(null); // null = not yet fetched this open
   const rootRef = useRef<HTMLDivElement>(null);
-  const expanded = hover || pinned;
   const current = activeBoardId();
 
-  // Refetch the mount list every time the strip expands — mounts change between opens (mirrors BoardsItem).
+  // Refetch the mount list every time the row opens — mounts change between opens (mirrors BoardsItem).
   useEffect(() => {
-    if (expanded) void listBoards().then(setBoards);
-  }, [expanded]);
+    if (open) void listBoards().then(setBoards);
+  }, [open]);
 
-  // A click pins the strip open; a click outside un-pins it (so touch/keyboard users can dismiss it).
+  // While open, dismiss on click-outside or Escape (a second handle-click toggles it via onClick below).
   useEffect(() => {
-    if (!pinned) return;
+    if (!open) return;
     const onDown = (e: MouseEvent) => {
-      if (!rootRef.current?.contains(e.target as Node)) setPinned(false);
+      if (!rootRef.current?.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
     };
     document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [pinned]);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
 
   const openRepo = () => {
     const p = window.prompt("Absolute path of the repo to open as a board:");
@@ -1304,41 +1309,48 @@ function BoardPill() {
   };
 
   const others = (boards ?? []).filter((b) => b.boardId !== current);
+  const handleTitle = `Current board: ${activeBoard().name}${activeBoard().isDefault ? " (dev)" : ""}`;
   return (
-    <div
-      ref={rootRef}
-      className="board-strip"
-      onMouseEnter={() => setHover(true)}
-      onMouseLeave={() => setHover(false)}
-    >
+    <div ref={rootRef} className="board-strip">
       <div className="board-tabs">
-        {/* The current board's tab — always shown, highlighted, inert (you can't switch to where you are).
-            A click toggles the pinned-open state so the row survives mouseleave. */}
+        {/* The drawer handle — the only standing chrome. A click toggles the tab row open/closed; hover
+            merely brightens it. Its native tooltip names the current board so wayfinding survives without a
+            standing label. */}
         <button
-          className="board-tab board-tab-current"
-          title={`Current board — ${activeBoard().name}`}
-          onClick={() => setPinned((p) => !p)}
+          className={`board-handle${open ? " board-handle-open" : ""}`}
+          title={handleTitle}
+          aria-label={handleTitle}
+          aria-expanded={open}
+          onClick={() => setOpen((o) => !o)}
         >
-          <span className="board-tab-name">{activeBoard().name}</span>
-          {activeBoard().isDefault && <span className="board-tab-tag">dev</span>}
+          <svg viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" strokeWidth="1.6"
+              strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
         </button>
-        {expanded && boards === null && <span className="board-tab board-tab-loading">…</span>}
-        {expanded &&
-          others.map((b) => (
-            <button
-              key={b.boardId}
-              className="board-tab"
-              title={b.repoPath}
-              onClick={() => location.assign(boardHref(b))}
-            >
-              <span className="board-tab-name">{b.name}</span>
-              {b.isDefault && <span className="board-tab-tag">dev</span>}
+        {open && (
+          <>
+            {/* The current board's tab — highlighted, inert (you can't switch to where you are). */}
+            <span className="board-tab board-tab-current" title={`Current board — ${activeBoard().name}`}>
+              <span className="board-tab-name">{activeBoard().name}</span>
+              {activeBoard().isDefault && <span className="board-tab-tag">dev</span>}
+            </span>
+            {boards === null && <span className="board-tab board-tab-loading">…</span>}
+            {others.map((b) => (
+              <button
+                key={b.boardId}
+                className="board-tab"
+                title={b.repoPath}
+                onClick={() => location.assign(boardHref(b))}
+              >
+                <span className="board-tab-name">{b.name}</span>
+                {b.isDefault && <span className="board-tab-tag">dev</span>}
+              </button>
+            ))}
+            <button className="board-tab board-tab-add" title="Open a repo as a board" onClick={openRepo}>
+              +
             </button>
-          ))}
-        {expanded && (
-          <button className="board-tab board-tab-add" title="Open a repo as a board" onClick={openRepo}>
-            +
-          </button>
+          </>
         )}
       </div>
     </div>
