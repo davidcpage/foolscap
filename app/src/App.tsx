@@ -12,7 +12,8 @@ import {
   type LayoutRecord,
 } from "./lib";
 import { IdbEventStore, IdbSnapshotStore, boardDbName } from "./idb";
-import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, importBoardPersist } from "./remote-store";
+import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, fetchBoardLog, importBoardPersist } from "./remote-store";
+import { seedProvenanceHistory } from "./provenance";
 import { activeBoard, activeBoardId, boardHref, listBoards, resolveBoard, type BoardListing } from "./board";
 import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
@@ -22,7 +23,7 @@ import { connectAgentBus } from "./agentBus";
 import { connectToThread, createThread, isThreadNode, isSessionNode, MEMBER_OPEN } from "./threads";
 import { CanvasView } from "./CanvasView";
 import { useSignal } from "./reactive";
-import { templatesSignal } from "./templates";
+import { templatesSignal, startRegistry } from "./templates";
 import {
   addClock,
   addComputedCard,
@@ -99,6 +100,11 @@ interface Engine {
 //   5. restore the camera pose, attach the snapshot half (debounced channel-2 saves), write a baseline;
 //   6. wire undo last, so the hydrated board isn't undoable.
 async function createEngine(boardId: string): Promise<Engine> {
+  // Kick the card-type registry off NOW, before we even await the boot fetch, so /api/card-types + the
+  // render.js module imports load IN PARALLEL with the persist fetch + hydrate — not serially after the
+  // first NodeView subscribes (which was strictly after this whole stage, leaving cards visibly empty).
+  // Idempotent, so the later templatesSignal.subscribe path is a no-op.
+  startRegistry();
   // The durable tier is the SERVER now (step 4: `<repo>/.canvas/board/` via remote-store.ts), so the
   // board travels with the repo and hydrates the same in any browser. IndexedDB is read exactly once
   // more per board — the adoption below — and left intact as a fallback, never written again.
@@ -172,6 +178,18 @@ async function createEngine(boardId: string): Promise<Engine> {
   persistence.attach(editor.store);
   await persistence.flush();
   const undo = new UndoManager(editor.store);
+  // Provenance backfill (the other half of the boot-tail win): the boot payload shipped only the
+  // post-watermark tail, so the provenance card's history and the who-touched-this actor badges start out
+  // holding just that tail. Fetch the FULL intent log AFTER first paint (idle callback → never blocks the
+  // blank screen) and seed it into the provenance mirror. Best-effort: a failure just leaves provenance
+  // tail-only until the next reload — the board itself is unaffected (it hydrated from the snapshot + tail).
+  const backfillProvenance = () => {
+    void fetchBoardLog(boardId)
+      .then((events) => seedProvenanceHistory(editor, events))
+      .catch((e) => console.warn("[provenance] history backfill failed:", e));
+  };
+  if (typeof requestIdleCallback === "function") requestIdleCallback(backfillProvenance);
+  else setTimeout(backfillProvenance, 0);
   return { m, undo, persistence };
 }
 

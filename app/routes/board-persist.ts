@@ -4,8 +4,8 @@ import { getServerContext } from "../server-context.js";
 import { prefix, type GlobalRoute } from "./router.js";
 import {
   clearBoardPersist,
-  compactBoardEvents,
   importBoardPersist,
+  readBoardBoot,
   readBoardPersist,
   readBoardSnapshot,
   writeBoardSnapshot,
@@ -131,11 +131,21 @@ export const boardPersistRoutes: GlobalRoute[] = [
       const b = getServerContext().reqBoard(url);
       if (!b) return sendJson(res, 400, { error: "unknown board" });
       if (url.pathname === "/api/board/persist" && req.method === "GET") {
-        // Compact on the boot read (once per page load): drop events the snapshot absorbed, beyond a
-        // generous tail — see board-persist.js. Never silent when it bites.
-        const { dropped } = compactBoardEvents(b.repoPath);
-        if (dropped > 0) console.log(`[boards] compacted ${b.boardId}: dropped ${dropped} events below the snapshot watermark tail`);
-        return sendJson(res, 200, readBoardPersist(b.repoPath));
+        // The BOOT read (once per page load): snapshot + only the POST-watermark event TAIL — the exact
+        // set hydrate replays. The full absorbed log contributes nothing to hydration and only bloats the
+        // blank-screen boot fetch (it grows unbounded with board history), so it is NOT shipped here; the
+        // provenance mirror fetches it lazily after first paint via /api/board/persist/log below. One parse
+        // of events.jsonl feeds both this tail and compaction (which is skipped when the watermark is stale).
+        const boot = readBoardBoot(b.repoPath);
+        if (boot.dropped > 0)
+          console.log(`[boards] compacted ${b.boardId}: dropped ${boot.dropped} events below the snapshot watermark tail`);
+        return sendJson(res, 200, { events: boot.events, snapshot: boot.snapshot }, req);
+      }
+      if (url.pathname === "/api/board/persist/log" && req.method === "GET") {
+        // The full intent log — the provenance mirror / who-touched-this actor badges. Fetched lazily
+        // after first paint (not on the boot path), so a blank screen never waits on it. gzip'd (it is
+        // large and highly compressible) when the client accepts it.
+        return sendJson(res, 200, { events: readBoardPersist(b.repoPath).events }, req);
       }
       if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
         clearBoardPersist(b.repoPath);

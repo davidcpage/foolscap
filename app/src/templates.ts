@@ -853,7 +853,11 @@ async function loadAll(attempt = 0, only?: ReadonlySet<string>): Promise<void> {
 // is loaded the SAME disk event also rides the file-watch into render.js's own file card, refreshing
 // its off-log content signal (content.ts) — the card body updates live, off the log, exactly as any
 // file card does. The template re-import and the body refresh are two reads of one disk change.
-function startRegistry(): void {
+// Exported so the app can kick the registry off EAGERLY at boot (App.tsx createEngine), in parallel with
+// the board persist fetch — otherwise the first NodeView subscription (templatesSignal, below) is what
+// starts it, strictly AFTER hydration, so cards sit empty through the whole boot fetch + hydrate stage.
+// Idempotent (the `started` guard), so the eager call and the lazy subscribe path can't double-load.
+export function startRegistry(): void {
   if (started) return;
   started = true;
   void loadAll();

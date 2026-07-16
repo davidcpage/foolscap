@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import chokidar from "chokidar";
 import { contentVersion } from "./cas-guard.js";
+import { MAX_BYTES } from "./server-http.js";
 
 // The card-type definitions folder (app/card-types/*/). A stateless filesystem location, so it lives here
 // with the other fs primitives rather than in a route module: both the card-types route (routes/card-types.ts,
@@ -108,6 +109,30 @@ export function fileVersion(abs: string): string | null {
   } catch {
     return null; // no such file — the version of "absent" (a create passes baseVersion:null)
   }
+}
+
+// The /api/file read used to read the whole file TWICE per request — once for the preview (readText)
+// and again for the version hash (fileVersion) — N cards ⇒ 2N sync reads queued on the event loop. This
+// reads ONCE and derives both from the same buffer: the head-clipped `maxBytes` preview (with the
+// `truncated` flag) AND the content version, which is the hash of the FULL bytes (`buf` is the whole file
+// regardless of `maxBytes`, so the version stays identical to fileVersion's). Null when the file can't be
+// read (same contract as readText). The two-read pattern stays only where a SECOND read is genuinely a
+// re-read of changed bytes (handleFileWrite's post-write version stamp).
+export function readFileWithVersion(
+  abs: string,
+  maxBytes: number = MAX_BYTES,
+): { content: string; truncated: boolean; version: string } | null {
+  let buf: Buffer;
+  try {
+    buf = fs.readFileSync(abs);
+  } catch {
+    return null;
+  }
+  return {
+    content: buf.subarray(0, maxBytes).toString("utf8"),
+    truncated: buf.length > maxBytes,
+    version: contentVersion(buf)!, // a real Buffer (the read succeeded) always hashes to a string, never null
+  };
 }
 
 // The chokidar watcher one watch subscription rides — shared by the SSE endpoint (handleWatch, the /api/watch

@@ -16,6 +16,7 @@ import {
   importBoardPersist,
   clearBoardPersist,
   compactBoardEvents,
+  readBoardBoot,
   readBoardSnapshot,
   boardPersistMtime,
   describeBoardEvents,
@@ -127,6 +128,43 @@ test("compaction is a no-op without a watermark, below minDrop, and for seq-less
   writeBoardSnapshot(legacy, { records: [], version: 2, seq: 100 });
   assert.deepEqual(compactBoardEvents(legacy, { keepTail: 0, minDrop: 1 }), { dropped: 1 });
   assert.deepEqual(readBoardPersist(legacy).events, [{ parent: 0 }]);
+});
+
+test("readBoardBoot ships snapshot + only the POST-watermark tail (the fast-boot payload)", () => {
+  const repo = tmpRepo();
+  for (let seq = 1; seq <= 10; seq++) appendBoardEvent(repo, { seq });
+  writeBoardSnapshot(repo, { records: [{ id: "n" }], version: 8, seq: 8 });
+  const boot = readBoardBoot(repo);
+  // The snapshot rides along; the events are ONLY the tail the snapshot hasn't absorbed (seq > 8).
+  assert.deepEqual(boot.snapshot, { records: [{ id: "n" }], version: 8, seq: 8 });
+  assert.deepEqual(boot.events, [{ seq: 9 }, { seq: 10 }]);
+  assert.equal(boot.full, false);
+  // The full log is untouched on disk — the lazy /log read still returns everything.
+  assert.equal(readBoardPersist(repo).events.length, 10);
+});
+
+test("readBoardBoot: empty tail when the watermark == last seq (this-board case)", () => {
+  const repo = tmpRepo();
+  for (let seq = 1; seq <= 5; seq++) appendBoardEvent(repo, { seq });
+  writeBoardSnapshot(repo, { records: [], version: 5, seq: 5 });
+  const boot = readBoardBoot(repo);
+  assert.deepEqual(boot.events, [], "nothing past the watermark → the boot fetch ships zero events");
+  assert.equal(boot.snapshot.seq, 5);
+});
+
+test("readBoardBoot: a legacy snapshot with no seq ships the whole log (full:true)", () => {
+  const repo = tmpRepo();
+  appendBoardEvent(repo, { seq: 1 });
+  appendBoardEvent(repo, { seq: 2 });
+  writeBoardSnapshot(repo, { records: [], version: 2 }); // no seq stamp
+  const boot = readBoardBoot(repo);
+  assert.equal(boot.full, true);
+  assert.deepEqual(boot.events, [{ seq: 1 }, { seq: 2 }], "can't define a tail safely → full log, hydrate's parent-filter fallback");
+});
+
+test("readBoardBoot: a fresh board is empty snapshot + empty tail", () => {
+  const repo = tmpRepo();
+  assert.deepEqual(readBoardBoot(repo), { snapshot: null, events: [], dropped: 0, full: true });
 });
 
 test("readBoardSnapshot reads only the snapshot; mtime reflects persisted state", () => {

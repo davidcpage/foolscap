@@ -124,6 +124,38 @@ test("a pre-watermark snapshot (no seq stamp) falls back to the linear parent fi
   assert.ok(store2.get("node:b"), "from the tail");
 });
 
+test("boot from snapshot + EMPTY tail adopts the watermark (no seq-0 rollback)", async () => {
+  // The app's boot payload ships only the POST-watermark tail; when the snapshot has absorbed everything
+  // (watermark == last seq — the common case) that tail is EMPTY, so the fresh Persistence sees an empty
+  // event store. The watermark must still be adopted from the snapshot, or the mirror's lastSeq would be
+  // 0 and the next debounced save would stamp a watermark BELOW the stored one (a stale rollback — the
+  // remote store rejects it 409 every boot) and the next gesture would restart the timeline at seq 1.
+  const events = new MemoryEventStore();
+  const snapshots = new MemorySnapshotStore();
+  const a = makeApp(events, snapshots);
+  a.editor.commit({ type: "addNode", actor: "human", payload: { id: "node:a", x: 0, y: 0 } });
+  a.editor.commit({ type: "addNode", actor: "human", payload: { id: "node:b", x: 0, y: 0 } });
+  await a.persistence.flush();
+  assert.equal((await snapshots.load())!.seq, 2, "snapshot watermark is the last event's seq");
+
+  // Boot with the snapshot but an EMPTY tail (the absorbed prefix is not fed to the client Persistence).
+  const p2 = new Persistence({ events: new MemoryEventStore(), snapshots });
+  const store2 = new Store();
+  const res = await p2.hydrate(store2);
+  assert.equal(res.replayed, 0, "nothing to replay — the snapshot covers it all");
+  assert.ok(store2.get("node:a") && store2.get("node:b"), "hydrated from the snapshot alone");
+
+  // The timeline CONTINUES above the adopted watermark — the next gesture is seq 3, not a reset to 1.
+  const editor2 = new Editor({ store: store2, log: p2 });
+  const ev = editor2.commit({ type: "setTitle", actor: "human", payload: { id: "node:a", title: "A2" } });
+  assert.equal(ev.seq, 3, "next seq sits above the adopted watermark, not reset to 1");
+
+  // …and the debounced save stamps that watermark — never below the stored one (no stale-409 rollback).
+  p2.attach(store2);
+  await p2.flush();
+  assert.equal((await snapshots.load())!.seq, 3, "the save stamps a watermark ahead of the boot one");
+});
+
 test("snapshot + tail replay == full replay from an empty log (no snapshot)", async () => {
   // Build the same history twice: once with a snapshot cache, once log-only; final states must match.
   const cmds: { type: string; payload: any }[] = [

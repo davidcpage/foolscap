@@ -153,6 +153,55 @@ test("server-fs fileVersion: null for absent, stable per bytes, changes on edit"
   }
 });
 
+test("server-fs readFileWithVersion: ONE read yields preview + truncated + the same version fileVersion would", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-rfv-"));
+  const abs = path.join(dir, "note.md");
+  try {
+    assert.equal(fsMod.readFileWithVersion(abs), null, "absent file → null (same contract as readText)");
+    fs.writeFileSync(abs, "hello world");
+    const r = fsMod.readFileWithVersion(abs);
+    assert.equal(r.content, "hello world");
+    assert.equal(r.truncated, false);
+    // The version derived from the same buffer MUST equal the standalone fileVersion (the full-file hash) —
+    // that equality is what lets the /api/file read collapse its old two-read (preview + hash) into one.
+    assert.equal(r.version, fsMod.fileVersion(abs), "version from the shared buffer == the full-file hash");
+    // A tiny maxBytes head-clips the preview and flags it, while the version still hashes the FULL bytes.
+    const clipped = fsMod.readFileWithVersion(abs, 5);
+    assert.equal(clipped.content, "hello");
+    assert.equal(clipped.truncated, true);
+    assert.equal(clipped.version, r.version, "the version is the full-file hash regardless of the preview cap");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("server-http sendJson: gzip only when the client accepts it AND the body clears the threshold", async () => {
+  const http = await import("../server-http.ts");
+  const zlib = await import("node:zlib");
+  const big = { blob: "x".repeat(4000) }; // well over GZIP_MIN_BYTES
+  // No req → plain JSON, exactly as every existing caller gets.
+  const plain = fakeRes();
+  http.sendJson(plain, 200, big);
+  assert.equal(plain._headers["Content-Encoding"], undefined, "no req ⇒ never gzip (backwards-compatible)");
+  assert.deepEqual(JSON.parse(plain._body), big);
+  // Client accepts gzip + body is large ⇒ gzip'd, and it round-trips back to the same JSON.
+  const gz = fakeRes();
+  http.sendJson(gz, 200, big, { headers: { "accept-encoding": "gzip, deflate, br" } });
+  assert.equal(gz._headers["Content-Encoding"], "gzip");
+  assert.equal(gz._headers["Vary"], "Accept-Encoding");
+  assert.deepEqual(JSON.parse(zlib.gunzipSync(gz._body).toString("utf8")), big);
+  assert.ok(gz._body.length < Buffer.byteLength(JSON.stringify(big)), "the gzip payload is smaller than the raw JSON");
+  // A tiny body stays uncompressed even when accepted (the framing would cost more than it saves).
+  const small = fakeRes();
+  http.sendJson(small, 200, { ok: true }, { headers: { "accept-encoding": "gzip" } });
+  assert.equal(small._headers["Content-Encoding"], undefined, "below the threshold ⇒ plain");
+  assert.deepEqual(JSON.parse(small._body), { ok: true });
+  // Client does NOT accept gzip ⇒ plain, even for a large body.
+  const noAccept = fakeRes();
+  http.sendJson(noAccept, 200, big, { headers: {} });
+  assert.equal(noAccept._headers["Content-Encoding"], undefined, "no gzip in Accept-Encoding ⇒ plain");
+});
+
 // ── Group B: server-snapshot pure record resolvers (no context) ─────────────────────────────────────
 const RECORDS = [
   { typeName: "node", id: "node:live:s1", type: "session", title: "s1", name: "Coordinator.s1" },

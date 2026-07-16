@@ -7,6 +7,7 @@ import {
   safeResolve,
   isInternalPath,
   fileVersion,
+  readFileWithVersion,
   EXCLUDE_DIRS,
   TEXT_EXT,
   IMAGE_EXT,
@@ -60,22 +61,24 @@ function handleLs(res: ServerResponse, root: string, sub: string): void {
 // Beyond even the ceiling we fall back to head-truncation (truncated flag → card's existing "too large"
 // notice); we never guess truncation from a parse failure — a malformed file is served verbatim.
 function handleNotebookFile(res: ServerResponse, abs: string, rel: string, mode: "render" | "agent"): void {
-  const raw = readText(abs, MAX_NOTEBOOK_BYTES);
+  // Read ONCE (up to the notebook ceiling) and derive both the content and the version from that buffer —
+  // a notebook is up to 32 MiB, so the old read-then-fileVersion pair was two 32 MiB sync reads per request.
+  const raw = readFileWithVersion(abs, MAX_NOTEBOOK_BYTES);
   if (!raw) return sendJson(res, 404, { error: "not found" });
   if (raw.truncated) {
     // File exceeds even the notebook ceiling — the bytes are already clipped, so we can't parse/transform.
     // Serve the head-truncated content with the flag; the card shows "too large", an agent sees the flag.
-    return sendJson(res, 200, { path: rel, content: raw.content, truncated: true, version: fileVersion(abs) });
+    return sendJson(res, 200, { path: rel, content: raw.content, truncated: true, version: raw.version });
   }
   const { content, trimmed } = transformNotebook(raw.content, { mode });
   // BUG-2: a TRIMMED projection is NOT the on-disk bytes (images elided to markers / text clamped / whole
-  // outputs dropped), so stamping fileVersion(abs) — the hash of the FULL file — would be a lie: a reader
-  // could echo it as baseVersion and the CAS would pass, letting the lossy projection overwrite the real
-  // outputs. Poison the version to null on any trimmed read, so a CAS-guarded write-back is refused (409,
-  // baseVersion:null vs the real hash → stale) and the reader must re-read. Only an UNtrimmed read (content
-  // == the real bytes) carries a real version and is a safe CAS base. The write path (handleFileWrite) also
+  // outputs dropped), so stamping the FULL-file hash would be a lie: a reader could echo it as baseVersion
+  // and the CAS would pass, letting the lossy projection overwrite the real outputs. Poison the version to
+  // null on any trimmed read, so a CAS-guarded write-back is refused (409, baseVersion:null vs the real hash
+  // → stale) and the reader must re-read. Only an UNtrimmed read (content == the real bytes) carries a real
+  // version (raw.version, from the same buffer) and is a safe CAS base. The write path (handleFileWrite) also
   // hard-rejects a body carrying elision markers, independent of the CAS, for a reader that omits baseVersion.
-  sendJson(res, 200, { path: rel, content, truncated: false, trimmed, version: trimmed ? null : fileVersion(abs) });
+  sendJson(res, 200, { path: rel, content, truncated: false, trimmed, version: trimmed ? null : raw.version });
 }
 
 function handleFile(res: ServerResponse, root: string, rel: string, notebook: string | null): void {
@@ -89,20 +92,22 @@ function handleFile(res: ServerResponse, root: string, rel: string, notebook: st
     !!abs && !isInternalPath(rel) && TEXT_EXT.has(path.extname(rel).toLowerCase());
   if (allowed && path.extname(rel).toLowerCase() === ".ipynb")
     return handleNotebookFile(res, abs!, rel, notebook === "render" ? "render" : "agent");
-  const r = allowed ? readText(abs!) : null;
+  // Read ONCE and derive both the preview and the W12 content version from the same buffer (the read used
+  // to hit disk twice — readText for the preview, fileVersion for the hash — 2N sync reads for N cards).
+  const r = allowed ? readFileWithVersion(abs!) : null;
   if (!r) {
     // Role cards read `.canvas/roles/<id>/role.md` through this endpoint. On a board with no override the
     // file exists only as a bundled default (app/default-roles/) — serve that read-only so the card mirrors
     // the shipped role instead of hanging on "loading…", until an edit writes the board copy (copy-on-write).
     // Same text gates already applied via `allowed`; the fallback is only reached on a genuine miss.
     const bundled = allowed ? bundledRoleFileFor(rel) : null;
-    const br = bundled ? readText(bundled) : null;
+    const br = bundled ? readFileWithVersion(bundled) : null;
     if (bundled && br)
-      return sendJson(res, 200, { path: rel, content: br.content, truncated: br.truncated, version: fileVersion(bundled) });
+      return sendJson(res, 200, { path: rel, content: br.content, truncated: br.truncated, version: br.version });
     return sendJson(res, 404, { error: "not found" });
   }
-  // W12: stamp the content version so a card can echo it back as `baseVersion` on write (optimistic lock).
-  sendJson(res, 200, { path: rel, content: r.content, truncated: r.truncated, version: fileVersion(abs!) });
+  // W12: the content version lets a card echo it back as `baseVersion` on write (optimistic lock).
+  sendJson(res, 200, { path: rel, content: r.content, truncated: r.truncated, version: r.version });
 }
 
 // WRITE a file's content (POST /api/file) — Phase-3 write-back, first consumer the notebook card's
