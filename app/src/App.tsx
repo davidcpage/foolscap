@@ -1215,58 +1215,6 @@ function NewFileItem({
   );
 }
 
-// The board switcher (multi-canvas). "Board: <name>" expands into every board the server knows — live
-// mounts plus the durable registry it remounted on boot, so repos opened before a restart are still
-// offered — with "Open repo…" to mount a new one by absolute path. Switching NAVIGATES: one tab is
-// exactly one board (board.ts), so a switch is a page load, not a state change. The rows go through
-// ?repo= (boardHref), which re-mounts idempotently — the same path a first open takes. Boards are
-// refetched on every expand (mounts change between menu opens), and the current board's row is inert.
-function BoardsItem() {
-  const [open, setOpen] = useState(false);
-  const [boards, setBoards] = useState<BoardListing[] | null>(null); // null = not yet fetched
-  const toggle = () => {
-    const next = !open;
-    setOpen(next);
-    if (next) void listBoards().then(setBoards);
-  };
-  const openRepo = () => {
-    const p = window.prompt("Absolute path of the repo to open as a board:");
-    if (p?.trim()) location.assign(`${location.pathname}?repo=${encodeURIComponent(p.trim())}`);
-  };
-  const current = activeBoardId();
-  return (
-    <div className="menu-roles">
-      <button className="menu-expand" aria-expanded={open} onClick={toggle}>
-        <span>
-          Board: <b>{activeBoard().name}</b>
-        </span>
-        <span className="menu-caret">{open ? "▾" : "▸"}</span>
-      </button>
-      {open && (
-        <div className="menu-rolelist">
-          {boards === null && <div className="menu-rolehint">loading boards…</div>}
-          {boards?.map((b) => (
-            <button
-              key={b.boardId}
-              className="menu-boardopt"
-              disabled={b.boardId === current}
-              title={b.repoPath}
-              onClick={() => location.assign(boardHref(b))}
-            >
-              <span className="menu-boardname">{b.name}</span>
-              {b.boardId === current && <span className="menu-boardtag">current</span>}
-              {b.boardId !== current && b.isDefault && <span className="menu-boardtag">dev</span>}
-            </button>
-          ))}
-          <button className="menu-boardopt menu-boardopen" onClick={openRepo}>
-            Open repo…
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // The board-switcher pill — standing VIEWPORT CHROME (not a HUD card, so it ignores the Alt-tap HUD toggle
 // and isn't in the HUD checkbox list). It rests as a slim pill at the bottom-left showing the current
 // board's name (+ a "dev" tag on the default board). Hover — or click, for touch/keyboard, which pins it
@@ -1471,8 +1419,9 @@ function CanvasMenu({
         <button onClick={() => run(() => addComputedCard(m, at))}>Computed</button>
         <button onClick={() => run(() => addProvenanceCard(m, at))}>Intent log</button>
         <div className="menu-divider" />
+        {/* Board switching lives in the bottom-left edge-tab strip (<BoardPill/>) now — the redundant
+            in-menu switcher was removed. What stays here is board-level OPERATIONS, not switching. */}
         <div className="menu-section">Board</div>
-        <BoardsItem />
         <button onClick={() => run(() => m.fitAll(isFloating))}>Zoom to fit <span className="menu-key">⇧1</span></button>
         <button onClick={() => run(() => exportBoard(m))}>Export…</button>
         <button onClick={() => { onImport(); onClose(); }}>Import…</button>

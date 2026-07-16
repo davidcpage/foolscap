@@ -3961,27 +3961,6 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   line-height: 1.35;
 }
 
-/* The board switcher (BoardsItem) — shares the role picker's indented-list shell. A row is the board's
-   name with a faint "current"/"dev" tag pushed right; the current board's row is inert. */
-.menu-list .menu-boardopt:disabled {
-  cursor: default;
-  color: #a1a1aa;
-}
-.menu-list .menu-boardopt:disabled:hover {
-  background: transparent;
-}
-.menu-boardname {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.menu-boardtag {
-  font-size: 10px;
-  color: #a1a1aa;
-}
-.menu-boardopen {
-  color: #52525b;
-}
-
 /* The board switcher — standing viewport chrome at the bottom-left. Rests as a minimal drawer handle flush
    against the left edge; a CLICK (never hover) expands it rightward into a spreadsheet-style tab row (one
    tab per mounted board + a `+`). NOT a HUD card, so it never hides with the Alt-tap HUD toggle. Light
