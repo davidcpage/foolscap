@@ -78,6 +78,54 @@ test("server-fs isInternalPath hides generated/internal trees but keeps .canvas 
   assert.equal(fsMod.isInternalPath("/abs/repo/.canvas/roles/pm/role.md"), false);
 });
 
+test("server-fs isInternalPath excludes Python virtualenvs (the fd-exhaustion guard) at any depth", () => {
+  // chokidar v4 holds one kqueue fd per watched file; a mounted external repo's ~10k-file `.venv`
+  // exhausted the process fd table (spawn EBADF, 2026-07-15). The watchers' shared `ignored` predicate
+  // must reject a venv wherever it appears — absolute or root-relative, `.venv` or bare `venv`.
+  assert.equal(fsMod.isInternalPath(".venv/lib/python3.12/site-packages/x.py"), true);
+  assert.equal(fsMod.isInternalPath("/abs/repo/.venv/lib/python3.12/x.py"), true);
+  assert.equal(fsMod.isInternalPath("venv/bin/activate"), true);
+  assert.equal(fsMod.isInternalPath("sub/project/.venv/pyvenv.cfg"), true);
+  // ...and the pre-existing heavy dirs stay excluded alongside it.
+  assert.equal(fsMod.isInternalPath("/abs/repo/node_modules/x"), true);
+  assert.equal(fsMod.isInternalPath("/abs/repo/.git/objects/aa/bb"), true);
+  // A normal source path — including one that merely CONTAINS the substring — is still served.
+  assert.equal(fsMod.isInternalPath("src/venv-tools.ts"), false);
+  assert.equal(fsMod.isInternalPath("docs/venvs.md"), false);
+});
+
+test("server-fs openRootWatcher never descends into a venv (behavioral: no fd, no event)", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-venv-watch-"));
+  fs.mkdirSync(path.join(root, ".venv/lib/python3.12"), { recursive: true });
+  fs.mkdirSync(path.join(root, "node_modules/pkg"), { recursive: true });
+  const events = [];
+  const close = fsMod.openRootWatcher(root, (ev) => events.push(ev));
+  try {
+    // Write into the excluded trees AND at the top level each round, then wait for the top-level add
+    // to arrive — chokidar picks both up in the same pass, so if the watcher had descended into
+    // `.venv`/`node_modules` their adds would ride along with (or before) the sentinel's. Rounds
+    // repeat because the first writes can land before chokidar's initial scan completes.
+    const deadline = Date.now() + 8000;
+    let round = 0;
+    while (!events.some((e) => e.path === `ok-${round}.txt`)) {
+      round++;
+      fs.writeFileSync(path.join(root, ".venv/lib/python3.12", `x-${round}.py`), "x = 1\n");
+      fs.writeFileSync(path.join(root, "node_modules/pkg", `y-${round}.js`), "y\n");
+      fs.writeFileSync(path.join(root, `ok-${round}.txt`), "ok\n");
+      const until = Date.now() + 400;
+      while (Date.now() < until && !events.some((e) => e.path === `ok-${round}.txt`))
+        await new Promise((r) => setTimeout(r, 25));
+      assert.ok(Date.now() < deadline, "watcher never delivered the top-level sentinel event");
+    }
+    await new Promise((r) => setTimeout(r, 300)); // settle: catch any straggler event from the excluded trees
+    const leaked = events.filter((e) => /(^|\/)(\.venv|node_modules)\//.test(e.path));
+    assert.deepEqual(leaked, [], "no watch event may come from inside .venv/ or node_modules/");
+  } finally {
+    close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("server-fs extension gates classify text vs image vs blocked", () => {
   for (const ext of [".md", ".ts", ".json", ".py", ".sh"]) assert.equal(fsMod.TEXT_EXT.has(ext), true, ext);
   for (const ext of [".png", ".jpg", ".svg", ".webp"]) assert.equal(fsMod.IMAGE_EXT.has(ext), true, ext);
