@@ -24,16 +24,26 @@ const MODEL_DISPLAY = {
   "gpt-5.6-terra": ["Terra", "silver"],
   "gpt-5.6-luna": ["Luna", "bronze"],
 };
-function modelChip(model, effort) {
+// Short model ALIASES on a Task/Agent tool_use `input.model` (subagent chips only) — kept in lockstep with
+// session/render.js's identical map. Mapped to the same friendly label + tier as the full-id MODEL_DISPLAY.
+const MODEL_ALIAS = {
+  fable: ["Fable", "gold"],
+  opus: ["Opus", "silver"],
+  sonnet: ["Sonnet", "bronze"],
+  haiku: ["Haiku", "plain"],
+};
+function modelChip(model, effort, variant) {
   if (typeof model !== "string" || !model) return null;
   let label, tier;
   if (MODEL_DISPLAY[model]) [label, tier] = MODEL_DISPLAY[model];
+  else if (MODEL_ALIAS[model]) [label, tier] = MODEL_ALIAS[model];
   else if (/^claude-haiku/.test(model)) [label, tier] = ["Haiku", "plain"];
   else [label, tier] = [model.replace(/^claude-/, ""), "plain"];
   const eff = typeof effort === "string" && effort ? effort : null;
+  const sub = variant === "sub"; // a subagent chip: smaller, dimmer, ↳-marked, never the main pill
   return html`<span
-    class="ses-model ses-model-${tier}"
-    title=${`model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
+    class="ses-model ses-model-${tier}${sub ? " ses-model-sub" : ""}"
+    title=${`${sub ? "subagent " : ""}model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
     >${label}${eff ? html`<span class="ses-model-effort"> ·${eff}</span>` : ""}</span
   >`;
 }
