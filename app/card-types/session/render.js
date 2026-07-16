@@ -986,6 +986,12 @@ export default {
       });
     };
 
+    // The assistant's provider-aware DISPLAY label: a Codex session says CODEX, not the hardcoded CLAUDE.
+    // `t.role` stays the semantic "claude"/"you" (it drives the ses-<role> styling class and the "is this
+    // an assistant turn?" answer gate); only the shown text switches on the provider. The live feed carries
+    // it (server-sessions publishSession + the historical codex feed both stamp `provider`); with no feed
+    // at all — a bare historical Claude transcript — default to claude.
+    const agentLabel = live && live.provider === "codex" ? "codex" : "claude";
     // Built BEFORE the outer template so the md-memo generation swap below sees every lookup this
     // pass made. Historical text blocks come from the memo (renderMd once per text, not per delta);
     // the last live claude turn — the streaming one, and the one whose ```ask may be interactive —
@@ -1001,7 +1007,7 @@ export default {
       const onAnswer = i === turns.length - 1 && active && t.role === "claude" ? answerAsk : null;
       return html`
         <div class="ses-turn ses-${t.role}">
-          <div class="ses-role">${t.role}</div>
+          <div class="ses-role">${t.role === "claude" ? agentLabel : t.role}</div>
           ${blocks.map((b) => (b.kind === "text" && !onAnswer ? memoTextBlock(st, b) : renderBlock(b, onAnswer)))}
         </div>
       `;
