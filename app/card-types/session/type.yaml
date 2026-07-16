@@ -32,4 +32,10 @@ contract: 1
 #   • `roots` — the board's roots (canonical checkout + git worktrees), each with a stable colour. Used
 #     ONLY to tint the touched-files activity strip by worktree (render.js maps the session's absolute
 #     tool-call paths onto these roots). Board-global + read-only — never a scope the session is bound to.
-capabilities: [session, sessionInput, sessionResume, sessionDone, sessionPermission, roots]
+#   • `rolesList` — this board's roles (GET /api/roles, reactive), read-only. Used ONLY by an UNSTARTED
+#     stub card to render its ROLE chip and pre-fill the resolved model/effort a role would spawn at.
+#   • `sessionConfigure` — an UNSTARTED stub's chip-write: merge a {provider,model,effort,roleId} patch
+#     into the stub descriptor (deferred-start-session-cards). Only meaningful before launch.
+#   • `sessionLaunch` — an UNSTARTED stub's first-prompt SPAWN: POST /api/session/spawn WITH this card's
+#     own id, so the stub becomes the live session in place (no new card). Both no-op without a host.
+capabilities: [session, sessionInput, sessionResume, sessionDone, sessionPermission, roots, rolesList, sessionConfigure, sessionLaunch]

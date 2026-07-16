@@ -261,7 +261,7 @@ async function handleSessionSpawn(
   } = getServerContext();
   const pendingHistoryMode = getPendingHistoryMode(fsState);
   let body: {
-    prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
+    id?: unknown; prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
     worktree?: unknown; base?: unknown; worktreeKey?: unknown; model?: unknown; provider?: unknown;
     effort?: unknown;
   } = {};
@@ -329,7 +329,20 @@ async function handleSessionSpawn(
   } catch (err) {
     return sendJson(res, 400, { error: "worktree spawn rejected", detail: String(err) });
   }
-  const id = crypto.randomUUID();
+  // The session id is normally SERVER-minted. A deferred-start card (deferred-start-session-cards) mints
+  // its OWN UUID client-side (so the stub card's node id + feed key are stable from creation) and passes it
+  // here as `id`; the process then adopts that id and the same card flips from stub to live with no id
+  // reconciliation. Validate it strictly — a proper UUID, not one already live (a routing collision) — and
+  // fall back to server minting when absent, so every other spawn path is unchanged.
+  let id: string;
+  if (body.id != null && body.id !== "") {
+    if (typeof body.id !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(body.id))
+      return sendJson(res, 400, { error: "id must be a UUID" });
+    if (liveSessions.has(body.id)) return sendJson(res, 409, { error: "session id already in use" });
+    id = body.id;
+  } else {
+    id = crypto.randomUUID();
+  }
   try {
     ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model, provider, effort);
   } catch (err) {

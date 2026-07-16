@@ -679,6 +679,75 @@ test("session template applies the jsonl codec: turns, tool calls with results, 
   assert.ok(empty.includes("0 turns") && empty.includes("no turns"), "empty session");
 });
 
+test("session template renders an UNSTARTED stub as toggleable chips + a launch input, never a transcript/resume/ended band", async () => {
+  const mod = await loadTemplate("session");
+
+  // An unstarted stub carries its chip state as a JSON blob in `text` (unstarted:true), with NO live feed.
+  // The card must branch to the pre-start UI: provider/model/effort/role chips + a launch prompt, and it
+  // must NOT compute any "ended"/"resume"/transcript state (the false-band regression the spec guards).
+  const stub = { unstarted: true, provider: "claude", model: null, effort: null, roleId: null };
+  const roles = [{ roleId: "pm", name: "Coordinator", colour: "green", model: "claude-fable-5", effort: "high" }];
+  let configured = null;
+  let launched = null;
+  const card = {
+    fields: { title: "11111111-1111-4111-8111-111111111111", text: JSON.stringify(stub), color: "blue" },
+    signals: {
+      rolesList: roles,
+      sessionConfigure: (patch) => (configured = patch),
+      sessionLaunch: (prompt) => { launched = prompt; return Promise.resolve(true); },
+    },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes('data-ses-state="unstarted"'), "the head reads the unstarted state");
+  assert.ok(out.includes("not started"), "an unstarted pill, not a live/ended band");
+  assert.ok(!out.includes("resume session"), "no resume control on an unstarted card");
+  assert.ok(!out.includes("turns") && !out.includes("no turns"), "no transcript body — the codec never ran");
+  // Chips: providers, the current provider's models, effort levels, and roles (+ their defaults/no-role).
+  assert.ok(out.includes("Claude") && out.includes("Codex"), "provider chips");
+  assert.ok(out.includes("Opus") && out.includes("Sonnet") && out.includes("Fable"), "claude model chips");
+  assert.ok(!out.includes("Sol"), "codex models are hidden while the provider is claude");
+  for (const lvl of ["low", "med", "high", "xhigh", "max"]) assert.ok(out.includes(`>${lvl}<`), `effort chip ${lvl}`);
+  assert.ok(out.includes("No role") && out.includes("Coordinator"), "role chips incl. the no-role default");
+  assert.ok(out.includes("launch"), "a launch button");
+  // The Default model chip stays selected (nothing pinned) so the spawn omits model — role default resolves it.
+  assert.ok(out.includes("ses-chip active") && out.includes("Default"), "an unset Default chip is the active one");
+
+  // Codex provider: the model list swaps (Sol/Terra/Luna), claude ids gone — the lockstep the spec requires.
+  const codexOut = flatten(
+    mod.render({ ...card, fields: { ...card.fields, text: JSON.stringify({ ...stub, provider: "codex" }) } }),
+  );
+  assert.ok(codexOut.includes("Sol") && codexOut.includes("Luna"), "codex model chips after the provider flip");
+  assert.ok(!codexOut.includes(">Opus<"), "claude models gone under the codex provider");
+
+  // With a role selected, the model/effort Default chips DISPLAY what they resolve to (the role frontmatter)
+  // without pinning an explicit value — "display what unset resolves to, don't send it".
+  const roleOut = flatten(
+    mod.render({ ...card, fields: { ...card.fields, text: JSON.stringify({ ...stub, roleId: "pm" }) } }),
+  );
+  assert.ok(roleOut.includes("Default · Fable"), "the model Default chip shows the selected role's default model");
+  assert.ok(roleOut.includes("Default · high"), "the effort Default chip shows the role's default effort");
+
+  // The capability contract: a chip write routes through sessionConfigure; picking Codex resets the model.
+  card.signals.sessionConfigure({ provider: "codex", model: null });
+  assert.deepEqual(configured, { provider: "codex", model: null }, "sessionConfigure carries the chip patch");
+  // A launch routes the first prompt through sessionLaunch.
+  card.signals.sessionLaunch("do the thing");
+  assert.equal(launched, "do the thing", "sessionLaunch carries the first prompt");
+
+  // Degrade with no grants (headless / pre-signal): still renders the chips read-only, never throws.
+  const noGrant = flatten(mod.render({ fields: card.fields, signals: {} }));
+  assert.ok(noGrant.includes("not started") && noGrant.includes("Claude"), "renders read-only without grants");
+  assert.ok(noGrant.includes("disabled"), "chips/launch disabled without the write grants");
+
+  // A LIVE feed supersedes the stub blob: even if the (stale) text still holds the JSON, a feed means the
+  // session launched, so the normal live path runs — NOT the unstarted branch.
+  const liveOut = flatten(
+    mod.render({ fields: card.fields, signals: { session: { content: "", status: "idle" } } }),
+  );
+  assert.ok(!liveOut.includes("not started"), "a live feed takes the normal path, not the unstarted branch");
+});
+
 test("session template folds TaskCreate/TaskUpdate into a current-state task panel", async () => {
   const mod = await loadTemplate("session");
   // TaskCreate's input has no id — the server assigns "Task #N" and only the tool_result echoes it; a
