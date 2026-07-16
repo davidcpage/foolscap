@@ -19,9 +19,34 @@
 # --thread and let the server do all of it.
 set -euo pipefail
 
-BOARD="${CANVAS_BOARD:-foolscap-a9921027}"
+# Board id: default from $CANVAS_BOARD (a spawned session gets it INJECTED into its shell env by the
+# spawn path — server-sessions.ts). There is DELIBERATELY no hardcoded fallback board: a stale guess
+# either 400s ("unknown board", loud but confusing) or — far worse — silently misdirects the write to a
+# valid-but-wrong board. When neither $CANVAS_BOARD nor --board is set we FAIL LOUDLY (require_board),
+# never guess. (This closes the footgun where the old baked-in default foolscap-a9921027 was posted to.)
+BOARD="${CANVAS_BOARD:-}"
 SERVER="${CANVAS_SERVER:-http://127.0.0.1:5173}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" # repo root (this script lives in scripts/)
+
+# Default posting identity for --from/--by. A spawned session carries its own sid in $CANVAS_SESSION_ID
+# (injected by the spawn path); the Claude CLI also exports $CLAUDE_CODE_SESSION_ID (the same value) into
+# every session shell, so the sid is available even before the injection propagates. We fall back to the
+# literal "human" ONLY when neither is set — i.e. a bare human terminal, never an agent session. This
+# closes the footgun where an agent that omitted --from silently impersonated the human in the durable
+# thread record (attribution drives wake/seat semantics, and the record can't be edited afterwards).
+# A human running the CLI from inside an unrelated interactive Claude session posts under that session's
+# id, not "human" — that surfaces loudly (non-member) rather than silently impersonating, and passing
+# --from human explicitly is always available when the human genuinely means to post as themselves.
+DEFAULT_FROM="${CANVAS_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-human}}"
+
+# Every board-scoped write needs a board id. Call this AFTER a verb's --board parsing, before the POST.
+require_board() {
+  if [ -z "${BOARD:-}" ]; then
+    echo "canvas: no board id — pass --board <id> or set \$CANVAS_BOARD (a spawned session gets it injected)." >&2
+    echo "canvas: refusing to guess a board — a wrong guess would 400 or, worse, misdirect the write." >&2
+    exit 2
+  fi
+}
 
 usage() {
   cat <<USAGE
@@ -56,7 +81,8 @@ canvas — session/coordination verbs over the agent bus
   scripts/canvas terminate <sid>                       kill a live session, free its slot
 
   scripts/canvas msg <thread> [TEXT] [--stdin|--text-file F] [--from ID] [--force]   post a thread message
-        (from = your sid, default "human"). Put @tags in the text; long/multi-paragraph text is best piped
+        (from defaults to your session sid via \$CANVAS_SESSION_ID/\$CLAUDE_CODE_SESSION_ID, else "human"
+        only in a bare human shell). Put @tags in the text; long/multi-paragraph text is best piped
         via --stdin or --text-file so it never has to survive shell-escaping. --force bypasses the
         unread-@-mention guard. Allow-listed, so it bypasses the classifier that gates raw curl to /api/thread/*.
   scripts/canvas inbox --session <sid> [--bytes N] [--limit N]   read your unread thread messages (advances
@@ -72,7 +98,8 @@ canvas — session/coordination verbs over the agent bus
         Default hides resolved (--all shows them). Replaces the hand-rolled /api/annotations curls.
   scripts/canvas anno reply <PATH> <ID> [TEXT] [--stdin|--text-file F] [--from ID]
         reply to one annotation. Pass long/multi-paragraph text via --stdin or --text-file so it never
-        has to survive shell-escaping. --from is the author (a session passes its sid; default "human").
+        has to survive shell-escaping. --from is the author (defaults to your session sid; "human" only
+        in a bare human shell with no session env).
   scripts/canvas anno batch <PATH> <replies.json> [--from ID]
         reply to many at once: replies.json is DATA — [{"id":..,"text":..}] or {"<id>":"<text>"} — so you
         author replies once as JSON (Write tool), not as an ad-hoc urllib script. One POST per entry.
@@ -123,7 +150,8 @@ canvas — session/coordination verbs over the agent bus
         thread rosters + marker read cursors) and corpus-wide. Read-only — exists so token regressions
         (a broken prefix cache, a chattier sweep) are visible. --limit caps the per-session table
         (default 30, 0 = all); --thread narrows to one thread's sessions.
-env: CANVAS_BOARD (default ${BOARD}), CANVAS_SERVER (default ${SERVER})
+env: CANVAS_BOARD (default ${BOARD:-<none — pass --board or set CANVAS_BOARD>}), CANVAS_SERVER (default ${SERVER})
+     CANVAS_SESSION_ID / CLAUDE_CODE_SESSION_ID (default --from/--by identity; a spawned session gets these injected)
 USAGE
 }
 
@@ -141,6 +169,16 @@ jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 # different field and a deliberate design), so we key ONLY on `delivered`, never `notified`.
 post() {
   local url="$1" data="$2" out status body rc=""
+  # Board-scoped guard: a board-scoped URL carries `?board=<id>`/`&board=<id>`. If <id> is empty the
+  # default board never resolved (no $CANVAS_BOARD, no --board) — fail HERE with a helpful message rather
+  # than let the server 400 with an opaque "unknown board". This is the single write-path chokepoint that
+  # covers every board-scoped verb; read-only GETs guard with require_board at their call site.
+  case "$url" in
+    *'?board='|*'&board='|*'?board=&'*|*'&board=&'*)
+      echo "canvas: no board id — pass --board <id> or set \$CANVAS_BOARD (a spawned session gets it injected)." >&2
+      echo "canvas: refusing to guess a board — a wrong guess would 400 or, worse, misdirect the write." >&2
+      return 1 ;;
+  esac
   out=$(curl -sS -w $'\n%{http_code}' -X POST "$url" -H 'Content-Type: application/json' -d "$data") || rc=$?
   if [ -n "$rc" ]; then
     echo "canvas: could not reach ${url%%/api/*} (curl exit $rc) — is the dev server up on 5173?" >&2
@@ -210,6 +248,7 @@ anno_list() {
     --*) echo "anno list: unknown flag '$1'" >&2; exit 2 ;;
     *) path="$1"; shift ;;
   esac; done
+  require_board
   local url; url="$(ANNO_URL)"
   [ -n "$path" ] && url="$url&path=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))' "$path")"
   if [ -n "$json" ]; then curl -sS "$url"; echo; return; fi
@@ -271,7 +310,7 @@ for a in ann:
 PY
 }
 anno_reply() {
-  local from="human" stdin="" tfile="" pos=()
+  local from="$DEFAULT_FROM" stdin="" tfile="" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --from) from="${2:-}"; shift 2 ;; --stdin) stdin=1; shift ;; --text-file) tfile="${2:-}"; shift 2 ;;
     --board) BOARD="${2:-}"; shift 2 ;;
@@ -291,7 +330,7 @@ PY
   post "$(ANNO_URL)" "$body"; echo
 }
 anno_batch() {
-  local from="human" pos=()
+  local from="$DEFAULT_FROM" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --from) from="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
     --*) echo "anno batch: unknown flag '$1'" >&2; exit 2 ;;
@@ -302,6 +341,7 @@ anno_batch() {
     echo "usage: canvas anno batch <path> <replies.json> [--from ID]" >&2
     echo "  replies.json = [{\"id\":...,\"text\":...}] or {\"<id>\":\"<text>\"} — author replies once as DATA," >&2
     echo "  not as an ad-hoc script; one POST per entry." >&2; exit 2; fi
+  require_board  # anno batch POSTs via python urllib, not post(), so guard the board here
   python3 - "$SERVER" "$BOARD" "$path" "$from" "$file" <<'PY'
 import json, sys, urllib.request
 server, board, path, frm, file = sys.argv[1:6]
@@ -326,7 +366,7 @@ PY
 # shell-escaping); optional --anchor-prefix/--anchor-suffix disambiguate a repeated quote. --options are
 # multiple-choice labels split on |; --blocking marks the asker as waiting (W5 will wake it on the answer).
 anno_ask() {
-  local from="human" question="" exact="" afile="" prefix="" suffix="" options="" blocking="" pos=()
+  local from="$DEFAULT_FROM" question="" exact="" afile="" prefix="" suffix="" options="" blocking="" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --from) from="${2:-}"; shift 2 ;; --question) question="${2:-}"; shift 2 ;;
     --anchor-exact) exact="${2:-}"; shift 2 ;; --anchor-file) afile="${2:-}"; shift 2 ;;
@@ -359,7 +399,7 @@ PY
 # Answer a question (docs/anchored-async-ask.md §4): an option label (--choice) and/or prose (--text /
 # --stdin / --text-file — a long answer never has to survive shell-escaping). Flips awaiting → answered.
 anno_answer() {
-  local by="human" choice="" tflag="" stdin="" tfile="" pos=()
+  local by="$DEFAULT_FROM" choice="" tflag="" stdin="" tfile="" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --by) by="${2:-}"; shift 2 ;; --choice) choice="${2:-}"; shift 2 ;;
     --text) tflag="${2:-}"; shift 2 ;; --stdin) stdin=1; shift ;; --text-file) tfile="${2:-}"; shift 2 ;;
@@ -388,7 +428,7 @@ PY
 # --replacement text, accepted or rejected as a unit. The anchor is a quote like a plain create; the
 # replacement rides --replacement "…" or --replacement-file F (a long body, no shell-escaping).
 anno_suggest() {
-  local from="human" exact="" afile="" prefix="" suffix="" replacement="" rfile="" note="" pos=()
+  local from="$DEFAULT_FROM" exact="" afile="" prefix="" suffix="" replacement="" rfile="" note="" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --from) from="${2:-}"; shift 2 ;;
     --anchor-exact) exact="${2:-}"; shift 2 ;; --anchor-file) afile="${2:-}"; shift 2 ;;
@@ -423,7 +463,7 @@ PY
 # bytes untouched). Both are one-shot — a decided suggestion is refused.
 anno_decide() { # $1 = accept|reject
   local op="$1"; shift
-  local by="human" pos=()
+  local by="$DEFAULT_FROM" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --by) by="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
     --*) echo "anno $op: unknown flag '$1'" >&2; exit 2 ;;
@@ -439,7 +479,7 @@ anno_decide() { # $1 = accept|reject
 # level; --unwatch drops it. Role defaults to Coordinator (the board's standing watcher). W4 is pull-mode
 # plumbing: this records the seat + level; the auto-spawn on a qualifying comment is W5.
 anno_watch() {
-  local role="Coordinator" level="" op="watch" by="human" pos=()
+  local role="Coordinator" level="" op="watch" by="$DEFAULT_FROM" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --role) role="${2:-}"; shift 2 ;; --level) level="${2:-}"; shift 2 ;;
     --pause) op="pause"; shift ;; --resume) op="resume"; shift ;; --unwatch) op="unwatch"; shift ;;
@@ -462,7 +502,7 @@ PY
 }
 anno_setstate() { # $1 = resolve|reopen
   local op="$1"; shift
-  local by="human" pos=()
+  local by="$DEFAULT_FROM" pos=()
   while [ $# -gt 0 ]; do case "$1" in
     --by) by="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
     --*) echo "anno $op: unknown flag '$1'" >&2; exit 2 ;;
@@ -498,7 +538,7 @@ job() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     add|set)
-      local thread="" doc="" instruction="" interval="" role="" from="human" jobid=""
+      local thread="" doc="" instruction="" interval="" role="" from="$DEFAULT_FROM" jobid=""
       while [ $# -gt 0 ]; do case "$1" in
         --instruction)          instruction="${2:-}"; shift 2 ;;
         --interval|--interval-ms) interval="${2:-}"; shift 2 ;;
@@ -544,7 +584,7 @@ PY
       # the sweep instruction never drifts. This is a deliberate, human-gated act: it starts an auto-firing
       # Coordinator that wakes on its interval to sweep the board (nudged if live, respawned if dormant).
       # Remove it (turn autonomy OFF) with `job list <THREAD>` then `job rm <THREAD> <jobId>`.
-      local thread="" interval="" from="human"
+      local thread="" interval="" from="$DEFAULT_FROM"
       while [ $# -gt 0 ]; do case "$1" in
         --interval|--interval-ms) interval="${2:-}"; shift 2 ;;
         --from) from="${2:-}"; shift 2 ;;
@@ -562,7 +602,7 @@ PY
 ) || { echo "job coordinator: failed to build the spec" >&2; exit 1; }
       post "$SERVER/api/thread/$thread/job?board=$BOARD" "$body"; echo ;;
     rm|remove|delete)
-      local thread="" doc="" jobid="" from="human" pos=()
+      local thread="" doc="" jobid="" from="$DEFAULT_FROM" pos=()
       while [ $# -gt 0 ]; do case "$1" in
         --from) from="${2:-}"; shift 2 ;; --doc) doc="${2:-}"; shift 2 ;; --board) BOARD="${2:-}"; shift 2 ;;
         --*) echo "job rm: unknown flag '$1'" >&2; exit 2 ;;
@@ -583,6 +623,7 @@ PY
         --*) echo "job list: unknown flag '$1'" >&2; exit 2 ;;
         *) thread="$1"; shift ;;
       esac; done
+      require_board
       if [ -n "$doc" ]; then
         # The per-file annotations read carries the doc's `jobs`; slice them out.
         local enc; enc=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$doc")
@@ -636,10 +677,11 @@ PY
     case "$sub" in
       list)
         thread="${1:?usage: canvas worktree list <thread>}"
+        require_board
         curl -sS "$SERVER/api/thread/$(enc "$thread")/worktrees?board=$BOARD"; echo ;;
       rm)
         thread="${1:?usage: canvas worktree rm <thread> [--key K|--role R] [--force] [--from ID]}"; shift
-        from="human"; key=""; role=""; force=""
+        from="$DEFAULT_FROM"; key=""; role=""; force=""
         while [ $# -gt 0 ]; do
           case "$1" in
             --key)   key="${2:-}"; shift 2 ;;
@@ -662,7 +704,7 @@ PY
         post "$SERVER/api/thread/$(enc "$thread")/worktree?board=$BOARD" "$body"; echo ;;
       merge)
         thread="${1:?usage: canvas worktree merge <thread> [--key K|--role R] [--base REF] [--no-verify] [--force] [--from ID]}"; shift
-        from="human"; key=""; role=""; base=""; noverify=""; force=""
+        from="$DEFAULT_FROM"; key=""; role=""; base=""; noverify=""; force=""
         while [ $# -gt 0 ]; do
           case "$1" in
             --key)       key="${2:-}"; shift 2 ;;
@@ -700,7 +742,7 @@ PY
     post "$SERVER/api/session/$sid/terminate" "{}"; echo ;;
   msg|message)
     thread="${1:?usage: canvas msg <thread> [TEXT] [--stdin|--text-file F] [--from ID] [--force]}"; shift
-    from="human"; force=""; stdin=""; tfile=""; textarg=""
+    from="$DEFAULT_FROM"; force=""; stdin=""; tfile=""; textarg=""
     while [ $# -gt 0 ]; do case "$1" in
       --from) from="${2:-}"; shift 2 ;;
       --force) force=1; shift ;;
@@ -736,7 +778,7 @@ PY
     intent="${1:?usage: canvas intent <thread> <intent> [--note TEXT] [--from ID]}"; shift
     case "$intent" in working|blocked:human|blocked:peer|done) ;;
       *) echo "intent: must be working|blocked:human|blocked:peer|done" >&2; exit 2 ;; esac
-    from="human"; note=""
+    from="$DEFAULT_FROM"; note=""
     while [ $# -gt 0 ]; do case "$1" in
       --note) note="${2:-}"; shift 2 ;;
       --from) from="${2:-}"; shift 2 ;;
@@ -755,7 +797,7 @@ PY
   pin)
     thread="${1:?usage: canvas pin <thread> <seq> [--unpin] [--from ID]}"; shift
     seq="${1:?usage: canvas pin <thread> <seq> [--unpin] [--from ID]}"; shift
-    from="human"; pinned="true"
+    from="$DEFAULT_FROM"; pinned="true"
     while [ $# -gt 0 ]; do case "$1" in
       --unpin) pinned="false"; shift ;;
       --from) from="${2:-}"; shift 2 ;;
@@ -765,7 +807,7 @@ PY
     post "$SERVER/api/thread/$(enc "$thread")/pin?board=$BOARD" "{\"from\":$(jstr "$from"),\"seq\":$seq,\"pinned\":$pinned}"; echo ;;
   join)
     thread="${1:?usage: canvas join <thread> [--from ID] [--history full|future]}"; shift
-    from="human"; history=""
+    from="$DEFAULT_FROM"; history=""
     while [ $# -gt 0 ]; do case "$1" in
       --from) from="${2:-}"; shift 2 ;;
       --history) history="${2:-}"; shift 2 ;;
@@ -783,7 +825,7 @@ PY
     post "$SERVER/api/thread/$(enc "$thread")/join?board=$BOARD" "$body"; echo ;;
   leave)
     thread="${1:?usage: canvas leave <thread> [--from ID]}"; shift
-    from="human"
+    from="$DEFAULT_FROM"
     while [ $# -gt 0 ]; do case "$1" in
       --from) from="${2:-}"; shift 2 ;;
       --board) BOARD="${2:-}"; shift 2 ;;
