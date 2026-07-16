@@ -2,6 +2,15 @@
 // public identity; provider thread ids remain private routing keys persisted by the caller in session
 // markers. This module owns no files and starts no process, so the long-lived sidecar can host it directly.
 
+// The ACTUAL serving model the app-server chose for a thread, read from the thread/start|resume response so
+// a spawn with no explicit model still reports what it ran (the app-server applies the plan default). The
+// Thread object carries it either at the top level or under its settings; fall back to the requested model
+// (spec.model) when neither is present, and null when nothing was requested either.
+function servingModel(result, spec) {
+  const thread = result?.thread;
+  return thread?.model ?? thread?.settings?.model ?? spec?.model ?? null;
+}
+
 export function createCodexSessionRouter({ client, onEvent = () => {}, onRequest = null }) {
   const maxEarlyThreads = 100;
   const byCanvas = new Map(); // sid -> {threadId,status,activeTurnId,cwd,model}
@@ -77,14 +86,14 @@ export function createCodexSessionRouter({ client, onEvent = () => {}, onRequest
       const result = await client.request("thread/start", spec);
       const threadId = result?.thread?.id;
       if (typeof threadId !== "string" || !threadId) throw new Error("thread/start returned no thread id");
-      return bind(sid, threadId, spec);
+      return bind(sid, threadId, { ...spec, model: servingModel(result, spec) });
     },
     async resume(sid, threadId, spec = {}) {
       await client.ready;
       const result = await client.request("thread/resume", { ...spec, threadId });
       const returned = result?.thread?.id;
       if (returned !== threadId) throw new Error(`thread/resume returned unexpected thread id ${String(returned)}`);
-      return bind(sid, threadId, spec);
+      return bind(sid, threadId, { ...spec, model: servingModel(result, spec) });
     },
     async prompt(sid, text, overrides = {}) {
       const state = byCanvas.get(sid);

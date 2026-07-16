@@ -198,7 +198,12 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
     const spawning = (async () => {
       const runtime = await getCodexRuntime();
       entry.pid = runtime.pid;
-      const spec = { cwd, model: msg.model, developerInstructions: msg.developerInstructions };
+      const spec = {
+        cwd,
+        model: msg.model,
+        reasoningEffort: msg.reasoningEffort,
+        developerInstructions: msg.developerInstructions,
+      };
       const bound = msg.resumeProviderId
         ? await runtime.resume(id, msg.resumeProviderId, spec)
         : await runtime.start(id, spec);
@@ -206,6 +211,9 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
       codexLine(id, "canvas/provider-bound", {
         provider: "codex",
         providerSessionId: bound.threadId,
+        // The ACTUAL serving model the app-server resolved for this thread (from the thread/start response),
+        // so a Codex spawn with no explicit model still reports what it ran and the card pill isn't blank.
+        ...(bound.model ? { model: bound.model } : {}),
         account: runtime.account,
       });
       if (msg.resumeProviderId) {

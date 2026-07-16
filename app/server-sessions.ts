@@ -105,12 +105,57 @@ const PERMISSION_TOOL = "mcp__canvas__permission_prompt"; // mcp__<server>__<too
 // Opus 4.8, the Coordinator/pm role pins Fable via its frontmatter, and any spawn can override per-call.
 export const DEFAULT_SESSION_MODEL = "claude-opus-4-8";
 
-/** The model a spawn runs: explicit spawn param > role `model:` frontmatter > DEFAULT_SESSION_MODEL. */
+// The reasoning-effort levels the New-session menu offers and the two providers accept. `claude --effort`
+// takes low|medium|high|xhigh|max; the Codex app-server `reasoningEffort` enum is a superset (it also has
+// minimal/ultra, which we deliberately don't expose) — so this exact set is valid on BOTH providers with no
+// per-provider mapping. Absent effort = the provider's own default (no flag / no `reasoningEffort` sent).
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
+/** Is `v` one of the reasoning-effort levels the spawn contract accepts? (spawn-body / role-frontmatter validation) */
+export function isValidEffort(v: unknown): v is EffortLevel {
+  return typeof v === "string" && (EFFORT_LEVELS as readonly string[]).includes(v);
+}
+
+// A Claude model id is the `claude-*` family; anything else (Codex Sol/Terra/Luna, gpt-*) is a Codex model.
+// This is the ONLY provider-membership test the resolver needs: an explicit model is trusted as-is (the
+// picker offers only the current provider's models), but a role/default model is IGNORED on a provider
+// mismatch so a Claude role's `model:` never gets sent to a Codex spawn (and vice versa).
+function modelMatchesProvider(model: string, provider: "claude" | "codex"): boolean {
+  const isClaude = model.startsWith("claude-");
+  return provider === "claude" ? isClaude : !isClaude;
+}
+
+/**
+ * The model a spawn runs, PROVIDER-AWARE: explicit spawn param > role `model:` frontmatter > provider
+ * default. The role/default only applies when it matches the target provider — a Claude role model is
+ * ignored on a Codex spawn and vice versa (the picker's explicit choice always matches, so it's trusted
+ * as-is). Claude's default is DEFAULT_SESSION_MODEL; Codex has NO hardcoded default (absent stays absent —
+ * the app-server picks the ChatGPT-plan default and we fold the ACTUAL serving model back from its events).
+ * Returns null only for a Codex spawn with no explicit/role model.
+ */
 export function resolveSessionModel(
   explicit?: string | null,
   role?: { model?: string | null } | null,
-): string {
-  return explicit || role?.model || DEFAULT_SESSION_MODEL;
+  provider: "claude" | "codex" = "claude",
+): string | null {
+  if (explicit) return explicit;
+  const roleModel = role?.model;
+  if (roleModel && modelMatchesProvider(roleModel, provider)) return roleModel;
+  return provider === "claude" ? DEFAULT_SESSION_MODEL : null;
+}
+
+/**
+ * The reasoning effort a spawn runs: explicit spawn param > role `effort:` frontmatter > unset (null). The
+ * levels are valid on both providers (EFFORT_LEVELS), so this is provider-agnostic; null means "send no
+ * flag / no `reasoningEffort`" and the provider applies its own default.
+ */
+export function resolveSessionEffort(
+  explicit?: string | null,
+  role?: { effort?: string | null } | null,
+): EffortLevel | null {
+  const chosen = explicit || role?.effort || null;
+  return isValidEffort(chosen) ? chosen : null;
 }
 
 // The full `claude -p` argv for a session spawn — extracted PURE so the spawn-arg contract (which model a
@@ -119,6 +164,7 @@ export function buildSessionArgs(opts: {
   id: string;
   resume: boolean;
   model: string;
+  effort?: string | null;
   mcpConfig: unknown;
   settingsOverride: unknown;
   appendPrompt: string;
@@ -132,6 +178,9 @@ export function buildSessionArgs(opts: {
     "--include-partial-messages",
     "--verbose",
     "--model", opts.model, // always explicit — never inherit ~/.claude/settings.json (see DEFAULT_SESSION_MODEL)
+    // Reasoning effort rides only when explicitly resolved (spawn param / role `effort:`); absent = the CLI's
+    // own default effort, so no flag (resolveSessionEffort → null). One of low|medium|high|xhigh|max.
+    ...(opts.effort ? ["--effort", opts.effort] : []),
     "--permission-mode", SESSION_PERMISSION_MODE,
     "--allowedTools", BASELINE_ALLOWED_TOOLS, // uniform baseline (commit + scripts/canvas), additive over auto
     "--disallowedTools", "AskUserQuestion", // auto-cancels here; steer to the ```ask convention instead
@@ -256,8 +305,17 @@ export function ensureSessionFeed(dir: string, id: string, repoPath: string): vo
     // the muted "inactive" band instead of guessing "live" from a status-less feed. Phase 2: carry the
     // durable end REASON off the marker too, so a post-restart card still splits "✓ done" from "✕ crashed"
     // (the in-memory s.endReason is gone after a restart — the marker on disk is the only surviving source).
-    const endReason = readCanvasSession(repoPath, id)?.endReason as string | undefined;
-    if (r) publishFeed(feed, { ...r, ended: true, endReason });
+    // Carry the durable model/effort/provider off the marker so a post-restart / Done file-tail card still
+    // renders the tinted model pill + effort suffix — they lived only in the live registry before, which is
+    // why the pill vanished on Done. Only the marker survives the process, so it's the honest source here.
+    const marker = readCanvasSession(repoPath, id);
+    const endReason = marker?.endReason as string | undefined;
+    if (r) publishFeed(feed, {
+      ...r, ended: true, endReason,
+      provider: marker?.provider === "codex" ? "codex" : "claude",
+      model: (marker?.model as string | undefined) ?? undefined,
+      effort: (marker?.effort as string | undefined) ?? undefined,
+    });
   };
   let t: ReturnType<typeof setTimeout> | null = null;
   const debounced = () => {
@@ -358,9 +416,14 @@ function foldCodexEvent(s: LiveSession, e: any): void {
   switch (e?.method) {
     case "canvas/provider-bound":
       s.providerSessionId = typeof p.providerSessionId === "string" ? p.providerSessionId : s.providerSessionId;
+      // The app-server's resolved serving model (from thread/start): fold it so a Codex spawn with no explicit
+      // model still shows what it ran — the previously-blank Codex pill — and doesn't overwrite an explicit
+      // model with a blank. Only take a real string.
+      if (typeof p.model === "string" && p.model) s.model = p.model;
       updateCanvasSession(s.repoPath, s.id, {
         provider: "codex",
         providerSessionId: s.providerSessionId,
+        ...(s.model ? { model: s.model } : {}), // durable serving model → the pill survives Done
         // Plan provenance is durable; the signed-in email is deliberately not copied into the repo marker.
         codexAccount: p.account
           ? { type: p.account.type, planType: p.account.planType }
@@ -424,6 +487,7 @@ function foldCodexEvent(s: LiveSession, e: any): void {
       s.status = "idle";
       s.verb = null;
       if (s.autoWake) s.idleSince = Date.now();
+      persistServingState(s); // make the folded Codex serving model durable so the pill survives Done
       if (s.nudge) flushNudge(s);
       if (p.turn?.status === "failed") {
         s.error = String(p.turn?.error?.message ?? p.turn?.error ?? "Codex turn failed");
@@ -576,6 +640,7 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       s.status = "idle"; // turn finished; the process waits on stdin for the next prompt
       s.verb = null; // no live activity to label; keep `usage` so the pill shows the turn's final counts
       if (s.autoWake) s.idleSince = Date.now(); // start the R1 keep-alive clock for an auto-wake worker
+      persistServingState(s); // the turn named the serving model — make it durable so the pill survives Done
       if (s.nudge) flushNudge(s); // a channel message arrived mid-turn → wake to read it at the boundary (§9)
       break;
     case "stream_event": {
@@ -730,8 +795,9 @@ export function ensureLiveSession(
   roleId: string | null = null,
   threadId: string | null = null,
   cwd: string = repoPath, // the process working dir — a worktree checkout for `spawn --worktree`, else the board root
-  model: string | null = null, // explicit per-spawn model; null → role `model:` frontmatter → DEFAULT_SESSION_MODEL
+  model: string | null = null, // explicit per-spawn model; null → role `model:` frontmatter → provider default
   provider: "claude" | "codex" = "claude",
+  effort: string | null = null, // explicit per-spawn effort; null → role `effort:` frontmatter → provider default
 ): LiveSession {
   const { liveSessions, fsState, boardIdentity } = getServerContext();
   const existing = liveSessions.get(id);
@@ -798,8 +864,16 @@ export function ensureLiveSession(
   // repoPath, so every mounted board gets its own store. (This repo's INTERACTIVE sessions are pointed at
   // the same dir via `.claude/settings.local.json`; --settings here covers spawned workers on any board.)
   const settingsOverride = { autoMemoryDirectory: path.join(repoPath, ".canvas", "memory") };
+  // Resolve model + effort ONCE, PROVIDER-AWARE, so the same chosen values flow into the spawn spec, the
+  // live-session seed, and the durable marker. resolvedModel is a non-null string for Claude (falls back to
+  // DEFAULT_SESSION_MODEL) and may be null for Codex (no hardcoded default — the app-server picks one and we
+  // fold the actual serving model back). resolvedEffort is null unless explicitly chosen (spawn / role).
+  const resolvedModel = resolveSessionModel(model, role, effectiveProvider);
+  // On a --resume no effort is passed, so fall back to the level the marker recorded at the original spawn
+  // (a roleless resume would otherwise lose it); a fresh spawn never has a prior effort (UUID ids).
+  const resolvedEffort = resolveSessionEffort(effort, role) ?? (isValidEffort(prior.effort) ? prior.effort : null);
   const args = buildSessionArgs({
-    id, resume, model: resolveSessionModel(model, role), mcpConfig, settingsOverride, appendPrompt,
+    id, resume, model: resolvedModel ?? DEFAULT_SESSION_MODEL, effort: resolvedEffort, mcpConfig, settingsOverride, appendPrompt,
   });
   // Does this session's role run an operating loop? Then its idle sessions are woken on the server heartbeat
   // (loopTick), and read calm "scheduled" rather than amber "waiting" between ticks. First heartbeat is one
@@ -820,7 +894,13 @@ export function ensureLiveSession(
   const spawnSpec: SpawnSpec = effectiveProvider === "codex"
     ? {
         provider: "codex", cwd,
-        ...(model ? { model } : {}),
+        // Provider-aware model: explicit > role `model:` (only if a Codex id) > absent. A Claude role's
+        // model is dropped here (modelMatchesProvider), so a Codex spawn under a Claude-shaped role no
+        // longer silently ignores the WHOLE resolution — it just falls through to the app-server default.
+        ...(resolvedModel ? { model: resolvedModel } : {}),
+        // Reasoning effort → the app-server's native `reasoningEffort` thread-start field (verified against
+        // the installed codex: the ReasoningEffort enum is a superset of our levels). Absent = the plan default.
+        ...(resolvedEffort ? { reasoningEffort: resolvedEffort } : {}),
         developerInstructions: appendPrompt,
         ...(resume && typeof prior.providerSessionId === "string"
           ? { resumeProviderId: prior.providerSessionId }
@@ -841,7 +921,12 @@ export function ensureLiveSession(
     // sendSessionInput flips it to running on the first real prompt; the result event flips it back.
     id, provider: effectiveProvider,
     providerSessionId: effectiveProvider === "codex" && typeof prior.providerSessionId === "string" ? prior.providerSessionId : null,
-    repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null, model: null, turnOut: 0,
+    // Seed `model` with the REQUESTED model so the pill renders immediately (before the first turn names the
+    // serving model); the stream then overwrites it with the authoritative serving model, tracking a refusal
+    // fallback. For Codex-with-no-explicit-model this stays null until the provider-bound event folds it.
+    // `effort` is fixed at spawn (no server-side effort fallback), so the resolved value is final.
+    repoPath, cwd, proc, lines: [], inflight: null, status: "idle", skills: null, verb: null, usage: null,
+    model: resolvedModel, effort: resolvedEffort, turnOut: 0,
     // Cursors revive from the marker (persistSessionState) so a --resume / sidecar adoption doesn't reset
     // them to 0 and re-deliver every joined thread's backlog as unread.
     read: prior.read && typeof prior.read === "object" ? { ...(prior.read as Record<string, number>) } : {},
@@ -858,6 +943,13 @@ export function ensureLiveSession(
     spawnedAt: Date.now(),
     origin,
     provider: effectiveProvider,
+    // Model + effort go durable HERE so the card/list pill survives Done (the root cause of the disappearing
+    // pill: they lived only in the live registry). `model` records the REQUESTED model; the actual serving
+    // model is folded back and re-persisted at each turn boundary (persistServingState). When resolvedModel
+    // is null (a Codex spawn with no explicit/role model), preserve any serving model a prior --resume folded
+    // rather than erasing it. `effort` is fixed at spawn.
+    ...(resolvedModel ? { model: resolvedModel } : (typeof prior.model === "string" ? { model: prior.model } : {})),
+    ...(resolvedEffort ? { effort: resolvedEffort } : {}),
     ...(effectiveProvider === "codex" && typeof prior.providerSessionId === "string"
       ? { providerSessionId: prior.providerSessionId }
       : {}),
@@ -947,7 +1039,12 @@ function adoptSession(client: SessionHostClient, info: HostSessionInfo): void {
     id: info.id, provider: info.provider ?? "claude", providerSessionId: info.providerSessionId ?? null,
     repoPath: boardRoot, cwd: info.cwd, proc, lines: [], inflight: null,
     status: info.busy ? "running" : "idle", skills: null, verb: info.busy ? "Working" : null,
-    usage: null, model: null, turnOut: 0,
+    // Revive model + effort from the durable marker so an adopted (post-restart) session shows its tinted
+    // pill immediately; a Claude session's seedFromTranscript then refreshes `model` to the last serving one.
+    usage: null,
+    model: typeof marker.model === "string" ? marker.model : null,
+    effort: typeof marker.effort === "string" ? marker.effort : null,
+    turnOut: 0,
     read: marker.read && typeof marker.read === "object" ? { ...(marker.read as Record<string, number>) } : {},
     nudge: false,
     waitingOn: Array.isArray(marker.waitingOn) ? (marker.waitingOn as string[]) : null,
@@ -1435,6 +1532,18 @@ export function sessionStatus(repoPath: string, id: string): SessionBand | null 
 // the session-host sidecar) still resets its cursors to 0 and the next inbox read re-delivers every joined
 // thread's whole backlog as "unread". Debounced per session (reads/posts come in bursts); the timer reads
 // s.read at fire time, so it always writes the latest cursors. Best-effort like every marker write.
+// Persist the folded serving model (and effort) onto the durable marker so an ENDED session still reports
+// what it ran (the disappearing-pill root cause). Called at each turn boundary: `model` tracks a serving-model
+// fallback / a Codex spawn learning its provider-picked model; `effort` is fixed at spawn but rides along
+// idempotently. Only truthy values are written — never spread `undefined`, which would ERASE a prior value.
+// Best-effort like every marker write (updateCanvasSession never throws).
+function persistServingState(s: LiveSession): void {
+  const patch: { model?: string; effort?: string } = {};
+  if (s.model) patch.model = s.model;
+  if (s.effort) patch.effort = s.effort;
+  if (patch.model || patch.effort) updateCanvasSession(s.repoPath, s.id, patch);
+}
+
 export function persistSessionState(s: LiveSession): void {
   const persistTimers = (getServerContext().fsState.persistTimers ??= new Map<string, ReturnType<typeof setTimeout>>());
   if (persistTimers.has(s.id)) return;
@@ -1494,6 +1603,7 @@ export function publishSession(s: LiveSession): void {
     plan: s.plan?.length ? s.plan : undefined,
     error: s.error ?? undefined,
     model: s.model ?? undefined, // the model actually serving the session (tracks refusal fallbacks)
+    effort: s.effort ?? undefined, // the reasoning effort this session was spawned at (pill suffix); absent = provider default
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
     // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:

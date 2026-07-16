@@ -7,6 +7,7 @@ export interface Role {
   colour: string | null;
   loops: boolean;
   model: string | null;
+  effort: string | null;
   charter: string;
 }
 
@@ -18,8 +19,8 @@ export function roleIdFor(name: string): string;
 export function readRole(repoPath: string, roleId: string): Role | null;
 export function createRole(
   repoPath: string,
-  role: { name: string; charter?: string; colour?: string; loops?: boolean; model?: string },
+  role: { name: string; charter?: string; colour?: string; loops?: boolean; model?: string; effort?: string },
 ): Role;
 export function listRoles(
   repoPath: string,
-): Array<{ roleId: string; name: string; colour: string | null; loops: boolean }>;
+): Array<{ roleId: string; name: string; colour: string | null; loops: boolean; model: string | null; effort: string | null }>;

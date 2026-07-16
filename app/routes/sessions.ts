@@ -10,7 +10,7 @@ import { durableSessionThreads } from "../server-snapshot.js";
 import { sessionSummaryFromText } from "../session-summary.js";
 import { readRole } from "../role-ledger.js";
 import { ensureWorktree } from "../worktrees.js";
-import { MAX_SESSION_BYTES, projectCodexHistory } from "../server-sessions.js";
+import { MAX_SESSION_BYTES, projectCodexHistory, isValidEffort, EFFORT_LEVELS } from "../server-sessions.js";
 
 // ── the sessions routes (read/list + lifecycle/spawn) — god-file split, Phase 4 ─────────────────────
 // The two GLOBAL-stage clusters that make sessions legible and drivable: the read/list pair (GET
@@ -86,6 +86,9 @@ async function handleSession(res: ServerResponse, dir: string, id: string | null
           provider: "codex",
           providerSessionId,
           endReason: marker?.endReason,
+          // Durable model/effort off the marker so the ended card keeps its tinted pill + effort suffix.
+          model: (marker?.model as string | undefined) ?? undefined,
+          effort: (marker?.effort as string | undefined) ?? undefined,
           error: projected.error ?? undefined,
         });
     } catch (err) {
@@ -101,6 +104,9 @@ async function handleSession(res: ServerResponse, dir: string, id: string | null
       provider: isCodex ? "codex" : "claude",
       providerSessionId: providerSessionId ?? undefined,
       endReason: marker.endReason,
+      // Durable model/effort off the marker so even a no-history ended card keeps its tinted pill + suffix.
+      model: (marker.model as string | undefined) ?? undefined,
+      effort: (marker.effort as string | undefined) ?? undefined,
       noHistory: true,
     });
   }
@@ -200,9 +206,12 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleName: (marker?.roleName as string | undefined) ?? null,
       roleColour: (marker?.roleColour as string | undefined) ?? null,
       provider: marker?.provider === "codex" ? "codex" : "claude",
-      // The serving model, known only for a session the registry holds live (folded from its stream /
-      // seeded transcript). Dead rows read null — the list renders no chip rather than a stale guess.
-      model: liveSessions.get(s.id)?.model ?? null,
+      // The serving model + effort. Prefer the LIVE registry (folded serving model, tracks a fallback), then
+      // fall back to the durable marker so an ENDED row still shows its tinted pill + effort suffix instead
+      // of a blank chip — the disappearing-pill fix. The marker records the requested model, re-persisted to
+      // the actual serving model at each turn boundary, so a dead row is honest, not a stale guess.
+      model: liveSessions.get(s.id)?.model ?? (marker?.model as string | undefined) ?? null,
+      effort: liveSessions.get(s.id)?.effort ?? (marker?.effort as string | undefined) ?? null,
     };
   });
   // Union in LIVE sessions the disk walk missed: a session that hasn't completed a single turn has a
@@ -229,6 +238,7 @@ function handleSessions(res: ServerResponse, dir: string, repoPath: string): voi
       roleColour: (marker?.roleColour as string | undefined) ?? null,
       provider: l.provider,
       model: l.model ?? null,
+      effort: l.effort ?? null,
     } as (typeof sessions)[number]);
   }
   sessions.sort((a, b) => b.mtime - a.mtime); // keep the newest-first contract across both sources
@@ -253,6 +263,7 @@ async function handleSessionSpawn(
   let body: {
     prompt?: unknown; roleId?: unknown; thread?: unknown; channel?: unknown; card?: unknown;
     worktree?: unknown; base?: unknown; worktreeKey?: unknown; model?: unknown; provider?: unknown;
+    effort?: unknown;
   } = {};
   try {
     const raw = await readBody(req);
@@ -289,6 +300,16 @@ async function handleSessionSpawn(
     if (typeof body.model !== "string") return sendJson(res, 400, { error: "model must be a string" });
     model = body.model;
   }
+  // Optional: the reasoning effort this session runs. One of low|medium|high|xhigh|max (valid on both
+  // providers); absent = the provider default (no `--effort` / `reasoningEffort` sent). Explicit here beats
+  // the role's `effort:` frontmatter (resolveSessionEffort in server-sessions.ts). A bad value is a 400,
+  // not a silent drop — the picker only ever sends a valid level, so a bad one is a client bug worth surfacing.
+  let effort: string | null = null;
+  if (body.effort != null && body.effort !== "") {
+    if (!isValidEffort(body.effort))
+      return sendJson(res, 400, { error: `effort must be one of ${EFFORT_LEVELS.join("|")}` });
+    effort = body.effort;
+  }
   // `thread` is the canonical spawn-into scope since §8 step 2; `channel` stays a working alias so live
   // agents and old recipes don't break mid-transition.
   const scope = typeof body.thread === "string" && body.thread ? body.thread : body.channel;
@@ -310,7 +331,7 @@ async function handleSessionSpawn(
   }
   const id = crypto.randomUUID();
   try {
-    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model, provider);
+    ensureLiveSession(id, repoPath, false, origin, roleId, threadId, cwd, model, provider, effort);
   } catch (err) {
     return sendJson(res, 500, { error: "failed to spawn", detail: String(err) });
   }

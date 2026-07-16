@@ -72,6 +72,9 @@ export async function createCodexHostRuntime({ cwd, onEvent, onRequest, onClose,
     const threadSpec = (spec) => ({
       cwd: spec.cwd,
       ...(spec.model ? { model: spec.model } : {}),
+      // The app-server's native per-thread reasoning-effort field (verified against the installed codex: the
+      // ReasoningEffort enum is a superset of our low|medium|high|xhigh|max). Absent = the plan default.
+      ...(spec.reasoningEffort ? { reasoningEffort: spec.reasoningEffort } : {}),
       ...(spec.developerInstructions ? { developerInstructions: spec.developerInstructions } : {}),
       approvalPolicy: "on-request",
       sandbox: "workspace-write",
