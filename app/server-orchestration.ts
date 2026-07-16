@@ -27,6 +27,8 @@ import {
   purgeCachedEmail,
   readUsageCache,
   retryAfterMs,
+  shouldSkipUsagePoll,
+  tokenFingerprint,
   usageCachePath,
   writeUsageCache,
 } from "./usage-feed-state.js";
@@ -248,16 +250,30 @@ export function startUsageFeed(): void {
   };
 
   let backoff = 0; // extra ms added after a 429, cleared on the next success
+  // The blocking gate (see shouldSkipUsagePoll): set on a 401 (dead token, held until the keychain
+  // token changes) or a 429 (rate-limited, held until the capped retry deadline). While it holds, we
+  // wake at BASE cadence but skip the upstream fetch — so we stop hammering a dead token / an abusive
+  // Retry-After, yet a token refresh mid-hold fires a prompt retry instead of waiting the sleep out.
+  let gate: { hash: string | null; until: number } | null = null;
   const pollClaude = async () => {
     let nextDelay = CLAUDE_USAGE_POLL_MS;
     try {
       const token = await readClaudeOAuthToken();
       if (!token) {
+        gate = null;
+        backoff = 0;
         publishProvider("claude", {
           ...provider("claude"), provider: "claude", billing: "anthropic-plan",
           error: "no-credentials", fetchedAt: Date.now(),
         });
       } else {
+        const hash = tokenFingerprint(token);
+        if (shouldSkipUsagePoll(gate, hash)) {
+          // Same failing token, still inside the hold window — keep the last published state (its
+          // retryAt still shows the scheduled retry) and just re-check the local token at base cadence.
+          setTimeout(pollClaude, CLAUDE_USAGE_POLL_MS);
+          return;
+        }
         const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
           headers: {
             Authorization: `Bearer ${token}`,
@@ -267,20 +283,37 @@ export function startUsageFeed(): void {
           },
         });
         if (res.status === 429) {
-          // Keep last-good windows and obey both server Retry-After and our exponential floor.
+          // Keep last-good windows; obey Retry-After + our exponential floor, but CAPPED (15 min) so an
+          // abusive Retry-After can't freeze the card for an hour. Hold this token until that deadline,
+          // but keep waking at base cadence to catch a token refresh (retry immediately when it lands).
           const retry = retryAfterMs(res.headers.get("retry-after"));
           ({ backoff, delay: nextDelay } = claudeRateLimitDelay(backoff, retry));
+          const retryAt = Date.now() + nextDelay;
+          gate = { hash, until: retryAt };
           publishProvider("claude", {
             ...provider("claude"), provider: "claude", billing: "anthropic-plan",
-            error: "rate-limited", retryAt: Date.now() + nextDelay, fetchedAt: Date.now(),
+            error: "rate-limited", retryAt, fetchedAt: Date.now(),
+          });
+          setTimeout(pollClaude, Math.min(CLAUDE_USAGE_POLL_MS, nextDelay));
+          return;
+        } else if (res.status === 401) {
+          // Dead token — stop hammering (that hammering is what earns the abuse-429). Hold until the
+          // keychain token changes; a Claude Code re-login then triggers an immediate retry.
+          gate = { hash, until: Number.POSITIVE_INFINITY };
+          publishProvider("claude", {
+            ...provider("claude"), provider: "claude", billing: "anthropic-plan",
+            error: "http-401", fetchedAt: Date.now(),
           });
         } else if (!res.ok) {
-          // 401 ⇒ token expired/needs re-auth; anything else ⇒ the endpoint changed or is down.
+          // The endpoint changed or is down — a transient server-side fault, not a credential problem,
+          // so don't gate: keep polling at base cadence.
+          gate = null;
           publishProvider("claude", {
             ...provider("claude"), provider: "claude", billing: "anthropic-plan",
             error: `http-${res.status}`, fetchedAt: Date.now(),
           });
         } else {
+          gate = null;
           backoff = 0;
           const data = (await res.json()) as Record<string, unknown>;
           publishProvider("claude", {
@@ -290,6 +323,7 @@ export function startUsageFeed(): void {
         }
       }
     } catch {
+      gate = null; // a network fault, not a credential/rate problem — retry normally
       publishProvider("claude", {
         ...provider("claude"), provider: "claude", billing: "anthropic-plan",
         error: "offline", fetchedAt: Date.now(),

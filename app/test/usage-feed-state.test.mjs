@@ -4,12 +4,16 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  CLAUDE_USAGE_MAX_BACKOFF_MS,
+  CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
   mergeUsageProvider,
   purgeCachedEmail,
   readUsageCache,
   retryAfterMs,
   scrubUsageEmail,
+  shouldSkipUsagePoll,
+  tokenFingerprint,
   usageCachePath,
   writeUsageCache,
 } from "../usage-feed-state.js";
@@ -24,6 +28,45 @@ test("Claude usage honors Retry-After while retaining exponential backoff", () =
   const second = claudeRateLimitDelay(first.backoff, null);
   assert.equal(second.backoff, 360_000);
   assert.equal(second.delay, 540_000);
+});
+
+test("an abusive Retry-After is capped at the 15-min max backoff (no hour-long freeze)", () => {
+  // Anthropic hands out Retry-After: 3600 after a hammering loop — must NOT be honored verbatim.
+  const capped = claudeRateLimitDelay(0, 3_600_000);
+  assert.equal(capped.delay, CLAUDE_USAGE_MAX_BACKOFF_MS, "honored Retry-After clamped to 15 min");
+  // The exponential floor (base + backoff) still wins when it exceeds the capped Retry-After.
+  const floored = claudeRateLimitDelay(CLAUDE_USAGE_MAX_BACKOFF_MS, 3_600_000);
+  assert.equal(floored.delay, CLAUDE_USAGE_POLL_MS + CLAUDE_USAGE_MAX_BACKOFF_MS, "base+backoff floor honored");
+});
+
+test("tokenFingerprint is stable, distinguishing, and never echoes the token", () => {
+  assert.equal(tokenFingerprint(null), null);
+  assert.equal(tokenFingerprint(""), null);
+  const a = tokenFingerprint("sk-ant-oauth-abc");
+  assert.equal(a, tokenFingerprint("sk-ant-oauth-abc"), "same token → same fingerprint");
+  assert.notEqual(a, tokenFingerprint("sk-ant-oauth-xyz"), "different token → different fingerprint");
+  assert.equal(a.length, 64, "sha-256 hex");
+  assert.ok(!a.includes("abc"), "fingerprint does not contain the token");
+});
+
+test("shouldSkipUsagePoll: hold a failing token, retry on rotation or deadline", () => {
+  const dead = tokenFingerprint("dead-token");
+  const fresh = tokenFingerprint("fresh-token");
+
+  // No gate → always fetch.
+  assert.equal(shouldSkipUsagePoll(null, dead), false);
+
+  // 401 hold (until: Infinity): skip while the SAME token is presented, fetch the instant it rotates.
+  const gate401 = { hash: dead, until: Number.POSITIVE_INFINITY };
+  assert.equal(shouldSkipUsagePoll(gate401, dead, 1_000), true, "same dead token → skip");
+  assert.equal(shouldSkipUsagePoll(gate401, fresh, 1_000), false, "token rotated → retry immediately");
+
+  // 429 hold: skip until the retry deadline, then fetch — and a rotation still cuts it short early.
+  const gate429 = { hash: dead, until: 10_000 };
+  assert.equal(shouldSkipUsagePoll(gate429, dead, 5_000), true, "before deadline → skip");
+  assert.equal(shouldSkipUsagePoll(gate429, dead, 10_000), false, "at deadline → fetch");
+  assert.equal(shouldSkipUsagePoll(gate429, dead, 20_000), false, "past deadline → fetch");
+  assert.equal(shouldSkipUsagePoll(gate429, fresh, 5_000), false, "rotation before deadline → fetch");
 });
 
 test("provider-explicit last-good usage survives a dev-server process restart cache", () => {
