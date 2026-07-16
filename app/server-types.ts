@@ -163,6 +163,16 @@ export interface LiveSession {
   // mid-session (there's no server-side effort fallback), so it's set once at spawn and rides the feed +
   // the durable marker so the pill's effort suffix survives Done.
   effort: string | null;
+  // Live subagents (Task/Agent sidechains) currently in flight, keyed by their spawning tool_use id. A
+  // subagent runs OFF the parent `-p` stream (CC 2.1.211 runs it as a `local_agent` task; its assistant
+  // turns are never inlined and carry no model on this stream), so we learn its requested model from the
+  // parent's Task/Agent tool_use block, not from any assistant message. This exists so the card can show a
+  // subagent on a DIFFERENT model as its OWN secondary chip instead of letting it hijack the main `model`
+  // pill. An entry is added when the tool_use is seen and DROPPED when it completes (matching tool_result,
+  // a terminal task_notification, or the turn's `result` boundary) — so we show a subagent only while
+  // active and never accumulate stale pills. publishSession serialises the model-known entries. Lazily
+  // created on first subagent; undefined = none seen this session.
+  subagents?: Map<string, { model: string | null; subagentType?: string }>;
   turnOut: number; // output tokens from this turn's COMPLETED messages; the live output adds the streaming delta on top
   // Channel delivery (4e): message CONTENT is never injected as user text — it lives in the off-log channel
   // log and the agent READS it by tool call (GET /api/inbox). The session only tracks, per channel, the

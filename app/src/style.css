@@ -2284,6 +2284,18 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   background: #f8efe7;
 }
 /* .ses-model-plain keeps the base grey — no override needed. */
+/* Subagent (Task/Agent sidechain) chips beside the main model pill: smaller, dimmer secondaries marked
+   with a ↳ so a subagent on a DIFFERENT model reads as subordinate — never mistaken for the main model.
+   Shown only while the subagent is in flight (server drops it on completion), so they don't accumulate. */
+.ses-model-sub {
+  font-size: 8px;
+  opacity: 0.82;
+}
+.ses-model-sub::before {
+  content: "↳";
+  margin-right: 2px;
+  opacity: 0.7;
+}
 /* Effort suffix inside the chip (e.g. "Fable ·xhigh") — shown only when effort was explicitly set,
    dimmed a touch so the model name stays primary. */
 .ses-model-effort {

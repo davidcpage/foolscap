@@ -26,16 +26,27 @@ const MODEL_DISPLAY = {
   "gpt-5.6-terra": ["Terra", "silver"],
   "gpt-5.6-luna": ["Luna", "bronze"],
 };
-function modelChip(model, effort) {
+// Short model ALIASES as they arrive on a Task/Agent tool_use `input.model` (subagent chips only) — the
+// spawn passes a bare tier name, not a full id. Mapped to the same friendly label + tier as MODEL_DISPLAY
+// so a subagent chip reads consistently with the main pill. Keep in lockstep with sessions/render.js.
+const MODEL_ALIAS = {
+  fable: ["Fable", "gold"],
+  opus: ["Opus", "silver"],
+  sonnet: ["Sonnet", "bronze"],
+  haiku: ["Haiku", "plain"],
+};
+function modelChip(model, effort, variant) {
   if (typeof model !== "string" || !model) return null;
   let label, tier;
   if (MODEL_DISPLAY[model]) [label, tier] = MODEL_DISPLAY[model];
+  else if (MODEL_ALIAS[model]) [label, tier] = MODEL_ALIAS[model];
   else if (/^claude-haiku/.test(model)) [label, tier] = ["Haiku", "plain"];
   else [label, tier] = [model.replace(/^claude-/, ""), "plain"];
   const eff = typeof effort === "string" && effort ? effort : null;
+  const sub = variant === "sub"; // a subagent chip: smaller, dimmer, ↳-marked, never the main pill
   return html`<span
-    class="ses-model ses-model-${tier}"
-    title=${`model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
+    class="ses-model ses-model-${tier}${sub ? " ses-model-sub" : ""}"
+    title=${`${sub ? "subagent " : ""}model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
     >${label}${eff ? html`<span class="ses-model-effort"> ·${eff}</span>` : ""}</span
   >`;
 }
@@ -729,6 +740,12 @@ export default {
     const model = live && typeof live.model === "string" ? live.model : null;
     const effort = live && typeof live.effort === "string" ? live.effort : null;
     const modelPill = modelChip(model, effort) ?? "";
+    // Subagent (Task/Agent sidechain) chips: the server publishes the model-known ones live while they run
+    // (server-sessions.ts publishSession). Rendered as smaller secondary chips AFTER the main pill so a
+    // subagent on a different model is visible without ever displacing it. Empty/absent → nothing.
+    const subPills = (live && Array.isArray(live.subagents) ? live.subagents : [])
+      .map((sa) => modelChip(sa && sa.model, null, "sub"))
+      .filter(Boolean);
 
     // The INPUT half (agent-sessions §3; session-timelines §4): send a prompt into the live session
     // through the granted `sessionInput` capability — a session-internal POST, never the canvas log.
@@ -1048,7 +1065,7 @@ export default {
         <button class="ses-name" type="button" title="Copy session id" @click=${copyId}>
           ${displayName}
         </button>
-        ${pill}${usagePill}${modelPill}
+        ${pill}${usagePill}${modelPill}${subPills}
         <span class="ses-meta">
           ${turns.length} turns · ${tools} tools${truncated ? html`<span class="ses-trunc"> · ⚠ truncated</span>` : ""}
         </span>

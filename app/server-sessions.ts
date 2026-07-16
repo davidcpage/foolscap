@@ -594,7 +594,7 @@ function toolVerb(name: string): string {
 // are the ones the live `claude -p --output-format stream-json --include-partial-messages` emits
 // (probed against this project): system/result/rate_limit framing, `stream_event` partial deltas, and
 // the CONSOLIDATED `user`/`assistant` events (already in the on-disk .jsonl codec's shape).
-function foldSessionEvent(s: LiveSession, e: any): void {
+export function foldSessionEvent(s: LiveSession, e: any): void {
   const { foldShadowEdits, flushNudge } = getServerContext();
   if (e?.type === "codex_event") {
     foldCodexEvent(s, e);
@@ -634,12 +634,39 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       }
       // The serving model, authoritative per message — tracks a mid-session refusal fallback the moment
       // the first fallen-back message lands (the requested model from init is only the opening claim).
-      if (e.type === "assistant" && typeof e.message?.model === "string" && e.message.model) s.model = e.message.model;
+      // GUARD: only a TOP-LEVEL (main-agent) message may set the pill. A subagent turn carries a top-level
+      // `parent_tool_use_id` (the id of the Task/Agent tool_use that spawned it) — its model must never
+      // latch onto the main pill. On CC 2.1.211 subagent turns don't inline here at all (they run as a
+      // `local_agent` task, off this stream), so this is belt-and-suspenders — but it keeps the main-agent
+      // refusal fallback working while a version that DOES inline sidechains can't hijack the pill.
+      if (e.type === "assistant" && !e.parent_tool_use_id && typeof e.message?.model === "string" && e.message.model) s.model = e.message.model;
+      // Subagent tracking: a Task/Agent tool_use names a subagent and (optionally) its requested model.
+      // Register it so the card can show a distinct secondary chip while it runs. The model is a short
+      // alias here (e.g. "haiku") or absent (inherit parent) — modelChip renders the alias, and an
+      // absent model is dropped downstream (no pill for a subagent on the main model).
+      if (e.type === "assistant" && Array.isArray(e.message?.content)) {
+        for (const b of e.message.content) {
+          if (b?.type === "tool_use" && (b.name === "Task" || b.name === "Agent") && typeof b.id === "string") {
+            (s.subagents ??= new Map()).set(b.id, {
+              model: typeof b.input?.model === "string" && b.input.model ? b.input.model : null,
+              subagentType: typeof b.input?.subagent_type === "string" ? b.input.subagent_type : undefined,
+            });
+          }
+        }
+      }
+      // A tool_result for a tracked subagent's tool_use = that subagent finished (synchronous path) — drop
+      // its chip now, so within a multi-subagent turn each pill clears as its subagent completes.
+      if (e.type === "user" && s.subagents?.size && Array.isArray(e.message?.content)) {
+        for (const b of e.message.content) {
+          if (b?.type === "tool_result" && typeof b.tool_use_id === "string") s.subagents.delete(b.tool_use_id);
+        }
+      }
       break;
     case "result":
       s.inflight = null;
       s.status = "idle"; // turn finished; the process waits on stdin for the next prompt
       s.verb = null; // no live activity to label; keep `usage` so the pill shows the turn's final counts
+      s.subagents?.clear(); // turn done → no subagent is still in flight; drop any chips (stale-pill backstop)
       if (s.autoWake) s.idleSince = Date.now(); // start the R1 keep-alive clock for an auto-wake worker
       persistServingState(s); // the turn named the serving model — make it durable so the pill survives Done
       if (s.nudge) flushNudge(s); // a channel message arrived mid-turn → wake to read it at the boundary (§9)
@@ -649,7 +676,9 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       if (ev?.type === "message_start") {
         s.inflight = [];
         s.usage = { input: ctxOf(ev.message?.usage), output: s.turnOut };
-        if (typeof ev.message?.model === "string" && ev.message.model) s.model = ev.message.model; // serving model, live
+        // Serving model, live — same top-level `parent_tool_use_id` guard as the consolidated assistant
+        // event: a subagent's message_start must not overwrite the main pill (see the assistant case).
+        if (!e.parent_tool_use_id && typeof ev.message?.model === "string" && ev.message.model) s.model = ev.message.model;
         s.verb = "Thinking"; // a neutral default until the first content_block_start names the activity
       } else if (ev?.type === "content_block_start" && s.inflight) {
         const cb = ev.content_block;
@@ -669,7 +698,19 @@ function foldSessionEvent(s: LiveSession, e: any): void {
       if (ev?.type === "message_start" || ev?.type === "content_block_start") resumeRunning(s);
       break;
     }
-    // system / rate_limit_event / anything else: framing only, nothing to render
+    case "system":
+      // Non-init system framing. A `task_notification` reports a subagent (Task/Agent) task's terminal
+      // state — the completion signal for a BACKGROUND subagent (whose tool_result won't land until later),
+      // complementing the synchronous tool_result path above. Drop the chip once it's no longer in flight.
+      // (init is handled + returned before this switch; task_updated is keyed by task_id, not tool_use_id,
+      // so we rely on task_notification's tool_use_id here.)
+      if (e.subtype === "task_notification" && s.subagents?.size && typeof e.tool_use_id === "string") {
+        const st = typeof e.status === "string" ? e.status : "";
+        const active = st === "in_progress" || st === "running" || st === "started" || st === "pending";
+        if (!active) s.subagents.delete(e.tool_use_id);
+      }
+      break;
+    // rate_limit_event / anything else: framing only, nothing to render
   }
 }
 
@@ -690,8 +731,11 @@ function seedFromTranscript(s: LiveSession): void {
       if ((e?.type === "user" || e?.type === "assistant") && e.message) {
         s.lines.push(JSON.stringify({ type: e.type, message: e.message }));
         // Recover the serving model from history too (last assistant message wins), so an adopted or
-        // resumed session shows its model chip before its first new turn.
-        if (e.type === "assistant" && typeof e.message.model === "string" && e.message.model) s.model = e.message.model;
+        // resumed session shows its model chip before its first new turn. GUARD on `isSidechain`: a
+        // subagent turn must not seed the main pill. (In CC 2.1.211 sidechains live in a separate
+        // subagents/*.jsonl, never inline in this main transcript, so this is defensive — but older CC
+        // inlined them with isSidechain:true, and this keeps the recovered model = the MAIN agent's.)
+        if (e.type === "assistant" && !e.isSidechain && typeof e.message.model === "string" && e.message.model) s.model = e.message.model;
       }
     } catch {
       // a non-JSON framing line or a ragged tail — skip, same tolerance as the codec
@@ -1621,6 +1665,16 @@ export function publishSession(s: LiveSession): void {
     error: s.error ?? undefined,
     model: s.model ?? undefined, // the model actually serving the session (tracks refusal fallbacks)
     effort: s.effort ?? undefined, // the reasoning effort this session was spawned at (pill suffix); absent = provider default
+    // Live subagents (Task/Agent sidechains) currently running, as their OWN secondary chips beside the
+    // main model pill — only those whose model we know (a subagent inheriting the parent model has no
+    // distinct model to show, so it's omitted rather than duplicating the main chip). Absent when none.
+    subagents: (() => {
+      if (!s.subagents?.size) return undefined;
+      const arr = [...s.subagents.values()]
+        .filter((x) => typeof x.model === "string" && x.model)
+        .map((x) => ({ model: x.model as string, subagentType: x.subagentType }));
+      return arr.length ? arr : undefined;
+    })(),
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
     // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:
