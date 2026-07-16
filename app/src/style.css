@@ -3408,6 +3408,39 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 }
 .chan-md-list:last-child { margin-bottom: 0; }
 .chan-md-list li { margin: 1px 0; }
+/* ATX headings in a message body — scaled down for a card, but still visibly heading-weight so a
+   `## Section` reads as structure rather than bold text. Mirrors the doc path's relative-size ramp. */
+.chan-h {
+  margin: 6px 0 3px;
+  font-weight: 700;
+  line-height: 1.25;
+  color: #18181b;
+}
+.chan-h:first-child { margin-top: 0; }
+.chan-h1 { font-size: 16px; }
+.chan-h2 { font-size: 14.5px; }
+.chan-h3 { font-size: 13px; }
+.chan-h4, .chan-h5, .chan-h6 { font-size: 12px; }
+.chan-h5, .chan-h6 { color: #52525b; }
+/* GFM pipe table in a message body — mirrors the doc path's .md-table (see above) so a table reads the
+   same in a thread post as in a brief. */
+.chan-md-table {
+  margin: 4px 0 6px;
+  border-collapse: collapse;
+  font-size: 11.5px;
+}
+.chan-md-table:last-child { margin-bottom: 0; }
+.chan-md-table th,
+.chan-md-table td {
+  padding: 3px 7px;
+  border: 1px solid #e4e4e7;
+  text-align: left;
+  vertical-align: top;
+}
+.chan-md-table th {
+  background: #00000006;
+  font-weight: 600;
+}
 /* a resolved @-tag inside a message (one that names a member / @all / @human) — tinted so the eye finds
    "who this was for" at a glance. Cosmetic; the server decides who a tag actually wakes. */
 .chan-tag {

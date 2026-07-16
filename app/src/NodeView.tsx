@@ -1191,9 +1191,33 @@ function highlightTags(text: string, entries: TagEntry[]): React.ReactNode {
 // markdown + @-tag highlighting run per block via renderInline: markdown is parsed over each block FIRST so a
 // tag INSIDE a bold span (e.g. `**…tag @7505562d…**`) can't split the `**…**` in two (highlighting tags first
 // left the bold markers unpaired — literal `**`, runaway bold); tags inside `code`/link labels stay literal
-// by design. Kept deliberately small (paragraphs + lists) — headings and tables are rare in a thread post;
-// the shared lit-html codec (vendor/markdown.js) is the wrong renderer here (raw target=_blank links, no
-// canvas-link/tag handling).
+// by design. Handles paragraphs, lists, ATX headings (`#`..`######`) and GFM pipe tables — heading/cell text
+// still flows through renderInline so links/@-tags keep working; the shared lit-html codec (vendor/markdown.js)
+// is the wrong renderer here (raw target=_blank links, no canvas-link/tag handling), so the table helpers are
+// ported below rather than imported.
+// GFM pipe-table helpers, ported from vendor/markdown.js. Detection keys on the delimiter row, so a bare
+// pipe-grid with no `|---|` stays a paragraph — as GFM wants.
+const DELIM_CELL = /^:?-+:?$/;
+type CellAlign = "left" | "right" | "center" | null;
+function splitRow(line: string): string[] {
+  // split on `|`, honouring `\|` escapes; one optional leading/trailing pipe is decoration, not a cell.
+  const s = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  const cells: string[] = [];
+  let cur = "";
+  for (let k = 0; k < s.length; k++) {
+    if (s[k] === "\\" && s[k + 1] === "|") { cur += "|"; k++; continue; }
+    if (s[k] === "|") { cells.push(cur.trim()); cur = ""; continue; }
+    cur += s[k];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+const isTableDelim = (line: string): boolean => {
+  const c = splitRow(line);
+  return c.length > 0 && c.every((x) => DELIM_CELL.test(x));
+};
+const cellAlign = (c: string): CellAlign =>
+  c.startsWith(":") && c.endsWith(":") ? "center" : c.endsWith(":") ? "right" : c.startsWith(":") ? "left" : null;
 // `time`, when given, is the message's timestamp, placed WhatsApp-style: floated into the bottom-right of
 // the LAST paragraph's tail via an invisible inline spacer that reserves room on the last line (the meta
 // sits in that gap when the line has room, and drops to a fresh line when the text fills the width). When
@@ -1202,20 +1226,42 @@ function renderMessageBody(text: string, entries: TagEntry[], m: InteractionMana
   const render = (run: string) => renderInline(run, m, (r) => highlightTags(r, entries));
   const lines = text.replace(/\r\n/g, "\n").split("\n");
   // Parse into block descriptors first, so the LAST block can be special-cased (spacer) at render time.
-  type Block = { kind: "p"; text: string } | { kind: "list"; ordered: boolean; items: string[] };
+  type Block =
+    | { kind: "p"; text: string }
+    | { kind: "list"; ordered: boolean; items: string[] }
+    | { kind: "heading"; level: number; text: string }
+    | { kind: "table"; header: string[]; aligns: CellAlign[]; rows: string[][] };
   const parsed: Block[] = [];
   let para: string[] = [];
   let list: { ordered: boolean; items: string[] } | null = null;
   const flushPara = () => { if (para.length) { parsed.push({ kind: "p", text: para.join("\n") }); para = []; } };
   const flushList = () => { if (list) { parsed.push({ kind: "list", ...list }); list = null; } };
-  for (const line of lines) {
+  for (let li = 0; li < lines.length; li++) {
+    const line = lines[li];
+    const heading = /^(#{1,6})\s+(.*?)\s*#*\s*$/.exec(line);
     const bullet = /^\s*[-*]\s+(.*)$/.exec(line);
     const numbered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
-    if (bullet || numbered) {
+    if (heading) {
+      flushPara();
+      flushList();
+      parsed.push({ kind: "heading", level: heading[1].length, text: heading[2] });
+    } else if (bullet || numbered) {
       flushPara();
       const ordered = !!numbered;
       if (!list || list.ordered !== ordered) { flushList(); list = { ordered, items: [] }; }
       list.items.push((bullet ?? numbered)![1]);
+    } else if (line.includes("|") && li + 1 < lines.length && isTableDelim(lines[li + 1])) {
+      // A row of pipes followed by a `|---|` delimiter opens a GFM table; body rows run until a blank /
+      // pipe-less line. (Detection on the delimiter keeps a stray `a | b` line a plain paragraph.)
+      flushPara();
+      flushList();
+      const header = splitRow(line);
+      const aligns = splitRow(lines[li + 1]).map(cellAlign);
+      li += 2;
+      const rows: string[][] = [];
+      while (li < lines.length && lines[li].trim() && lines[li].includes("|")) { rows.push(splitRow(lines[li])); li++; }
+      li--; // the for-loop's li++ steps past the row that ended the table
+      parsed.push({ kind: "table", header, aligns, rows });
     } else if (line.trim() === "") {
       flushPara();
       flushList();
@@ -1235,6 +1281,24 @@ function renderMessageBody(text: string, entries: TagEntry[], m: InteractionMana
           {render(b.text)}
           {time && i === lastIdx && <span className="chan-msg-timespace" aria-hidden="true" />}
         </div>
+      );
+    }
+    if (b.kind === "heading") {
+      const Tag = `h${b.level}` as keyof React.JSX.IntrinsicElements;
+      return <Tag className={`chan-h chan-h${b.level}`} key={i}>{render(b.text)}</Tag>;
+    }
+    if (b.kind === "table") {
+      return (
+        <table className="chan-md-table" key={i}>
+          <thead>
+            <tr>{b.header.map((c, j) => <th key={j} style={{ textAlign: b.aligns[j] ?? undefined }}>{render(c)}</th>)}</tr>
+          </thead>
+          <tbody>
+            {b.rows.map((r, ri) => (
+              <tr key={ri}>{r.map((c, ci) => <td key={ci} style={{ textAlign: b.aligns[ci] ?? undefined }}>{render(c)}</td>)}</tr>
+            ))}
+          </tbody>
+        </table>
       );
     }
     const items = b.items.map((it, j) => <li key={j}>{render(it)}</li>);
