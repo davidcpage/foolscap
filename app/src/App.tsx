@@ -943,15 +943,15 @@ function Board({ m, undo, persistence }: Engine) {
         </div>
       )}
 
-      {/* Transient confirmation for a keyboard view action (save / recall / step-back). Centred top, a
-          glance like the fs-watch chip; auto-clears via the toast effect. */}
+      {/* Transient confirmation for a keyboard view action (save / recall / step-back). Centred at the
+          bottom, above the waiting stack; a glance like the fs-watch chip; auto-clears via the toast effect. */}
       {toast && (
         <div className="view-toast" key={toast.seq}>
           {toast.text}
         </div>
       )}
 
-      {/* Persistent "your turn" stack, top-centre: a chip per session waiting on you, each a light glassy
+      {/* Persistent "your turn" stack, bottom-centre: a chip per session waiting on you, each a light glassy
           pill with the amber waiting dot. Clears itself as sessions resolve; click a chip to fly to its
           card. A new chip slides in on mount (keyed by sid, so it animates only on arrival). Capped, with
           a "+N more" when many wait at once. */}

@@ -4296,12 +4296,12 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   vector-effect: non-scaling-stroke;
 }
 
-/* Transient confirmation for a keyboard view action (saved view N / recall / step-back). Centred near
-   the top so it reads as a HUD message distinct from the bottom-left fs-watch chip; pointer-transparent
-   and short-lived (the JS timer unmounts it). */
+/* Transient confirmation for a keyboard view action (saved view N / recall / step-back). Centred at
+   the bottom, offset ABOVE the "your turn" waiting stack (anchored bottom:14px) so the two clear each
+   other for a typical 1–2 chip stack; pointer-transparent and short-lived (the JS timer unmounts it). */
 .view-toast {
   position: absolute;
-  top: 14px;
+  bottom: 72px;
   left: 50%;
   z-index: 30;
   padding: 4px 12px;
@@ -4317,25 +4317,27 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   animation: view-toast-fade 1400ms ease forwards;
 }
 @keyframes view-toast-fade {
-  0% { opacity: 0; transform: translate(-50%, -6px); }
+  0% { opacity: 0; transform: translate(-50%, 6px); }
   10% { opacity: 1; transform: translate(-50%, 0); }
   80% { opacity: 1; transform: translate(-50%, 0); }
-  100% { opacity: 0; transform: translate(-50%, -3px); }
+  100% { opacity: 0; transform: translate(-50%, 3px); }
 }
 
-/* Persistent "your turn" stack — sessions waiting on you, top-centre (clear of the minimap at top-right).
-   A vertical column of light glassy chips (the fs-watch chip idiom: translucent white, blur, hairline
-   border) so it reads as quiet canvas chrome, not a loud banner; the only colour is the small amber waiting
-   dot. The column itself is pointer-transparent; each chip re-enables clicks (jump to the session). It
+/* Persistent "your turn" stack — sessions waiting on you, bottom-centre (bottom-centre is empty; the
+   board strip and event chip live at bottom-LEFT, so nothing collides here, unlike the clock HUD it used
+   to sit on at top-centre). A vertical column of light glassy chips (the fs-watch chip idiom: translucent
+   white, blur, hairline border) so it reads as quiet canvas chrome, not a loud banner; the only colour is
+   the small amber waiting dot. column-reverse so the newest chip stacks toward the screen edge (bottom).
+   The column itself is pointer-transparent; each chip re-enables clicks (jump to the session). It
    persists — no fade — and shrinks/clears itself as sessions resolve. */
 .waiting-stack {
   position: absolute;
-  top: 14px;
+  bottom: 14px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 30;
   display: flex;
-  flex-direction: column;
+  flex-direction: column-reverse;
   align-items: center;
   gap: 6px;
   pointer-events: none;
@@ -4390,7 +4392,7 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   animation: ses-frame-pulse 1.5s ease-in-out infinite; /* same gentle pulse as the card's waiting band */
 }
 @keyframes waiting-chip-in {
-  0% { opacity: 0; transform: translateY(-6px); }
+  0% { opacity: 0; transform: translateY(6px); }
   100% { opacity: 1; transform: translateY(0); }
 }
 
