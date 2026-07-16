@@ -1331,6 +1331,63 @@ export async function spawnLiveSession(
   });
 }
 
+// The pre-start ("unstarted") session-card descriptor — a session card that has a NODE but no process yet
+// (deferred-start-session-cards). It rides in the node's `text` as a small JSON blob (a stub has no
+// transcript to hold there); render.js branches on `unstarted:true` before its jsonl codec ever runs, so
+// the transcript path never sees it. Chip toggles merge into this blob (sessionConfigure); the first prompt
+// spawns the process with these choices (sessionLaunch), the live feed supersedes the blob, and the card
+// flips to its normal live duplex. `model`/`effort`/`roleId` null = "unset" (the server resolves the
+// default at spawn); they're OMITTED from the spawn body so a role's own frontmatter default stays meaningful.
+export interface SessionStub {
+  unstarted: true;
+  provider: SessionProvider;
+  model: string | null;
+  effort: EffortLevel | null;
+  roleId: string | null;
+}
+
+export function newSessionStub(): SessionStub {
+  return { unstarted: true, provider: "claude", model: null, effort: null, roleId: null };
+}
+
+// Parse the stub descriptor out of a session card's `text`, or null if it isn't one (a live/historical
+// transcript, or empty). A stub is a single JSON object with `unstarted:true`; a jsonl transcript is
+// multi-line and never parses whole, so this can't misfire on a real transcript. Missing fields fall back
+// to the base stub so an older/partial blob still reads cleanly.
+export function parseSessionStub(text: string | undefined): SessionStub | null {
+  const s = (text ?? "").trim();
+  if (!s || s[0] !== "{") return null;
+  try {
+    const o = JSON.parse(s) as Partial<SessionStub>;
+    return o && o.unstarted === true ? { ...newSessionStub(), ...o, unstarted: true } : null;
+  } catch {
+    return null;
+  }
+}
+
+// Create an UNSTARTED session card from the canvas (the right-click "New session" item). No spawn, no
+// process: a client-side addNode whose title is a fresh client-minted UUID, so the card's `session` feed +
+// `sessionInput`/`sessionLaunch` are keyed by an id that's stable from creation (the one server change lets
+// the first prompt spawn WITH this id, so the stub becomes the live session in place — no id reconciliation).
+// The chip state lives in `text`; the card renders its provider/model/effort/role chips off it until launch.
+export function createUnstartedSession(m: InteractionManager, at?: Pos): void {
+  const id = crypto.randomUUID();
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: {
+      id: liveNodeId(id),
+      type: "session",
+      title: id, // the (future) session id: the template keys its feed + spawn/input off it
+      text: JSON.stringify(newSessionStub()),
+      color: "blue",
+      ...(at ?? spawnAt(m, SESSION_CARD_W, SESSION_CARD_H)),
+      w: SESSION_CARD_W,
+      h: SESSION_CARD_H,
+    },
+  });
+}
+
 // Interrupt the live Claude session shown in the SELECTED session card (the Escape binding). Reads the
 // single selected node; if it's a session card, fires the session-internal interrupt for its id. Like
 // sessionInput/sessionResume this is a plain POST, never the canvas log. A no-op unless the selection is

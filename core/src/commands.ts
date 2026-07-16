@@ -69,6 +69,13 @@ export const defaultCommands: Record<string, CommandHandler> = {
     store.update<import("./records.js").NodeRecord>(p.id, { text: p.text });
   },
 
+  // Set the OPTIONAL display handle (NodeRecord.name) — the friendly label rendered in preference to the
+  // title (e.g. a role-spawned session's "<RoleName>.<short-sid>"). Semantic like setTitle, but it never
+  // touches the title, so the machinery a card keys off its title (a session's feed id) stays intact.
+  setName(store, p: { id: Id<"node">; name: string }) {
+    store.update<import("./records.js").NodeRecord>(p.id, { name: p.name });
+  },
+
   // Layout-only edit; an agent's setTitle and this never collide on the same record.
   moveNode(store, p: { id: Id<"node">; x: number; y: number }) {
     store.update<import("./records.js").LayoutRecord>(layoutId(p.id), { x: p.x, y: p.y });

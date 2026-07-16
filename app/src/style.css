@@ -2704,6 +2704,76 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
 .ses-head[data-ses-state="crashed"] {
   background: #fef2f2;
 }
+/* UNSTARTED stub (deferred-start-session-cards): a calm neutral-blue header — it makes no demand on you,
+   it's a card waiting to be configured and launched. */
+.ses-head[data-ses-state="unstarted"] {
+  background: #f5f7ff;
+}
+.ses-unstarted-pill {
+  color: #6366f1;
+  animation: none; /* not a live process — no pulse */
+}
+/* The unstarted card body: the configuration surface, chips laid out in labelled rows. */
+.ses-unstarted {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 12px 14px;
+  overflow-y: auto;
+}
+.ses-unstarted-hint {
+  font-size: 11px;
+  color: #71717a;
+  line-height: 1.4;
+}
+.ses-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px;
+}
+.ses-chip-label {
+  flex: none;
+  width: 58px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.ses-chip {
+  font: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 3px 9px;
+  border: 1px solid #d4d4d8;
+  border-radius: 999px;
+  background: #fff;
+  color: #3f3f46;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ses-chip:hover:not(:disabled) {
+  border-color: #a5b4fc;
+}
+.ses-chip.active {
+  border-color: #6366f1;
+  background: #eef2ff;
+  color: #4338ca;
+}
+.ses-chip:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+/* The launch input reuses the duplex input-row chrome; a coloured button marks it as the commit action. */
+.ses-unstarted-launch button {
+  border-color: #c7d2fe;
+  background: #eef2ff;
+  color: #4338ca;
+}
+.ses-unstarted-launch button:hover:not(:disabled) {
+  background: #e0e7ff;
+}
 /* Phase-2 "End session" button (head, right of the meta): a quiet ghost control until you arm it. The
    first click flips it to a red "end?" confirm (.armed); a second within the window fires /done. */
 .ses-end {

@@ -52,6 +52,135 @@ function modelChip(model, effort, variant, note) {
   >`;
 }
 
+// Per-provider model id lists for the UNSTARTED session card's model chip (deferred-start-session-cards).
+// DUPLICATED from loader.ts's PROVIDER_MODELS by design — a card render.js may import only /vendor/*
+// (card-templates.test.mjs enforces the boundary), so the ids can't be imported. Keep in lockstep with
+// loader.ts PROVIDER_MODELS and the MODEL_DISPLAY map above (both are id→ tables over the same ids).
+const PROVIDER_MODELS = {
+  claude: ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"],
+  codex: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+};
+const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"]; // lockstep with loader.ts EFFORT_LEVELS
+const STUB_DEFAULTS = { unstarted: true, provider: "claude", model: null, effort: null, roleId: null };
+
+// The friendly model label for a chip — MODEL_DISPLAY's name, or the id with `claude-` stripped (same
+// fallback the pill uses). Kept tiny; the full tinting map is modelChip's job, not the pre-start chip's.
+function modelLabelOf(id) {
+  if (MODEL_DISPLAY[id]) return MODEL_DISPLAY[id][0];
+  if (/^claude-haiku/.test(id)) return "Haiku";
+  return id.replace(/^claude-/, "");
+}
+
+// Parse the UNSTARTED-stub descriptor out of a session card's raw text, or null if it isn't one. A stub is
+// one JSON object with `unstarted:true`; a jsonl transcript is multi-line and never parses whole, so this
+// can't misfire on a real transcript. Mirrors loader.ts's parseSessionStub (the codec can't import it).
+function parseStub(raw) {
+  const s = (raw || "").trim();
+  if (!s || s[0] !== "{") return null;
+  try {
+    const o = JSON.parse(s);
+    return o && o.unstarted === true ? { ...STUB_DEFAULTS, ...o } : null;
+  } catch {
+    return null;
+  }
+}
+
+// The UNSTARTED session card (deferred-start-session-cards): a session card with a node but no process yet.
+// It shows toggleable provider / model / effort / role chips (chip writes route through the granted
+// `sessionConfigure` action) and a prompt input whose first message SPAWNS the process with those choices
+// (`sessionLaunch`). No feed, no status, no marker → no "ended"/"resume" band ever computes for it. Once
+// launched, the live feed supersedes the stub blob and render() takes its normal live path instead.
+function renderUnstartedSession(card, stub) {
+  const cfg = card.signals.sessionConfigure; // chip write; absent (headless/no-host) → chips read-only
+  const launch = card.signals.sessionLaunch; // first-prompt spawn; absent → launch disabled
+  const roles = Array.isArray(card.signals.rolesList) ? card.signals.rolesList : [];
+  const provider = stub.provider === "codex" ? "codex" : "claude";
+  const role = stub.roleId ? roles.find((r) => r.roleId === stub.roleId) : null;
+  const set = (patch) => cfg && cfg(patch);
+  const chip = (active, label, onClick, title) => html`<button
+    class="ses-chip${active ? " active" : ""}"
+    ?disabled=${!cfg}
+    aria-pressed=${active ? "true" : "false"}
+    title=${title || label}
+    @click=${onClick}
+  >${label}</button>`;
+  // "Default" (unset) is displayed with what it RESOLVES to — the selected role's frontmatter default, if
+  // any — but stays null on the wire so the spawn omits it and the server resolves (explicit > role >
+  // provider default). Picking a role therefore only sets roleId; model/effort track the role's defaults.
+  const modelDefault = role && role.model ? `Default · ${modelLabelOf(role.model)}` : "Default";
+  const effortDefault = role && role.effort ? `Default · ${role.effort}` : "Default";
+  return html`
+    <div class="ses-head" data-ses-state="unstarted">
+      <span class="ses-name">${card.fields.name || "New session"}</span>
+      <span class="ses-live ses-unstarted-pill">○ not started</span>
+    </div>
+    <div class="ses-body ses-unstarted" data-text>
+      <div class="ses-unstarted-hint">
+        Choose provider, model, effort and role — then send the first message to launch.
+      </div>
+      <div class="ses-chip-row" role="group" aria-label="Provider">
+        <span class="ses-chip-label">provider</span>
+        ${chip(provider === "claude", "Claude", () => set({ provider: "claude", model: null }))}
+        ${chip(provider === "codex", "Codex", () => set({ provider: "codex", model: null }))}
+      </div>
+      <div class="ses-chip-row" role="group" aria-label="Model">
+        <span class="ses-chip-label">model</span>
+        ${chip(stub.model === null, modelDefault, () => set({ model: null }),
+          role && role.model ? `role default: ${role.model}` : "provider default")}
+        ${PROVIDER_MODELS[provider].map((id) =>
+          chip(stub.model === id, modelLabelOf(id), () => set({ model: id }), id))}
+      </div>
+      <div class="ses-chip-row" role="group" aria-label="Reasoning effort">
+        <span class="ses-chip-label">effort</span>
+        ${chip(stub.effort === null, effortDefault, () => set({ effort: null }),
+          role && role.effort ? `role default: ${role.effort}` : "provider default")}
+        ${EFFORT_LEVELS.map((lvl) =>
+          chip(stub.effort === lvl, lvl === "medium" ? "med" : lvl, () => set({ effort: lvl })))}
+      </div>
+      <div class="ses-chip-row" role="group" aria-label="Role">
+        <span class="ses-chip-label">role</span>
+        ${chip(!stub.roleId, "No role", () => set({ roleId: null }))}
+        ${roles.map((r) =>
+          chip(stub.roleId === r.roleId, r.name, () => set({ roleId: r.roleId }),
+            r.model ? `${r.name} — ${modelLabelOf(r.model)}${r.effort ? ` ·${r.effort}` : ""}` : r.name))}
+      </div>
+    </div>
+    <div class="ses-input-row ses-unstarted-launch">
+      <input
+        class="ses-input"
+        type="text"
+        ?disabled=${!launch}
+        placeholder=${launch ? "first message launches the session…" : "launch unavailable"}
+        @keydown=${(e) => {
+          e.stopPropagation();
+          if (e.key === "Enter") {
+            e.preventDefault();
+            launchUnstarted(launch, e.currentTarget);
+          }
+        }}
+      />
+      <button
+        ?disabled=${!launch}
+        @click=${(e) => launchUnstarted(launch, e.target.closest(".ses-input-row").querySelector("input"))}
+      >
+        launch
+      </button>
+    </div>
+  `;
+}
+
+// Fire the first-prompt spawn from the unstarted card's input. Disables the field in flight (imperative,
+// like resume/end, so a streamed re-render can't double-fire); on a failed spawn (provider unavailable /
+// cap reached) it re-enables so the user can retry. On success the card flips to the live session in place.
+function launchUnstarted(launch, el) {
+  const text = String(el.value || "").trim();
+  if (!text || !launch) return;
+  el.disabled = true;
+  Promise.resolve(launch(text)).then((ok) => {
+    if (!ok) el.disabled = false;
+  });
+}
+
 // NO turn-count cap. Memory is bounded ONCE, upstream, by the BYTE caps on what reaches this codec
 // (MAX_SESSION_BYTES for a static/file-tail transcript, MAX_SESSION_FEED_BYTES for a live one — both
 // in vite-fs-plugin.ts, both keep the TAIL and flag `truncated`). A second cap here on the number of
@@ -565,6 +694,16 @@ export default {
     // card.signals.session here is what subscribes the card to the feed.
     const live = card.signals.session;
     const raw = (live ? live.content : card.fields.text) ?? "";
+    // UNSTARTED stub (deferred-start-session-cards): a session card with a node but no process yet — its
+    // chip state rides in `text` as a JSON blob. Branch here, BEFORE the jsonl codec: a stub never has a
+    // live feed (it has never spawned), and a real transcript is multi-line and won't parse whole, so this
+    // can't misfire. Returning early means the transcript/status path never runs, so no false "ended"/
+    // "resume" band is computed for a card that simply hasn't launched. Once launched the feed supersedes
+    // the blob (`live` truthy) and the normal live path below takes over.
+    if (!live) {
+      const stub = parseStub(raw);
+      if (stub) return renderUnstartedSession(card, stub);
+    }
     // Incremental parse (eventsFor): only newly-appended lines are JSON.parsed each render, so a
     // streaming session no longer re-walks its whole transcript every frame.
     const st = eventsFor(card, raw);

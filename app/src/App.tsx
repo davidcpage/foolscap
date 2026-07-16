@@ -52,17 +52,10 @@ import {
   reconcileDetachedMemberCards,
   registerFileCommands,
   reprojectContent,
-  spawnLiveSession,
-  type SessionProvider,
-  fetchRoles,
+  createUnstartedSession,
   addRolesCard,
   watchDataset,
-  PROVIDER_MODELS,
-  EFFORT_LEVELS,
-  type EffortLevel,
-  modelLabel,
   type Pos,
-  type Role,
   type WatchEvent,
 } from "./loader";
 import { baseName } from "./fileTypes";
@@ -1000,133 +993,6 @@ function Board({ m, undo, persistence }: Engine) {
   );
 }
 
-// The "New session" menu item, expanded into a ROLE PICKER (agent-roles.md). Click it to reveal the roles
-// a session can be spawned "as" — "No role" (a bare session, the original behaviour) plus each role read
-// from GET /api/roles, swatched by its colour. Picking one spawns a session under it (the server appends
-// the role's charter to the prompt and stamps roleId/roleName), and the new card carries the friendly
-// "<RoleName>.<short-sid>" name. Roles are fetched lazily on first expand (not on every menu open) and
-// cached for the menu's life; the list degrades to just "No role" until the backend endpoint lands or if
-// no roles exist, so the picker is always usable.
-function NewSessionItem({
-  m,
-  at,
-  run,
-}: {
-  m: InteractionManager;
-  at: Pos;
-  run: (fn: () => void) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [roles, setRoles] = useState<Role[] | null>(null); // null = not yet fetched
-  const [provider, setProvider] = useState<SessionProvider>("claude");
-  // Explicit model + effort overrides. null = "Default" (send nothing; the server resolves explicit >
-  // role > provider default) — that null state is what keeps a role's own default model meaningful, so a
-  // role button spawns at the role's model UNLESS the user pins one here.
-  const [model, setModel] = useState<string | null>(null);
-  const [effort, setEffort] = useState<EffortLevel | null>(null);
-  const toggle = () => {
-    const next = !open;
-    setOpen(next);
-    if (next && roles === null) void fetchRoles().then(setRoles);
-  };
-  // A claude model id is meaningless for codex (and vice versa), so reset the explicit model when the
-  // provider flips; the picked model must belong to the current provider's list. Effort is provider-neutral.
-  const pickProvider = (p: SessionProvider) => {
-    setProvider(p);
-    setModel(null);
-  };
-  const spawn = (roleId?: string) =>
-    run(() => void spawnLiveSession(m, at, roleId, provider, model ?? undefined, effort ?? undefined));
-  return (
-    <div className="menu-roles">
-      <button className="menu-expand" aria-expanded={open} onClick={toggle}>
-        <span>New session</span>
-        <span className="menu-caret">{open ? "▾" : "▸"}</span>
-      </button>
-      {open && (
-        <div className="menu-rolelist">
-          <div className="menu-provider" role="group" aria-label="Session provider">
-            <button
-              className={`menu-provideropt${provider === "claude" ? " active" : ""}`}
-              aria-pressed={provider === "claude"}
-              onClick={() => pickProvider("claude")}
-            >
-              Claude
-            </button>
-            <button
-              className={`menu-provideropt${provider === "codex" ? " active" : ""}`}
-              aria-pressed={provider === "codex"}
-              onClick={() => pickProvider("codex")}
-            >
-              Codex
-            </button>
-          </div>
-          {/* Model row — switches with the provider. "Default" (null) lets the server/role resolve it. */}
-          <div className="menu-optrow" role="group" aria-label="Model">
-            <button
-              className={`menu-opt${model === null ? " active" : ""}`}
-              aria-pressed={model === null}
-              onClick={() => setModel(null)}
-            >
-              Default
-            </button>
-            {PROVIDER_MODELS[provider].map((mm) => (
-              <button
-                key={mm.id}
-                className={`menu-opt${model === mm.id ? " active" : ""}`}
-                aria-pressed={model === mm.id}
-                title={mm.id}
-                onClick={() => setModel(mm.id)}
-              >
-                {mm.label}
-              </button>
-            ))}
-          </div>
-          {/* Effort row — "Default" sends no effort field; the five levels map to --effort / codex override. */}
-          <div className="menu-optrow" role="group" aria-label="Reasoning effort">
-            <button
-              className={`menu-opt${effort === null ? " active" : ""}`}
-              aria-pressed={effort === null}
-              onClick={() => setEffort(null)}
-            >
-              Default
-            </button>
-            {EFFORT_LEVELS.map((lvl) => (
-              <button
-                key={lvl}
-                className={`menu-opt${effort === lvl ? " active" : ""}`}
-                aria-pressed={effort === lvl}
-                onClick={() => setEffort(lvl)}
-              >
-                {lvl === "medium" ? "med" : lvl}
-              </button>
-            ))}
-          </div>
-          <button className="menu-roleopt" onClick={() => spawn()}>
-            <span className="menu-roleswatch menu-roleswatch-none" />
-            No role
-          </button>
-          {roles === null && <div className="menu-rolehint">loading roles…</div>}
-          {roles?.map((r) => (
-            <button key={r.roleId} className="menu-roleopt" onClick={() => spawn(r.roleId)}>
-              <span className={`menu-roleswatch c-${r.colour ?? "blue"}`} style={swatchStyle(r.colour)} />
-              {r.name}
-              {/* The role's own default model (from /api/roles) as a quiet suffix — shown only when the
-                  user hasn't pinned an explicit model that would override it. */}
-              {r.model && model === null && (
-                <span className="menu-roledefault" title={`role default: ${r.model}`}>
-                  {modelLabel(r.model)}
-                  {r.effort ? ` ·${r.effort}` : ""}
-                </span>
-              )}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 // The "New file" affordance (Slice 2 — create a markdown/text file from the canvas). Shares the role
 // picker's expandable shell: the row expands to a title input and an editable path field pre-filled with
 // `.canvas/docs/<slug>.md` (slug from the title). The path auto-tracks the title UNTIL the user edits it by
@@ -1305,14 +1171,6 @@ function BoardPill() {
   );
 }
 
-// A role's colour may be a NOTE_COLORS key (styled via the `c-<key>` class) or an explicit CSS colour. We
-// can't know which here, so when it doesn't look like a bare palette key we set it as an inline background
-// too — the class covers the keys, the inline style covers raw colours, and one of them always paints.
-function swatchStyle(colour?: string): React.CSSProperties | undefined {
-  if (!colour) return undefined;
-  return /[#(]/.test(colour) ? { background: colour } : undefined;
-}
-
 // The right-click add menu — the single affordance for putting things on the board, replacing the
 // header toolbar. Every item is placed at `at` (the click's page-space point) and drops ONE card; the
 // browser cards (File tree, Sessions) then let you drill in and drag the specific file/session out (the
@@ -1382,7 +1240,10 @@ function CanvasMenu({
     <div className="canvas-menu" ref={ref} style={{ left: pos.x, top: pos.y }}>
       <div className="menu-list">
         <div className="menu-section">Session</div>
-        <NewSessionItem m={m} at={at} run={run} />
+        {/* "New session" now drops an UNSTARTED session card (deferred-start-session-cards): no picker maze,
+            no process. The card carries toggleable provider/model/effort/role chips; the FIRST prompt sent
+            to it spawns the session with those choices (render.js's unstarted branch → sessionLaunch). */}
+        <button onClick={() => run(() => createUnstartedSession(m, at))}>New session</button>
         <button onClick={() => run(() => addRolesCard(m, at))}>Roles</button>
         <button onClick={() => run(() => void createThread(m.editor, at))}>New thread</button>
         {/* The HUD singletons (usage / sessions / clock / Threads) — true singletons: one instance, stable id.

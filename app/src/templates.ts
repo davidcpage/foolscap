@@ -3,7 +3,7 @@ import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal, onFeedsReconnect } from "./feeds";
 import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, rootOfId, type RootId } from "./loader";
+import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, rootOfId, sessionSpawnBody, newSessionStub, parseSessionStub, type SessionStub, type RootId } from "./loader";
 // The role.md codec — the ONE source for `role.md text <-> {name,colour,charter}`, shared with the server
 // ledger (role-ledger.js). The host parses/serialises here so the role CARD stays a pure view (it can only
 // import /vendor/, never this) — exactly how the host hands cards parsed sessionList/dirListing data.
@@ -520,6 +520,55 @@ export function buildCard(
           (r) => r.ok,
           () => false,
         );
+      continue;
+    }
+    // `sessionConfigure` is the UNSTARTED session card's chip-write (deferred-start-session-cards): a
+    // per-card ACTION that merges a {provider?,model?,effort?,roleId?} patch into the stub descriptor
+    // carried in the node's `text` and commits it (actor "user", undoable — a stub is a real card the human
+    // is arranging). Only meaningful before launch; once the live feed supersedes the blob render.js gates
+    // the chips read-only, so this never fires on a running session. A no-op without a host (headless mock).
+    if (name === "sessionConfigure" && host) {
+      const { id, editor } = host;
+      signals.sessionConfigure = (patch: Partial<SessionStub>): void => {
+        const cur = parseSessionStub(nodeSub.get()?.text) ?? newSessionStub();
+        editor.commit({ type: "setText", actor: "user", payload: { id, text: JSON.stringify({ ...cur, ...patch }) } });
+      };
+      continue;
+    }
+    // `sessionLaunch` is the UNSTARTED card's first-prompt SPAWN (deferred-start-session-cards): a per-card
+    // ACTION that reads the stub's chosen provider/model/effort/role and POSTs /api/session/spawn WITH this
+    // card's OWN id (its title), so the process adopts that id and the feed — keyed by the same id — flips
+    // this card from stub to live duplex with no new card. On success it clears the stub blob (so the card
+    // reads as a fresh just-spawned session even before the first feed frame) and stamps the role's friendly
+    // name; on failure the stub is left intact for a retry. The spawn is a POST; the text/name stamps are the
+    // card's own commits, exactly as the stub's addNode was.
+    if (name === "sessionLaunch" && host) {
+      const { id, editor } = host;
+      signals.sessionLaunch = (prompt: string): Promise<boolean> => {
+        const stub = parseSessionStub(nodeSub.get()?.text) ?? newSessionStub();
+        const sid = nodeSub.get()?.title ?? "";
+        const body = {
+          id: sid,
+          ...sessionSpawnBody(stub.roleId ?? undefined, stub.provider, stub.model ?? undefined, stub.effort ?? undefined),
+          prompt,
+        };
+        return fetch(`/api/session/spawn?board=${activeBoardId()}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).then(
+          async (r) => {
+            if (!r.ok) return false;
+            const { roleName } = (await r.json().catch(() => ({}))) as { roleName?: string };
+            // Clear the stub so the card stops reading as unstarted even before the first live frame.
+            editor.commit({ type: "setText", actor: "system", payload: { id, text: "" } });
+            if (roleName)
+              editor.commit({ type: "setName", actor: "system", payload: { id, name: `${roleName}.${sid.slice(0, 8)}` } });
+            return true;
+          },
+          () => false,
+        );
+      };
       continue;
     }
     // `sessionPermission` is the answer half of the permission-prompt relay (permission-prompt-tool):
