@@ -18,6 +18,7 @@ import { sessionHasScheduledWake } from "./standing-jobs.js";
 import { readRole } from "./role-ledger.js";
 import { ensureWorktree, listWorktrees as listThreadWorktrees, workItemKey, worktreeOnboarding } from "./worktrees.js";
 import { sendJson } from "./server-http.js";
+import { isTmpdirRepo } from "./server-boards.js";
 import type { LiveSession, SessionBand } from "./server-types.js";
 
 // ── the session / spawn / host ENGINE (P5 sub-step 2) ───────────────────────────────────────────────────
@@ -1068,22 +1069,25 @@ export const liveSessionCount = (): number => {
 
 // Board-level spawn refusal: the reason NO real `claude` session — explicit spawn or server-fired wake —
 // may run on this board, or null when spawning is allowed. Two triggers: the explicit `noSessions` mount
-// flag (sticky, registry-persisted), and a backstop for any board whose repo lives under the OS tmpdir —
-// tmpdir repos are scratch/test boards by construction (the http-contract suite's board lives there), and
-// its annotation writes once auto-woke a REAL doc worker per test run. Every refusal is LOUD (403 on the
-// spawn route, a warn on the auto-wake path) — never a silent drop.
+// flag (sticky, registry-persisted), and a backstop for any board whose repo lives under the OS tmpdir
+// (isTmpdirRepo, the single definition in server-boards) — tmpdir repos are scratch/test boards by
+// construction (the http-contract suite's board lives there), and its annotation writes once auto-woke a
+// REAL doc worker per test run. The EXPLICIT spawn route stays LOUD (403) — never a silent drop; the
+// auto-wake path's refusal is definitional on a scratch board, so its warn is quieted there (isScratchBoard).
 export function sessionSpawnRefusal(boardId: string): string | null {
   const b = getServerContext().boards.get(boardId);
   if (!b) return null; // unknown board — the spawn path's own board resolution surfaces that error
   if (b.noSessions) return `board ${boardId} is mounted noSessions — real sessions never spawn on a test/scratch board`;
-  try {
-    const tmp = fs.realpathSync(os.tmpdir());
-    if (fs.realpathSync(b.repoPath).startsWith(tmp + path.sep))
-      return `board ${boardId} lives under the OS tmpdir (${b.repoPath}) — treated as a scratch/test board, real sessions never spawn here`;
-  } catch {
-    /* repo path vanished — let the spawn path surface its own error */
-  }
+  if (isTmpdirRepo(b.repoPath))
+    return `board ${boardId} lives under the OS tmpdir (${b.repoPath}) — treated as a scratch/test board, real sessions never spawn here`;
   return null;
+}
+
+// The boolean twin of sessionSpawnRefusal, for the call sites that only need "is this a throwaway board?"
+// (skip shadow machinery, quiet the definitional guard warns) rather than the refusal reason string. True
+// for both the noSessions mount flag and a tmpdir repo — either way, no real work should ever run here.
+export function isScratchBoard(boardId: string): boolean {
+  return sessionSpawnRefusal(boardId) !== null;
 }
 
 // Footprint of a SERVER-created worker card (matches the client's session-card default size).
@@ -1169,7 +1173,11 @@ export function serverSpawnWorker(opts: {
   // real session, however it was triggered — the http-contract suite's annotation answers used to.
   const refusal = sessionSpawnRefusal(opts.boardId);
   if (refusal) {
-    console.warn(`[auto-wake] REFUSED server-fired spawn for ${opts.claimKey}: ${refusal}`);
+    // Quiet on a scratch/test board — a refused wake there is DEFINITIONAL (the http-contract suite trips
+    // this deterministically per run), not an event worth a warn. A real board keeps the loud line so an
+    // operator sees a wake that should have serviced a doc/seat being turned away.
+    if (!isScratchBoard(opts.boardId))
+      console.warn(`[auto-wake] REFUSED server-fired spawn for ${opts.claimKey}: ${refusal}`);
     return null;
   }
   if (liveSessionCount() >= MAX_LIVE_SESSIONS) {

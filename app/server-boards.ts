@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { execFileSync } from "node:child_process";
@@ -45,6 +46,29 @@ export function boardIdentity(repoPath: string): { boardId: string; name: string
   return { boardId: `${slug(name)}-${hash}`, name, repoPath: real };
 }
 
+// A scratch/test board's repo lives under the OS tmpdir — the http-contract suite mounts its board there,
+// and such a tree is throwaway by construction. This is the ONE definition of that predicate (don't persist
+// one, prune it at boot, refuse real sessions on it — sessionSpawnRefusal shares it). Match at ANY depth
+// under tmpdir; NEVER a substring match (a sibling like `${tmp}-evil` is a different tree, so compare against
+// `tmp + path.sep`), and realpath BOTH sides so a symlinked tmpdir (macOS `/tmp` → `/private/var/…`) matches.
+// A path that can't be realpath'd (a scratch dir already deleted) falls back to its resolved form — the
+// registry stores repoPaths already realpath'd, so a vanished tmpdir entry still matches and gets pruned.
+export function isTmpdirRepo(repoPath: string): boolean {
+  let tmp: string;
+  try {
+    tmp = fs.realpathSync(os.tmpdir());
+  } catch {
+    tmp = path.resolve(os.tmpdir());
+  }
+  let real: string;
+  try {
+    real = fs.realpathSync(repoPath);
+  } catch {
+    real = path.resolve(repoPath);
+  }
+  return real === tmp || real.startsWith(tmp + path.sep);
+}
+
 export const DEFAULT_BOARD = boardIdentity(ROOTS.repo!);
 // boardId → its served root + metadata. Pinned on globalThis so mounts made through /api/boards SURVIVE a
 // dev-server re-eval (a plugin edit re-runs this module in the same process) — an open non-default tab would
@@ -72,6 +96,10 @@ export function readBoardRegistry(): BoardRegistryEntry[] {
 // Upsert on every mount POST — read-modify-write against the FILE, not a cached copy (the module hot
 // re-evals; cheap correctness beats a stale mirror at this call rate).
 export function recordBoardOpened(boardId: string, name: string, repoPath: string, noSessions?: boolean): void {
+  // Scratch/test boards (repo under the OS tmpdir) are NEVER persisted: boot would otherwise re-mount the
+  // dead tmpdir forever and re-arm shadow/feed machinery on it (the http-contract suite's board did exactly
+  // that). The mount still works in-memory for this process — it just isn't remembered across a restart.
+  if (isTmpdirRepo(repoPath)) return;
   const all = readBoardRegistry();
   const prev = all.find((e) => e.boardId === boardId);
   const entries = all.filter((e) => e.boardId !== boardId);
@@ -85,16 +113,33 @@ export function recordBoardOpened(boardId: string, name: string, repoPath: strin
     console.error("[boards] registry write failed:", e instanceof Error ? e.message : e);
   }
 }
-// Boot remount: re-register every remembered board whose repo still exists. Entries for vanished paths
-// are KEPT in the file (a repo on an unmounted volume isn't gone forever) but not served this run.
-for (const e of readBoardRegistry()) {
-  if (boards.has(e.boardId)) continue;
-  try {
-    if (!fs.statSync(e.repoPath).isDirectory()) continue;
-  } catch {
-    continue;
+// Boot prune of scratch residue + remount. A tmpdir board should never have been persisted
+// (recordBoardOpened now refuses one), but existing installs carry one written before this fix — the
+// http-contract suite's `canvas-contract-board-<hash>`. Drop every tmpdir entry from the durable registry
+// ONCE at boot so the file self-heals with no hand-editing, then remount the survivors: re-register every
+// remembered board whose repo still exists. Entries for vanished non-tmpdir paths are KEPT in the file (a
+// repo on an unmounted volume isn't gone forever) but not served this run.
+{
+  const all = readBoardRegistry();
+  const kept = all.filter((e) => !isTmpdirRepo(e.repoPath));
+  if (kept.length !== all.length) {
+    try {
+      fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
+      fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: kept }, null, 2) + "\n");
+      console.log(`[boards] pruned ${all.length - kept.length} scratch (tmpdir) board(s) from the registry`);
+    } catch (e) {
+      console.error("[boards] scratch-prune write failed:", e instanceof Error ? e.message : e);
+    }
   }
-  boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath, ...(e.noSessions ? { noSessions: true } : {}) });
+  for (const e of kept) {
+    if (boards.has(e.boardId)) continue;
+    try {
+      if (!fs.statSync(e.repoPath).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    boards.set(e.boardId, { root: e.repoPath, name: e.name, repoPath: e.repoPath, ...(e.noSessions ? { noSessions: true } : {}) });
+  }
 }
 // …and the reverse: PRUNE pinned entries the registry no longer records (the file is the durable truth —
 // deleting an entry there is how a scratch/test board is retired without bouncing the whole process; the
