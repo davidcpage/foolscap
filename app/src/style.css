@@ -3982,12 +3982,83 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   color: #52525b;
 }
 
+/* The board-switcher pill — standing viewport chrome at the bottom-left. Rests as the current board's tab;
+   expands rightward on hover/click into a spreadsheet-style tab row (one tab per mounted board + a `+`).
+   NOT a HUD card, so it never hides with the Alt-tap HUD toggle. Light glassy styling mirrors .event-chip. */
+.board-strip {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  z-index: 12; /* above the fs-watch event-chip (10), which is nudged up to bottom:48px to clear this */
+  pointer-events: none; /* only the tabs themselves catch clicks; empty space falls through to the canvas */
+}
+.board-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+}
+.board-tab {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 160px;
+  padding: 4px 10px;
+  background: #ffffffcc;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #00000012;
+  border-radius: 8px;
+  color: #52525b;
+  font-size: 11px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.board-tab:hover {
+  background: #ffffff;
+  color: #3f3f46;
+}
+.board-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* The current board's tab: highlighted and inert for navigation (you can't switch to where you are). */
+.board-tab-current {
+  color: #3f3f46;
+  font-weight: 600;
+  background: #eef2ffdd;
+  border-color: #6366f133;
+  cursor: default;
+}
+.board-tab-current:hover {
+  background: #eef2ffee;
+}
+.board-tab-tag {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.board-tab-add {
+  font-weight: 600;
+  color: #6366f1;
+  padding: 4px 9px;
+}
+.board-tab-loading {
+  pointer-events: none;
+  color: #a1a1aa;
+  cursor: default;
+}
+
 /* The live fs-watch indicator — an unobtrusive chip floating at the bottom-left. It fades in, holds, then
    fades out over ~2.6s (the JS timer unmounts it at the tail); the last survivor of the removed status bar.
    Kept small and pointer-transparent so it never reads as standing chrome or intercepts a click. */
 .event-chip {
   position: absolute;
-  bottom: 12px;
+  /* Sits ABOVE the standing board-switcher pill (bottom:12px, ~26px tall) so the two never overlap. */
+  bottom: 48px;
   left: 12px;
   z-index: 10;
   padding: 3px 9px;
