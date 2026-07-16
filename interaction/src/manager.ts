@@ -278,7 +278,8 @@ export class InteractionManager implements InteractionContext {
     if (ids.length === 0) return this.fitAll(skipLayout);
     const box = selectionBounds(this.editor.store, ids);
     if (!box) return;
-    const s = this.camera.fitState(box, this.viewportW, this.viewportH, { pad: 0.15, maxZoom: 2 });
+    // maxZoom 1 matches fitAll and peek: a single small card frames at natural size, not slammed to 2×.
+    const s = this.camera.fitState(box, this.viewportW, this.viewportH, { pad: 0.15, maxZoom: 1 });
     if (s) this.flyTo(s);
   }
 
