@@ -260,6 +260,33 @@ function handleFeeds(req: IncomingMessage, res: ServerResponse): void {
 const wsAttachedServers: WeakSet<object> = ((globalThis as { __canvasWsAttached?: WeakSet<object> })
   .__canvasWsAttached ??= new WeakSet());
 
+// The minimal ws surface the heartbeat reaper touches (the real `ws` WebSocket satisfies it; a test can
+// pass a fake). `on("pong", …)` re-arms the liveness flag; `terminate()` force-closes a half-open socket
+// (which fires the existing ws.on("close"), the ONE WsClient removal path); `ping()` probes.
+interface HeartbeatWs {
+  readyState: number;
+  OPEN: number;
+  on(event: "pong", cb: () => void): void;
+  ping(): void;
+  terminate(): void;
+}
+
+// Standard ws heartbeat reaper (exported for direct test). Each tick: if the socket missed the previous
+// ping (no pong arrived since it was armed), terminate it — that fires ws.on("close") which removes the
+// WsClient, so an orphaned board-switch socket is reaped within ~2 intervals (~50s). Otherwise re-arm
+// isAlive=false and ping. Returns the interval handle so the close handler can clearInterval it.
+export function installWsHeartbeat(ws: HeartbeatWs, intervalMs = 25000): ReturnType<typeof setInterval> {
+  let isAlive = true;
+  ws.on("pong", () => {
+    isAlive = true;
+  });
+  return setInterval(() => {
+    if (!isAlive) return void ws.terminate();
+    isAlive = false;
+    if (ws.readyState === ws.OPEN) ws.ping();
+  }, intervalMs);
+}
+
 function attachWs(server: ViteDevServer): void {
   const http = server.httpServer;
   if (!http || wsAttachedServers.has(http)) return;
@@ -278,6 +305,7 @@ function attachWs(server: ViteDevServer): void {
       if (!b) return void ws.close(4400, "unknown board");
       const client: WsClient = {
         boardId: b.boardId,
+        tab: url.searchParams.get("tab") ?? undefined, // stable per-tab id — dedupes board-switch overlap
         watches: new Map(),
         send(msg) {
           if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(msg));
@@ -301,9 +329,11 @@ function attachWs(server: ViteDevServer): void {
       // server-side at /api/command (with or without a live tab), so a freshly-attached tab hydrates every
       // created node/edge from the durable store via its boot GET /api/board/persist — there is nothing left
       // to hand-replay on attach.
-      const ping = setInterval(() => {
-        if (ws.readyState === ws.OPEN) ws.ping();
-      }, 25000);
+      // Heartbeat reaper (see installWsHeartbeat): a board switch is a full-page nav, so the old page's
+      // socket should close — but an abrupt document teardown can lose the close frame, leaving a half-open
+      // socket filed forever under the same board id. That was the phantom "N tabs now live" over-count;
+      // the reaper terminates a socket that missed its ping, which fires ws.on("close") to remove the client.
+      const ping = installWsHeartbeat(ws);
       ws.on("message", (data) => {
         let msg: { sub?: unknown; unsub?: unknown; root?: unknown };
         try {
@@ -450,9 +480,19 @@ function busClientsFor(boardId: string): Set<SseClient> {
 
 // How many tabs can ACT on this board right now — the same census dispatchBusCommand's `delivered` is
 // judged against (the app's tabs ride /api/ws; the SSE set is the compat path). The `tabs` liveness
-// signal on GET /api/canvas.
-function tabCountFor(boardId: string): number {
-  return (busClients.get(boardId)?.size ?? 0) + [...getWsClients(fsState)].filter((c) => c.boardId === boardId).length;
+// signal on GET /api/canvas. WS clients are deduped by their stable per-tab id (?tab=), so a board-switch
+// overlap — the old page's socket lingering until the reaper takes it — counts as ONE tab, not two;
+// untagged/legacy WS connections have no id and each count individually. The SSE busClients keep counting
+// as before (one compat path per connection).
+export function tabCountFor(boardId: string): number {
+  const tabs = new Set<string>();
+  let untagged = 0;
+  for (const c of getWsClients(fsState)) {
+    if (c.boardId !== boardId) continue;
+    if (c.tab) tabs.add(c.tab);
+    else untagged++;
+  }
+  return (busClients.get(boardId)?.size ?? 0) + tabs.size + untagged;
 }
 
 // T3c helper: tear down every edge touching `nodeId` before its removeNode lands. Emits a removeEdge over

@@ -108,6 +108,8 @@ export interface PendingPermission {
 // connection slots. A WebSocket lives in a separate, much larger browser budget.
 export interface WsClient {
   boardId: string; // fixed at connect (?board=) — bus commands fan out per board
+  tab?: string; // stable per-tab id (?tab=, sessionStorage-scoped) so tabCountFor dedupes a board-switch
+  // overlap (old page's socket not yet reaped) into ONE tab; absent = legacy/untagged, counts individually
   watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
   send(msg: unknown): void;
 }
