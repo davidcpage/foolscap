@@ -75,9 +75,17 @@ function withLock(key, fn) {
 }
 
 async function provision(gitDir, workTree) {
-  if (fs.existsSync(path.join(gitDir, "HEAD"))) return; // idempotent
-  fs.mkdirSync(gitDir, { recursive: true });
   const base = ["--git-dir", gitDir, "--work-tree", workTree];
+  // Idempotent, but verify the shadow DB is REAL — not merely that HEAD exists. macOS's tmp-reaper can
+  // half-wipe a shadow git dir (HEAD left behind, objects/refs gone), and every later `git add` then dies
+  // "fatal: not a git repository" forever. `rev-parse --git-dir` is git's OWN is-this-a-repo check (it fails
+  // exactly that validity test): exit 0 → already provisioned, skip; else fall through and (re-)init over the
+  // ruins so a REAL board's shadow self-heals instead of throwing on every commit.
+  if (fs.existsSync(path.join(gitDir, "HEAD"))) {
+    const probe = await run([...base, "rev-parse", "--git-dir"], workTree);
+    if (probe.code === 0) return;
+  }
+  fs.mkdirSync(gitDir, { recursive: true });
   const init = await run([...base, "init", "--quiet"], workTree);
   if (init.code !== 0) throw new Error(`shadow git init failed: ${init.stderr.trim()}`);
   await run([...base, "config", "core.bare", "false"], workTree);

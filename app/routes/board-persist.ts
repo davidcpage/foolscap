@@ -11,6 +11,7 @@ import {
   writeBoardSnapshot,
 } from "../board-persist.js";
 import { appendTabEvent, dropBoardEngine, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
+import { isScratchBoard } from "../server-sessions.js";
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) — Phase 1 split ─
 // The browser's EventStore/SnapshotStore (core's persistence seam) are HTTP clients over these endpoints
@@ -64,10 +65,15 @@ async function handleBoardPersistWrite(
       if (
         before && typeof before.seq === "number" && typeof snap.seq === "number" && snap.seq < before.seq
       ) {
-        console.warn(
-          `[boards] STALE snapshot save refused for ${boardId}: seq ${snap.seq} < stored ${before.seq} — ` +
-            `a second writer is behind the board (another tab or a leaked probe)`,
-        );
+        // The 409 is unconditional (the guard BEHAVIOR never changes — the stale write must not clobber),
+        // but the warn is quieted on a scratch/test board: the http-contract suite provokes this 409 on
+        // purpose every run, so on that board it is expected, not news. A real board keeps the loud line —
+        // a stale second writer there is a genuine desync worth surfacing.
+        if (!isScratchBoard(boardId))
+          console.warn(
+            `[boards] STALE snapshot save refused for ${boardId}: seq ${snap.seq} < stored ${before.seq} — ` +
+              `a second writer is behind the board (another tab or a leaked probe)`,
+          );
         return sendJson(res, 409, { error: "stale snapshot", storedSeq: before.seq, gotSeq: snap.seq });
       }
       writeBoardSnapshot(repoPath, snap as Record<string, unknown>);

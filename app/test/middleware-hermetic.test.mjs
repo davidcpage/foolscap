@@ -36,6 +36,7 @@ const snap = await import("../server-snapshot.ts");
 const ctx = await import("../server-context.ts");
 const orch = await import("../server-orchestration.ts");
 const sess = await import("../server-sessions.ts");
+const boardsMod = await import("../server-boards.ts");
 const delivery = await import("../server-delivery.ts");
 const engine = await import("../board-engine.ts");
 const bp = await import("../board-persist.js");
@@ -833,4 +834,51 @@ test("dropped-delivery regression: posting while a message from ANOTHER is unrea
   session.read[tid] = casGuard.senderCursorAfterPost(2, 3);
   assert.equal(session.read[tid], 3);
   assert.equal(inbox.computeInbox("s1", NO_OPTS).body.channels.length, 0, "caught-up sender sees no echo of its own post");
+});
+
+// ── Group H: scratch-board predicates (phase-2 log-noise fix) ────────────────────────────────────────
+// isTmpdirRepo is the ONE definition of "this repo is a throwaway scratch/test board" (server-boards.ts):
+// recordBoardOpened refuses to persist one, boot prunes one, and sessionSpawnRefusal/isScratchBoard build on
+// it. Tested DIRECTLY (the Coordinator's ask): match at any depth, never a substring of a sibling.
+test("isTmpdirRepo matches under the OS tmpdir at any depth but never a substring sibling", () => {
+  const tmp = fs.realpathSync(os.tmpdir());
+  // A real dir directly under tmpdir → scratch.
+  const shallow = fs.mkdtempSync(path.join(tmp, "scratch-shallow-"));
+  assert.equal(boardsMod.isTmpdirRepo(shallow), true, "a dir directly under tmpdir is scratch");
+  // A real dir nested several levels under tmpdir → still scratch (depth-independent, not a prefix hack).
+  const deep = path.join(shallow, "a", "b", "c");
+  fs.mkdirSync(deep, { recursive: true });
+  assert.equal(boardsMod.isTmpdirRepo(deep), true, "a deeply nested dir under tmpdir is scratch");
+  // A path that no longer exists but is stored as a tmpdir path → still scratch (the vanished-scratch case:
+  // realpath fails, the fallback compares the resolved stored path, which the registry already stored real).
+  assert.equal(boardsMod.isTmpdirRepo(path.join(tmp, "canvas-contract-board-gone")), true, "a deleted tmpdir path still prunes");
+  // A SIBLING whose name merely shares tmpdir as a string prefix is NOT scratch (the substring-match trap):
+  // `${tmp}-evil` is a different tree, guarded by comparing against `tmp + path.sep`.
+  assert.equal(boardsMod.isTmpdirRepo(tmp + "-evil/repo"), false, "a `${tmp}-evil` sibling is not scratch");
+  // A real repo well outside tmpdir (this checkout) is a real board.
+  assert.equal(boardsMod.isTmpdirRepo(process.cwd()), false, "the dev checkout is a real board");
+});
+
+test("isScratchBoard is true for a tmpdir repo OR the noSessions flag, false for a real board / unknown", () => {
+  const tmpBoard = fs.mkdtempSync(path.join(os.tmpdir(), "scratch-board-"));
+  const realBoard = fs.mkdtempSync(path.join(process.cwd(), "hermetic-real-")); // a real dir, NOT under tmpdir
+  try {
+    ctx.setServerContext({
+      boards: new Map([
+        ["tmp-b", { boardId: "tmp-b", repoPath: tmpBoard }],
+        ["flag-b", { boardId: "flag-b", repoPath: realBoard, noSessions: true }],
+        ["real-b", { boardId: "real-b", repoPath: realBoard }],
+      ]),
+    });
+    assert.equal(sess.isScratchBoard("tmp-b"), true, "tmpdir repo → scratch");
+    assert.equal(sess.isScratchBoard("flag-b"), true, "noSessions flag → scratch even off tmpdir");
+    assert.equal(sess.isScratchBoard("real-b"), false, "a real board off tmpdir with no flag → not scratch");
+    assert.equal(sess.isScratchBoard("no-such-board"), false, "an unknown board is not scratch (spawn path surfaces its own error)");
+    // sessionSpawnRefusal, its string twin, agrees and names the reason.
+    assert.match(sess.sessionSpawnRefusal("tmp-b") ?? "", /tmpdir/, "the refusal reason names the tmpdir backstop");
+    assert.match(sess.sessionSpawnRefusal("flag-b") ?? "", /noSessions/, "the refusal reason names the sticky flag");
+    assert.equal(sess.sessionSpawnRefusal("real-b"), null, "a real board is spawn-allowed");
+  } finally {
+    fs.rmSync(realBoard, { recursive: true, force: true });
+  }
 });
