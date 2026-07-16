@@ -61,6 +61,14 @@ test("mount: POST /api/boards is idempotent and mints a stable boardId", { skip:
   assert.equal((await fetch(`${HOST}/api/board/persist?board=${boardId}`, { method: "DELETE" })).status, 200);
 });
 
+test("scratch board stays out of the GET /api/boards listing", { skip: !up && "no dev server on 5173" }, async () => {
+  // The mount works in-memory (this suite reaches its board by id all through the run), but a tmpdir
+  // scratch board must not show in the picker — it used to linger in the boards menu until a restart.
+  const listed = (await (await fetch(`${HOST}/api/boards`)).json()).boards;
+  assert.ok(Array.isArray(listed) && listed.length > 0, "listing still serves real boards");
+  assert.equal(listed.find((b) => b.boardId === boardId), undefined, "tmpdir scratch board is not listed");
+});
+
 test("no real sessions on a scratch board: explicit spawn is 403", { skip: !up && "no dev server on 5173" }, async () => {
   // The tmpdir backstop alone must refuse (the sticky noSessions flag is belt on top): a board whose repo
   // lives under os.tmpdir() never runs a live `claude`. If this 200s, a test run just cost real tokens.

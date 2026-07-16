@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
 import { getServerContext } from "../server-context.js";
+import { isTmpdirRepo } from "../server-boards.js";
 import { exact, type GlobalRoute } from "./router.js";
 
 // ── /api/boards — the board registry (god-file split, Phase 1) ──────────────────────────────────────
@@ -25,8 +26,13 @@ function handleBoards(res: ServerResponse): void {
   // lastOpened rides along from the registry (0 for the default board / anything unrecorded) so the
   // picker can sort by recency without a second endpoint.
   const opened = new Map(ctx.readBoardRegistry().map((e) => [e.boardId, e.lastOpened]));
+  // Tmpdir scratch boards (the http-contract suite's mount) stay OUT of the listing: they're never
+  // persisted, never picker-worthy, and would linger in the menu until a restart. The mount itself still
+  // works — a test tab reaches its board via ?repo=, not the picker.
   sendJson(res, 200, {
-    boards: [...ctx.boards.entries()].map(([id, b]) => ({ ...boardJson(id, b), lastOpened: opened.get(id) ?? 0 })),
+    boards: [...ctx.boards.entries()]
+      .filter(([, b]) => !isTmpdirRepo(b.repoPath))
+      .map(([id, b]) => ({ ...boardJson(id, b), lastOpened: opened.get(id) ?? 0 })),
   });
 }
 

@@ -175,7 +175,10 @@ function realpath(p: string): string {
 function listWorktrees(canonicalPath: string): RootInfo[] {
   let out: string;
   try {
-    out = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: canonicalPath, encoding: "utf8" });
+    // stderr silenced: execFileSync passes the child's stderr through to the terminal by default, so a
+    // non-git board (a tmpdir scratch repo) would print `fatal: not a git repository` on every roots scan
+    // even though the catch below already handles it.
+    out = execFileSync("git", ["worktree", "list", "--porcelain"], { cwd: canonicalPath, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return []; // not a git repo / git absent — no worktrees, just the canonical root
   }
