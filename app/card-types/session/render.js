@@ -35,7 +35,7 @@ const MODEL_ALIAS = {
   sonnet: ["Sonnet", "bronze"],
   haiku: ["Haiku", "plain"],
 };
-function modelChip(model, effort, variant) {
+function modelChip(model, effort, variant, note) {
   if (typeof model !== "string" || !model) return null;
   let label, tier;
   if (MODEL_DISPLAY[model]) [label, tier] = MODEL_DISPLAY[model];
@@ -44,9 +44,10 @@ function modelChip(model, effort, variant) {
   else [label, tier] = [model.replace(/^claude-/, ""), "plain"];
   const eff = typeof effort === "string" && effort ? effort : null;
   const sub = variant === "sub"; // a subagent chip: smaller, dimmer, ↳-marked, never the main pill
+  const kind = sub ? `subagent${note ? ` (${note})` : ""} ` : ""; // note = subagent_type, in the tooltip
   return html`<span
     class="ses-model ses-model-${tier}${sub ? " ses-model-sub" : ""}"
-    title=${`${sub ? "subagent " : ""}model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
+    title=${`${kind}model: ${model}${eff ? ` · effort: ${eff}` : ""}`}
     >${label}${eff ? html`<span class="ses-model-effort"> ·${eff}</span>` : ""}</span
   >`;
 }
@@ -744,7 +745,7 @@ export default {
     // (server-sessions.ts publishSession). Rendered as smaller secondary chips AFTER the main pill so a
     // subagent on a different model is visible without ever displacing it. Empty/absent → nothing.
     const subPills = (live && Array.isArray(live.subagents) ? live.subagents : [])
-      .map((sa) => modelChip(sa && sa.model, null, "sub"))
+      .map((sa) => modelChip(sa && sa.model, null, "sub", sa && sa.subagentType))
       .filter(Boolean);
 
     // The INPUT half (agent-sessions §3; session-timelines §4): send a prompt into the live session

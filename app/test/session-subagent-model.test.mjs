@@ -105,13 +105,29 @@ test("a Task/Agent tool_use registers a subagent with its requested model + type
   assert.equal(s.model, "claude-sonnet-5", "registering a subagent must not touch the main pill");
 });
 
-test("a subagent with no requested model is tracked but omitted from the published (model-known) chips", () => {
+test("publishedSubagents: an explicit-model subagent publishes that alias", () => {
   wire();
   const s = makeSession("claude-sonnet-5");
-  sessions.foldSessionEvent(s, toolUse("Task", "toolu_x", { subagent_type: "general-purpose" })); // inherits parent model
-  assert.equal(s.subagents.get("toolu_x").model, null);
-  const known = [...s.subagents.values()].filter((x) => x.model);
-  assert.equal(known.length, 0, "an inherited-model subagent yields no distinct chip");
+  sessions.foldSessionEvent(s, toolUse("Agent", "toolu_a", { model: "haiku", subagent_type: "general-purpose" }));
+  assert.deepEqual(sessions.publishedSubagents(s), [{ model: "haiku", subagentType: "general-purpose" }]);
+});
+
+test("publishedSubagents: an INHERITED-model subagent is still shown, with the parent's effective model", () => {
+  wire();
+  const s = makeSession("claude-sonnet-5");
+  sessions.foldSessionEvent(s, toolUse("Task", "toolu_x", { subagent_type: "general-purpose" })); // no input.model
+  assert.equal(s.subagents.get("toolu_x").model, null, "stored as inherited (null)");
+  assert.deepEqual(
+    sessions.publishedSubagents(s),
+    [{ model: "claude-sonnet-5", subagentType: "general-purpose" }],
+    "an active subagent is always worth showing → falls back to the parent's serving model",
+  );
+});
+
+test("publishedSubagents: undefined when there are no subagents", () => {
+  wire();
+  const s = makeSession("claude-sonnet-5");
+  assert.equal(sessions.publishedSubagents(s), undefined);
 });
 
 test("a matching tool_result drops the subagent chip (synchronous path)", () => {
@@ -138,6 +154,32 @@ test("the turn's result event clears any lingering subagent chips (stale-pill ba
   sessions.foldSessionEvent(s, toolUse("Agent", "toolu_4", { model: "haiku" }));
   sessions.foldSessionEvent(s, { type: "result", subtype: "success", result: "done" });
   assert.equal(s.subagents === undefined || s.subagents.size === 0, true, "no subagent survives the turn boundary");
+});
+
+test("seedFromTranscript recovers the MAIN model, guarding against an inlined sidechain (isSidechain)", () => {
+  wire();
+  // seedFromTranscript reads ~/.claude/projects/<cwd-slug>/<id>.jsonl (sessionsDir → projectsDirForCwd).
+  // Seed a transcript where the LAST assistant message is a sidechain (older-CC inline shape): the
+  // recovered model must be the main agent's earlier one, NOT the sidechain's.
+  const uniqueCwd = fs.mkdtempSync(path.join(os.tmpdir(), "seed-cwd-"));
+  const dir = sessions.sessionsDir(uniqueCwd);
+  fs.mkdirSync(dir, { recursive: true });
+  const id = "seed-test";
+  const lines = [
+    JSON.stringify({ type: "assistant", isSidechain: false, message: { model: "claude-sonnet-5", content: [{ type: "text", text: "main" }] } }),
+    JSON.stringify({ type: "assistant", isSidechain: true, message: { model: "claude-haiku-4-5-20251001", content: [{ type: "text", text: "sub" }] } }),
+  ].join("\n");
+  fs.writeFileSync(path.join(dir, id + ".jsonl"), lines + "\n");
+  try {
+    const s = makeSession(null);
+    s.id = id;
+    s.cwd = uniqueCwd;
+    sessions.seedFromTranscript(s);
+    assert.equal(s.model, "claude-sonnet-5", "a trailing sidechain message must not become the recovered model");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(uniqueCwd, { recursive: true, force: true });
+  }
 });
 
 test("REPLAY of a real claude -p subagent capture: main model stays put, no chip lingers at turn end", () => {

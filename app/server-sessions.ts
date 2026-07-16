@@ -719,7 +719,7 @@ export function foldSessionEvent(s: LiveSession, e: any): void {
 // on-disk `.jsonl`, or recommencing would blank the card's history (the live feed supersedes the
 // static fields.text). The registry "materialising"/pinning the transcript for the live tail
 // (session-timelines.md §5). Same shape foldSessionEvent stores: one {type,message} string per turn.
-function seedFromTranscript(s: LiveSession): void {
+export function seedFromTranscript(s: LiveSession): void {
   // Claude Code stores transcripts per PROCESS working dir, so key off cwd (the worktree for a --worktree
   // session), not the canonical board root — else a worktree session's transcript wouldn't be found.
   const r = readSessionFile(sessionsDir(s.cwd), s.id);
@@ -1629,6 +1629,19 @@ function permissionsOf(sid: string): Array<{ id: string; toolName: string; input
 
 // Publish the session's buffer (completed lines + the in-flight synthetic turn) on its feed. Bounded
 // from the tail; `truncated` mirrors the codec's existing cap signal so the card flags a clipped view.
+// The live subagents projected for the feed: each tracked Task/Agent sidechain as {model, subagentType},
+// its model being the explicitly-requested one or — when it inherited the parent's — the session's current
+// serving model (its effective model). An entry with no resolvable model at all (subagent seen before the
+// main pill was ever set) is dropped. Returns undefined when there's nothing to show. Pure over `s` so the
+// resolution is unit-testable (session-subagent-model.test.mjs).
+export function publishedSubagents(s: LiveSession): Array<{ model: string; subagentType?: string }> | undefined {
+  if (!s.subagents?.size) return undefined;
+  const arr = [...s.subagents.values()]
+    .map((x) => ({ model: (x.model || s.model || "") as string, subagentType: x.subagentType }))
+    .filter((x) => !!x.model);
+  return arr.length ? arr : undefined;
+}
+
 export function publishSession(s: LiveSession): void {
   const { publishFeed } = getServerContext();
   const lines = [...s.lines];
@@ -1666,15 +1679,10 @@ export function publishSession(s: LiveSession): void {
     model: s.model ?? undefined, // the model actually serving the session (tracks refusal fallbacks)
     effort: s.effort ?? undefined, // the reasoning effort this session was spawned at (pill suffix); absent = provider default
     // Live subagents (Task/Agent sidechains) currently running, as their OWN secondary chips beside the
-    // main model pill — only those whose model we know (a subagent inheriting the parent model has no
-    // distinct model to show, so it's omitted rather than duplicating the main chip). Absent when none.
-    subagents: (() => {
-      if (!s.subagents?.size) return undefined;
-      const arr = [...s.subagents.values()]
-        .filter((x) => typeof x.model === "string" && x.model)
-        .map((x) => ({ model: x.model as string, subagentType: x.subagentType }));
-      return arr.length ? arr : undefined;
-    })(),
+    // main model pill. An active subagent is always worth showing, so a subagent that INHERITED the parent
+    // model (no explicit input.model) is published with the parent's serving model — its effective model —
+    // rather than hidden. Absent when none. See publishedSubagents.
+    subagents: publishedSubagents(s),
     endReason: s.endReason ?? undefined, // Phase 2: done/terminated/crashed → the exited band's flavour
     waitingOn: s.waitingOn ?? undefined, // @-tag: idle + this set ⇒ blue "waiting on an agent", not orange
     // The card can't consult the jobs ledger, so the server tells it whether a wake is ACTUALLY scheduled:
