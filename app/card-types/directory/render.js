@@ -62,7 +62,15 @@ export default {
     const ts = card.signals.treeState;
     const fsOpen = card.signals.fsOpen;
     const roots = card.signals.roots || [];
-    const open = ts.get() ?? new Set();
+    // Which rows are open. `ts.get()` is undefined until the user has toggled anything (or a persisted
+    // set loads) — a stored set (even an explicitly all-collapsed empty one) always wins. With NOTHING
+    // stored, the COMBINED "roots" card defaults to its top-level roots expanded (one level): seed the
+    // open-set with tkey(root.id, "") per root, computed here at render time because roots load async.
+    // Single-root cards keep their empty default (no depth change). The first toggle persists a real set
+    // via ts.set(), so the default stops applying the moment the user interacts.
+    const stored = ts.get();
+    const open =
+      stored ?? (card.root === "roots" ? new Set(roots.map((r) => tkey(r.id, ""))) : new Set());
     const toggle = (k) => {
       const next = new Set(open);
       next.has(k) ? next.delete(k) : next.add(k);
