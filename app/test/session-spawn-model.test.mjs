@@ -26,7 +26,8 @@ registerHooks({
   },
 });
 
-const { buildSessionArgs, resolveSessionModel, resolveSessionEffort, isValidEffort, EFFORT_LEVELS, resolveClaudeCommand, projectCodexHistory, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
+const { buildSessionArgs, resolveSessionModel, resolveSessionEffort, isValidEffort, EFFORT_LEVELS, resolveClaudeCommand, DEFAULT_SESSION_MODEL } = await import("../server-sessions.ts");
+const { projectCodexHistory } = await import("../codex-projection.ts");
 const { readRole } = await import("../role-ledger.js");
 
 test("Claude executable discovery honors the explicit GUI-safe override", () => {
