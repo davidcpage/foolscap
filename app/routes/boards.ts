@@ -2,7 +2,7 @@ import fs from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { sendJson, readBody } from "../server-http.js";
 import { getServerContext } from "../server-context.js";
-import { isTmpdirRepo } from "../server-boards.js";
+import { isTmpdirRepo, forgetBoard } from "../server-boards.js";
 import { exact, type GlobalRoute } from "./router.js";
 
 // ── /api/boards — the board registry (god-file split, Phase 1) ──────────────────────────────────────
@@ -76,7 +76,20 @@ async function handleBoardMount(req: IncomingMessage, res: ServerResponse): Prom
   sendJson(res, 200, boardJson(id.boardId, ctx.boards.get(id.boardId)!));
 }
 
+// Forget a board (DELETE /api/boards?board=<id>). Registry removal / unmount ONLY — forgetBoard never
+// deletes the board's data, so a removed board can be re-added via `+`. The default board is refused
+// (forgetBoard guards it); the picker also never offers a `×` on the current or default board. 400 with no
+// id, 404 when nothing matched (an unknown id or the default board), 200 on removal.
+function handleBoardForget(url: URL, res: ServerResponse): void {
+  const id = url.searchParams.get("board");
+  if (!id) return sendJson(res, 400, { error: "missing board id" });
+  if (!forgetBoard(id)) return sendJson(res, 404, { error: "not a removable board" });
+  console.log(`[boards] forgot ${id} (registry removal / unmount — data untouched)`);
+  sendJson(res, 200, { boardId: id, removed: true });
+}
+
 export const boardRoutes: GlobalRoute[] = [
   { method: "POST", match: exact("/api/boards"), run: (req, res) => void handleBoardMount(req, res) },
+  { method: "DELETE", match: exact("/api/boards"), run: (_req, res, url) => handleBoardForget(url, res) },
   { match: exact("/api/boards"), run: (_req, res) => handleBoards(res) },
 ];
