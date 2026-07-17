@@ -13,7 +13,7 @@ import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./boar
 import { boardStoreCanvasSnapshot } from "./board-engine.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
-import { sendJson, readBody, openSse, type SseClient } from "./server-http.js";
+import { sendJson, readBody, openSse, originHostAllowed, type SseClient } from "./server-http.js";
 import type { CanvasFsState, LiveSession, ThreadMsg, WsClient } from "./server-types.js";
 import { boardIdentity, boardRoots, boards, DEFAULT_BOARD, ensureCanvasExcluded, invalidateBoardRoots, readBoardRegistry, recordBoardOpened, reqBoard, rootDir } from "./server-boards.js";
 import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
@@ -301,6 +301,12 @@ function attachWs(server: ViteDevServer): void {
       return;
     }
     if (url.pathname !== "/api/ws") return; // not ours — Vite's HMR listener handles its own upgrades
+    // Origin/Host allowlist (pre-push audit, MEDIUM): a cross-origin page or a DNS-rebind Host must not
+    // open a board/feed read socket. Same rule as the HTTP dispatcher; reject with a raw 403 + destroy.
+    if (!originHostAllowed(req.headers.origin, req.headers.host)) {
+      socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return void socket.destroy();
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       const b = reqBoard(url);
       if (!b) return void ws.close(4400, "unknown board");
@@ -875,6 +881,12 @@ export function fsApi(): Plugin {
         }
         if (!req.url || !(req.url.startsWith("/api/") || req.url.startsWith("/card-types/")))
           return next();
+        // Origin/Host allowlist (pre-push audit, MEDIUM): reject any /api/ request whose Host is not a
+        // loopback host (DNS-rebind guard) or that carries a foreign Origin (cross-origin browser fetch).
+        // No-Origin CLI/agent-bus/sidecar traffic and same-origin browser traffic pass untouched. Scoped to
+        // /api/ — the static /card-types/ assets are read-only module fetches the app itself loads same-origin.
+        if (req.url.startsWith("/api/") && !originHostAllowed(req.headers.origin, req.headers.host))
+          return sendJson(res, 403, { error: "forbidden: origin/host not allowed" });
         const url = new URL(req.url, "http://localhost");
         if (url.pathname.startsWith("/card-types/")) return handleCardTypeAsset(res, url.pathname);
 

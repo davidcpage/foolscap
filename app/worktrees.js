@@ -255,11 +255,13 @@ export function ensureWorktree(repoPath, threadId, key, base = null) {
     }
   }
   const baseRef = base || "HEAD";
+  // `--` separates options from positionals so a request-controlled base (baseRef) — or any path/ref that
+  // begins with `-` — can never be parsed as a git flag (option-injection guard; pre-push audit LOW).
   if (branchExists(repoPath, branch)) {
     // The branch outlived a prior teardown — check it back out (don't -b, that'd fail "already exists").
-    git(repoPath, ["worktree", "add", wtPath, branch]);
+    git(repoPath, ["worktree", "add", "--", wtPath, branch]);
   } else {
-    git(repoPath, ["worktree", "add", "-b", branch, wtPath, baseRef]);
+    git(repoPath, ["worktree", "add", "-b", branch, "--", wtPath, baseRef]);
   }
   const linked = linkNodeModules(repoPath, wtPath);
   const created = { path: realpath(wtPath), branch, base: baseRef, key, createdAt: Date.now() };

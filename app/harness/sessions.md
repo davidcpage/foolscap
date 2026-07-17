@@ -11,7 +11,7 @@ permission-gated).
 
 ## Spawn
 
-`POST /api/session/spawn?board=<board>` `{ prompt?, roleId?, thread?, card?, model? }` → `{ id, carded }`.
+`POST /api/session/spawn?board=<board>` `{ prompt?, roleId?, thread?, card?, model?, provider?, effort? }` → `{ id, carded }`.
 - `thread:<id>` → the SERVER drops the worker's session card + `member:open` edge, positions it by the
   thread card, and onboards it to *await its task on the thread* — you then assign via a tagged thread post.
   **Never put the task in the spawn prompt.** `card:true` → a standalone card, no edge.
@@ -20,6 +20,10 @@ permission-gated).
   Role-based spawns (mention-spawn, the Coordinator heartbeat) pick up the role's `model:` automatically —
   the shipped Coordinator/pm role pins `claude-fable-5`. Which model a worker gets is the spawner's
   (usually the Coordinator's) call.
+- `provider:<"claude"|"codex">` picks the agent backend; absent = `claude`. Any other value is a `400`.
+- `effort:<low|medium|high|xhigh|max>` picks the reasoning effort (valid on both providers); absent = the
+  provider default (no effort sent). Precedence mirrors `model`: explicit spawn param > the role's `effort:`
+  frontmatter. A value outside the set is a `400`, not a silent drop.
 - `429` when the live-session cap (`MAX_LIVE_SESSIONS=12`, across all boards) is hit — `terminate` one to
   free a slot.
 

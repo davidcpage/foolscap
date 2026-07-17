@@ -40,6 +40,47 @@ export function sendJson(res: ServerResponse, status: number, body: unknown, req
   res.end(json);
 }
 
+// ── Origin/Host allowlist (pre-push audit, MEDIUM) ────────────────────────────────────────────────
+// The dev server binds loopback only, but two browser-reachable holes remain: (1) DNS rebinding — a
+// hostile page served from a name that resolves to 127.0.0.1 reaches the API with a foreign Host, since
+// the OS loopback bind never inspects the Host header; (2) any cross-origin page can no-cors POST to the
+// state-changing endpoints (/api/session/spawn spawns a claude process, /api/command, /api/file writes,
+// and via a live kernel /api/kernel/*/run runs Python) and open /api/ws for a full read of board/feed
+// state. This gate closes both at the one shared HTTP dispatcher AND the WS upgrade:
+//   - Host MUST be a loopback host (any port) — a DNS-rebind request carries a non-loopback Host, so this
+//     alone defeats rebinding even on GETs that carry no Origin.
+//   - If an Origin header is present it MUST be same-origin: a loopback host whose host:port equals the
+//     Host header — blocks cross-origin browser fetches, including another local dev server on a diff port.
+//   - NO Origin header ⇒ a non-browser client (curl, scripts/canvas, the agent bus, the session-host
+//     sidecar, the contract tests) ⇒ allowed. Browsers ALWAYS attach Origin to cross-origin requests, to
+//     every non-GET, and to WebSocket handshakes, so a missing Origin is never an attacker-controlled tab.
+// Pure (headers in, boolean out) so it unit-tests without a live server.
+
+// Loopback test on a Host / Origin-host value that MAY carry a :port and MAY be a bracketed IPv6 literal.
+export function isLoopbackHost(hostPort: string): boolean {
+  if (!hostPort) return false;
+  let h = hostPort;
+  const br = h.match(/^\[(.+)\](?::\d+)?$/); // [::1] or [::1]:5173 — unwrap without eating the inner colons
+  if (br) h = br[1];
+  else h = h.replace(/:\d+$/, ""); // ipv4 / hostname with an optional :port
+  h = h.toLowerCase();
+  return h === "localhost" || h === "127.0.0.1" || h === "::1" || /^127\.\d+\.\d+\.\d+$/.test(h);
+}
+
+// The shared allowlist decision for an HTTP request or a WS upgrade. `origin` / `host` are the raw header
+// values (undefined when absent). See the block comment above for the threat model each clause closes.
+export function originHostAllowed(origin: string | undefined, host: string | undefined): boolean {
+  if (!host || !isLoopbackHost(host)) return false; // missing/foreign Host ⇒ reject (DNS-rebind guard)
+  if (!origin) return true; // no Origin ⇒ non-browser client ⇒ allow
+  let o: URL;
+  try {
+    o = new URL(origin);
+  } catch {
+    return false; // "null" / any non-URL Origin ⇒ reject
+  }
+  return isLoopbackHost(o.host) && o.host.toLowerCase() === host.toLowerCase(); // same-origin only
+}
+
 export function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
