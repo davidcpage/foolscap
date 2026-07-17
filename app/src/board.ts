@@ -69,8 +69,11 @@ async function selectBoard(): Promise<Board> {
 
 // ── the board picker's read side ──────────────────────────────────────────────────────────────────
 // Every board the server knows: the in-memory mounts plus the durable registry it remounted on boot
-// (vite-fs-plugin's boards.json), so repos you opened before a restart are still offered. Sorted default
-// first, then most recently opened.
+// (vite-fs-plugin's boards.json), so repos you opened before a restart are still offered. STABLE ORDER:
+// default board first, then the server's registry/insertion order left as-is (a stable sort keyed only on
+// isDefault). We deliberately DON'T sort by lastOpened — that reshuffled the picker on every switch, since
+// switching bumps the current board's stamp; the registry now upserts in place (recordBoardOpened) so this
+// order stays put across switches.
 export interface BoardListing {
   boardId: string;
   name: string;
@@ -92,7 +95,16 @@ export async function listBoards(): Promise<BoardListing[]> {
       isDefault: !!b.default,
       lastOpened: b.lastOpened ?? 0,
     }))
-    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault) || b.lastOpened - a.lastOpened);
+    .sort((a, b) => Number(b.isDefault) - Number(a.isDefault));
+}
+
+// Remove a board from the registry (and unmount it in-memory) — registry removal ONLY, it never touches the
+// board's data (`.canvas/board/` in that repo stays, so a removed board can be re-added via `+`). The server
+// refuses the default board; the caller (BoardPill) additionally never offers a `×` on the current or
+// default board. Returns true when the entry was removed.
+export async function removeBoard(boardId: string): Promise<boolean> {
+  const res = await fetch(`/api/boards?board=${encodeURIComponent(boardId)}`, { method: "DELETE" });
+  return res.ok;
 }
 
 // Where a tab for this board lives. ?repo= (not ?board=) so the navigation itself re-mounts the repo —

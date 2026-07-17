@@ -101,17 +101,43 @@ export function recordBoardOpened(boardId: string, name: string, repoPath: strin
   // that). The mount still works in-memory for this process — it just isn't remembered across a restart.
   if (isTmpdirRepo(repoPath)) return;
   const all = readBoardRegistry();
-  const prev = all.find((e) => e.boardId === boardId);
-  const entries = all.filter((e) => e.boardId !== boardId);
+  const idx = all.findIndex((e) => e.boardId === boardId);
+  const prev = idx >= 0 ? all[idx] : undefined;
   // noSessions is STICKY: once a board is flagged, a later mount POST without the flag must not quietly
   // re-arm real spawns on it (the flagging mount was the deliberate act; unflag by editing the registry).
-  entries.push({ boardId, name, repoPath, lastOpened: Date.now(), ...(noSessions || prev?.noSessions ? { noSessions: true } : {}) });
+  const entry: BoardRegistryEntry = { boardId, name, repoPath, lastOpened: Date.now(), ...(noSessions || prev?.noSessions ? { noSessions: true } : {}) };
+  // Upsert IN PLACE: an already-registered board keeps its slot (only its lastOpened refreshes), a new one
+  // appends. This is what makes the picker's order STABLE across switches — before, re-mounting moved the
+  // entry to the end, so opening a board reshuffled the list every time (see listBoards' order note).
+  const entries = idx >= 0 ? all.map((e, i) => (i === idx ? entry : e)) : [...all, entry];
   try {
     fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
     fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: entries }, null, 2) + "\n");
   } catch (e) {
     console.error("[boards] registry write failed:", e instanceof Error ? e.message : e);
   }
+}
+// Forget a board: drop it from the durable registry AND unmount it in-memory (its requests 400 until a tab
+// re-mounts it via ?repo=). Registry removal / unmount ONLY — this NEVER deletes the board's data
+// (`.canvas/board/` in that repo is untouched), so a forgotten board can be re-added via `+`. The default
+// board is implicit and never in the registry, so it can't be forgotten (guarded here as defence; the
+// picker also never offers a `×` on it or on the current board). Returns true if anything was removed.
+export function forgetBoard(boardId: string): boolean {
+  if (boardId === DEFAULT_BOARD.boardId) return false;
+  const all = readBoardRegistry();
+  const entries = all.filter((e) => e.boardId !== boardId);
+  const removed = entries.length !== all.length || boards.has(boardId);
+  if (entries.length !== all.length) {
+    try {
+      fs.mkdirSync(path.dirname(BOARDS_FILE), { recursive: true });
+      fs.writeFileSync(BOARDS_FILE, JSON.stringify({ version: 1, boards: entries }, null, 2) + "\n");
+    } catch (e) {
+      console.error("[boards] registry remove-write failed:", e instanceof Error ? e.message : e);
+    }
+  }
+  boards.delete(boardId);
+  rootsCache.delete(boardId); // its cached roots are meaningless once unmounted
+  return removed;
 }
 // Boot prune of scratch residue + remount. A tmpdir board should never have been persisted
 // (recordBoardOpened now refuses one), but existing installs carry one written before this fix — the

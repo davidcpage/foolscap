@@ -14,7 +14,7 @@ import {
 import { IdbEventStore, IdbSnapshotStore, boardDbName } from "./idb";
 import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, fetchBoardLog, importBoardPersist } from "./remote-store";
 import { seedProvenanceHistory } from "./provenance";
-import { activeBoard, activeBoardId, boardHref, listBoards, resolveBoard, type BoardListing } from "./board";
+import { activeBoard, activeBoardId, boardHref, listBoards, removeBoard, resolveBoard, type BoardListing } from "./board";
 import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
@@ -1084,13 +1084,28 @@ function NewFileItem({
 // The board-switcher pill — standing VIEWPORT CHROME (not a HUD card, so it ignores the Alt-tap HUD toggle
 // and isn't in the HUD checkbox list). It rests as a slim pill at the bottom-left showing the current
 // board's name (+ a "dev" tag on the default board). Hover — or click, for touch/keyboard, which pins it
-// open until a click-outside — expands it IN PLACE into a spreadsheet-style tab row: the current board's
-// tab stays put and highlighted, the other mounted boards slide in to its right (default-first then
-// most-recently-opened, the order listBoards() already yields), and a `+` tab runs the same Open-repo
-// prompt as the menu's BoardsItem. Clicking another board's tab navigates via boardHref (a ?repo= reload,
-// one tab = one board). The board list is lazy-fetched on each expand, since mounts change between opens.
+// open until a click-outside — expands it IN PLACE into a spreadsheet-style tab row rendering EVERY board in
+// listBoards' stable order (default-first, then registry order — never lastOpened, so it doesn't reshuffle
+// on a switch); the current board renders in its NATURAL position, highlighted and inert. A `+` tab runs
+// the same Open-repo prompt as the menu's BoardsItem, and each other board carries a small `×` that forgets
+// it (registry removal / unmount only — never touches its data; no `×` on the current or default board).
+// Clicking another board's tab navigates via boardHref (a ?repo= reload, one tab = one board). The list is
+// lazy-fetched on each expand, since mounts change between opens.
+//
+// STAY-OPEN-ACROSS-SWITCH: a switch is a full reload (location.assign), which would drop React state and
+// close the drawer as a side effect. We mirror `open` into sessionStorage so a freshly-loaded BoardPill
+// re-opens if it was open when the switch fired; the drawer still closes only on an EXPLICIT gesture
+// (handle click / outside click / Escape), which clears the flag.
+const BOARD_PILL_OPEN_KEY = "foolscap:boardPill:open";
+function readPillOpen(): boolean {
+  try {
+    return sessionStorage.getItem(BOARD_PILL_OPEN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
 function BoardPill() {
-  const [open, setOpen] = useState(false); // click toggles the tab row; hover never opens it
+  const [open, setOpen] = useState(readPillOpen); // click toggles the tab row; hover never opens it
   const [boards, setBoards] = useState<BoardListing[] | null>(null); // null = not yet fetched this open
   const rootRef = useRef<HTMLDivElement>(null);
   const current = activeBoardId();
@@ -1098,6 +1113,17 @@ function BoardPill() {
   // Refetch the mount list every time the row opens — mounts change between opens (mirrors BoardsItem).
   useEffect(() => {
     if (open) void listBoards().then(setBoards);
+  }, [open]);
+
+  // Mirror the open state into sessionStorage so it survives a board switch's full reload (see the
+  // stay-open note above); an explicit close clears it so the drawer stays shut on the next load.
+  useEffect(() => {
+    try {
+      if (open) sessionStorage.setItem(BOARD_PILL_OPEN_KEY, "1");
+      else sessionStorage.removeItem(BOARD_PILL_OPEN_KEY);
+    } catch {
+      /* storage unavailable (private mode / disabled) — fall back to per-session-only open state */
+    }
   }, [open]);
 
   // While open, dismiss on click-outside or Escape (a second handle-click toggles it via onClick below).
@@ -1122,7 +1148,11 @@ function BoardPill() {
     if (p?.trim()) location.assign(`${location.pathname}?repo=${encodeURIComponent(p.trim())}`);
   };
 
-  const others = (boards ?? []).filter((b) => b.boardId !== current);
+  // Forget a board from the list (registry removal / unmount — never its data), then refetch so the row
+  // reflects the change immediately. Only offered on other, non-default boards (see the × guard below).
+  const remove = async (b: BoardListing) => {
+    if (await removeBoard(b.boardId)) setBoards(await listBoards());
+  };
   const handleTitle = `Current board: ${activeBoard().name}${activeBoard().isDefault ? " (dev)" : ""}`;
   return (
     <div ref={rootRef} className="board-strip">
@@ -1144,23 +1174,47 @@ function BoardPill() {
         </button>
         {open && (
           <>
-            {/* The current board's tab — highlighted, inert (you can't switch to where you are). */}
-            <span className="board-tab board-tab-current" title={`Current board — ${activeBoard().name}`}>
-              <span className="board-tab-name">{activeBoard().name}</span>
-              {activeBoard().isDefault && <span className="board-tab-tag">dev</span>}
-            </span>
+            {/* Until the list loads, show just the current board's tab (highlighted, inert) + a loading
+                marker so the row has an immediate anchor. Once loaded, EVERY board renders in listBoards'
+                stable order and the current one appears in its natural slot (below), not pinned first. */}
+            {/* Fallback current tab: shown while the list is loading, and also if the loaded list doesn't
+                include the current board (an unlisted scratch board) — so wayfinding never vanishes. When
+                the current board IS in the list, it renders in its natural slot below instead. */}
+            {(boards === null || !boards.some((b) => b.boardId === current)) && (
+              <span className="board-tab board-tab-current" title={`Current board — ${activeBoard().name}`}>
+                <span className="board-tab-name">{activeBoard().name}</span>
+                {activeBoard().isDefault && <span className="board-tab-tag">dev</span>}
+              </span>
+            )}
             {boards === null && <span className="board-tab board-tab-loading">…</span>}
-            {others.map((b) => (
-              <button
-                key={b.boardId}
-                className="board-tab"
-                title={b.repoPath}
-                onClick={() => location.assign(boardHref(b))}
-              >
-                <span className="board-tab-name">{b.name}</span>
-                {b.isDefault && <span className="board-tab-tag">dev</span>}
-              </button>
-            ))}
+            {(boards ?? []).map((b) =>
+              b.boardId === current ? (
+                // The current board's tab — highlighted, inert (you can't switch to where you are), in place.
+                <span key={b.boardId} className="board-tab board-tab-current" title={`Current board — ${b.name}`}>
+                  <span className="board-tab-name">{b.name}</span>
+                  {b.isDefault && <span className="board-tab-tag">dev</span>}
+                </span>
+              ) : (
+                <span key={b.boardId} className="board-tab-wrap">
+                  <button className="board-tab" title={b.repoPath} onClick={() => location.assign(boardHref(b))}>
+                    <span className="board-tab-name">{b.name}</span>
+                    {b.isDefault && <span className="board-tab-tag">dev</span>}
+                  </button>
+                  {/* Remove from the list — only on other, non-default boards (never the current or default
+                      board). Registry removal / unmount only; the board's data is untouched. */}
+                  {!b.isDefault && (
+                    <button
+                      className="board-tab-remove"
+                      title={`Remove ${b.name} from the list (its data is kept)`}
+                      aria-label={`Remove ${b.name} from the list`}
+                      onClick={() => void remove(b)}
+                    >
+                      ×
+                    </button>
+                  )}
+                </span>
+              ),
+            )}
             <button className="board-tab board-tab-add" title="Open a repo as a board" onClick={openRepo}>
               +
             </button>

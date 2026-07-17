@@ -4140,6 +4140,41 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   text-transform: uppercase;
   color: #a1a1aa;
 }
+/* An other-board tab plus its remove affordance. The wrapper needs pointer-events:auto (the strip is
+   pointer-events:none) so its :hover — which reveals the × — actually fires. The × overlaps the tab's
+   top-right corner and only appears on hover, so a resting row stays clean. */
+.board-tab-wrap {
+  pointer-events: auto;
+  position: relative;
+  display: inline-flex;
+}
+.board-tab-remove {
+  pointer-events: auto;
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  background: #ffffff;
+  border: 1px solid #00000018;
+  border-radius: 50%;
+  color: #71717a;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 2px #0000001a;
+}
+.board-tab-wrap:hover .board-tab-remove {
+  display: inline-flex;
+}
+.board-tab-remove:hover {
+  color: #ef4444;
+  border-color: #ef444455;
+}
 .board-tab-add {
   font-weight: 600;
   color: #6366f1;
