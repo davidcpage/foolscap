@@ -21,6 +21,7 @@ import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureComm
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
+import { foldCodexEvent } from "./codex-projection.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
@@ -702,6 +703,9 @@ setServerContext({
   // user tool_result into the shadow-git committer. Its def lives in server-orchestration.ts (with the
   // shadow-git cluster); the seam injects it here, exactly like the delivery ops above.
   foldShadowEdits,
+  // Codex event fold — def in codex-projection.ts (dev-server half of the codex-* family); foldSessionEvent
+  // dispatches a codex_event frame to it via the seam, same as foldShadowEdits.
+  foldCodexEvent,
 });
 
 // ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────

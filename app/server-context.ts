@@ -189,6 +189,11 @@ export interface ServerContext {
   // the shadow-git committer here. Its DEFINITION is the shadow-git cluster still in the shell (sub-step 3), so
   // — exactly like the delivery ops — the seam injects the operation and the def repoints when it moves.
   foldShadowEdits: (s: LiveSession, e: { type?: string; message?: { content?: unknown } }) => void;
+  // Codex event fold (codex extraction): foldSessionEvent dispatches a `codex_event` frame to the Codex-
+  // specific projection engine. Its DEFINITION lives in codex-projection.ts (the dev-server half of the
+  // codex-* family); the seam injects it here so server-sessions.ts stays provider-agnostic — exactly like
+  // foldShadowEdits above.
+  foldCodexEvent: (s: LiveSession, e: unknown) => void;
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter

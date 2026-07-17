@@ -10,7 +10,8 @@ import { durableSessionThreads } from "../server-snapshot.js";
 import { sessionSummaryFromText } from "../session-summary.js";
 import { readRole } from "../role-ledger.js";
 import { ensureWorktree } from "../worktrees.js";
-import { MAX_SESSION_BYTES, projectCodexHistory, isValidEffort, EFFORT_LEVELS } from "../server-sessions.js";
+import { MAX_SESSION_BYTES, isValidEffort, EFFORT_LEVELS } from "../server-sessions.js";
+import { projectCodexHistory } from "../codex-projection.js";
 
 // ── the sessions routes (read/list + lifecycle/spawn) — god-file split, Phase 4 ─────────────────────
 // The two GLOBAL-stage clusters that make sessions legible and drivable: the read/list pair (GET
