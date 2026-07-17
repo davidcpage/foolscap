@@ -192,6 +192,63 @@ test("thread pin (R-PIN): pin → unpin round-trip, snapshots head context, 400/
   assert.equal((await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/pin?board=${boardId}`, j({ from: "human", seq: 99999 }))).status, 404);
 });
 
+test("thread edit/delete (amendment events): round-trip, pin-snapshot refresh, guardrails", { skip: !up && "no dev server on 5173" }, async (t) => {
+  const threadId = `node:thread:edit-${runTag}`;
+  const T = (a) => `${HOST}/api/thread/${encodeURIComponent(threadId)}/${a}?board=${boardId}`;
+  // FEATURE-DETECT the route so this test survives the contract-lag: the merge-on-green gate runs against
+  // the CURRENTLY-running server, which predates this endpoint until it hot-reloads post-merge. A server
+  // WITHOUT the /edit route 404s (the SPA fallback, no JSON error); a server WITH it returns 400 "missing
+  // from" on an empty body. Probe with {} — 404 ⇒ skip cleanly (one line), 400 ⇒ the route is live, run it.
+  const probe = await fetch(T("edit"), j({}));
+  if (probe.status === 404) return t.skip("running server predates POST /thread/:id/edit (contract lag — runs after hot-reload)");
+  assert.equal(probe.status, 400, "route present: an empty body is a 400 (missing from), never the 404 fallback");
+
+  // Mint the thread-node save's seq from the live counter (never hardcode — stage 2 only folds a save AHEAD
+  // of the watermark). The scratch board's store was cleared at mount; this lands the node so posts resolve.
+  const curSeq = (await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json()).snapshot.seq ?? 0;
+  await fetch(`${HOST}/api/board/persist/snapshot?board=${boardId}`, j({ snapshot: { seq: curSeq + 1, version: 3, records: [{ typeName: "node", id: threadId, type: "thread", title: "Edit" }] } }));
+
+  const m1 = await (await fetch(T("message"), j({ from: "human", text: "teh typo" }))).json();
+  const m2 = await (await fetch(T("message"), j({ from: "human", text: "delete me" }))).json();
+
+  // EDIT: 200 with edited:true; the amendment is a NEW appended event (editSeq > the target seq), never a
+  // renumber. The raw log grows; the fold applies the new text at read time.
+  const editRes = await fetch(T("edit"), j({ from: "human", seq: m1.seq, text: "the typo — fixed" }));
+  assert.equal(editRes.status, 200);
+  const edited = await editRes.json();
+  assert.equal(edited.edited, true);
+  assert.equal(edited.deleted, false);
+  assert.ok(edited.editSeq > m1.seq, "the edit is appended as a new seq, not a mutation");
+
+  // PIN-SNAPSHOT REFRESH: pin the target, edit it again, and the pin's snapshot text (a by-value copy) must
+  // track the amendment — otherwise the head-context tray keeps showing the stale original.
+  await fetch(T("pin"), j({ from: "human", seq: m1.seq }));
+  const reEdit = await (await fetch(T("edit"), j({ from: "human", seq: m1.seq, text: "the typo — fixed twice" }))).json();
+  assert.equal(reEdit.pins.find((p) => p.seq === m1.seq).text, "the typo — fixed twice", "the pin snapshot refreshes on edit");
+
+  // DELETE (tombstone): 200 with deleted:true; a pinned tombstone's snapshot becomes the [deleted] stub.
+  await fetch(T("pin"), j({ from: "human", seq: m2.seq }));
+  const delRes = await fetch(T("edit"), j({ from: "human", seq: m2.seq, text: null }));
+  assert.equal(delRes.status, 200);
+  const del = await delRes.json();
+  assert.equal(del.deleted, true);
+  assert.equal(del.pins.find((p) => p.seq === m2.seq).text, "[deleted]", "a pinned tombstone's snapshot becomes the stub");
+
+  // GUARDRAILS (4xx): bad seq (400), a seq with no message (404), a card-only intent entry is immutable
+  // (409), and mention-set invariance — even the human may not add a tag by edit (400).
+  assert.equal((await fetch(T("edit"), j({ from: "human", seq: "x", text: "y" }))).status, 400, "non-integer seq → 400");
+  assert.equal((await fetch(T("edit"), j({ from: "human", seq: 99999, text: "y" }))).status, 404, "no message at seq → 404");
+  // A card-only entry (intent act) is immutable → 409. The intent endpoint returns its appended seq.
+  const intent = await (await fetch(T("intent"), j({ from: "human", intent: "working" }))).json();
+  assert.equal((await fetch(T("edit"), j({ from: "human", seq: intent.seq, text: "hijack" }))).status, 409, "ask/intent immutable → 409");
+  // A tag added by edit is rejected regardless of author (seenMentions is seq-keyed — an added mention wakes no one).
+  assert.equal(
+    (await fetch(T("edit"), j({ from: "human", seq: m1.seq, text: "the typo — fixed twice @all" }))).status,
+    400,
+    "mention-set invariance: an edit may not add an @-tag",
+  );
+});
+
 test("thread and channel API paths are aliases", { skip: !up && "no dev server on 5173" }, async () => {
   const a = await (await fetch(`${HOST}/api/threads?board=${boardId}`)).json();
   const b = await (await fetch(`${HOST}/api/channels?board=${boardId}`)).json();

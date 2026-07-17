@@ -3477,6 +3477,18 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* Amendment markers (message edit / tombstone delete). "(edited)" is a subtle, honest marker — the original
+   is on hover (title); a tombstoned message reads as a muted italic stub keeping seq + author so references
+   still resolve. Deliberately quiet: an edit must not shout on the card. */
+.chan-msg-edited {
+  color: #a1a1aa;
+  font-size: 0.85em;
+  cursor: help;
+}
+.chan-msg-deleted {
+  color: #a1a1aa;
+  font-style: italic;
+}
 /* Message body blocks (renderMessageBody): paragraphs get real spacing between them; lists read as lists.
    These are what lift a long agent post toward a session turn's readability. */
 .chan-p {

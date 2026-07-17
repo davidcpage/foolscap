@@ -103,7 +103,7 @@ export interface ServerContext {
     threadId: string,
     from: string,
     text: string,
-    extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
+    extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent } | { kind: "edit"; target: number; deleted?: boolean },
   ) => ThreadMsg;
   wakeThreadMembers: (
     boardId: string,

@@ -18,6 +18,7 @@ import {
 } from "./thread-ledger.js";
 import { threadMemberSids } from "./server-snapshot.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
+import { foldAmendments } from "./thread-fold.js";
 import { wakesSeat } from "./notification-levels.js";
 import { COORDINATOR_ROLE } from "./coordinator-heartbeat.js";
 import type { WorkIntent } from "./work-intent.js";
@@ -91,7 +92,13 @@ export function publishThreadFeed(boardId: string, threadId: string, messages: T
   // observer needs — `youWaitingSeqs`, EVERY still-unseen mention seq to watch — plus the count for parity
   // with the rail. The rail popover's preview/more ride /api/threads (handleThreads), not this feed.
   const seen = repoPath ? readSeenMentions(repoPath, threadId) : [];
+  // humanWaiting is computed on the RAW log (pre-fold): mention-set invariance means an EDIT can't change it,
+  // and a DELETE tombstones the display but must NOT retroactively un-ping the human — the raw message still
+  // carries the @you, so the waiting signal is stable across amendments (thread-fold.js checkEdit rationale).
   const { waiting: youWaiting, count: youWaitingCount, seqs: youWaitingSeqs } = humanWaiting(messages, seen);
+  // The card sees the FOLDED log: edit events dropped, edits/tombstones applied onto their targets, each
+  // carrying display metadata ("(edited)" + original-on-hover; a `[deleted by @x]` stub keeping seq+author).
+  const folded = foldAmendments(messages);
   // The DURABLE member roster (sid + role/seat display name), so the card can paint a pill for a member
   // whose session card was deleted — the edge (and its edge-derived pill) vanished, but the membership and
   // seat outlived them (server-snapshot's threadMemberSids folds those cardless durable members in). The
@@ -115,7 +122,7 @@ export function publishThreadFeed(boardId: string, threadId: string, messages: T
     };
   });
   publishFeed("thread:" + threadId, {
-    messages,
+    messages: folded,
     truncated,
     pins,
     youWaiting,
@@ -135,7 +142,7 @@ export function appendThreadMsg(
   threadId: string,
   from: string,
   text: string,
-  extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent },
+  extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent } | { kind: "edit"; target: number; deleted?: boolean },
 ): ThreadMsg {
   const { boards, threadLog, boardSnapshotRecords, threadNode, MAX_THREAD_MSGS } = getServerContext();
   const log = threadLog(boardId, threadId); // lazy-seeds from the ledger — never mint seq 1 onto a real tail

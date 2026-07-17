@@ -917,6 +917,51 @@ test("dropped-delivery regression: posting while a message from ANOTHER is unrea
   assert.equal(inbox.computeInbox("s1", NO_OPTS).body.channels.length, 0, "caught-up sender sees no echo of its own post");
 });
 
+// ── Group I2: computeInbox folds amendment events (message edit + tombstone delete) — thread-fold.js ──
+// The agent-facing projection: an edit/delete is a card-only `kind:"edit"` event appended to the log; the
+// inbox read must fold it onto its target (clean amended text, no marker) and NOT surface the event itself.
+// This is the same read-time fold the card feed uses, so the three projections (feed / inbox / backlog
+// replay) stay in lockstep — exercised here without a live server (the scratch board can't spawn a session).
+const editEvent = (seq, target, text, deleted) => ({
+  seq, ts: 1_700_000_000_000 + seq, from: "human", text, kind: "edit", target, ...(deleted ? { deleted: true } : {}),
+});
+
+test("computeInbox: an edit folds onto its target (clean amended text, no marker) and the edit event is hidden", () => {
+  const tid = "node:thread:t";
+  inboxFake("s1", tid, [msg(1, "teh cat"), editEvent(2, 1, "the cat")]);
+  const { body } = inbox.computeInbox("s1", NO_OPTS);
+  const ms = body.channels[0].messages;
+  assert.deepEqual(ms.map((m) => m.seq), [1], "the kind:edit event is card-only — never inbox content");
+  assert.equal(ms[0].text, "the cat", "agents get CLEAN amended text (no '(edited)' marker)");
+});
+
+test("computeInbox: a tombstone renders a [deleted by @handle] stub keeping seq + author", () => {
+  const tid = "node:thread:t";
+  inboxFake("s1", tid, [msg(1, "oops secret"), editEvent(2, 1, "", true)]);
+  const { body } = inbox.computeInbox("s1", NO_OPTS);
+  const ms = body.channels[0].messages;
+  assert.deepEqual(ms.map((m) => m.seq), [1], "the tombstoned message survives (as a stub); the edit event is hidden");
+  assert.equal(ms[0].text, "[deleted by @human]", "the stub names the deleter and keeps the seq");
+  assert.equal(ms[0].from, "human", "the original author is preserved so #seq references still resolve");
+});
+
+test("computeInbox: the fold applies on a ?since=0 backlog replay too (a fresh joiner self-heals)", () => {
+  const tid = "node:thread:t";
+  inboxFake("s1", tid, [msg(1, "typo here"), msg(2, "keep"), editEvent(3, 1, "fixed here")], { [tid]: 99 });
+  // cursor is past the tail; ?since=0 replays the whole backlog non-consuming — the fold still applies.
+  const { body } = inbox.computeInbox("s1", { ...NO_OPTS, since: 0 });
+  const ms = body.channels[0].messages;
+  assert.deepEqual(ms.map((m) => m.seq), [1, 2], "the edit event is folded out of the replay");
+  assert.equal(ms[0].text, "fixed here", "the backlog replay serves the amended text");
+});
+
+test("computeInbox: cursor still advances past the edit event (fold doesn't lose the raw max seq)", () => {
+  const tid = "node:thread:t";
+  const { session } = inboxFake("s1", tid, [msg(1, "one"), editEvent(2, 1, "one!")]);
+  inbox.computeInbox("s1", NO_OPTS);
+  assert.equal(session.read[tid], 2, "the cursor tracks the RAW log's max seq (incl. the edit event), not the folded tail");
+});
+
 // ── Group H: scratch-board predicates (phase-2 log-noise fix) ────────────────────────────────────────
 // isTmpdirRepo is the ONE definition of "this repo is a throwaway scratch/test board" (server-boards.ts):
 // recordBoardOpened refuses to persist one, boot prunes one, and sessionSpawnRefusal/isScratchBoard build on
