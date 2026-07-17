@@ -8,14 +8,14 @@ import { getServerContext, getShadowRoots, getWsClients } from "./server-context
 import { commitRoot, watchRoot } from "./shadow-git.js";
 import { isInternalPath } from "./server-fs.js";
 import { autoWakeReapTick, reconcileSessionBands, resolveClaudeCommand } from "./server-sessions.js";
-import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
+import { canvasThreadsDir, fillSeat, listThreads, readThreadMeta, releaseSeat, seatForSid, threadIntentForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
 import { canvasRolesDir, readRole } from "./role-ledger.js";
 import { dueJobs, jobClaimKey, jobDueWithInterval, planRoleJobFire, readJobs, removeJob, stampFired, upsertJob } from "./standing-jobs.js";
 import { COORDINATOR_ROLE, coordinatorHeartbeatJobSpec, heartbeatEffectiveInterval, heartbeatSweepSignature } from "./coordinator-heartbeat.js";
 import { docJobClaimKey, listDocsWithJobs, readDocJobs, stampDocFired } from "./doc-jobs.js";
 import { readWatchers } from "./doc-watch.js";
 import { listWorktrees, removeWorktree, realpath as wtRealpath } from "./worktrees.js";
-import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
+import { docSurfaceKey, isSurfaceClaimed, qualifyingWatchers, releaseSurface, seatSurfaceKey, shouldDetachDoneIntent, shouldDetachDoneMember, surfaceClaimant } from "./auto-wake.js";
 import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./server-types.js";
@@ -407,9 +407,13 @@ function loopTick(): void {
   //                          push — the catch-all for out-of-band transitions the instant paths don't cover.
 }
 
-// P5 — the done-member DETACH sweep. Board-wide over every thread's DURABLE member roster: a member whose
-// session ended cleanly (endReason:"done") more than DETACH_DELAY_MS ago and is not currently live gets its
-// membership dropped (forgetDurableMember — marker AND the in-memory durableMembers mirror) and any seat released (releaseSeat). Both are marker writes on the
+// P5 — the done-member DETACH sweep. Board-wide over every thread's DURABLE member roster: a member gets its
+// membership dropped (forgetDurableMember — marker AND the in-memory durableMembers mirror) and any seat
+// released (releaseSeat) when EITHER (a) its session ended cleanly (endReason:"done") more than
+// DETACH_DELAY_MS ago and is not currently live [the original P5 exited path], OR (b) it declared `done` on
+// THIS thread more than DETACH_DELAY_MS ago even while STILL LIVE [thread "Thread liveness": a shared
+// Coordinator seated on a meta thread + children, done on one child but working elsewhere — without this it
+// defaults to `working` and keeps the finished child `active` forever]. Both are marker writes on the
 // thread ledger — TAB-INDEPENDENT and AUTHORITATIVE: the write fires the threads:<board> feed, the pill
 // (now durable-membership-driven) clears with or without a live tab. The on-canvas session card is NOT
 // removed here — that's a canvas mutation that 503s without a tab (canvas-mutations-need-live-tab); a live
@@ -439,7 +443,16 @@ export function detachDoneMembersTick(): void {
       let dropped = false;
       for (const sid of threadMembersFromMeta(meta)) {
         const marker = readCanvasSession(board.repoPath, sid);
-        if (!shouldDetachDoneMember(sid, marker, now, DETACH_DELAY_MS, isLive)) continue;
+        // Two independent detach triggers, same drop (releaseSeat + forgetDurableMember): the EXITED-done path
+        // (a cleanly-finished process past the grace window, guarded off-live) OR the STILL-LIVE done-INTENT path
+        // (a member — e.g. a shared Coordinator seated on a meta thread + children — that declared `done` on
+        // THIS thread's seat while its process works elsewhere; without this it defaults to `working` and keeps
+        // the finished child `active` forever, thread "Thread liveness"). A later non-done intent overwrites the
+        // done at its key, so a re-declared `working` cancels the pending detach (threadIntentForSid reads the
+        // freshest; its ts is the clock).
+        const detachExited = shouldDetachDoneMember(sid, marker, now, DETACH_DELAY_MS, isLive);
+        const detachDoneIntent = shouldDetachDoneIntent(threadIntentForSid(meta?.intents, sid), now, DETACH_DELAY_MS);
+        if (!detachExited && !detachDoneIntent) continue;
         forgetDurableMember(board.repoPath, t.threadId, sid); // authoritative: drops durable membership (marker + the in-memory fsState.durableMembers mirror) → pill clears; the marker-only removeThreadMember left the mirror stale until restart (BUG-1)
         releaseSeat(board.repoPath, t.threadId, sid); // no-op unless this sid still holds a seat here
         detached++;

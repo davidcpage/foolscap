@@ -34,6 +34,14 @@ call is large, ambiguous, or irreversible, loop the human in with a summary + a 
 auto-continue past `Done when:`** — a next work-item is a deliberate new thread, not something a wind-down
 does.
 
+**Seated on several threads at once (a meta thread + its children)? Declare `done` per child as you close
+it.** One live seat with no per-thread intent defaults to `working`, so a finished child stays green in the
+Threads card while you keep working the meta thread and its siblings. Post your `done` on THAT child's seat
+(`/intent {intent:"done"}`) the moment it resolves — the server's done-detach sweep then releases your seat
+there, drops the membership, and clears that child's heartbeat after the grace window, so it derives
+**dormant**. It's per-thread: your seats on the meta thread and the other children are untouched, and
+declaring `working` again on a child before the window elapses cancels the pending detach.
+
 The thread log **is** the record — don't curate a wiki. Keep the brief tight; post decisions/status/
 handoffs as messages. On close, consider a one-time `docs/` write-up and promote any generalisable lesson
 to role memory — most threads need neither.

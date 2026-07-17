@@ -307,6 +307,31 @@ export function sessionIdleIntent(metas, sid) {
 }
 
 /**
+ * The latest work-intent record `sid` itself declared on ONE thread (`meta.intents`), or null when it has
+ * declared none. "Its own" mirrors ownBlockedIntentKeys / sessionIdleIntent: a record is this session's when
+ * its `sid` stamp matches (which covers a SEAT-keyed declaration — recordThreadIntent stamps the declarer even
+ * when the key is the seat handle) or the key is the bare sid. DELIBERATELY not a `key === seatForSid(sid)`
+ * match: a `done` a DIFFERENT (now-exited) occupant left on a seat this session later re-filled is not this
+ * session's stance — so a fresh occupant is never detached on its predecessor's declaration. Freshest by `ts`
+ * when more than one record matches (a bare-sid AND a seat-keyed self-declaration). Pure — the done-detach
+ * sweep (server-orchestration.detachDoneMembersTick) passes each thread member's own record to
+ * shouldDetachDoneIntent (auto-wake.js). `ts` is the clock: a later non-`done` declaration OVERWRITES the
+ * `done` at the same key, so a re-declared `working` cancels a pending detach for free.
+ *
+ * @param {Record<string, {intent?: string, sid?: string, ts?: number}>|undefined} intents
+ * @param {string} sid
+ * @returns {{intent?: string, sid?: string, ts?: number}|null} the freshest matching record, or null
+ */
+export function threadIntentForSid(intents, sid) {
+  let best = null;
+  for (const [key, rec] of Object.entries(intents ?? {})) {
+    if (key !== sid && rec?.sid !== sid) continue;
+    if (!best || (typeof rec?.ts === "number" ? rec.ts : 0) > (typeof best.ts === "number" ? best.ts : 0)) best = rec;
+  }
+  return best;
+}
+
+/**
  * The occupant sid of a thread's `role` seat that an UNTAGGED post should NUDGE, or null (untagged→Coordinator,
  * Option B). An untagged post (neither a room `broadcast` nor an @-`mentioned` post) wakes no member by the
  * normal seat-level fan-out — the ambient case principle 3 keeps quiet. But a role like the Coordinator is the

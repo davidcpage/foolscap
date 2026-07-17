@@ -142,6 +142,28 @@ export function shouldDetachDoneMember(sid, marker, now, delayMs, isLive) {
 }
 
 /**
+ * The done-INTENT detach decision — the STILL-LIVE companion to shouldDetachDoneMember (thread "Thread
+ * liveness"). A shared Coordinator seated on several threads (a meta thread + children) that finishes ONE child
+ * declares `done` on that child's seat while its process stays live (working the others). The exited-done path
+ * above never fires — the session hasn't exited — and a live member with no per-thread intent defaults to
+ * `working` (thread-state.js), so the finished child stays `active` forever. This detaches such a member off
+ * its own PER-THREAD `done` intent instead of its process end, so the child goes dormant. Detach iff BOTH:
+ *   - the member's latest OWN intent on THIS thread is `done` (threadIntentForSid resolves it by the record's
+ *     `sid` stamp — the intent is often keyed by SEAT HANDLE, not sid). A later non-`done` declaration
+ *     overwrites the `done` at the same key, so a re-declared `working` cancels the pending detach for free.
+ *   - that declaration is AT LEAST `delayMs` old (its `ts` is the clock; the same grace window the exited path
+ *     gives, so a just-closed child doesn't vanish out from under a human still reading it).
+ * DELIBERATELY no liveness guard: this branch EXISTS to detach a still-live member (its whole reason for being).
+ * `intentRec` is threadIntentForSid's result (or null when the member declared nothing → never detach).
+ */
+export function shouldDetachDoneIntent(intentRec, now, delayMs) {
+  if (!intentRec || intentRec.intent !== "done") return false; // no own `done` on this thread → leave it
+  if (typeof intentRec.ts !== "number" || !Number.isFinite(intentRec.ts)) return false; // no honest clock
+  if (now - intentRec.ts < delayMs) return false; // still inside the grace window
+  return true;
+}
+
+/**
  * Which of a doc's `watchers` does an annotation event of `eventKind` wake? Filters the watcher roster
  * through `wakesSeat(watcherEffectiveLevel(w), class)` — the exact W4 gate a thread nudge uses, one surface
  * over. Empty when the event wakes no one (a non-triggering kind, or every watcher opted below its class).

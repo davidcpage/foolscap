@@ -106,6 +106,10 @@ export function sessionIdleIntent(
   metas: ThreadMetaMarker[] | undefined,
   sid: string,
 ): "blocked:human" | "blocked:peer" | null;
+export function threadIntentForSid(
+  intents: Record<string, DeclaredIntent> | undefined,
+  sid: string,
+): DeclaredIntent | null;
 export function untaggedSeatNudgeTarget(
   meta: ThreadMetaMarker | null | undefined,
   role: string,

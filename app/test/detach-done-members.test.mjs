@@ -6,6 +6,9 @@
 //       CANNOT see: the tick must clear BOTH the durable-member MARKER and the in-memory `fsState.durableMembers`
 //       MIRROR — a marker-only drop (the BUG-1 regression: it called removeThreadMember, not forgetDurableMember)
 //       left the mirror stale until restart, so pills never cleared and stale sids kept flowing into wake fan-out.
+//   (3) the STILL-LIVE done-INTENT branch (thread "Thread liveness"): a shared Coordinator seated on a meta
+//       thread + children, done on one child but still live, is detached off its per-thread `done` intent —
+//       the pure predicates (threadIntentForSid + shouldDetachDoneIntent) and the real tick that reads them.
 // (The best-effort client card-removal is a browser-only reactor; see the P5 report.)
 
 import { test } from "node:test";
@@ -23,10 +26,12 @@ import {
   removeThreadMember,
   seatForSid,
   setReopenSet,
+  threadIntentForSid,
   threadMembersFromMeta,
+  upsertThreadMeta,
 } from "../thread-ledger.js";
 import { recordSessionEnd, readCanvasSession } from "../session-ledger.js";
-import { shouldDetachDoneMember } from "../auto-wake.js";
+import { shouldDetachDoneIntent, shouldDetachDoneMember } from "../auto-wake.js";
 
 // The split server modules import each other by the TS/Vite `.js`-specifier convention (`./server-context.js`
 // resolving to server-context.ts). `node --test` resolves raw, so rewrite a relative `.js` import to its `.ts`
@@ -205,4 +210,91 @@ test("real tick: a just-done member inside the grace window is left in BOTH tier
 
   assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)), ["fresh-done"], "marker: fresh-done retained");
   assert.deepEqual([...fsState.durableMembers.get(T)], ["fresh-done"], "mirror: fresh-done retained");
+});
+
+// ── the STILL-LIVE done-INTENT branch (thread "Thread liveness") ──────────────────────────────────────
+// A shared Coordinator seated on a meta thread + children, done on ONE child but still LIVE (working the
+// others), must be detached from that child off its per-thread `done` INTENT — the exited path never fires
+// (the process hasn't exited) and a live member with no intent defaults to `working`, so the child would stay
+// `active` forever. These cover the sweep's second trigger and the pure predicates behind it.
+
+test("threadIntentForSid: resolves a SEAT-keyed record by its sid stamp; freshest wins; a predecessor's is not 'its own'", () => {
+  const intents = {
+    pm: { intent: "done", ts: 100, sid: "coord" }, // keyed by the SEAT HANDLE, stamped with the declarer
+    "sess-x": { intent: "working", ts: 50, sid: "sess-x" }, // bare-sid key
+  };
+  assert.equal(threadIntentForSid(intents, "coord")?.intent, "done", "seat-keyed record found via sid stamp");
+  assert.equal(threadIntentForSid(intents, "sess-x")?.intent, "working", "bare-sid record found");
+  assert.equal(threadIntentForSid(intents, "nobody"), null, "no record → null");
+  assert.equal(
+    threadIntentForSid({ pm: { intent: "done", ts: 1, sid: "old-occupant" } }, "new-occupant"),
+    null,
+    "a predecessor's done on a re-filled seat is not the new occupant's own",
+  );
+  const dup = { pm: { intent: "done", ts: 100, sid: "c" }, c: { intent: "working", ts: 200, sid: "c" } };
+  assert.equal(threadIntentForSid(dup, "c")?.intent, "working", "freshest by ts when two records match");
+});
+
+test("shouldDetachDoneIntent: done+aged → true; fresh / non-done / no-ts / null → false", () => {
+  const now = 10 * DELAY;
+  assert.equal(shouldDetachDoneIntent({ intent: "done", ts: now - DELAY - 1 }, now, DELAY), true, "done past the window");
+  assert.equal(shouldDetachDoneIntent({ intent: "done", ts: now - 1 }, now, DELAY), false, "inside the grace window");
+  assert.equal(shouldDetachDoneIntent({ intent: "working", ts: now - DELAY - 1 }, now, DELAY), false, "not a done intent");
+  assert.equal(shouldDetachDoneIntent({ intent: "done" }, now, DELAY), false, "no honest ts clock");
+  assert.equal(shouldDetachDoneIntent(null, now, DELAY), false, "no record at all");
+});
+
+test("real tick: a still-LIVE member that declared done on this thread (past the grace window) is detached", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:live-done";
+  const { fsState, published, liveSessions } = wireDetachContext(repo);
+  snap.recordDurableMember(repo, T, "coord", 1);
+  snap.recordDurableMember(repo, T, "worker", 1);
+  fillSeat(repo, T, "pm", "coord", 1); // seated — its intent is keyed by the SEAT HANDLE, not the sid
+  liveSessions.set("coord", { status: "idle" }); // still LIVE (working other threads); NO end marker
+  liveSessions.set("worker", { status: "running" });
+  // coord declared `done` on THIS thread past the grace window — the real shape: keyed "pm", stamped sid:coord.
+  upsertThreadMeta(repo, T, { intents: { pm: { intent: "done", ts: Date.now() - DELAY - 10_000, sid: "coord" } } });
+
+  orch.detachDoneMembersTick();
+
+  const meta = readThreadMeta(repo, T);
+  assert.deepEqual(threadMembersFromMeta(meta), ["worker"], "the live done-intent member is detached, the worker stays");
+  assert.deepEqual([...fsState.durableMembers.get(T)], ["worker"], "in-memory mirror drops it too");
+  assert.equal(seatForSid(meta.seats, "coord"), null, "its seat is released");
+  assert.ok(published.some((p) => p.threadId === T), "the pill-clearing thread-feed republish fired");
+});
+
+test("real tick: a member that re-declared working after done is NOT detached (the newer intent cancels it)", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:redeclared";
+  const { fsState, liveSessions } = wireDetachContext(repo);
+  snap.recordDurableMember(repo, T, "coord", 1);
+  fillSeat(repo, T, "pm", "coord", 1);
+  liveSessions.set("coord", { status: "idle" });
+  // Re-declaring working OVERWRITES the done at the same seat key — the marker only ever holds the latest, so
+  // even a fresh `working` timestamp still reads as `working`, well within any window.
+  upsertThreadMeta(repo, T, { intents: { pm: { intent: "working", ts: Date.now(), sid: "coord" } } });
+
+  orch.detachDoneMembersTick();
+
+  const meta = readThreadMeta(repo, T);
+  assert.deepEqual(threadMembersFromMeta(meta), ["coord"], "still a member");
+  assert.deepEqual([...fsState.durableMembers.get(T)], ["coord"], "mirror unchanged");
+  assert.equal(seatForSid(meta.seats, "coord"), "pm", "seat retained");
+});
+
+test("real tick: a still-LIVE done-intent INSIDE the grace window is left (the ts is the clock)", () => {
+  const repo = tmpRepo();
+  const T = "node:thread:live-fresh-done";
+  const { fsState, liveSessions } = wireDetachContext(repo);
+  snap.recordDurableMember(repo, T, "coord", 1);
+  fillSeat(repo, T, "pm", "coord", 1);
+  liveSessions.set("coord", { status: "idle" });
+  upsertThreadMeta(repo, T, { intents: { pm: { intent: "done", ts: Date.now() - 1, sid: "coord" } } }); // just now
+
+  orch.detachDoneMembersTick();
+
+  assert.deepEqual(threadMembersFromMeta(readThreadMeta(repo, T)), ["coord"], "not yet past the grace window");
+  assert.deepEqual([...fsState.durableMembers.get(T)], ["coord"], "mirror retains it");
 });

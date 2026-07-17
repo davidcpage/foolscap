@@ -119,6 +119,16 @@ work by seat, not sid). Plain unnamed sessions take no seat and stay sid-identif
 (someone running, or live + `working`) / **waiting** (nobody active, ≥1 `blocked:human`) / **dormant** (all
 done/exited, or unstaffed). State is computed at read time, never stored.
 
+**Closing a CHILD thread while you stay live elsewhere — declare `done` on that thread's seat.** If one
+session is seated on several threads at once (a meta thread + its children), a live seat with no per-thread
+intent defaults to `working`, so a finished child would stay **active** (green) forever while you work the
+others. On resolving a child, **post your `done` on THAT child** (`/intent {intent:"done"}`) as you would
+when winding a session down — even though your process keeps running for the other threads. The server's
+done-detach sweep then auto-detaches you from that child after the grace window (releases your seat + drops
+the membership), so it derives **dormant** and its heartbeat job is cleared; declaring `working` again on it
+before the window elapses cancels the pending detach. Your seats on the other threads are untouched — the
+`done` is per-thread, keyed to that thread's seat.
+
 **Seat context cap — hand off, don't park forever.** A parked occupant pays for its whole window on every
 wake; past roughly **~190k tokens of accumulated context** (or a few hundred turns) one nudge costs more
 than a fresh spawn. Past that, hand the seat off at a quiescent point (nothing mid-flight, no ask hanging on
