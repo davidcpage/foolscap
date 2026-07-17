@@ -25,5 +25,10 @@ export function shouldDetachDoneMember(
   delayMs: number,
   isLive?: (sid: string) => boolean,
 ): boolean;
+export function shouldDetachDoneIntent(
+  intentRec: { intent?: string; ts?: number } | null | undefined,
+  now: number,
+  delayMs: number,
+): boolean;
 export function annotationWakeClass(eventKind: string): { mentioned: boolean; broadcast: boolean };
 export function qualifyingWatchers(watchers: WatchRecord[] | null | undefined, eventKind: string): WatchRecord[];
