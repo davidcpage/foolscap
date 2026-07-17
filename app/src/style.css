@@ -3599,6 +3599,75 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
 .chan-pin-abs { position: absolute; top: 3px; right: 5px; z-index: 1; }
 .chan-msg:hover .chan-pin-toggle { opacity: 0.5; }
 .chan-pin-toggle.on { opacity: 1; filter: none; }
+/* The per-message hover toolbar (thread node:8f661d03): the human's edit ✎ / delete ✕ affordance plus the
+   pin, grouped top-right and out of the text flow. Faint until the bubble is hovered so the log stays quiet
+   — matching the pin's treatment. The pin, when lit (pinned), stays visible even unhovered (its .on rule). */
+.chan-msg-actions {
+  position: absolute;
+  top: 3px;
+  right: 5px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.chan-msg-act {
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  color: #71717a;
+  opacity: 0;
+  transition: opacity 0.1s, color 0.1s;
+}
+.chan-msg:hover .chan-msg-act { opacity: 0.55; }
+.chan-msg-act:hover { opacity: 1; color: #3f3f46; }
+.chan-msg-act.danger,
+.chan-msg-act.danger:hover { color: #dc2626; opacity: 1; }
+/* Inline message editor: a prefilled textarea in place of the message text, with save/cancel + an Esc hint,
+   and a red guardrail-error line when the endpoint 4xxs (mention-set change, ask/intent immutable). */
+.chan-msg-editor { display: flex; flex-direction: column; gap: 4px; }
+.chan-msg-editarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: none;
+  border: 1px solid #c4b5fd;
+  border-radius: 5px;
+  padding: 4px 6px;
+  font: inherit;
+  line-height: 1.35;
+  background: #fff;
+  color: inherit;
+}
+.chan-msg.me .chan-msg-editarea { border-color: #86efac; }
+.chan-msg-editrow { display: flex; align-items: center; gap: 6px; }
+.chan-msg-editbtn {
+  border: 1px solid #d4d4d8;
+  border-radius: 4px;
+  background: #6d28d9;
+  color: #fff;
+  border-color: #6d28d9;
+  cursor: pointer;
+  font-size: 11px;
+  padding: 2px 8px;
+  line-height: 1.2;
+}
+.chan-msg-editbtn.ghost { background: none; color: #52525b; border-color: #d4d4d8; }
+.chan-msg-editbtn.danger { background: #dc2626; border-color: #dc2626; }
+.chan-msg-edithint { font-size: 10px; color: #a1a1aa; }
+.chan-msg-amend-error { font-size: 11px; color: #dc2626; }
+/* Lightweight delete confirm (no browser alert()): a small inline bar under the message. */
+.chan-msg-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.chan-msg-confirm-q { color: #52525b; }
 /* Pinned messages stand out by CONTRAST (Thread card UI): a bold left GUTTER BAR + a deeper fill than the
    lightened non-pinned bubbles. The bar is a ::before element (an inset box-shadow was invisible — the
    bubble's rounded corners clipped it away); inset a few px + top/bottom so the radius never eats it, and
