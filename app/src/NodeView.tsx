@@ -9,7 +9,7 @@ import { summarizeDiff } from "./lib";
 import { buildCard, mountTemplate, templatesSignal, type CardTemplate } from "./templates";
 import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
-import { MEMBER_OPEN, postToThread, setThreadPin } from "./threads";
+import { MEMBER_OPEN, postToThread, setThreadPin, editThreadMsg } from "./threads";
 import { unionPillMembers, type PillMember } from "./pill-members";
 import { consumePendingJump, openCanvasLink, openDocLink, openSession, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
 import { HUD_GAP, HUD_SNAP, type HudChrome } from "./hud";
@@ -677,6 +677,16 @@ function ThreadView({
   const [title, setTitle] = useState(node.title);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
+  // Human edit/delete affordance (thread node:8f661d03): the browser viewer IS the human, so amendments go
+  // with from:"human" and the server enforces the rest. `editingSeq` is the row whose text is swapped for an
+  // inline editor; `editText` its draft; `confirmDeleteSeq` the row awaiting a second-click delete confirm;
+  // `amendError` surfaces the endpoint's guardrail 4xx (mention-set change, ask/intent immutable) next to the
+  // active editor rather than failing silently. Only one row is ever mid-amend, so a single set suffices.
+  const [editingSeq, setEditingSeq] = useState<number | null>(null);
+  const [editText, setEditText] = useState("");
+  const [confirmDeleteSeq, setConfirmDeleteSeq] = useState<number | null>(null);
+  const [amendError, setAmendError] = useState<string | null>(null);
+  const editInputRef = useRef<HTMLTextAreaElement>(null);
   // A pending cross-card jump-to-message (user waiting-state, P3): set when the rail's preview popover
   // transports here (window event / consumePendingJump on mount), consumed by an effect that scrolls to the
   // seq once its element renders (jumpToSeq). null when there's nothing to jump to.
@@ -882,6 +892,62 @@ function ThreadView({
     const r = await setThreadPin(id, "human", seq, pinned);
     if (!r.ok) setStatus(r.error ?? "pin failed");
   };
+  // Human message edit/delete (thread node:8f661d03). Open the inline editor prefilled with the CURRENT
+  // (folded) text; cancel a pending delete-confirm since the two are mutually exclusive per row.
+  const beginEdit = (mm: ThreadMsg) => {
+    setConfirmDeleteSeq(null);
+    setAmendError(null);
+    setEditText(mm.text);
+    setEditingSeq(mm.seq);
+  };
+  const cancelEdit = () => {
+    setEditingSeq(null);
+    setEditText("");
+    setAmendError(null);
+  };
+  // Submit an edit. On success the WS feed re-publishes the folded log (amended text + "(edited)" marker),
+  // so we just close the editor; a guardrail 4xx (mention-set change) surfaces inline instead.
+  const submitEdit = async (seq: number) => {
+    const t = editText.trim();
+    if (!t) { setAmendError("an edit can't be empty — delete the message instead"); return; }
+    const r = await editThreadMsg(id, "human", seq, t);
+    if (r.ok) cancelEdit();
+    else setAmendError(r.error ?? "edit failed");
+  };
+  // Delete = tombstone (text:null). A first ✕ click arms the inline confirm; the confirm click fires it.
+  const armDelete = (seq: number) => {
+    setEditingSeq(null);
+    setAmendError(null);
+    setConfirmDeleteSeq(seq);
+  };
+  const confirmDelete = async (seq: number) => {
+    const r = await editThreadMsg(id, "human", seq, null);
+    if (r.ok) { setConfirmDeleteSeq(null); setAmendError(null); }
+    else setAmendError(r.error ?? "delete failed");
+  };
+  // Enter=submit / Escape=cancel for the inline editor must ride a NATIVE listener: React 18 delegates at
+  // #root, but the card-host keydown seam (onKD) stops propagation there so canvas shortcuts don't fire —
+  // which also blocks React's synthetic onKeyDown for elements inside the card (the same reason send() does
+  // this). Refs keep the bound-once listener reading the freshest closures.
+  const submitEditRef = useRef(submitEdit);
+  submitEditRef.current = submitEdit;
+  const cancelEditRef = useRef(cancelEdit);
+  cancelEditRef.current = cancelEdit;
+  useEffect(() => {
+    if (editingSeq == null) return;
+    const el = editInputRef.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); void submitEditRef.current(editingSeq); }
+      else if (e.key === "Escape") { e.preventDefault(); cancelEditRef.current(); }
+    };
+    el.addEventListener("keydown", onKey);
+    return () => el.removeEventListener("keydown", onKey);
+  }, [editingSeq]);
   // Minimal pinned-nav (Thread card UI): the "📌 N" header count's ‹/› step through the pinned messages,
   // scrolling each to the TOP of the log in turn (cycling). Queries the live pinned message elements in the
   // log rather than tracking refs per message; the index rides a ref so stepping doesn't re-render.
@@ -1063,6 +1129,12 @@ function ThreadView({
                 continue;
               }
               const isMe = mm.from === "human";
+              const isEditing = editingSeq === mm.seq;
+              const isConfirmingDelete = confirmDeleteSeq === mm.seq;
+              // The human (the browser viewer) may amend ANY message (server bypasses author-only for a
+              // non-session `from`), so the edit/delete controls show on every real message — but not on an
+              // ask row (the endpoint 409s: card-only entries are immutable) nor an already-tombstoned one.
+              const canAmend = mm.kind !== "ask" && !mm.deleted;
               out.push(
                 <div
                   key={mm.seq}
@@ -1076,21 +1148,68 @@ function ThreadView({
                       <span className="chan-msg-from" title={mm.from}>{senderLabel(mm.from, nameForSid(mm.from))}</span>
                     </div>
                   )}
-                  {/* Pin toggle: a faint top-right hover affordance, out of the text flow (WhatsApp-style, so
-                      it doesn't compete with the floated timestamp meta below). */}
-                  <button
-                    className={`chan-pin-toggle chan-pin-abs${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
-                    data-interactive
-                    title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
-                    onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
-                  >
-                    📌
-                  </button>
+                  {/* A faint top-right hover toolbar (out of the text flow so it doesn't compete with the
+                      floated timestamp meta): the human's edit/delete affordance plus the pin toggle. Edit and
+                      delete are hidden while THIS row is mid-edit (the editor is showing) and on ask/deleted
+                      rows (canAmend). data-interactive keeps a click off the canvas pan/drag seam. */}
+                  <div className="chan-msg-actions" data-interactive>
+                    {canAmend && !isEditing && (
+                      <>
+                        <button
+                          className="chan-msg-act"
+                          data-interactive
+                          title="edit this message"
+                          onClick={(e) => { e.stopPropagation(); beginEdit(mm); }}
+                        >
+                          ✎
+                        </button>
+                        <button
+                          className={`chan-msg-act${isConfirmingDelete ? " danger" : ""}`}
+                          data-interactive
+                          title="delete this message"
+                          onClick={(e) => { e.stopPropagation(); armDelete(mm.seq); }}
+                        >
+                          ✕
+                        </button>
+                      </>
+                    )}
+                    <button
+                      className={`chan-pin-toggle${pinnedSeqs.has(mm.seq) ? " on" : ""}`}
+                      data-interactive
+                      title={pinnedSeqs.has(mm.seq) ? "unpin — remove from head context" : "pin as head context (re-read on every wake)"}
+                      onClick={(e) => { e.stopPropagation(); void togglePin(mm.seq); }}
+                    >
+                      📌
+                    </button>
+                  </div>
                   {/* The timestamp is placed by renderMessageBody: floated into the last paragraph's tail
                       (WhatsApp inline meta), or a below-line row when the body ends in a list. A tombstoned
                       message renders a muted `[deleted by @x]` stub keeping seq + author (so "#seq" references
                       resolve); an edited one appends a subtle "(edited)" marker with the original on hover. */}
-                  {mm.deleted ? (
+                  {isEditing ? (
+                    // Inline editor: swaps the message text for a prefilled textarea. Enter submits, Escape
+                    // cancels (native keydown, above); guardrail 4xx surface in the red line below.
+                    <div className="chan-msg-editor" data-interactive>
+                      <textarea
+                        ref={editInputRef}
+                        className="chan-msg-editarea"
+                        data-interactive
+                        value={editText}
+                        onChange={(e) => {
+                          setEditText(e.target.value);
+                          const el = e.target as HTMLTextAreaElement;
+                          el.style.height = "auto";
+                          el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+                        }}
+                      />
+                      {amendError && <div className="chan-msg-amend-error" data-interactive>{amendError}</div>}
+                      <div className="chan-msg-editrow">
+                        <button className="chan-msg-editbtn" data-interactive onClick={(e) => { e.stopPropagation(); void submitEdit(mm.seq); }}>save</button>
+                        <button className="chan-msg-editbtn ghost" data-interactive onClick={(e) => { e.stopPropagation(); cancelEdit(); }}>cancel</button>
+                        <span className="chan-msg-edithint">Enter to save · Esc to cancel</span>
+                      </div>
+                    </div>
+                  ) : mm.deleted ? (
                     <div className="chan-msg-text chan-msg-deleted" data-text>
                       [deleted{mm.deletedBy ? ` by ${senderLabel(mm.deletedBy, nameForSid(mm.deletedBy))}` : ""}]
                     </div>
@@ -1106,6 +1225,16 @@ function ThreadView({
                           {" "}(edited)
                         </span>
                       )}
+                    </div>
+                  )}
+                  {/* Lightweight delete confirm (no browser alert()): the first ✕ arms it, this bar fires it.
+                      A guardrail 4xx (should be none for a delete, but honest) surfaces in the red line. */}
+                  {isConfirmingDelete && !isEditing && (
+                    <div className="chan-msg-confirm" data-interactive>
+                      <span className="chan-msg-confirm-q">Delete this message?</span>
+                      <button className="chan-msg-editbtn danger" data-interactive onClick={(e) => { e.stopPropagation(); void confirmDelete(mm.seq); }}>delete</button>
+                      <button className="chan-msg-editbtn ghost" data-interactive onClick={(e) => { e.stopPropagation(); setConfirmDeleteSeq(null); setAmendError(null); }}>cancel</button>
+                      {amendError && <div className="chan-msg-amend-error" data-interactive>{amendError}</div>}
                     </div>
                   )}
                 </div>,

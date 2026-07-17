@@ -204,6 +204,31 @@ export async function setThreadPin(
   }
 }
 
+// AMEND a thread message (message edit / tombstone delete) through the server /edit endpoint — the
+// interactive human affordance on the thread card (the passive fold + rendering already landed at 76de1cd).
+// `from` is "human" when the board owner amends from the card (the server's non-session bypass of the
+// author-only guardrail). `text` is the replacement text for an EDIT, or `null` for a tombstone DELETE.
+// Returns a thin ok/error so the row's inline editor can surface the endpoint's guardrail 4xx (mention-set
+// change, ask/intent immutable) next to the editor rather than failing silently.
+export async function editThreadMsg(
+  threadId: string,
+  from: string,
+  seq: number,
+  text: string | null,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/edit?board=${activeBoardId()}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ from, seq, text }),
+    });
+    const body = (await res.json().catch(() => ({}))) as { error?: string };
+    return res.ok ? { ok: true } : { ok: false, error: body.error ?? `HTTP ${res.status}` };
+  } catch (e) {
+    return { ok: false, error: String(e) };
+  }
+}
+
 // Set how much of the backlog a member sees: "full" replays the whole history to them on their next read
 // (and nudges them), "future" jumps them to the latest. Applies now if they're a live member, else it's
 // remembered for when they join. The board owner's per-member control on the thread card.
