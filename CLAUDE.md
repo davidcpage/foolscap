@@ -52,8 +52,9 @@ memory pressure it guards against. The pattern each time: a cap silently kept th
 *second redundant cap*, and the missing content looked like a stale/forked/desynced state. Before adding or
 trusting one:
 
-- **Bound size in ONE place — the byte read** (`MAX_SESSION_BYTES`, `MAX_SESSION_FEED_BYTES`, `MAX_BYTES`
-  in `vite-fs-plugin.ts`). That string IS the memory bound; a downstream cap on *turns/rows/items* frees no
+- **Bound size in ONE place — the byte read** (`MAX_SESSION_BYTES`, `MAX_SESSION_FEED_BYTES` in
+  `server-sessions.ts`; `MAX_BYTES` in `server-http.ts`). That string IS the memory bound; a downstream cap
+  on *turns/rows/items* frees no
   memory (the string is already bounded) and only re-drops content. The session codec renders **every** turn
   it's given for exactly this reason — don't reintroduce a turn cap.
 - **Keep the TAIL for append-only / scroll-to-bottom logs** (transcripts, feeds, the provenance panel): the
