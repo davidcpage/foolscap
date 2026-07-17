@@ -4,21 +4,17 @@ import fs from "node:fs";
 import path from "node:path";
 import { canvasSessionsDir, recordSessionEnd } from "./session-ledger.js";
 import { type SessionProc } from "./session-proc.js";
-import { listThreads, migrateChannelLedger, readSeenMentions, seatForSid, threadMembersFromMeta, type ThreadMetaMarker } from "./thread-ledger.js";
-import { humanWaiting, cardOnly } from "./thread-waiting.js";
-import { connectedEdgeIds } from "./node-cascade.js";
+import { migrateChannelLedger } from "./thread-ledger.js";
+import { cardOnly } from "./thread-waiting.js";
 import { intentLine, type WorkIntent } from "./work-intent.js";
-import { deriveThreadState } from "./thread-state.js";
-import { boardPersistMtime, describeBoardEvents, readBoardPersist } from "./board-persist.js";
-import { boardStoreCanvasSnapshot } from "./board-engine.js";
 import chokidar from "chokidar";
 import { WebSocketServer } from "ws";
-import { sendJson, readBody, openSse, originHostAllowed, type SseClient } from "./server-http.js";
+import { sendJson, openSse, originHostAllowed, type SseClient } from "./server-http.js";
 import type { CanvasFsState, LiveSession, ThreadMsg, WsClient } from "./server-types.js";
 import { boardIdentity, boardRoots, boards, DEFAULT_BOARD, ensureCanvasExcluded, invalidateBoardRoots, readBoardRegistry, recordBoardOpened, reqBoard, rootDir } from "./server-boards.js";
-import { getBusClients, getEmittedMembers, getWsClients, setServerContext } from "./server-context.js";
-import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, ensureCommandId, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
-import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, MAX_SESSION_BYTES, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
+import { getBusClients, getWsClients, setServerContext } from "./server-context.js";
+import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
+import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import { foldCodexEvent } from "./codex-projection.js";
@@ -35,9 +31,11 @@ import { annotationBoardRoutes } from "./routes/annotations.js";
 import { rootsBoardRoutes } from "./routes/roots.js";
 import { inboxRoutes } from "./routes/inbox.js";
 import { askRoutes } from "./routes/asks.js";
-import { threadRoutes } from "./routes/threads.js";
+import { threadRoutes, threadListRoutes } from "./routes/threads.js";
 import { sessionLifecycleRoutes, sessionReadRoutes } from "./routes/sessions.js";
 import { kernelRoutes } from "./routes/kernel.js";
+import { notebookRoutes } from "./routes/notebook.js";
+import { canvasRoutes } from "./routes/canvas.js";
 import { shutdownKernel } from "./server-kernel.js";
 import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js";
 
@@ -67,110 +65,10 @@ import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js"
 const boardFeedsStarted: Set<string> = ((globalThis as { __canvasBoardFeeds?: Set<string> })
   .__canvasBoardFeeds ??= new Set());
 
-// The PARTICIPANTS a thread's state derives from (§8 step 3): the union of the current member:open
-// roster (snapshot edges + the emitted-membership registry) and the seats' current occupants — seats
-// are the DURABLE participants, so a thread whose card (and edges) were removed, or a board whose tab
-// hasn't pushed a snapshot yet (a cold server), still projects from its seat records. Each participant
-// pairs what the canvas OBSERVES (its process-state, from the live-session registry; absent = exited)
-// with what only the agent could SAY (its latest work-intent off the marker, seat-keyed where it holds
-// one so the declaration survives a respawn). Intent keys that name no agent (the human's own mark at
-// the card) annotate the log but are not participants — humans emit no work-intent (lifecycle §6);
-// the close verb (§8 step 6) is the human's tool.
-interface ThreadParticipantOut {
-  sid: string;
-  seat: string | null; // the seat handle it occupies (§5), null for a plain unnamed session
-  role: string | null; // the seat's role name (= handle until labelled multiplicity ships)
-  processState: "running" | "idle" | "exited";
-  intent: string | null; // latest declared work-intent, null if never declared
-}
-function threadParticipants(boardId: string, threadId: string, marker: ThreadMetaMarker): ThreadParticipantOut[] {
-  const records = boardSnapshotRecords(boardId) ?? [];
-  const seats = marker.seats ?? {};
-  const intents = marker.intents ?? {};
-  const sids = new Set<string>(threadMemberSids(records, threadId));
-  for (const s of Object.values(seats)) if (s.sid) sids.add(s.sid);
-  return [...sids].map((sid) => {
-    const live = liveSessions.get(sid);
-    const seat = seatForSid(seats, sid);
-    return {
-      sid,
-      seat,
-      role: seat ? (seats[seat]?.role ?? seat) : null,
-      processState: live?.status ?? "exited",
-      intent: intents[seat ?? sid]?.intent ?? null,
-    };
-  });
-}
+// The /api/threads + /api/channels list (handleThreads) and its §8 step-3 participant projection
+// (threadParticipants) moved to routes/threads.ts — they read the roster/seats/live-registry through the
+// ServerContext seam, alongside the rest of the thread routes.
 
-// GET /api/threads (alias: /api/channels) → every thread this board has on disk (newest activity first),
-// for the list rail (the threads browser card, the sessions card's twin). Mirrors handleSessions: a cheap
-// readdir of the `.canvas/threads/` markers, NOT the message logs — the rail wants title/brief/activity,
-// not the conversation (the card reads that off the thread:<id> feed once opened). `messages` is the last
-// seq, the monotonic count of everything posted; a thread deleted from the canvas still lists here, so
-// "reopen it later" needs no canvas persistence — the marker is the source of truth (the sessions list's
-// .jsonl rationale). Each entry carries the id under BOTH `threadId` (canonical) and `chanId` (what the
-// pre-rename rail card reads), and the response under both `threads` and `channels` — transition aliases.
-// `state` + `participants` are the §8 step-3 DERIVED projection (thread-state.js — active/waiting/dormant
-// the way `status` rides /api/sessions): computed at read time from marker × roster × live registry,
-// never stored — the marker keeps only what was declared, the projection is always current.
-function handleThreads(res: ServerResponse, boardId: string, repoPath: string): void {
-  const threads = listThreads(repoPath).map((m) => {
-    const participants = threadParticipants(boardId, m.threadId, m);
-    // The board owner's UNSEEN-MENTION signal per thread (user waiting-state + you-pill): an @you/@human
-    // mention the human has not yet VIEWED (humanWaiting × the durable per-thread `seenMentions`) → the
-    // threads-list row shows signal (a): a quiet count badge + an interactive hover popover of the pending
-    // mentions, each click a cross-card jump to that message. Same derivation the thread card feeds off, so
-    // list and card agree with no client re-derivation. threadLog is the in-memory tail (seeded at boot, kept
-    // fresh by appendThreadMsg); the threads:<board> ping re-pulls on any message/reply/seen, so the signal
-    // sets and clears live. Unlike the card feed, the rail carries the PREVIEW (sender + snippet) — the rail
-    // is where the human picks a specific message to jump to (the "you" pill is presence-only now). Sender
-    // labels resolve server-side (the rail card can't reach the client name registry): a seated poster shows
-    // its role handle, else a short sid — @human mentions come from seated agents, so the role reads well.
-    const seats = m.seats ?? {};
-    const fromLabel = (sid: string) =>
-      sid === "human" ? "you" : sid === "system" ? "system" : (seatForSid(seats, sid) ?? sid.slice(0, 8));
-    const log = threadLog(boardId, m.threadId);
-    const { waiting: youWaiting, count: youWaitingCount, preview, more: youWaitingMore } =
-      humanWaiting(log, readSeenMentions(repoPath, m.threadId));
-    const youWaitingPreview = preview.map((p) => ({ ...p, fromLabel: fromLabel(p.from) }));
-    // Has this thread EVER been staffed by an agent? Distinguishes never-staffed (a freshly-opened,
-    // unassigned thread — a 'placeholder' row) from staffed-but-now-dormant (all its workers exited/done).
-    // Both derive `state: dormant`, so the client can't tell them apart from that alone. A thread is staffed
-    // if any agent (a sid that isn't the human or the system) has either declared a work-intent on the marker
-    // or posted to the log tail — both inputs are already in hand here, so this adds no IO.
-    const isAgentSid = (sid: string | undefined): boolean => !!sid && sid !== "human" && sid !== "system";
-    const everStaffed =
-      Object.values(m.intents ?? {}).some((rec) => isAgentSid(rec.sid)) ||
-      log.some((msg) => isAgentSid(msg.from));
-    return {
-      threadId: m.threadId,
-      chanId: m.threadId,
-      title: typeof m.title === "string" ? m.title : "",
-      text: typeof m.text === "string" ? m.text : "",
-      messages: typeof m.lastSeq === "number" ? m.lastSeq : 0,
-      mtime: (m.lastTs ?? m.createdAt ?? 0) as number,
-      youWaiting,
-      youWaitingCount,
-      youWaitingPreview,
-      youWaitingMore,
-      // Latest declared work-intent per participant (threads-as-cards §6; keyed by seat handle where the
-      // declarer holds one, else sid) — the raw material the state projection derives from.
-      intents: m.intents ?? {},
-      // The §5 seat records: the durable per-thread participants (role posts), 1:1 with roles until labels.
-      seats: m.seats ?? {},
-      // The RAW durable member roster (sids on the marker) — the P5 client card-reconciler's source of truth.
-      // Distinct from `participants` (derived from the snapshot's member:open EDGES ∪ seats): when the P5 sweep
-      // detaches a done member it drops `members` here, but the on-canvas edge (and its card) linger, so the
-      // client needs the marker's own list to know a card is now orphaned. Also folds in seat occupants (a
-      // seated member always counts) so a seat-only membership isn't misread as detached.
-      members: [...new Set([...threadMembersFromMeta(m), ...Object.values(m.seats ?? {}).map((s) => s.sid).filter((x): x is string => !!x)])],
-      state: deriveThreadState(participants),
-      everStaffed,
-      participants,
-    };
-  });
-  sendJson(res, 200, { threads, channels: threads });
-}
 
 // ── feeds (demo §10: "the clock with a fetch in it") ────────────────────────────────────────────
 // A tiny server-side feed registry, multiplexed onto ONE SSE stream (/api/feeds). Each feed is a
@@ -477,14 +375,6 @@ function startFeeds(): void {
 
 const busClients = getBusClients(fsState);
 
-// The bus-client set for a board, created on first subscribe. (The SSE close handler in openSse deletes
-// the client from the set but leaves the empty set in the map — harmless; one entry per ever-seen board.)
-function busClientsFor(boardId: string): Set<SseClient> {
-  let set = busClients.get(boardId);
-  if (!set) busClients.set(boardId, (set = new Set<SseClient>()));
-  return set;
-}
-
 // How many tabs can ACT on this board right now — the same census dispatchBusCommand's `delivered` is
 // judged against (the app's tabs ride /api/ws; the SSE set is the compat path). The `tabs` liveness
 // signal on GET /api/canvas. WS clients are deduped by their stable per-tab id (?tab=), so a board-switch
@@ -502,114 +392,12 @@ export function tabCountFor(boardId: string): number {
   return (busClients.get(boardId)?.size ?? 0) + tabs.size + untagged;
 }
 
-// T3c helper: tear down every edge touching `nodeId` before its removeNode lands. Emits a removeEdge over
-// the bus for each connected edge (connectedEdgeIds off the durable snapshot) so the cascade is server-
-// authoritative, and — for a session card — also drops its member edges from the emitted-membership bridge,
-// including any join still inside the ~400ms save window (the snapshot wouldn't list those yet). Idempotent:
-// re-removing an edge the store already dropped is a no-op.
-function cascadeNodeEdges(boardId: string, nodeId: string, actor: string, origin: string): void {
-  const emittedMembers = getEmittedMembers(fsState);
-  const records = boardSnapshotRecords(boardId) ?? [];
-  const ids = new Set(connectedEdgeIds(records, nodeId));
-  const sid = nodeSessionId(records, nodeId);
-  if (sid)
-    for (const [edgeId, m] of emittedMembers)
-      if (m.sid === sid) {
-        ids.add(edgeId);
-        emittedMembers.delete(edgeId); // clear the bridge even with no live tab to apply the removeEdge
-      }
-  for (const id of ids) dispatchBusCommand(boardId, { type: "removeEdge", actor, payload: { id } }, origin);
-}
+// The agent-bus core handlers — /api/bus (SSE), POST /api/command (+ its removeNode edge-cascade), and
+// GET /api/canvas (the durable board read) — moved to routes/canvas.ts. tabCountFor (above) stays: the
+// transport owns the client sets it counts, and the seam exposes it to the extracted /api/canvas handler.
 
-async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId: string, origin: string): Promise<void> {
-  let cmd: { type?: unknown; payload?: unknown; actor?: unknown };
-  try {
-    cmd = JSON.parse(await readBody(req));
-  } catch {
-    return sendJson(res, 400, { error: "body must be JSON" });
-  }
-  if (typeof cmd.type !== "string") return sendJson(res, 400, { error: "missing command type" });
-  // T3c: a removeNode CASCADES its edges server-side, so "delete edges before nodes" is no longer a rule the
-  // operator carries. The browser store already tears a node's wires down (core removeNode), but re-deriving
-  // the edge set here and emitting a removeEdge for each FIRST makes the cascade client-independent and — the
-  // part only the server owns — lets us clear the in-memory emitted-membership bridge, so a deleted session
-  // card stops counting as a thread member at once rather than after the 60s TTL.
-  if (cmd.type === "removeNode") {
-    const nodeId = typeof (cmd.payload as { id?: unknown } | undefined)?.id === "string" ? String((cmd.payload as { id: string }).id) : null;
-    if (nodeId) cascadeNodeEdges(boardId, nodeId, typeof cmd.actor === "string" ? cmd.actor : "system", origin);
-  }
-  // Bug B/C: mint the created node/edge id SERVER-side when the caller omits it, so a headless caller can
-  // ADDRESS what it just created. ensureCommandId writes the id into `cmd.payload` (so the tab we broadcast
-  // to uses it rather than minting its own) and returns it to echo in the response. null for non-create
-  // commands, which carry no created id.
-  const createdId = ensureCommandId(cmd as { type?: string; payload?: unknown });
-  // §9 stage 2: COMMIT the command server-side (durable + folded into the live store + diff broadcast to
-  // tabs) and echo the created id + the authoritative seq. No live tab is required any more — the mutation
-  // is durable and visible to GET /api/canvas the instant this returns (the old 503-on-no-tab is retired).
-  // A durable-write failure throws out to the route error boundary (→ 500, the client retries); an unknown
-  // command type is a clean reject (null → 400).
-  const event = dispatchBusCommand(boardId, cmd as { type: string; payload?: Record<string, unknown>; actor?: string }, origin);
-  if (!event) return sendJson(res, 400, { error: `unknown command type: ${cmd.type}`, board: boardId });
-  sendJson(res, 200, { ok: true, board: boardId, seq: event.seq, ...(createdId ? { id: createdId } : {}) });
-}
-
-// The agents' board read, served from the DURABLE store (unification: the browser used to push a
-// second, near-identical snapshot here just for this read — retired; remote-store.ts's persistence
-// save is the one write path now). `tabs` is the liveness signal: a successful read no longer implies
-// a live tab (that was the old 404's meaning), and a WRITE still needs one — check `tabs`/`delivered`
-// before treating the board as actionable. 404 only for a board with nothing persisted yet.
-function handleCanvasGet(res: ServerResponse, boardId: string): void {
-  const b = boards.get(boardId);
-  if (!b) return sendJson(res, 400, { error: "unknown board" });
-  const { events, snapshot } = readBoardPersist(b.repoPath);
-  if (!snapshot && events.length === 0)
-    return sendJson(res, 404, { error: "no board state persisted yet" });
-  // Records served from the live server-materialized store (board-engine, §9 stage 1): fresher than the
-  // debounced snapshot.json cache — it already reflects the event tail. version/seq ride for shape-compat;
-  // `live` is non-null past the 404 guard, the fallbacks are belt-and-braces.
-  const live = boardStoreCanvasSnapshot(boardId, b.repoPath);
-  sendJson(res, 200, {
-    ts: boardPersistMtime(b.repoPath),
-    tabs: tabCountFor(boardId),
-    snapshot: live ?? snapshot ?? { records: [], version: 0 },
-    recentIntent: describeBoardEvents(events),
-  });
-}
-
-// ── notebook outputs (docs/notebook-card.md §7, step-3 agent-legibility) ───────────────────────────
-// A notebook card's cell OUTPUTS are off-log signia atoms living in the BROWSER (notebook-runtime.ts), so
-// they're absent from the file tree AND the /api/canvas snapshot — an agent reads a notebook's source with
-// `Read` but otherwise can't see what a cell PRODUCED. The runtime relays them here exactly as agentBus
-// relays the canvas snapshot, and the server is the same dumb relay: it holds only the last push, PER
-// (board, node id). So GET returns data only WHILE A TAB IS LIVE pushing (404 cold) — the deliberate
-// step-3 scope, a window onto a live run rather than a durable artefact (that's the step-4 memo-cache /
-// shadow store). The blob is already value-bounded at the browser's serialization point; we cap the whole
-// push as a memory safety, matching the file-write 413.
-//
-//   POST /api/notebook/<id>/outputs ?board=  { ts, root, path, cells:[…], exports:{…} } (stored verbatim)
-//   GET  /api/notebook/<id>/outputs ?board=  → that card's last push, or 404 until one has arrived
-const lastNotebookOutputs = (fsState.lastNotebookOutputs ??= new Map<string, string>()); // key: boardId \0 nodeId → the pushed blob
-const nbOutKey = (boardId: string, id: string): string => boardId + "\0" + id;
-
-async function handleNotebookOutputsPush(
-  req: IncomingMessage,
-  res: ServerResponse,
-  boardId: string,
-  id: string,
-): Promise<void> {
-  const body = await readBody(req);
-  if (Buffer.byteLength(body, "utf8") > MAX_SESSION_BYTES) return sendJson(res, 413, { error: "too large" });
-  lastNotebookOutputs.set(nbOutKey(boardId, id), body);
-  sendJson(res, 200, { ok: true });
-}
-
-function handleNotebookOutputsGet(res: ServerResponse, boardId: string, id: string): void {
-  const blob = lastNotebookOutputs.get(nbOutKey(boardId, id));
-  if (blob == null) return sendJson(res, 404, { error: "no outputs pushed for this notebook (is a tab open on it?)" });
-  res.statusCode = 200;
-  res.setHeader("Content-Type", "application/json");
-  res.end(blob);
-}
+// The notebook-outputs relay (POST/GET /api/notebook/<id>/outputs) moved to routes/notebook.ts; its
+// last-push map lives on the pinned fsState (fsState.lastNotebookOutputs), reached via getServerContext.
 
 // ── threads (threads-as-cards.md — the per-task container; renamed from channels at §8 step 2) ──────
 // A THREAD is a task with a conversation attached, reified as a NODE (a card): its `title` is the task,
@@ -712,6 +500,9 @@ setServerContext({
   // Codex event fold — def in codex-projection.ts (dev-server half of the codex-* family); foldSessionEvent
   // dispatches a codex_event frame to it via the seam, same as foldShadowEdits.
   foldCodexEvent,
+  // The live-tab census: def stays here (the transport owns the client sets); the seam exposes it to the
+  // extracted /api/canvas handler (routes/canvas.ts).
+  tabCountFor,
 });
 
 // ── the route table (replaces the linear if/else ladder) ──────────────────────────────────────────
@@ -777,58 +568,16 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   // (list) — same two arms, same order/method/gate-stage, spread here after the thread routes and before
   // the bare /api/threads list, exactly where the inline entries sat.
   ...sessionReadRoutes,
-  {
-    match: oneOf("/api/threads", "/api/channels"),
-    run: (_req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleThreads(res, b.boardId, b.repoPath);
-    },
-  },
+  ...threadListRoutes, // GET /api/threads + /api/channels list (routes/threads.ts) — same arm, same position
   ...roleRoutes, // /api/roles list + create (routes/roles.ts) — same arm, same position
   ...cardTypeRoutes, // /api/card-types (routes/card-types.ts) — same GET arm, same position
   ...boardRoutes, // /api/boards POST(mount)+GET(list) (routes/boards.ts) — same two arms, same order
   // The durable board store (step 4): the browser's persistence backends live here now. (routes/board-persist.ts)
   ...boardPersistRoutes,
-  // The agent bus IS board-scoped now (Phase 3): ?board=<id> picks which board's tabs a command reaches and
-  // which board's snapshot is read back (default board if omitted).
-  {
-    match: exact("/api/bus"),
-    run: (req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return void openSse(req, res, busClientsFor(b.boardId));
-    },
-  },
-  {
-    method: "POST",
-    match: exact("/api/command"),
-    run: (req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return void handleCommand(req, res, b.boardId, originOf(req));
-    },
-  },
-  {
-    match: exact("/api/canvas"),
-    run: (_req, res, url) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      return handleCanvasGet(res, b.boardId);
-    },
-  },
-  // Notebook outputs (§7 agent-legibility). The id is a node id carrying colons + a slashed path, so the
-  // client percent-encodes it — match a non-slash segment and decode, exactly like channels.
-  {
-    match: re(/^\/api\/notebook\/([^/]+)\/outputs$/),
-    run: (req, res, url, g) => {
-      const b = reqBoard(url);
-      if (!b) return sendJson(res, 400, { error: "unknown board" });
-      const id = decodeURIComponent(g[0]!);
-      if (req.method === "POST") return void handleNotebookOutputsPush(req, res, b.boardId, id);
-      return handleNotebookOutputsGet(res, b.boardId, id);
-    },
-  },
+  // The agent-bus core: /api/bus (SSE), POST /api/command, GET /api/canvas (routes/canvas.ts) — same three
+  // arms, same order/method/gate-stage the inline entries held.
+  ...canvasRoutes,
+  ...notebookRoutes, // /api/notebook/<id>/outputs GET+POST (routes/notebook.ts) — same arm, same position
   ...weatherRoutes, // /api/weather (routes/weather.ts) — self-contained, same position
 ];
 

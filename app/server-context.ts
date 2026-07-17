@@ -194,6 +194,11 @@ export interface ServerContext {
   // codex-* family); the seam injects it here so server-sessions.ts stays provider-agnostic — exactly like
   // foldShadowEdits above.
   foldCodexEvent: (s: LiveSession, e: unknown) => void;
+  // The board's live-tab census (the `tabs` liveness signal on GET /api/canvas). Its DEFINITION stays in the
+  // shell (the WS/SSE transport in vite-fs-plugin.ts owns the client sets it counts and calls it directly);
+  // the seam exposes it so the extracted /api/canvas handler (routes/canvas.ts) reaches it without a
+  // routes→shell import cycle — same pattern as publishFeed et al.
+  tabCountFor: (boardId: string) => number;
 }
 
 // Pin the holder on globalThis (like fsState) so a hot re-eval doesn't strand a stale context: the getter
