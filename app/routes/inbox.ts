@@ -3,8 +3,8 @@ import { sendJson, windowParam, nonNegParam, DEFAULT_INBOX_BYTES } from "../serv
 import { getServerContext } from "../server-context.js";
 import { exact, type GlobalRoute } from "./router.js";
 import { cardOnly } from "../thread-waiting.js";
+import { foldAmendments } from "../thread-fold.js";
 import { readThreadLog, readPins } from "../thread-ledger.js";
-import type { ThreadMsg } from "../server-types.js";
 
 // ── the inbox read tool (GET /api/inbox) — god-file split, Phase 3 ──────────────────────────────────
 // The read side of channel messaging: an agent GETs this with Bash so unread thread messages land in TOOL
@@ -52,11 +52,11 @@ function fmtTs(ts: number): string {
 // drop). Applies a max message COUNT (`limit`) and/or a max TEXT-BYTE budget (`bytes`) to `fresh`, keeping
 // the most recent. Always keeps ≥1 message (a budget smaller than the last message still yields it, flagged).
 // Returns the kept tail + how many older messages were omitted (0 ⇒ nothing trimmed).
-function windowTail(fresh: ThreadMsg[], limit: number | null, bytes: number | null): { kept: ThreadMsg[]; omitted: number } {
+function windowTail<T extends { text: string }>(fresh: T[], limit: number | null, bytes: number | null): { kept: T[]; omitted: number } {
   if (limit == null && bytes == null) return { kept: fresh, omitted: 0 };
   let kept = limit != null && fresh.length > limit ? fresh.slice(fresh.length - limit) : fresh.slice();
   if (bytes != null) {
-    const out: ThreadMsg[] = [];
+    const out: T[] = [];
     let used = 0;
     for (let i = kept.length - 1; i >= 0; i--) {
       const size = Buffer.byteLength(kept[i]!.text, "utf8");
@@ -125,7 +125,12 @@ export function computeInbox(sid: string | null, opts: InboxOpts): { status: num
         const full = readThreadLog(s.repoPath, threadId);
         if (full.length) log = full;
       }
-      const fresh = log.filter((mng) => mng.seq > floor && !cardOnly(mng)); // ask-echoes / intent acts are card-only
+      // Fold amendment events (edit / tombstone delete) onto their targets BEFORE the unread/card-only filter,
+      // so a fresh joiner's backlog replay AND every incremental read serve the clean amended text. The fold
+      // drops the card-only `kind:"edit"` events themselves; the surviving folded target keeps its own seq, so
+      // the `seq > floor` frontier and the cursor advance below are unaffected (the cursor still tracks the RAW
+      // log's max seq — set from `log`, not the fold — so it advances past the edit events too).
+      const fresh = foldAmendments(log).filter((mng) => mng.seq > floor && !cardOnly(mng));
       // Keep the recent TAIL within the byte budget (+ opt-in count). The omitted are OLDER; on a consuming
       // read the cursor advances past them (below), so recover them in ONE GET with a larger &bytes= or a
       // &since=<seq> replay (non-consuming) — never a leave+rejoin. Surfaced as `truncated`, never dropped.
@@ -134,7 +139,15 @@ export function computeInbox(sid: string | null, opts: InboxOpts): { status: num
         const out: OutChan = {
           channel: threadId,
           title: threadNode(records, threadId)?.title || "",
-          messages: kept.map((m) => ({ seq: m.seq, t: fmtTs(m.ts), from: inboxHandle(records, m.from), text: m.text })),
+          // Agents get CLEAN amended text — no "(edited)" marker (provenance stays in the raw log; the subtle
+          // marker is UI-only). A tombstoned message renders as a `[deleted by @<handle>]` stub keeping its
+          // seq + author, so a later "#seq" reference still resolves and the reader doesn't act on stale text.
+          messages: kept.map((m) => ({
+            seq: m.seq,
+            t: fmtTs(m.ts),
+            from: inboxHandle(records, m.from),
+            text: m.deleted ? `[deleted by @${inboxHandle(records, m.deletedBy ?? m.from)}]` : m.text,
+          })),
         };
         if (omitted > 0)
           out.truncated = {

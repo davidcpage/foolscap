@@ -67,9 +67,13 @@ export interface ThreadMsg {
   text: string;
   // CARD-ONLY entries: the card renders them but inbox/nudge skip them (they wake no one). "ask" is the
   // §16 Q→A legibility echo; "intent" is the work-intent typed act (threads-as-cards §6) with the declared
-  // intent in `intent` (the machine truth — `text` is just its legible face, see intentLine).
-  kind?: "ask" | "intent";
+  // intent in `intent` (the machine truth — `text` is just its legible face, see intentLine); "edit" is an
+  // AMENDMENT event (message edit / tombstone delete) whose `target` is the seq it amends, folded onto that
+  // message at read time (thread-fold.js) — never a mutation, so seq contiguity is preserved.
+  kind?: "ask" | "intent" | "edit";
   intent?: WorkIntent;
+  target?: number; // kind:"edit" — the seq this event amends
+  deleted?: boolean; // kind:"edit" — this amendment is a tombstone (a delete, not a text edit)
 }
 
 // §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —

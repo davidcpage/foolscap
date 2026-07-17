@@ -557,7 +557,22 @@ function ProvenanceView({
 // a template card — it must contain its own interior interactions: native listeners stop an input's
 // pointerdown (focus, don't drag the card) and keydown (don't leak Space→pan / Backspace→delete) from
 // reaching the canvas. Mirrors TemplateCard's seam.
-type ThreadMsg = { seq: number; ts: number; from: string; text: string; kind?: "ask" | "intent"; intent?: string };
+// The feed carries the FOLDED log (server-side thread-fold.js): amendment events are dropped and edits /
+// tombstones applied onto their targets, which then carry display metadata — `edited` (+ `originalText` for
+// the on-hover original, `editedBy`) and `deleted` (+ `deletedBy` for the "[deleted by @x]" stub).
+type ThreadMsg = {
+  seq: number;
+  ts: number;
+  from: string;
+  text: string;
+  kind?: "ask" | "intent" | "edit";
+  intent?: string;
+  edited?: boolean;
+  originalText?: string;
+  editedBy?: string;
+  deleted?: boolean;
+  deletedBy?: string;
+};
 // A pinned message (R-PIN): a snapshot flagged as head context, rendered in the collapsible pinned tray.
 type PinnedMsg = { seq: number; from: string; text: string; ts: number; pinnedBy?: string; pinnedAt?: number };
 // A member's readable display handle: a role-spawned session carries a `.name` ("Coordinator.97acc4bc"); show it as
@@ -1072,8 +1087,27 @@ function ThreadView({
                     📌
                   </button>
                   {/* The timestamp is placed by renderMessageBody: floated into the last paragraph's tail
-                      (WhatsApp inline meta), or a below-line row when the body ends in a list. */}
-                  <div className="chan-msg-text" data-text>{renderMessageBody(mm.text, openEntries, m, `#${mm.seq} · ${formatEventTime(mm.ts)}`)}</div>
+                      (WhatsApp inline meta), or a below-line row when the body ends in a list. A tombstoned
+                      message renders a muted `[deleted by @x]` stub keeping seq + author (so "#seq" references
+                      resolve); an edited one appends a subtle "(edited)" marker with the original on hover. */}
+                  {mm.deleted ? (
+                    <div className="chan-msg-text chan-msg-deleted" data-text>
+                      [deleted{mm.deletedBy ? ` by ${senderLabel(mm.deletedBy, nameForSid(mm.deletedBy))}` : ""}]
+                    </div>
+                  ) : (
+                    <div className="chan-msg-text" data-text>
+                      {renderMessageBody(mm.text, openEntries, m, `#${mm.seq} · ${formatEventTime(mm.ts)}`)}
+                      {mm.edited && (
+                        <span
+                          className="chan-msg-edited"
+                          data-interactive
+                          title={mm.originalText != null ? `original: ${mm.originalText}` : "edited"}
+                        >
+                          {" "}(edited)
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>,
               );
             }

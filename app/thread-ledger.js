@@ -572,6 +572,22 @@ export function pinMessage(repoPath, threadId, msg, by, ts) {
 }
 
 /**
+ * Refresh a pin's snapshot TEXT for one seq — the amendment companion to pinMessage. Pins snapshot the
+ * message text BY COPY (so a pin survives the log's bounded tail), so an accepted edit/delete of a pinned
+ * message must update the snapshot or the head-context tray would keep showing the stale original. A no-op
+ * (returns the prior set unchanged) when that seq isn't pinned, or when the text already matches. `newText`
+ * is the amended text (or the `[deleted]` stub for a tombstone). Returns the updated (or unchanged) pins.
+ */
+export function refreshPinSnapshot(repoPath, threadId, seq, newText) {
+  const prior = readPins(repoPath, threadId);
+  const idx = prior.findIndex((p) => p.seq === seq);
+  if (idx < 0 || prior[idx].text === newText) return prior; // not pinned, or nothing to change
+  const pins = prior.map((p) => (p.seq === seq ? { ...p, text: newText } : p));
+  upsertThreadMeta(repoPath, threadId, { pins });
+  return pins;
+}
+
+/**
  * Unpin a message by seq. A no-op (returns the prior set) if that seq wasn't pinned. Returns updated pins.
  */
 export function unpinMessage(repoPath, threadId, seq) {

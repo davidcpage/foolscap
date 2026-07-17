@@ -7,6 +7,7 @@ import { humanWaiting } from "../thread-waiting.js";
 import { deriveThreadState } from "../thread-state.js";
 import { classifyMentionSpawn, resolveTags } from "../thread-tags.js";
 import { unreadMentions, senderCursorAfterPost } from "../cas-guard.js";
+import { checkEdit, DELETED_STUB } from "../thread-fold.js";
 import { isWorkIntent, intentLine, WORK_INTENTS, type WorkIntent } from "../work-intent.js";
 import { isNotificationLevel, NOTIFICATION_LEVELS } from "../notification-levels.js";
 import { listRoles } from "../role-ledger.js";
@@ -21,6 +22,7 @@ import {
   readSeenMentions,
   readThreadLog,
   readThreadMeta,
+  refreshPinSnapshot,
   releaseSeat,
   roleMentionRoute,
   seatForSid,
@@ -640,6 +642,106 @@ async function handleThreadPin(
   sendJson(res, 200, { ok: true, thread: threadId, channel: threadId, seq: body.seq, pinned, pins });
 }
 
+// POST /api/thread/<id>/edit { from, seq, text } — AMEND a thread message: edit its text, or DELETE it
+// (tombstone) with `text:null`. An amendment is NEVER a mutation — the log is append-only and seq contiguity
+// is load-bearing — so this appends a card-only `kind:"edit"` event (`target:<seq>`), folded onto the target
+// at read time (thread-fold.js) across every projection (the card feed, /inbox, backlog replay). It wakes NO
+// ONE (card-only, like intent/ask): a member whose cursor hasn't reached the message reads the amended text
+// on first read (zero chatter); a substantive correction is the author's own call via a normal @-tagged post.
+// Guardrails (thread-fold.checkEdit, a pure unit-testable decision): author-only (an agent amends only its
+// own; the human — a non-session `from` — may amend anything); ask/intent immutable; mention-set invariance
+// on an edit (may not add/remove @-tags — seenMentions is seq-keyed, so an added mention would wake no one).
+// The target is resolved from the in-memory tail, falling back to the full ledger (like the pin handler) so a
+// message that scrolled out of the bounded tail can still be amended. A pinned target's snapshot is refreshed
+// (pins copy text by value). Consent mirrors handleThreadPin: a member (or the human at the card) may act.
+async function handleThreadEdit(
+  req: IncomingMessage,
+  res: ServerResponse,
+  boardId: string,
+  threadId: string,
+): Promise<void> {
+  const {
+    boardSnapshotRecords,
+    threadNode,
+    sessionNodeForSid,
+    threadMemberSids,
+    boards,
+    threadLog,
+    appendThreadMsg,
+    publishThreadFeed,
+    publishFeed,
+  } = getServerContext();
+  let body: { from?: unknown; seq?: unknown; text?: unknown };
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: "body must be JSON" });
+  }
+  if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  if (typeof body.seq !== "number" || !Number.isInteger(body.seq) || body.seq < 1)
+    return sendJson(res, 400, { error: "seq must be a positive integer" });
+  const isDelete = body.text === null;
+  if (!isDelete && (typeof body.text !== "string" || !body.text))
+    return sendJson(res, 400, { error: "text must be a non-empty string (an edit) or null (a delete)" });
+  const repoPath = boards.get(boardId)?.repoPath;
+  if (!repoPath) return sendJson(res, 409, { error: "no repo for this board" });
+  // Existence gate is the LEDGER marker, canvas-node fallback (the seen/pin pattern): amending is a durable
+  // ledger op that must not need the thread's card on the board.
+  const records = boardSnapshotRecords(boardId);
+  const meta = readThreadMeta(repoPath, threadId);
+  if (!meta && !(records && threadNode(records, threadId)))
+    return sendJson(res, 404, { error: "thread not found" });
+  // Consent mirrors message/pin: a SESSION sender must be a member (snapshot ∪ ledger union); the human at
+  // the card is not a session node and always may. That non-session `from` is also the `isHuman` authority
+  // that bypasses the author-only guardrail below (records-less ⇒ can't prove it's a session, so permissive,
+  // matching every other consent gate here).
+  if (
+    records &&
+    sessionNodeForSid(records, body.from) &&
+    !threadMemberSids(records, threadId).includes(body.from) &&
+    !threadMembersFromMeta(meta).includes(body.from)
+  )
+    return sendJson(res, 403, { error: "sender is not a member of this thread" });
+  const isHuman = !(records && sessionNodeForSid(records, body.from));
+
+  // Resolve the target: the in-memory tail first (the common case), else the full ledger (a message that has
+  // scrolled out of the bounded tail — the very case the ledger read exists for, mirroring the pin handler).
+  const log = threadLog(boardId, threadId);
+  let target = log.find((m) => m.seq === body.seq) as ThreadMsg | undefined;
+  if (!target) target = readThreadLog(repoPath, threadId).find((m) => m.seq === body.seq) as ThreadMsg | undefined;
+
+  const newText = isDelete ? null : (body.text as string);
+  const verdict = checkEdit(target, newText, { fromSid: body.from, isHuman });
+  if (!verdict.ok) return sendJson(res, verdict.status, { error: verdict.error });
+
+  // Append the amendment event durably (BUG-6: honest accept — appendThreadMsg throws on a durable failure).
+  let editMsg: ThreadMsg;
+  try {
+    editMsg = appendThreadMsg(boardId, threadId, body.from, isDelete ? "" : (newText as string), {
+      kind: "edit",
+      target: body.seq,
+      ...(isDelete ? { deleted: true } : {}),
+    });
+  } catch (e) {
+    return sendJson(res, 500, { error: "edit could not be persisted — not applied, retry", detail: String((e as Error)?.message ?? e) });
+  }
+  // Refresh a pinned target's snapshot (pins copy text by value), then re-publish so the pinned tray reflects
+  // the amendment live — appendThreadMsg already published the folded message tail, this corrects the pins.
+  const pins = refreshPinSnapshot(repoPath, threadId, body.seq, isDelete ? DELETED_STUB : (newText as string));
+  publishThreadFeed(boardId, threadId, threadLog(boardId, threadId), false);
+  publishFeed("threads:" + boardId, { ts: Date.now() }); // rail re-pull, like pin does
+  sendJson(res, 200, {
+    ok: true,
+    thread: threadId,
+    channel: threadId,
+    seq: body.seq,
+    deleted: isDelete,
+    edited: !isDelete,
+    editSeq: editMsg.seq,
+    pins,
+  });
+}
+
 // POST /api/thread/<id>/seen { from, seqs } — mark @you/@human MENTION seqs the human has now VIEWED (user
 // waiting-state + you-pill). Driven by the thread card's viewport observer: when a still-unseen mention
 // scrolls into the log while the card is focused, its seq is POSTed here and unioned into the durable
@@ -826,7 +928,7 @@ async function handleThreadJob(
 export const threadRoutes: GlobalRoute[] = [
   {
     method: "POST",
-    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|seen|job|worktree)$/),
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/(message|join|leave|invite|history|ask|reply|intent|level|pin|edit|seen|job|worktree)$/),
     run: (req, res, url, g) => {
       const ctx = getServerContext();
       const b = ctx.reqBoard(url);
@@ -840,6 +942,7 @@ export const threadRoutes: GlobalRoute[] = [
       if (action === "intent") return void handleThreadIntent(req, res, b.boardId, threadId);
       if (action === "level") return void handleThreadLevel(req, res, b.boardId, threadId);
       if (action === "pin") return void handleThreadPin(req, res, b.boardId, threadId);
+      if (action === "edit") return void handleThreadEdit(req, res, b.boardId, threadId);
       if (action === "seen") return void handleThreadSeen(req, res, b.boardId, threadId);
       if (action === "job") return void handleThreadJob(req, res, b.boardId, threadId);
       if (action === "worktree") return void handleThreadWorktree(req, res, b.boardId, threadId);

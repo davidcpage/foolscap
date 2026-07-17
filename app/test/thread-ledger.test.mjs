@@ -26,6 +26,7 @@ import {
   threadLevelForSid,
   readPins,
   pinMessage,
+  refreshPinSnapshot,
   unpinMessage,
   readSeenMentions,
   markSeenMentions,
@@ -388,6 +389,25 @@ test("pins (R-PIN): pin snapshots a message, is idempotent, stays chronological,
   assert.deepEqual(unpinMessage(repo, id, 2).map((p) => p.seq), [5]);
   assert.deepEqual(unpinMessage(repo, id, 2).map((p) => p.seq), [5], "unpin of a non-pin is a no-op");
   assert.deepEqual(readPins(repo, id).map((p) => p.seq), [5], "the durable marker reflects the unpin");
+});
+
+test("refreshPinSnapshot: an amendment of a pinned message updates its snapshot text (edit + tombstone)", () => {
+  const repo = tmpRepo();
+  const id = "node:thread:pin-refresh";
+  pinMessage(repo, id, msg(3, "teh done-when"), "human", 300);
+  pinMessage(repo, id, msg(7, "chatter"), "human", 700);
+  // An edit refreshes only the matching pin's text; who/when pinned is untouched.
+  const afterEdit = refreshPinSnapshot(repo, id, 3, "the done-when");
+  assert.equal(afterEdit.find((p) => p.seq === 3).text, "the done-when");
+  assert.equal(afterEdit.find((p) => p.seq === 3).pinnedAt, 300, "pin provenance is preserved");
+  assert.equal(afterEdit.find((p) => p.seq === 7).text, "chatter", "an unrelated pin is untouched");
+  assert.equal(readPins(repo, id).find((p) => p.seq === 3).text, "the done-when", "the durable marker reflects it");
+  // A tombstone refreshes the pin to the stub.
+  refreshPinSnapshot(repo, id, 7, "[deleted]");
+  assert.equal(readPins(repo, id).find((p) => p.seq === 7).text, "[deleted]");
+  // No-ops: an unpinned seq, or a no-change text, don't churn the marker.
+  assert.deepEqual(refreshPinSnapshot(repo, id, 999, "x").map((p) => p.seq), [3, 7], "unpinned seq → no-op returns prior set");
+  assert.equal(refreshPinSnapshot(repo, id, 3, "the done-when").find((p) => p.seq === 3).text, "the done-when", "same-text → no-op, still correct");
 });
 
 test("pins ride the marker beside seats/intents without clobbering them", () => {

@@ -5,14 +5,18 @@ import type { WorkIntent } from "./work-intent.js";
 import type { NotificationLevel } from "./notification-levels.js";
 
 // One persisted thread message — the same shape the in-memory ThreadMsg holds. `kind` marks a CARD-ONLY
-// entry (ask echo / work-intent act — rendered by the card, never inbox content); `intent` rides kind:"intent".
+// entry (ask echo / work-intent act / amendment event — rendered by the card, never inbox content);
+// `intent` rides kind:"intent"; `target`/`deleted` ride kind:"edit" (a message edit / tombstone delete,
+// folded onto its target at read time — thread-fold.js).
 export interface ThreadLogMsg {
   seq: number;
   ts: number;
   from: string;
   text: string;
-  kind?: "ask" | "intent";
+  kind?: "ask" | "intent" | "edit";
   intent?: WorkIntent;
+  target?: number;
+  deleted?: boolean;
 }
 
 // The latest work-intent a participant declared (threads-as-cards §6), on the marker's `intents` — keyed by
@@ -137,6 +141,7 @@ export function pinMessage(
   by: string,
   ts: number,
 ): PinnedMsg[];
+export function refreshPinSnapshot(repoPath: string, threadId: string, seq: number, newText: string): PinnedMsg[];
 export function unpinMessage(repoPath: string, threadId: string, seq: number): PinnedMsg[];
 export function readSeenMentions(repoPath: string, threadId: string): number[];
 export function markSeenMentions(repoPath: string, threadId: string, seqs: number[]): number[];

@@ -8,7 +8,7 @@
 # verbs instead of raw curl. Per the session permission model, this is a UNIFORM baseline capability for
 # every session, not a role permission.
 #
-# Thread verbs (msg/inbox/intent/pin/join/leave) are ALSO wrapped here now, so board messaging goes
+# Thread verbs (msg/inbox/intent/pin/edit/join/leave) are ALSO wrapped here now, so board messaging goes
 # through the allow-listed path and bypasses the auto-mode permission classifier — raw curl to
 # /api/thread/* otherwise gets gated/prompted, and stalls entirely when the classifier model is
 # unavailable. (ask/reply/invite stay raw curl for now — add them here if the friction bites.)
@@ -90,6 +90,10 @@ canvas — session/coordination verbs over the agent bus
   scripts/canvas intent <thread> working|blocked:human|blocked:peer|done [--note TEXT] [--from ID]
         declare your work-intent on a thread (card-only, wakes no one).
   scripts/canvas pin <thread> <seq> [--unpin] [--from ID]     pin (or --unpin) a message as head context.
+  scripts/canvas edit <thread> <seq> [TEXT|--stdin|--text-file F] [--delete] [--from ID]   amend a message:
+        edit its text, or --delete it (a tombstone → a "[deleted by @x]" stub). Author-only for agents (the
+        human may amend anything); an edit may not add/remove @-tags. Silent — wakes no one; a fresh read
+        gets the amended text. Long/multi-paragraph text is best piped via --stdin/--text-file.
   scripts/canvas join <thread> [--from ID] [--history full|future]   join a thread; leave <thread> leaves it.
   scripts/canvas leave <thread> [--from ID]
 
@@ -805,6 +809,37 @@ PY
       *) echo "pin: unexpected arg '$1'" >&2; exit 2 ;;
     esac; done
     post "$SERVER/api/thread/$(enc "$thread")/pin?board=$BOARD" "{\"from\":$(jstr "$from"),\"seq\":$seq,\"pinned\":$pinned}"; echo ;;
+  edit)
+    thread="${1:?usage: canvas edit <thread> <seq> [TEXT|--stdin|--text-file F] [--delete] [--from ID]}"; shift
+    seq="${1:?usage: canvas edit <thread> <seq> [TEXT|--stdin|--text-file F] [--delete] [--from ID]}"; shift
+    from="$DEFAULT_FROM"; del=""; stdin=""; tfile=""; textarg=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --from) from="${2:-}"; shift 2 ;;
+      --delete) del=1; shift ;;
+      --stdin) stdin=1; shift ;;
+      --text-file) tfile="${2:-}"; shift 2 ;;
+      --board) BOARD="${2:-}"; shift 2 ;;
+      --*) echo "edit: unknown flag '$1'" >&2; exit 2 ;;
+      *) textarg="$1"; shift ;;
+    esac; done
+    if [ -n "$del" ]; then
+      body=$(python3 - "$from" "$seq" <<'PY'
+import json, sys
+frm, seq = sys.argv[1], int(sys.argv[2])
+print(json.dumps({"from": frm, "seq": seq, "text": None}))
+PY
+)
+    else
+      text="$(anno_read_text "$textarg" "$stdin" "$tfile")"
+      [ -n "$text" ] || { echo "edit: empty text (pass TEXT, --stdin, --text-file, or --delete)" >&2; exit 2; }
+      body=$(python3 - "$from" "$seq" "$text" <<'PY'
+import json, sys
+frm, seq, text = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+print(json.dumps({"from": frm, "seq": seq, "text": text}))
+PY
+)
+    fi
+    post "$SERVER/api/thread/$(enc "$thread")/edit?board=$BOARD" "$body"; echo ;;
   join)
     thread="${1:?usage: canvas join <thread> [--from ID] [--history full|future]}"; shift
     from="$DEFAULT_FROM"; history=""
