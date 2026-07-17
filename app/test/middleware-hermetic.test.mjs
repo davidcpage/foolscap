@@ -202,6 +202,38 @@ test("server-http sendJson: gzip only when the client accepts it AND the body cl
   assert.equal(noAccept._headers["Content-Encoding"], undefined, "no gzip in Accept-Encoding ⇒ plain");
 });
 
+// ── Origin/Host allowlist (pre-push audit, MEDIUM) — the pure decision behind the HTTP + WS guards ──
+test("server-http isLoopbackHost: loopback names/ips (any port, incl. bracketed IPv6) yes; everything else no", async () => {
+  const { isLoopbackHost } = await import("../server-http.ts");
+  // Loopback — with and without a :port
+  for (const h of ["127.0.0.1", "127.0.0.1:5173", "localhost", "localhost:5173", "LOCALHOST:5173",
+                    "127.5.6.7", "[::1]", "[::1]:5173"]) {
+    assert.equal(isLoopbackHost(h), true, `loopback: ${h}`);
+  }
+  // Not loopback — the DNS-rebind and public-name cases
+  for (const h of ["", "evil.com", "evil.com:5173", "attacker.127.0.0.1.nip.io:5173", "10.0.0.5:5173",
+                    "192.168.1.9", "0.0.0.0", "127x0x0x1"]) {
+    assert.equal(isLoopbackHost(h), false, `not loopback: ${h}`);
+  }
+});
+
+test("server-http originHostAllowed: allow same-origin + no-Origin CLI; reject foreign Origin + rebind Host + null Origin", async () => {
+  const { originHostAllowed } = await import("../server-http.ts");
+  // ALLOW — the traffic that must never break
+  assert.equal(originHostAllowed(undefined, "127.0.0.1:5173"), true, "curl/CLI/agent-bus/sidecar: no Origin, loopback Host");
+  assert.equal(originHostAllowed("", "127.0.0.1:5173"), true, "empty Origin treated as absent");
+  assert.equal(originHostAllowed("http://127.0.0.1:5173", "127.0.0.1:5173"), true, "same-origin browser POST");
+  assert.equal(originHostAllowed("http://localhost:5173", "localhost:5173"), true, "same-origin on the localhost spelling");
+  assert.equal(originHostAllowed(undefined, "localhost:5173"), true, "no-Origin GET on the localhost spelling");
+  // REJECT — the two audit holes
+  assert.equal(originHostAllowed("https://evil.com", "127.0.0.1:5173"), false, "cross-origin no-cors POST from a web page");
+  assert.equal(originHostAllowed("http://127.0.0.1:8080", "127.0.0.1:5173"), false, "another LOCAL dev server on a different port");
+  assert.equal(originHostAllowed(undefined, "rebind.evil.com:5173"), false, "DNS rebinding: foreign Host, no Origin");
+  assert.equal(originHostAllowed("http://rebind.evil.com:5173", "rebind.evil.com:5173"), false, "DNS rebinding with a matching foreign Origin");
+  assert.equal(originHostAllowed("null", "127.0.0.1:5173"), false, "Origin: null (sandboxed iframe / opaque origin)");
+  assert.equal(originHostAllowed("http://127.0.0.1:5173", undefined), false, "missing Host header");
+});
+
 // ── Group B: server-snapshot pure record resolvers (no context) ─────────────────────────────────────
 const RECORDS = [
   { typeName: "node", id: "node:live:s1", type: "session", title: "s1", name: "Coordinator.s1" },
