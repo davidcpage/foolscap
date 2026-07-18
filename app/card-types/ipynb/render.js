@@ -260,7 +260,7 @@ function cellActions(cell, editApi, isEditing) {
           >
             ✕ Cancel
           </button>`
-      : html`<button class="ipynb-cellbtn ipynb-cell-edit" title="Edit source" @click=${(e) => editApi.enterEdit(id, src, bodyOf(e))}>✎ Edit</button>`}
+      : html`<button class="ipynb-cellbtn ipynb-cell-edit" title="Edit source" @click=${(e) => editApi.enterEdit(id, src, bodyOf(e))}>✎</button>`}
     <button class="ipynb-cellbtn" title="Move cell up" @click=${() => editApi.op({ type: "moveCell", cellId: id, dir: "up" })}>↑</button>
     <button class="ipynb-cellbtn" title="Move cell down" @click=${() => editApi.op({ type: "moveCell", cellId: id, dir: "down" })}>↓</button>
     <button class="ipynb-cellbtn" title="Add code cell below" @click=${(e) => editApi.op({ type: "addCell", cellType: "code", afterCellId: id }, bodyOf(e))}>＋Code</button>
