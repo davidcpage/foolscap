@@ -15,15 +15,17 @@
 // The registry (`liveKernels`) hangs off the re-eval-surviving `fsState` (server-context). A kernel need not
 // survive a full dev-server RESTART for this cut (approved) — a dead kernel is simply re-started on next run.
 
-import fs from "node:fs";
-import path from "node:path";
 import crypto from "node:crypto";
 import WebSocket from "ws";
 import { getServerContext } from "./server-context.js";
-import { transformNotebook } from "./ipynb-codec.js";
-import { contentVersion, isStaleWrite } from "./cas-guard.js";
-import { safeResolve, fileVersion } from "./server-fs.js";
-import { MAX_NOTEBOOK_BYTES } from "./server-http.js";
+import {
+  type Notebook,
+  joinMaybe,
+  resolveNotebookPath,
+  readNotebook,
+  casWriteNotebook,
+  ensureCellIds,
+} from "./server-notebook.js";
 import { ensureGateway } from "./jupyter-host.js";
 
 // One nbformat output, as the render codec / render.js already understand them.
@@ -81,10 +83,10 @@ function publishKernel(boardId: string, nodeId: string, frame: Record<string, un
 }
 
 // ── nbformat helpers ────────────────────────────────────────────────────────────────────────────────
-
-function joinMaybe(v: unknown): string {
-  return Array.isArray(v) ? v.join("") : typeof v === "string" ? v : "";
-}
+// The notebook FILE read / normalize / full-fidelity CAS-write primitives live in server-notebook.ts and are
+// SHARED with the structural-edit engine there — so a kernel output-merge and a card source-edit go through
+// the SAME by-cell-id CAS-write path and can't clobber each other. This module owns only the IOPub→nbformat
+// mapping and the output-merge that consume them.
 
 // Map one IOPub message to an nbformat output (or null for non-output messages like status/execute_input).
 function iopubToOutput(msgType: string, content: Record<string, unknown>): NbOutput | null {
@@ -110,86 +112,6 @@ function iopubToOutput(msgType: string, content: Record<string, unknown>): NbOut
     default:
       return null;
   }
-}
-
-// A short, collision-resistant nbformat cell id (nbformat 4.5+). Kept ≤ the spec's suggested length.
-function newCellId(): string {
-  return crypto.randomBytes(6).toString("hex");
-}
-
-// ── notebook file read / normalize / write-back ─────────────────────────────────────────────────────
-
-interface Notebook {
-  cells: Array<{ id?: string; cell_type?: string; source?: unknown; outputs?: unknown; execution_count?: unknown }>;
-  metadata?: Record<string, unknown>;
-  [k: string]: unknown;
-}
-
-function resolveNotebookPath(rootDir: string, relPath: string): string | null {
-  const abs = safeResolve(rootDir, relPath);
-  if (!abs) return null;
-  if (path.extname(abs).toLowerCase() !== ".ipynb") return null;
-  return abs;
-}
-
-function readNotebook(abs: string): { nb: Notebook; version: string | null } | null {
-  let text: string;
-  try {
-    text = fs.readFileSync(abs, "utf8");
-  } catch {
-    return null;
-  }
-  let nb: Notebook;
-  try {
-    nb = JSON.parse(text);
-  } catch {
-    return null;
-  }
-  if (!nb || typeof nb !== "object" || !Array.isArray(nb.cells)) return null;
-  return { nb, version: contentVersion(text) };
-}
-
-// Serialize a notebook object through the FULL-FIDELITY codec projection — the ONLY sanctioned write path
-// (strips the render-only `metadata.__foolscap`, validates shape, never elides). CAS-write with the given
-// baseVersion; returns "ok" | "stale" | "error". Small check-then-write race window is tolerated (all writes
-// for one kernel are serialized upstream; the CAS defends against EXTERNAL concurrent writes only).
-function casWriteNotebook(abs: string, nb: Notebook, baseVersion: string | null): "ok" | "stale" | "error" {
-  const { content, parsed } = transformNotebook(JSON.stringify(nb), { mode: "full" });
-  if (!parsed) return "error";
-  if (Buffer.byteLength(content, "utf8") > MAX_NOTEBOOK_BYTES) return "error";
-  if (isStaleWrite(baseVersion, fileVersion(abs))) return "stale";
-  try {
-    fs.writeFileSync(abs, content, "utf8");
-    return "ok";
-  } catch {
-    return "error";
-  }
-}
-
-// Ensure every cell carries an nbformat id (4.5+). Older notebooks (incl. the demo) omit them, but write-back
-// keys on cell id — so we normalize once and persist. Returns the (id-bearing) notebook + current version, or
-// null on a read/parse failure. Persists via CAS; a lost race just means someone else beat us — re-read.
-function ensureCellIds(abs: string): { nb: Notebook; version: string | null } | null {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const read = readNotebook(abs);
-    if (!read) return null;
-    const { nb, version } = read;
-    let changed = false;
-    const seen = new Set<string>();
-    for (const cell of nb.cells) {
-      if (!cell.id || seen.has(cell.id)) {
-        cell.id = newCellId();
-        changed = true;
-      }
-      seen.add(cell.id);
-    }
-    if (!changed) return read;
-    const r = casWriteNotebook(abs, nb, version);
-    if (r === "ok") return { nb, version: contentVersion(transformNotebook(JSON.stringify(nb), { mode: "full" }).content) };
-    if (r === "error") return null;
-    // stale → an external write landed; loop and re-read.
-  }
-  return readNotebook(abs); // give up normalizing under contention; serve what's there
 }
 
 // Merge one cell's fresh outputs + execution_count into the file by CELL ID, under CAS. Retries on a stale

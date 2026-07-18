@@ -379,6 +379,91 @@ test("ipynb template honors truncation + parse failure, and the empty/pre-signal
   assert.ok(empty.includes("Empty notebook"), "a cell-less notebook shows the empty marker");
 });
 
+test("ipynb template stays read-only without notebookEdit + treeState (P1 behaviour, no edit affordances)", async () => {
+  const mod = await loadTemplate("ipynb");
+  const notebook = {
+    nbformat: 4,
+    metadata: { language_info: { name: "python" } },
+    cells: [
+      { id: "aaa", cell_type: "markdown", source: ["# Intro"] },
+      { id: "bbb", cell_type: "code", source: ["print(1)"], outputs: [], execution_count: null },
+    ],
+  };
+  const out = flatten(
+    mod.render({ fields: { title: "explore.ipynb", text: "", color: "orange" }, signals: { fileContent: JSON.stringify(notebook) } }),
+  );
+  // The P1 read-only render: prose + highlighted source, and NONE of the edit affordances.
+  assert.ok(out.includes("md-prose"), "markdown still renders as prose");
+  assert.ok(out.includes("ipynb-source"), "code still renders as a source box");
+  assert.ok(!out.includes("ipynb-cell-actions"), "no per-cell edit toolbar without the grants");
+  assert.ok(!out.includes("✎ Edit"), "no edit button without the grants");
+  assert.ok(!out.includes("ipynb-append"), "no append-cell row without the grants");
+  assert.ok(!out.includes("ipynb-edit"), "no source editor without the grants");
+});
+
+test("ipynb template is EDITABLE with notebookEdit + treeState: per-cell actions, append row, click-to-edit md", async () => {
+  const mod = await loadTemplate("ipynb");
+  const notebook = {
+    nbformat: 4,
+    metadata: { language_info: { name: "python" } },
+    cells: [
+      { id: "aaa", cell_type: "markdown", source: ["# Intro"] },
+      { id: "bbb", cell_type: "code", source: ["print(1)"], outputs: [], execution_count: null },
+    ],
+  };
+  let editing = new Set(); // treeState value — nothing in edit mode yet
+  const ops = [];
+  const card = {
+    fields: { title: "explore.ipynb", text: "", color: "orange" },
+    signals: {
+      fileContent: JSON.stringify(notebook),
+      treeState: { get: () => editing, set: (v) => { editing = v; } },
+      notebookEdit: (op) => { ops.push(op); return Promise.resolve({ ok: true, cellId: "new" }); },
+    },
+  };
+  const out = flatten(mod.render(card));
+
+  // Every cell gets the edit toolbar (Edit · move · add · delete) and the notebook gets an append row.
+  assert.ok(out.includes("ipynb-cell-actions"), "per-cell edit toolbar renders when editable");
+  assert.ok(out.includes("✎ Edit"), "an Edit affordance per cell");
+  assert.ok(out.includes("＋Code") && out.includes("＋Md"), "add-below affordances");
+  assert.ok(out.includes("ipynb-cell-del"), "a delete affordance");
+  assert.ok(out.includes("ipynb-append") && out.includes("＋Code cell"), "an append-at-end row");
+  // A markdown cell is click-to-edit (the sticky card's gesture); code is not (preserve copy-selection).
+  assert.ok(out.includes("ipynb-md-clickable"), "markdown prose is click-to-edit when editable");
+
+  // The action buttons route structural ops through the capability (verify the payload shape).
+  card.signals.notebookEdit({ type: "deleteCell", cellId: "bbb" });
+  assert.deepEqual(ops.at(-1), { type: "deleteCell", cellId: "bbb" });
+});
+
+test("ipynb editing a cell renders a raw-source textarea seeded from source (draft-bindable, caret-safe)", async () => {
+  const mod = await loadTemplate("ipynb");
+  const notebook = {
+    nbformat: 4,
+    metadata: { language_info: { name: "python" } },
+    cells: [{ id: "bbb", cell_type: "code", source: ["print(1)\n", "print(2)"], outputs: [], execution_count: null }],
+  };
+  let editing = new Set(["bbb"]); // this cell is in edit mode
+  const card = {
+    fields: { title: "explore.ipynb", text: "", color: "orange" },
+    signals: {
+      fileContent: JSON.stringify(notebook),
+      treeState: { get: () => editing, set: (v) => { editing = v; } },
+      notebookEdit: () => Promise.resolve({ ok: true }),
+    },
+  };
+  const out = flatten(mod.render(card));
+  // The editing cell shows a raw <textarea class="ipynb-edit" data-cell=bbb> holding the VERBATIM source
+  // (child-text bound, not `.value` — an uncontrolled box whose caret the DOM owns across re-renders).
+  assert.ok(out.includes("ipynb-edit"), "an editing cell is a raw-source textarea");
+  assert.ok(out.includes('data-cell="bbb"') || out.includes("data-cell=bbb"), "the textarea is keyed by cell id");
+  assert.ok(out.includes("print(1)\nprint(2)"), "the textarea holds the joined source verbatim");
+  assert.ok(out.includes("✓ Done") && out.includes("✕ Cancel"), "editing shows Save + Cancel");
+  // The highlighted read-only <pre> is REPLACED by the editor for this cell (no double render).
+  assert.ok(!out.includes("ipynb-source hljs"), "the highlighted source box is gone while editing");
+});
+
 test("directory template is an in-card tree: dirListing(path) per level, treeState expands, every row drags / folders also expand", async () => {
   const mod = await loadTemplate("directory");
   assert.equal(mod.contract, 1);
