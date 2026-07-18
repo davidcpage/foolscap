@@ -5,8 +5,8 @@
 
 The board's live state is the signia store in the browser; the durable copy is server-side. You read and
 mutate it **only through the agent bus** — never by touching `.canvas/` files (they lag and their layout is
-private). Reads are served from the durable store and work with **no tab live**; writes are broadcast to
-the board's connected tabs and only land if one is live.
+private). Reads are served from the durable store and work with **no tab live**; writes commit **server-side**
+into the live store — durable and visible immediately, tab or no tab — and broadcast to connected tabs as a diff.
 
 **Per-board.** Every bus endpoint takes `?board=<board>` (defaults to the dev board when omitted). `GET
 /api/boards` lists mounted boards; a command for board X reaches only X's tabs.
@@ -15,8 +15,8 @@ the board's connected tabs and only land if one is live.
 
 `GET /api/canvas?board=<board>` → `{ ts, tabs, snapshot, recentIntent }`.
 - `snapshot.records` are the nodes/edges/layouts.
-- `tabs` is the **liveness signal** — `0` means nobody can act on this board (an outage); a successful read
-  does NOT mean the board is live.
+- `tabs` is a **human-presence signal** (who has the board open in a browser) — it gates nothing; `0` just
+  means no human is watching, reads and writes work regardless.
 - `404` only for a board that has never persisted anything.
 
 ## Mutate the board
@@ -25,9 +25,10 @@ the board's connected tabs and only land if one is live.
 logged / attributed / persisted path a gesture uses. E.g. remove a card:
 `{ type:"removeNode", actor:"<your-sid>", payload:{ id } }`.
 
-- **Delivery:** a command with no live tab for that board returns **503 `{delivered:0}`** — it went
-  nowhere (an unknown `?board=` → 400). `scripts/canvas` hard-errors on both for you, so on the sanctioned
-  path there's nothing to check; only the raw-curl path needs to read these itself.
+- **Delivery:** the server commits the command itself — durable, folded into the live store, broadcast to
+  any tabs — and returns **200 `{ok, seq, id}`** (no live tab required; `id` echoes the created node/edge
+  id so you can address what you just made). An unknown `?board=` or command type → 400. `scripts/canvas`
+  hard-errors on failures for you; only the raw-curl path needs to read these itself.
 - **Removing cards:** just `removeNode` — the server cascades its edges (no dangling wires, no delete-edges-
   first dance). File-card ids are deterministic `node:repo:<path>`, so a removal set can be derived without
   reading the board.

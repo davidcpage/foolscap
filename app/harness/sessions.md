@@ -17,7 +17,7 @@ permission-gated).
   **Never put the task in the spawn prompt.** `card:true` → a standalone card, no edge.
 - `model:<id>` (or `scripts/canvas spawn --model <id>`) picks the Claude model the session runs. Precedence:
   explicit spawn param > the role's `model:` frontmatter (role.md) > the server default `claude-opus-4-8`.
-  Role-based spawns (mention-spawn, the Coordinator heartbeat) pick up the role's `model:` automatically —
+  Role-based spawns (mention-spawn) pick up the role's `model:` automatically —
   the shipped Coordinator/pm role pins `claude-fable-5`. Which model a worker gets is the spawner's
   (usually the Coordinator's) call.
 - `provider:<"claude"|"codex">` picks the agent backend; absent = `claude`. Any other value is a `400`.

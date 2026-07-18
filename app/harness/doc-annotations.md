@@ -17,9 +17,15 @@ highlights a span on a doc card and asks; your answer lands where the question l
 - `scripts/canvas anno ask <path> --question "…" --anchor-exact "…" [--options "A|B|C"] [--blocking]` —
   raise an anchored question the human answers on the doc.
 - `scripts/canvas anno answer <path> <id> [--choice LABEL] [--text "…"]` — answer such a question.
+- `scripts/canvas anno suggest <path> --anchor-exact "…" --replacement "…"` — propose a track-changes
+  edit; `anno accept|reject <path> <id>` decides it (accept splices the bytes + resolves, reject resolves
+  untouched).
+- `scripts/canvas anno watch <path> [--role R] [--level all|mentions|paused] [--pause|--resume|--unwatch]`
+  — bind a role as a doc watcher (who to wake when a comment lands).
 
 Raw endpoints if needed: `GET/POST <base>/api/annotations?board=<board>` (ops: `create` / `reply` /
-`answer` / `resolve` / `reopen` / `reanchor` / `thread`). The per-file `GET` returns `anchor.exact` (the
+`answer` / `resolve` / `reopen` / `accept` / `reject` / `reanchor` / `thread`; doc-watch: `watch` /
+`pause` / `resume` / `unwatch`; doc-jobs: `job` / `unjob`). The per-file `GET` returns `anchor.exact` (the
 quoted span) plus `orphaned` / `range`, and for a question its `state` (awaiting a human / answered, ready
 to apply / resolved).
 
