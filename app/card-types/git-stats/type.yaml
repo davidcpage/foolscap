@@ -1,0 +1,14 @@
+# The git-stats card type (card-types-as-data.md §3, Github-feed thread work item 2). A live visualization of
+# a repo's historical CODE GROWTH + CHURN, derived server-side from `git log --numstat` and published under
+# the generic `data:*` primitive. Like the git-log card its TITLE is a `data:*` feed name, but it reads the
+# feed's FULL-history DISK MIRROR (`.canvas/feeds/<name>.json`) rather than the bus tail — so it can draw the
+# whole timeline, and it stays live because a mirror write pings the file-watch. Created titled
+# `data:git-stats` (the board repo's own history, produced by startGitStatsFeed); retitle it to any other
+# `data:*` feed whose producer writes a git-stats-shaped mirror. Capabilities:
+#   • `dataFeedHistory` — the full-history feed read, keyed by the title. Refuses any non-`data:*` name (the
+#     security boundary), so this card can never reach session/thread/kernel feeds.
+#   • `setTitle` — the one WRITE, so the header input commits the feed name to this card's own record.
+# Renders a stacked-area LOC-growth chart (by top-level directory) + a top-file churn bar list. See render.js.
+name: git-stats
+contract: 1
+capabilities: [dataFeedHistory, setTitle]

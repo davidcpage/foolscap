@@ -853,6 +853,24 @@ export function addGitLogCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
+// The git-stats / code-growth visualization card (Github-feed thread work item 2): a card-type-as-data whose
+// title is a `data:*` feed name, reading that feed's FULL-history mirror (`.canvas/feeds/<name>.json`) through
+// the `dataFeedHistory` capability. Created titled `data:git-stats` — the board repo's live growth+churn
+// series (startGitStatsFeed) — but retyping the title points it at any other git-stats-shaped `data:*` feed.
+// Title-as-query, so a fresh nodeId per card (you can chart several feeds at once). Wider/taller than git-log
+// to fit the stacked-area chart + churn bars.
+export function addGitStatsCard(m: InteractionManager, at?: Pos): void {
+  const w = 360;
+  const h = 440;
+  const id = nodeId();
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "git-stats", title: "data:git-stats", text: "", color: "green", ...(at ?? spawnAt(m, w, h)), w, h },
+  });
+  m.selection.set([id]);
+}
+
 // Open a HISTORICAL agent session as a card (agent-sessions-on-canvas.md §12). Pure existing
 // architecture — a file-backed card like any other. The server reads a real Claude Code `.jsonl`
 // transcript (`id` omitted → the most recent), and the content rides in `text` exactly as a file card's

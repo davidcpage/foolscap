@@ -79,6 +79,7 @@ Current capabilities:
 | `now` | signal | off-log clock tick (`nowSignal`) |
 | `githead`, `hn`, `usage` | signal | off-log feeds (`feeds.ts`) — external data, never on the canvas log |
 | `dataFeed` | callable | generic off-log feed read, keyed by a `data:*` name — `dataFeed("data:git-log")`; refuses any non-`data:*` name (the git-log card) |
+| `dataFeedHistory` | callable | a `data:*` feed's FULL-history disk mirror (`.canvas/feeds/<name>.json`), parsed + live via the file-watch — `dataFeedHistory("data:git-stats")`; the companion to `dataFeed`'s bounded tail (the git-stats card) |
 | `session` | per-card signal | this card's live transcript tail, keyed by its title |
 | `sessionInput`, `sessionResume` | per-card action | POST into this card's live session (session-internal, not the canvas log) |
 | `setText`, `setTitle` | per-card **write** action | commit an edit to this card's own record |
@@ -108,6 +109,12 @@ command payload key).
   server-side under the `data:*` namespace) renders commit rows; retitle it to any other `data:*` feed
   (e.g. one an agent publishes via `POST /api/feed/data:demo`) to watch that stream. The reference for the
   generic feed capability.
+- **`git-stats/`** — a live code-growth + churn VISUALIZATION: its title is a `data:*` feed name read through
+  the `dataFeedHistory` callable + `setTitle`. Default title `data:git-stats` (the board repo's per-file/
+  per-commit stats, derived server-side by `startGitStatsFeed` and written FULL-history to
+  `.canvas/feeds/data-git-stats.json`) renders a hand-rolled SVG stacked-area LOC-growth chart (by top-level
+  directory) + a top-file churn bar list. The reference for the full-history feed capability and for a chart
+  card drawn with lit-html alone (no vendored chart lib).
 
 ## Interacting inside a card
 

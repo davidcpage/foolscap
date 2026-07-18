@@ -29,6 +29,7 @@ import {
   addComputedCard,
   addGitHeadCard,
   addGitLogCard,
+  addGitStatsCard,
   addHnCard,
   addFileTreeCard,
   addMinimapCard,
@@ -1328,6 +1329,7 @@ function CanvasMenu({
             not duplicable world widgets. */}
         <button onClick={() => run(() => addGitHeadCard(m, at))}>Git HEAD</button>
         <button onClick={() => run(() => addGitLogCard(m, at))}>Git log</button>
+        <button onClick={() => run(() => addGitStatsCard(m, at))}>Git stats</button>
         <button onClick={() => run(() => addHnCard(m, at))}>Hacker News</button>
         <button onClick={() => run(() => addWeatherCard(m, at))}>Weather</button>
         <button onClick={() => run(() => addComputedCard(m, at))}>Computed</button>

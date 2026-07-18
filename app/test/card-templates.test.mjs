@@ -1515,6 +1515,71 @@ test("git-log template renders a data-feed timeline from the off-log `dataFeed` 
   assert.equal(titled, "data:demo", "the feed name commits through the granted setTitle capability");
 });
 
+test("git-stats template renders code-growth + churn from the `dataFeedHistory` capability, keyed by title", async () => {
+  const mod = await loadTemplate("git-stats");
+  assert.equal(mod.contract, 1);
+
+  // `dataFeedHistory` is a CALLABLE keyed by the feed NAME (the card's title) — it hands the card the feed's
+  // full-history mirror object (server-data-feeds.ts deriveGitStats shape). The header is an editable feed
+  // name (setTitle), the body draws a stacked-area growth chart (by dir) + a churn bar list + a totals line.
+  const now = Date.now();
+  const series = {
+    name: "data:git-stats",
+    updatedAt: now,
+    totals: { commits: 467, adds: 99763, dels: 16016, net: 83747, files: 812 },
+    dirs: ["app", "docs"],
+    growth: { t: [now - 86400_000, now], cum: [[10, 5], [66364, 10184]] },
+    commits: [
+      { s: "aaaaaaa", a: 15, d: 0, t: now - 86400_000 },
+      { s: "bbbbbbb", a: 20, d: 8, t: now },
+    ],
+    churn: [
+      { p: "app/vite-fs-plugin.ts", a: 12000, d: 2988, c: 14988 },
+      { p: "app/src/style.css", a: 4000, d: 1747, c: 5747 },
+    ],
+    downsampled: false,
+    truncated: false,
+  };
+  let titled;
+  const card = {
+    fields: { title: "data:git-stats", text: "", color: "green" },
+    signals: { dataFeedHistory: (n) => (n === "data:git-stats" ? series : undefined), setTitle: (v) => (titled = v) },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("gs-name"), "editable feed-name input renders");
+  assert.ok(out.includes("Code growth by directory"), "the growth section renders");
+  assert.ok(out.includes("Top file churn"), "the churn section renders");
+  assert.ok(out.includes("<polygon"), "the stacked-area chart draws a band polygon");
+  assert.ok(out.includes("app") && out.includes("docs"), "the dir legend lists the top-level dirs");
+  assert.ok(out.includes("vite-fs-plugin.ts"), "a top-churn file is listed");
+  assert.ok(out.includes("467") && out.includes("83.7k"), "the totals line shows commit count + net LOC (kfmt)");
+  assert.ok(!out.includes("?readonly=true"), "editable when setTitle is granted");
+
+  // A downsampled / truncated series surfaces the note (never hide a cap that bit).
+  const capped = flatten(
+    mod.render({
+      fields: { title: "data:git-stats", text: "", color: "green" },
+      signals: { dataFeedHistory: () => ({ ...series, downsampled: true, truncated: true }), setTitle: () => {} },
+    }),
+  );
+  assert.ok(capped.includes("downsampled") && capped.includes("other"), "downsample + rollup notes surface");
+
+  // Empty title → the hint; a non-data title → the namespace-only message; neither reads a feed or throws.
+  const hint = flatten(mod.render({ fields: { title: "", text: "", color: "green" }, signals: { dataFeedHistory: () => undefined, setTitle: () => {} } }));
+  assert.ok(hint.includes("Type a") && hint.includes("data:git-stats"), "empty title shows the feed hint");
+  const wrong = flatten(mod.render({ fields: { title: "session:abcd", text: "", color: "green" }, signals: { dataFeedHistory: () => undefined, setTitle: () => {} } }));
+  assert.ok(wrong.includes("isn't a") && wrong.includes("namespace"), "a non-data title is refused with the namespace note");
+
+  // Pre-publish beat (mirror not written yet) → waiting; never throws.
+  const waiting = flatten(mod.render({ fields: { title: "data:git-stats", text: "", color: "green" }, signals: { dataFeedHistory: () => undefined, setTitle: () => {} } }));
+  assert.ok(waiting.includes("Waiting for data:git-stats"), "a pending mirror shows a waiting line");
+
+  // setTitle is the per-card write action a feed-name edit commits through.
+  card.signals.setTitle("data:demo");
+  assert.equal(titled, "data:demo", "the feed name commits through the granted setTitle capability");
+});
+
 test("notebook template views a .html file: prose, module cells with wiring/policy + Run + output, feeds the graph", async () => {
   const mod = await loadTemplate("notebook");
   assert.equal(mod.contract, 1);

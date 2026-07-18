@@ -116,11 +116,184 @@ export function feedMirrorRelPath(name: string): string {
 // and NOISY on failure, never throwing into the publish path (a lost mirror is cosmetic; a thrown feed
 // once crashed the whole dev server). `repo` is the board's canonical checkout (BoardInfo.repoPath).
 export function writeFeedMirror(repo: string, name: string, value: DataFeedValue): void {
+  writeFeedMirrorObject(repo, name, value);
+}
+
+// Mirror an ARBITRARY object to a feed's disk mirror. The generic tail feed writes a DataFeedValue here
+// (writeFeedMirror above); a derived producer whose mirror is a FULL-history carrier (the git-stats source,
+// Github-feed thread work item 2) writes its own richer shape to the SAME `.canvas/feeds/<name>.json` path —
+// so the `dataFeedHistory` capability, which reads that mirror, hands the card whatever the producer chose
+// to persist there (a bounded tail for the generic feeds, a full series for git-stats). Same best-effort +
+// noisy + never-throw discipline: a lost mirror is cosmetic, a thrown feed once crashed the dev server.
+export function writeFeedMirrorObject(repo: string, name: string, obj: unknown, pretty: boolean = true): void {
   try {
     const abs = path.join(repo, feedMirrorRelPath(name));
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, JSON.stringify(value, null, 2) + "\n");
+    // Generic tail mirrors are small + human-inspectable → pretty. A derived FULL-history series (git-stats)
+    // passes pretty=false: it's machine-read, and 2-space indent over arrays-of-numbers ~doubles the bytes —
+    // compact keeps the mirror comfortably under the /api/file byte cap (so the card's read never truncates).
+    fs.writeFileSync(abs, JSON.stringify(obj, null, pretty ? 2 : undefined) + "\n");
   } catch (err) {
     console.warn(`[data-feed] mirror write failed for ${name}: ${String(err)}`);
   }
+}
+
+// ── the git-stats derived series (Github-feed thread work item 2) ────────────────────────────────────
+// A PURE derivation of per-file/per-commit git stats from a `git log --reverse --numstat` dump — no fs, no
+// git, no server context, so it's unit-testable against a fixed dump. The server producer (startGitStatsFeed
+// in server-orchestration.ts) runs the git command and hands the raw stdout here; the result is written to
+// the feed mirror (the FULL-history carrier a `git-stats` card reads via `dataFeedHistory`) plus a bounded
+// recent tail published on the bus. Designed to DEGRADE on much larger repos: top-level-dir rollup, top-N
+// dirs collapsed into `other`, top-N churn files, and growth/commit series downsampled to a point budget —
+// each bound raises `truncated`/`downsampled` so the card can say so (CLAUDE.md: never hide a cap that bit).
+
+// The compact, columnar full-history series. Kept comfortably under the /api/file byte cap (128KB) so the
+// mirror is never head-truncated (which would break the card's JSON.parse) — hence short keys + downsampling.
+export interface GitStatsSeries {
+  name: string; // the base `data:*` feed name (e.g. "data:git-stats")
+  updatedAt: number;
+  totals: { commits: number; adds: number; dels: number; net: number; files: number };
+  // Top-level directories kept, ordered by final cumulative net LOC (desc). A trailing "other" bucket holds
+  // every dir past the top-N (so the stacked areas still sum to the true total).
+  dirs: string[];
+  // Cumulative NET LOC (adds−dels) by kept dir over time. `t[i]` is a commit timestamp (ms), `cum[i]` the
+  // per-dir cumulative snapshot at that commit, index-aligned to `dirs`. Oldest→newest; downsampled to a
+  // point budget on huge repos.
+  growth: { t: number[]; cum: number[][] };
+  // Per-commit diff sizes (adds/dels), oldest→newest, bounded to a recent window on huge repos. `s` short sha.
+  commits: { s: string; a: number; d: number; t: number }[];
+  // Top-N files by total churn (adds+dels) across all history. `p` path, `c` churn.
+  churn: { p: string; a: number; d: number; c: number }[];
+  downsampled: boolean; // the growth/commit series was thinned to fit the point budget
+  truncated: boolean; // dirs collapsed into "other", or the file list capped past top-N
+}
+
+export interface GitStatsOpts {
+  maxDirs?: number; // top-level dirs kept before the rest roll into "other"
+  topFiles?: number; // churn table length
+  maxPoints?: number; // growth-sample budget (downsample past this)
+  maxCommits?: number; // per-commit diff-size window (keep the most recent this many)
+}
+
+// git numstat renders a rename as `old => new` (whole-path) or `pre/{old => new}/post` (partial). We only
+// want the NEW path (for the dir bucket + churn key), so collapse both forms. Non-rename paths pass through.
+function normalizeNumstatPath(p: string): string {
+  let s = p;
+  s = s.replace(/\{[^{}]*=>\s*([^{}]*)\}/g, "$1"); // pre/{old => new}/post → pre/new/post
+  if (s.includes(" => ")) s = s.slice(s.indexOf(" => ") + 4); // bare old => new → new
+  return s.replace(/\/{2,}/g, "/").trim();
+}
+
+// Keep at most `budget` items from an array, ALWAYS including the first and last, evenly spaced. Returns the
+// array unchanged (same reference) when it already fits — the caller uses that to leave `downsampled` false.
+function downsampleIndices(len: number, budget: number): number[] | null {
+  if (len <= budget || budget < 2) return null;
+  const idx: number[] = [];
+  for (let i = 0; i < budget; i++) idx.push(Math.round((i * (len - 1)) / (budget - 1)));
+  return [...new Set(idx)]; // de-dupe any rounding collisions (keeps order)
+}
+
+// Derive the full series from a `git log --reverse --numstat` dump whose commits are separated by an RS
+// (\x1e) prefix and whose header line is `sha\x1f author \x1f unix-seconds \x1f subject`. Pure.
+export function deriveGitStats(raw: string, name: string, updatedAt: number, opts: GitStatsOpts = {}): GitStatsSeries {
+  const maxDirs = opts.maxDirs ?? 8;
+  const topFiles = opts.topFiles ?? 30;
+  const maxPoints = opts.maxPoints ?? 500;
+  const maxCommits = opts.maxCommits ?? 600;
+
+  interface Parsed { short: string; ts: number; adds: number; dels: number; delta: Map<string, number> }
+  const parsed: Parsed[] = [];
+  const churn = new Map<string, { a: number; d: number }>();
+  const dirFinal = new Map<string, number>();
+  let totalAdds = 0;
+  let totalDels = 0;
+
+  for (const block of raw.split("\x1e")) {
+    if (!block.trim()) continue;
+    const nl = block.indexOf("\n");
+    const header = (nl === -1 ? block : block.slice(0, nl)).trim();
+    const [sha = "", , ct = ""] = header.split("\x1f");
+    if (!sha) continue;
+    const ts = Number(ct) * 1000;
+    let adds = 0;
+    let dels = 0;
+    const delta = new Map<string, number>();
+    const rows = nl === -1 ? [] : block.slice(nl + 1).split("\n");
+    for (const row of rows) {
+      if (!row.trim()) continue;
+      const parts = row.split("\t");
+      if (parts.length < 3) continue;
+      const a = parts[0] === "-" ? 0 : Number(parts[0]) || 0; // "-" ⇒ binary file
+      const d = parts[1] === "-" ? 0 : Number(parts[1]) || 0;
+      const p = normalizeNumstatPath(parts.slice(2).join("\t"));
+      if (!p) continue;
+      adds += a;
+      dels += d;
+      const top = p.includes("/") ? p.slice(0, p.indexOf("/")) : "(root)";
+      delta.set(top, (delta.get(top) ?? 0) + a - d);
+      dirFinal.set(top, (dirFinal.get(top) ?? 0) + a - d);
+      const c = churn.get(p) ?? { a: 0, d: 0 };
+      c.a += a;
+      c.d += d;
+      churn.set(p, c);
+    }
+    totalAdds += adds;
+    totalDels += dels;
+    parsed.push({ short: sha.slice(0, 7), ts, adds, dels, delta });
+  }
+
+  // Kept dirs: top-N by final cumulative net LOC; the rest fold into "other" (so stacks still total truthfully).
+  const ranked = [...dirFinal.entries()].sort((x, y) => y[1] - x[1]).map(([d]) => d);
+  const kept = ranked.slice(0, maxDirs);
+  const collapsed = ranked.length > kept.length;
+  const dirs = collapsed ? [...kept, "other"] : kept;
+  const keptIndex = new Map(kept.map((d, i) => [d, i]));
+  const otherIdx = collapsed ? kept.length : -1;
+
+  // Growth: replay commits accumulating cumulative net LOC per kept dir (+ other), one sample per commit.
+  const run = new Array(dirs.length).fill(0);
+  const tAll: number[] = [];
+  const cumAll: number[][] = [];
+  for (const c of parsed) {
+    for (const [dir, net] of c.delta) {
+      const i = keptIndex.has(dir) ? keptIndex.get(dir)! : otherIdx;
+      if (i >= 0) run[i] += net;
+    }
+    tAll.push(c.ts);
+    cumAll.push([...run]);
+  }
+
+  // Downsample growth + commit series to the point budget (always keep first + last).
+  const gIdx = downsampleIndices(tAll.length, maxPoints);
+  const t = gIdx ? gIdx.map((i) => tAll[i]!) : tAll;
+  const cum = gIdx ? gIdx.map((i) => cumAll[i]!) : cumAll;
+
+  // Per-commit diff sizes: keep the most-recent window (the diff-size strip reads newest history).
+  const commitsWindowed = parsed.length > maxCommits ? parsed.slice(parsed.length - maxCommits) : parsed;
+  const commits = commitsWindowed.map((c) => ({ s: c.short, a: c.adds, d: c.dels, t: c.ts }));
+
+  const churnArr = [...churn.entries()]
+    .map(([p, v]) => ({ p, a: v.a, d: v.d, c: v.a + v.d }))
+    .sort((x, y) => y.c - x.c)
+    .slice(0, topFiles);
+
+  return {
+    name,
+    updatedAt,
+    totals: { commits: parsed.length, adds: totalAdds, dels: totalDels, net: totalAdds - totalDels, files: churn.size },
+    dirs,
+    growth: { t, cum },
+    commits,
+    churn: churnArr,
+    downsampled: Boolean(gIdx) || parsed.length > maxCommits,
+    truncated: collapsed || churn.size > churnArr.length,
+  };
+}
+
+// The bounded recent tail published on the bus for the git-stats feed — the "byte-bounded recent-events feed
+// under data:*" the primitive expects, alongside the full mirror. One event per recent commit: its diff size.
+export function gitStatsRecentTail(series: GitStatsSeries, n: number = 50): DataFeedEvent[] {
+  return series.commits
+    .slice(Math.max(0, series.commits.length - n))
+    .map((c) => ({ ts: c.t, data: { shortSha: c.s, adds: c.a, dels: c.d } }));
 }

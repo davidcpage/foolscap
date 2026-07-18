@@ -16,7 +16,7 @@ import { getBusClients, getWsClients, setServerContext } from "./server-context.
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, onboardMemberOpen, publishThreadFeed, repaintReopenedMemberEdges, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
-import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startGitLogFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
+import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startGitLogFeed, startGitStatsFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import { foldCodexEvent } from "./codex-projection.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
@@ -360,6 +360,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   boardFeedsStarted.add(boardId);
   startGitHeadFeed(boardId, repoPath);
   startGitLogFeed(boardId, repoPath); // the board repo's recent commit log, under the generic `data:*` namespace
+  startGitStatsFeed(boardId, repoPath); // per-file/per-commit code-growth + churn series (data:git-stats + full mirror)
   const markersDir = canvasSessionsDir(repoPath);
   try {
     fs.mkdirSync(markersDir, { recursive: true }); // so chokidar has a dir to watch before the first spawn
