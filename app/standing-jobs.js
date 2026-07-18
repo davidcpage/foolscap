@@ -171,8 +171,8 @@ export function jobClaimKey(threadId, job) {
  * A role-seat job fires INTO its role's seat every interval (standingJobsTick NUDGES the seat's live occupant
  * — timers nudge, never spawn: a dormant seat is left for a real event to revive, per 4f5a3ad), so a live
  * standing job schedules a wake for `sid` exactly when some marker carries a job
- * with a `role` whose seat is currently occupied by `sid`. A BARE (roleless) job always spawns a FRESH worker
- * — it targets no existing session — so it never schedules a wake for an already-live `sid`. This is the gate
+ * with a `role` whose seat is currently occupied by `sid`. A BARE (roleless) job is a no-op on fire (no seat
+ * to nudge, and timers don't spawn) — it targets no session — so it never schedules a wake for any `sid`. This is the gate
  * behind the calm "scheduled" band: the static `loops` role flag means only "this is a looping-TYPE role", not
  * that any timer will fire (jobs are human-gated and often absent), so an idle looping session must consult
  * THIS before claiming it's asleep on a heartbeat rather than genuinely "waiting".

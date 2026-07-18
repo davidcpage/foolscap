@@ -108,9 +108,10 @@ trusting one:
 
 The agent bus and its features ARE this repo's product; the implementation map (usage of these lives in the
 harness leaves, not here):
-- `vite-fs-plugin.ts` — the dev-server middleware: serves the file tree + watch stream, hosts the agent bus
-  and session endpoints, and injects the collab brief (`harness.md`, with `{{base}}`/`{{boardId}}`/
-  `{{sessionId}}`/`{{harnessDir}}` substituted).
+- `vite-fs-plugin.ts` — the dev-server middleware: serves the file tree + watch stream and hosts the agent
+  bus and session endpoints (implementations split into `server-*.ts` + `routes/*.ts`; the collab-brief
+  injection — `harness.md` with `{{base}}`/`{{boardId}}`/`{{sessionId}}`/`{{harnessDir}}` substituted —
+  lives in `server-sessions.ts`).
 - `src/agentBus.ts` — browser side of the bus; `src/remote-store.ts` — HTTP persistence stores;
   `board-persist.js` (+ `/api/board/persist`) — the server-side board record store (`.canvas/board/`). The
   bus runs over one `/api/ws` WebSocket per tab (feeds + bus + file-watch) — standing SSE streams starved
@@ -121,6 +122,8 @@ harness leaves, not here):
 - `app/annotations.js` (+ `.canvas/annotations/`) + `app/anchors.js` — doc annotations (standoff, W3C
   quote anchors); `app/src/NodeView.tsx` + `app/src/annotations.ts` — the annotation card UI (host chrome).
 - `app/role-format.js` / `app/role-ledger.js` (+ `app/default-roles/`) — role charters (frontmatter + body).
+- `app/codex-app-server.js` / `codex-host-runtime.js` / `codex-projection.ts` / `codex-session-router.js` —
+  the Codex session provider (sessions run `provider:"claude"|"codex"`).
 - `app/dev-supervisor.js` — the thin dev-stack lifecycle owner behind `npm run dev`: owns Vite as a
   process-group child, tracks + reaps the sidecars on its own exit (their existing stop verbs), and serves
   `restart-server` / `restart-jupyter` / `stop` / `status` over a checkout-keyed tmpdir control socket. No
