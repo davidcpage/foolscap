@@ -96,7 +96,9 @@ export function feedsConnected(): boolean {
 // fresh random on any storage failure (private-mode quotas) — a fallback tab just isn't deduped, which is
 // the pre-existing behaviour, never an over-count crash.
 let cachedTabId: string | null = null;
-function tabId(): string {
+// Exported (stage 3, D6) so the durable /event POST can carry the SAME stable per-tab id the WS connects
+// with — the server excludes this tab from its own commit's rebroadcast (it already applied it optimistically).
+export function tabId(): string {
   if (cachedTabId) return cachedTabId;
   const fresh = crypto.randomUUID();
   try {

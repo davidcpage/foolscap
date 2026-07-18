@@ -1,4 +1,5 @@
 import type { EventStore, SnapshotStore, IntentEvent, PersistedSnapshot } from "./lib";
+import { tabId } from "./feeds";
 
 // The server-backed durable stores (external-repo boards step 4) — the OTHER instantiation of core's
 // persistence seam that idb.ts always advertised. The dev server owns the durable tier now
@@ -107,7 +108,9 @@ export class RemoteEventStore implements EventStore {
   async append(e: IntentEvent): Promise<void> {
     // keepalive: an event is small (one gesture's diff) and this lets the LAST append of a closing
     // tab finish against the 64KB keepalive budget — the snapshot save is too big to get the same.
-    const res = await requestRetry(persistUrl(this.boardId, "/event"), {
+    // `&tab=` (stage 3, D6): the server excludes this originating tab from the diff rebroadcast it now
+    // does on every human commit — this tab already applied the edit optimistically.
+    const res = await requestRetry(`${persistUrl(this.boardId, "/event")}&tab=${encodeURIComponent(tabId())}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ event: e }),

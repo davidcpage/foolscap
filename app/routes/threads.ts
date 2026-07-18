@@ -341,6 +341,7 @@ async function handleThreadMembership(
     appendThreadMsg,
     publishFeed,
     historyKey,
+    onboardMemberOpen,
   } = getServerContext();
   const pendingHistoryMode = getPendingHistoryMode(getServerContext().fsState);
   let body: { from?: unknown; target?: unknown; history?: unknown };
@@ -391,29 +392,49 @@ async function handleThreadMembership(
     return sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid });
   }
 
-  // join/invite still need the canvas: they CREATE the membership's view (an edge needs a session node to
-  // hang off), and the member:open onboarding funnel resolves the joiner through the snapshot.
-  if (!records) return sendJson(res, 409, { error: "no canvas state for this board yet" });
-  if (!threadNode(records, threadId)) return sendJson(res, 404, { error: "channel not found" });
-  const sessionNode = sessionNodeForSid(records, subjectSid);
-  if (!sessionNode) return sendJson(res, 400, { error: `no session card on this board for ${subjectSid}` });
+  // Thread existence: the ledger marker ∪ the snapshot node (D7 — a join no longer requires the thread's
+  // CARD to be on the board, only that the thread exists as a durable fact). Matches /leave's gate above.
+  if (!readThreadMeta(repoPath ?? "", threadId) && !(records && threadNode(records, threadId)))
+    return sendJson(res, 404, { error: "channel not found" });
 
-  // An optional history choice rides the invite/join — stash it for the member:open onboarding to consume
-  // when it seeds the cursor (a pending invite carries it through to the eventual accept). Absent ⇒ default.
+  // An optional history choice rides the invite/join — stash it for onboarding to consume when it seeds the
+  // read cursor (a pending invite carries it through to the eventual accept). Absent ⇒ default.
   const mode = historyMode(body.history);
   if (mode) pendingHistoryMode.set(historyKey(threadId, subjectSid), mode);
 
+  // D7: membership is LEDGER-FIRST and does NOT gate on a session-card node — the `if (!sessionNode) return
+  // 400` gate is deleted. A member with no card on the board (a CLOSED session card, or a headless join) is
+  // a perfectly valid ledger member. The `member:open` edge is only the membership's VIEW.
+  const sessionNode = records ? sessionNodeForSid(records, subjectSid) : null;
+
+  if (action === "join") {
+    // Record the durable membership + onboard FACT-FIRST — unconditional, no card required. Idempotent: a
+    // re-join of an existing member is a no-op redraw via onboardMemberOpen's REOPEN GUARD. This is what
+    // makes proof #3 work: a session whose card was closed can still /join (the ledger append is the truth).
+    onboardMemberOpen(boardId, threadId, subjectSid, origin);
+    // Paint the member:open edge VIEW only when a session card exists — a server-derived projection of the
+    // fact just recorded (onboardMemberOpen already ran, so the edge's own funnel sees wasMember=true and
+    // does NOT re-onboard). No card ⇒ no edge painted ⇒ zero effect on the membership fact. The canonical
+    // edge id matches the spawn + client-redraw + server-repaint scheme so all painters converge on one edge.
+    let persisted: boolean | undefined;
+    if (sessionNode && records) {
+      const id = memberEdge(records, sessionNode, threadId) ?? `edge:member:${subjectSid}:${threadId}`;
+      dispatchBusCommand(boardId, { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type: "member:open" } }, origin);
+      // T3b: with a card, don't return until the member:open edge is visible (so a follow-up that reads the
+      // snapshot sees it). Cardless membership is already durable synchronously above — no edge to await.
+      persisted = await waitForEdgePersisted(boardId, id, JOIN_PERSIST_TIMEOUT_MS);
+    }
+    return sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid, ...(persisted === undefined ? {} : { persisted }) });
+  }
+
+  // invite (member:pending): propose membership. The pending edge hangs off the invitee's session card and
+  // the invite is delivered through that edge's onboarding funnel, so this path still needs the card — the
+  // invitee is identified by an on-board card. (D7's gate deletion is load-bearing for JOIN; a cardless
+  // invite has no view to paint and no established delivery, so it stays card-gated.)
+  if (!sessionNode || !records) return sendJson(res, 400, { error: `no session card on this board for ${subjectSid}` });
   const id = memberEdge(records, sessionNode, threadId) ?? `edge:${crypto.randomUUID().slice(0, 8)}`;
-  const type = action === "join" ? "member:open" : "member:pending";
-  const cmd = { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type } };
-  // §9 stage 2: the edge is committed + made durable server-side here (no live tab required — the old
-  // 503-on-no-tab is retired). commitBoardCommand folds it into the live store synchronously, so the
-  // member:open edge is visible to server reads (threadNode / waitForEdgePersisted) the instant this returns.
-  dispatchBusCommand(boardId, cmd, origin);
-  // T3b: a join doesn't return until its member:open edge is visible in the live store (waitForEdgePersisted),
-  // so the caller can message/ask straight away. Now durable at commit, this resolves on the first poll.
-  const persisted = action === "join" ? await waitForEdgePersisted(boardId, String(cmd.payload.id), JOIN_PERSIST_TIMEOUT_MS) : undefined;
-  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid, ...(persisted === undefined ? {} : { persisted }) });
+  dispatchBusCommand(boardId, { type: "addEdge", actor: body.from, payload: { id, from: sessionNode, to: threadId, type: "member:pending" } }, origin);
+  sendJson(res, 200, { ok: true, channel: threadId, action, subject: subjectSid });
 }
 
 // POST /api/thread/<id>/history { target, mode:"full"|"future" } — set how much of the backlog a member

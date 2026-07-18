@@ -637,6 +637,29 @@ test("delete-card-keep-session: edge removal alone never drops membership (BUG-5
   assert.equal(gone.members, 0, "the explicit /leave is what drops membership");
 });
 
+test("D7 ledger-first /join: a session with NO card on the board joins (was 400 'no session card', now 200)", { skip: !up && "no dev server on 5173" }, async () => {
+  // §9 stage 3, D7: membership is ledger-first + unconditional — the `if (!sessionNode) return 400` gate is
+  // deleted. A session whose card is CLOSED or never existed is a valid ledger member (proof #3). Put ONLY
+  // the thread card on the board (no session card), mint the save seq from the live counter (stage-2 folds
+  // only a save AHEAD of the watermark — never hardcode).
+  const threadId = `node:thread:d7join-${runTag}`;
+  const sid = `d7-headless-${runTag}`;
+  const snap = `${HOST}/api/board/persist/snapshot?board=${boardId}`;
+  const curSeq = (await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json()).snapshot.seq ?? 0;
+  assert.equal((await fetch(snap, j({ snapshot: { seq: curSeq + 1, version: 8, records: [
+    { typeName: "node", id: threadId, type: "thread", title: "D7 join" },
+  ] } }))).status, 200);
+  const joinUrl = `${HOST}/api/thread/${encodeURIComponent(threadId)}/join?board=${boardId}`;
+  assert.equal((await fetch(joinUrl, j({ from: sid }))).status, 200, "cardless /join is not refused — the session-card gate is gone");
+  // The join recorded durable membership: a ledger-first /message from the cardless member lands (200, not 403/404).
+  const msgUrl = `${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`;
+  const posted = await fetch(msgUrl, j({ from: sid, text: "cardless member speaking" }));
+  assert.equal(posted.status, 200, "the cardless joiner posts as a real ledger member");
+  // A join to a thread that exists NOWHERE (no marker, no node) is still a 404.
+  const unknown = `${HOST}/api/thread/${encodeURIComponent(`node:thread:nope-${runTag}`)}/join?board=${boardId}`;
+  assert.equal((await fetch(unknown, j({ from: sid }))).status, 404, "an unknown thread still 404s");
+});
+
 // Slice 2 (create new file cards) leans entirely on POST /api/file to CREATE a not-yet-existing file:
 // addTextFileCard writes empty content to `.canvas/docs/<slug>.md`, and only drops a card if the write
 // succeeds. So the two facts it depends on are (a) a POST to a fresh, text-extension path under `.canvas/`

@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { RECORD_TYPE, EDGE_TYPE, MEMBER_EDGE_PREFIX } from "../core/src/records.js";
+import { RECORD_TYPE, NODE_TYPE, EDGE_TYPE, MEMBER_EDGE_PREFIX } from "../core/src/records.js";
 import type { IntentEvent } from "../core/src/log.js";
 import { defaultCommands } from "../core/src/commands.js";
 import { getAnnouncedMemberships, getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
-import { commitBoardCommand } from "./board-engine.js";
+import { appendTabEvent, commitBoardCommand } from "./board-engine.js";
 import {
   appendThreadLine,
   fillSeat,
@@ -16,7 +16,7 @@ import {
   upsertThreadMeta,
   type PinnedMsg,
 } from "./thread-ledger.js";
-import { threadMemberSids } from "./server-snapshot.js";
+import { durableSessionThreads, threadMemberSids } from "./server-snapshot.js";
 import { humanWaiting, cardOnly } from "./thread-waiting.js";
 import { foldAmendments } from "./thread-fold.js";
 import { wakesSeat } from "./notification-levels.js";
@@ -382,16 +382,43 @@ export function dispatchBusCommand(
 // never re-committed or re-echoed. The `seq` rides along so the tab's Persistence mirror can adopt the
 // server's authoritative watermark (design §10). Returns the tab count reached (informational only — a
 // bus command is already durable regardless of who's listening).
-function broadcastBusDiff(boardId: string, diff: unknown, seq: number): number {
+//
+// `exceptTab` (design §9 stage 3, D6) excludes the ORIGINATING tab of a human gesture commit — it already
+// applied its own edit optimistically, so re-sending it the server's diff is redundant. Keyed on the same
+// stable `?tab=` id the WS carries (WsClient.tab). Exclusion is an OPTIMIZATION, not a correctness
+// dependency: applyDiffAsChange is idempotent (a re-put of identical values is a no-op), so a diff that
+// DOES reach the origin harms nothing. An agent bus command has no origin tab (exceptTab omitted → reaches
+// all), so those broadcasts are unchanged. The SSE compat set carries no tab id, so it is never excluded.
+export function broadcastBusDiff(boardId: string, diff: unknown, seq: number, exceptTab?: string): number {
   const { fsState } = getServerContext();
   const busClients = getBusClients(fsState);
   const wsClients = getWsClients(fsState);
   const clients = busClients.get(boardId); // SSE compat path — the app's tabs ride /api/ws now
-  const sockets = [...wsClients].filter((c) => c.boardId === boardId);
+  const sockets = [...wsClients].filter((c) => c.boardId === boardId && !(exceptTab && c.tab === exceptTab));
   const frame = `data: ${JSON.stringify({ diff, seq })}\n\n`;
   if (clients) for (const c of clients) c.res.write(frame);
   for (const c of sockets) c.send({ ch: "bus", diff, seq });
   return (clients?.size ?? 0) + sockets.length;
+}
+
+// COMMIT a tab-originated human gesture event (design §9 stage 3, the unified commit path). Where a bus
+// COMMAND re-executes server-side (dispatchBusCommand → commitBoardCommand), a gesture event carries a diff
+// the server cannot reconstruct from the command payload (gesture coalescing applied the result via live
+// atom mutation — D1), so the server SEQUENCES + PERSISTS + FOLDS the tab's diff rather than re-running it.
+// This is the shared tail both write endpoints reach: appendTabEvent mints the board's next authoritative
+// seq, durably appends, and folds into the live store; then the resulting diff is broadcast to every OTHER
+// tab on the board (excluding the origin — D6) so a human edit in one tab converges live in a second with
+// no reload. Returns the authoritative seq for the tab to adopt (§10). The /api/board/persist/event route
+// delegates here; it retires in stage 4 when the tab echo moves fully server-side.
+export function commitTabEvent(
+  boardId: string,
+  repoPath: string,
+  ev: Parameters<typeof appendTabEvent>[2],
+  exceptTab?: string,
+): number {
+  const seq = appendTabEvent(boardId, repoPath, ev);
+  if (ev.diff) broadcastBusDiff(boardId, ev.diff, seq, exceptTab);
+  return seq;
 }
 
 // Onboarding's SECOND trigger. The first is dispatchBusCommand, which fires for an agent-initiated POST
@@ -442,6 +469,53 @@ export function announceNewMemberships(
   // — a card delete published nothing, so the pill rode a stale frame or (on a freshly-loaded tab with no
   // frame yet) vanished outright. Republish the roster frame so the display snaps to durable truth.
   for (const threadId of rosterTouched) publishThreadFeedCtx(boardId, threadId, threadLog(boardId, threadId), false);
+}
+
+// Repaint member:open edges for a session card that just APPEARED on the board (design §9 stage 3, D7):
+// the member:open edge is a server-derived PROJECTION of the ledger fact, so when a session card reopens
+// (or a headless member's card first appears) the server — not a tab — paints its edges from the durable
+// membership. Diffs session NODES before↔after a snapshot save: for each session node NEW in `after`, paint
+// a member:open edge to every thread the ledger says it belongs to whose thread card is ALSO on the board,
+// unless that edge is already present (the client redraw, an overlap path retiring in stage 4, usually wins
+// the race → this is then a no-op backstop that also covers the no-tab/headless case). Painting routes
+// through dispatchBusCommand → maybeAnnounceMembership → onboardMemberOpen's REOPEN GUARD (wasMember true
+// for a durable member), so a repaint never re-onboards. Idempotent edge id (`edge:member:<sid>:<thread>`)
+// matches the spawn + client-redraw scheme, so the two painters converge on one edge (LWW, no dup). A first
+// (before==null) snapshot is a baseline — its edges are already persisted, nothing to repaint.
+export function repaintReopenedMemberEdges(
+  boardId: string,
+  before: Array<Record<string, unknown>> | null,
+  after: Array<Record<string, unknown>> | null,
+  origin: string,
+): void {
+  if (before == null || after == null) return;
+  const { boards, dispatchBusCommand } = getServerContext();
+  const repoPath = boards.get(boardId)?.repoPath;
+  const beforeSessions = new Set<string>();
+  for (const r of before)
+    if (r.typeName === RECORD_TYPE.node && r.type === NODE_TYPE.session && typeof r.id === "string") beforeSessions.add(r.id);
+  const threadIds = new Set<string>();
+  const openEdges = new Set<string>(); // `${from}\0${to}` for existing member:open edges
+  for (const r of after) {
+    if (r.typeName === RECORD_TYPE.node && (r.type === NODE_TYPE.thread || r.type === NODE_TYPE.channel) && typeof r.id === "string")
+      threadIds.add(r.id);
+    else if (r.typeName === RECORD_TYPE.edge && r.type === EDGE_TYPE.memberOpen)
+      openEdges.add(`${String(r.from)}\0${String(r.to)}`);
+  }
+  for (const r of after) {
+    if (r.typeName !== RECORD_TYPE.node || r.type !== NODE_TYPE.session || typeof r.id !== "string" || typeof r.title !== "string") continue;
+    if (beforeSessions.has(r.id)) continue; // not newly-appeared — only a reopen/first-appearance repaints
+    const sid = r.title;
+    for (const threadId of durableSessionThreads(repoPath, sid)) {
+      if (!threadIds.has(threadId)) continue; // paint only an edge whose thread card is on the board (the view)
+      if (openEdges.has(`${r.id}\0${threadId}`)) continue; // already wired (client redraw beat us) — no-op
+      dispatchBusCommand(
+        boardId,
+        { type: "addEdge", actor: "system", payload: { id: `edge:member:${sid}:${threadId}`, from: r.id, to: threadId, type: EDGE_TYPE.memberOpen } },
+        origin,
+      );
+    }
+  }
 }
 
 // When a membership edge crosses the bus, ONBOARD the affected session. Onboarding (and only onboarding) is
@@ -508,84 +582,130 @@ function maybeAnnounceMembership(
     return;
   }
   if (type === EDGE_TYPE.memberOpen) {
-    // Record the DURABLE membership on EVERY sighting (idempotent), ahead of the onboarding dedup: this is
-    // the single funnel every join path reaches — a bus addEdge (spawn/join/invite-accept) AND a human-drawn
-    // join replayed here from the snapshot diff. The membership now outlives the card/edge (deleting the card
-    // removes the view, not this record); it's dropped only by a real leave (announceNewMemberships / /leave).
-    // REOPEN GUARD (card-close/reopen is display-only, P1): if `sid` is ALREADY a durable member, this
-    // member:open is a REDRAW of an existing membership — a reopened session card repainting its wire — NOT
-    // a fresh join. Onboarding here would re-push the welcome text, re-wake peers, reseed the read cursor,
-    // and re-fill the seat: all forbidden on a display-only reopen. So record (idempotent) + mark announced,
-    // then stop. Checked BEFORE recordDurableMember so a genuine first join reads false. A real RE-join after
-    // a leave still onboards (leave dropped the membership → wasMember is false). The dedup Set alone can't
-    // stand in for this test: a card delete's removeEdge clears the key, so a reopen would slip through.
-    const repoPath = boards.get(boardId)?.repoPath;
-    const wasMember = !!(repoPath && readThreadMeta(repoPath, thread.id)?.members?.[sid]);
-    recordDurableMember(repoPath, thread.id, sid, Date.now());
-    if (wasMember) {
-      announcedMemberships.add(announceKey(String(p.id), type));
-      return;
+    // The member:open onboarding funnel (stage 3, D7): a single implementation, reached both by this
+    // edge-driven path (a spawn/join-painted bus addEdge AND a human-drawn join replayed from the snapshot
+    // diff) and — fact-first, with no edge at all — directly by the /join route when the joining session has
+    // no card on the board. Pass the edge id so the per-edge announce dedup still fires on the edge path.
+    onboardMemberOpen(boardId, thread.id, sid, origin, String(p.id));
+  }
+}
+
+/**
+ * Onboard `sid` as a member:open of `threadId` (design §9 stage 3, D7): membership is a LEDGER fact, the
+ * member:open edge only its view. This records the durable membership (idempotent) and, on a genuine FIRST
+ * join, pushes the welcome text, wakes the room, seeds the read cursor, and fills the role seat — none of
+ * which requires a session-card node on the board. It is the ONE onboarding implementation, reached by:
+ *   • the /join route directly (fact-first — works when the session card is CLOSED or never existed), and
+ *   • maybeAnnounceMembership when a member:open edge crosses the bus or appears in a snapshot diff (a
+ *     human-drawn join, or the route's own edge-view repaint), carrying `edgeId` for the per-edge dedup.
+ *
+ * REOPEN GUARD (card close/reopen is display-only, P1): if `sid` is ALREADY a durable member this is a
+ * REDRAW of an existing membership — a reopened/repainted card rewiring its edge — NOT a fresh join. Re-
+ * onboarding would re-push the welcome, re-wake peers, reseed the cursor and re-fill the seat: all forbidden
+ * on a display-only reopen. So record (idempotent) + mark the edge announced, then stop. A real RE-join
+ * after a /leave still onboards (leave dropped the membership → wasMember is false). The dedup Set alone
+ * can't stand in for this: a card delete's removeEdge clears the key, so a reopen would slip through.
+ */
+export function onboardMemberOpen(boardId: string, threadId: string, sid: string, origin: string, edgeId?: string): void {
+  const {
+    boards,
+    liveSessions,
+    fsState,
+    boardSnapshotRecords,
+    threadNode,
+    threadMemberSids,
+    sessionNameForSid,
+    sendSessionInput,
+    persistSessionState,
+    seedCursor,
+    historyKey,
+    threadLog,
+    recordDurableMember,
+    ensureCoordinatorHeartbeat,
+  } = getServerContext();
+  const announcedMemberships = getAnnouncedMemberships(fsState);
+  const pendingHistoryMode = getPendingHistoryMode(fsState);
+  const records = boardSnapshotRecords(boardId);
+  const repoPath = boards.get(boardId)?.repoPath;
+  const meta = repoPath ? readThreadMeta(repoPath, threadId) : null;
+  const thread = records ? threadNode(records, threadId) : null;
+  // Onboarding needs the thread's title/description. Prefer the live snapshot node; fall back to the durable
+  // marker so a headless join to a thread whose card isn't on the board still onboards with a real title.
+  const title = thread?.title || meta?.title || "(untitled)";
+  const description = thread ? descriptionOf(thread) : typeof meta?.text === "string" ? meta.text.trim() : "";
+  const descLine = description ? `brief: ${description}\n` : "";
+  const base = `http://${origin}`;
+  const openKey = edgeId ? announceKey(edgeId, EDGE_TYPE.memberOpen) : null;
+
+  // Record the DURABLE membership on EVERY sighting (idempotent), ahead of the onboarding dedup. The
+  // wasMember read is BEFORE recordDurableMember so a genuine first join reads false.
+  const wasMember = !!(repoPath && readThreadMeta(repoPath, threadId)?.members?.[sid]);
+  recordDurableMember(repoPath, threadId, sid, Date.now());
+  if (wasMember) {
+    if (openKey) announcedMemberships.add(openKey);
+    return;
+  }
+  if (openKey) {
+    if (announcedMemberships.has(openKey)) return;
+    announcedMemberships.add(openKey);
+  }
+  const others = threadMemberSids(records ?? [], threadId).filter((m) => m !== sid);
+  const roster = [sid, ...others].join(", ");
+  // full (the default) → the joiner's first inbox read replays the whole backlog; future → only new ones.
+  const mode = pendingHistoryMode.get(historyKey(threadId, sid)) ?? "full";
+  pendingHistoryMode.delete(historyKey(threadId, sid));
+  const log = threadLog(boardId, threadId);
+  const backlog =
+    log.length && mode === "full"
+      ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read${log.length > 60 ? "; for a long backlog window the tail with ?bytes=20000 or ?limit=40" : ""})`
+      : "";
+  sendSessionInput(
+    sid,
+    `[canvas] You joined thread ${threadId} "${title}".\n${descLine}members: ${roster}\n` +
+      `post: POST ${base}/api/thread/${threadId}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
+      `consult one member and block for the answer: POST ${base}/api/thread/${threadId}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
+      `declare your work-intent (card-only, wakes no one): POST ${base}/api/thread/${threadId}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished; a "done" should carry a thread message with PROOF against the pinned Done-when condition (R5)\n` +
+      `pin a message as head context (re-read every wake): POST ${base}/api/thread/${threadId}/pin {"from":"${sid}","seq":<n>,"pinned":true} — pin the task statement + the Done-when condition; unpin with pinned:false. /inbox returns a thread's pins under \`pinned\`\n` +
+      `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
+  );
+  if (others.length) {
+    // Best-effort: appendThreadMsg now throws if the durable append fails (BUG-6), but a "joined" SYSTEM
+    // line failing to persist must not abort onboarding — the durable membership is already recorded on the
+    // marker above, so the join itself stands. Log it and still wake the room.
+    try {
+      appendThreadMsg(boardId, threadId, "system", `${sid} joined the thread. members now: ${roster}.`);
+    } catch (e) {
+      console.warn(`[thread] join system line for ${sid} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
     }
-    if (announcedMemberships.has(announceKey(String(p.id), type))) return;
-    announcedMemberships.add(announceKey(String(p.id), type));
-    const others = threadMemberSids(records, thread.id).filter((m) => m !== sid);
-    const roster = [sid, ...others].join(", ");
-    // full (the default) → the joiner's first inbox read replays the whole backlog; future → only new ones.
-    const mode = pendingHistoryMode.get(historyKey(thread.id, sid)) ?? "full";
-    pendingHistoryMode.delete(historyKey(thread.id, sid));
-    const log = threadLog(boardId, thread.id);
-    const backlog =
-      log.length && mode === "full"
-        ? ` (${log.length} earlier message${log.length === 1 ? "" : "s"} to read${log.length > 60 ? "; for a long backlog window the tail with ?bytes=20000 or ?limit=40" : ""})`
-        : "";
-    sendSessionInput(
-      sid,
-      `[canvas] You joined thread ${thread.id} "${title}".\n${descLine}members: ${roster}\n` +
-        `post: POST ${base}/api/thread/${thread.id}/message {"text":"…","from":"${sid}"} — a post is LOGGED for all but only WAKES the members you @-tag (by an id prefix, e.g. @${sid.slice(0, 8)}; @all = everyone; no tag = nobody is woken)\n` +
-        `consult one member and block for the answer: POST ${base}/api/thread/${thread.id}/ask {"to":"<sid>","text":"…","from":"${sid}"}\n` +
-        `declare your work-intent (card-only, wakes no one): POST ${base}/api/thread/${thread.id}/intent {"from":"${sid}","intent":"working"|"blocked:human"|"blocked:peer"|"done","note":"…"} — declare blocked:human when you ask the human and stop, done when your part is finished; a "done" should carry a thread message with PROOF against the pinned Done-when condition (R5)\n` +
-        `pin a message as head context (re-read every wake): POST ${base}/api/thread/${thread.id}/pin {"from":"${sid}","seq":<n>,"pinned":true} — pin the task statement + the Done-when condition; unpin with pinned:false. /inbox returns a thread's pins under \`pinned\`\n` +
-        `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
-    );
-    if (others.length) {
-      // Best-effort: appendThreadMsg now throws if the durable append fails (BUG-6), but a "joined" SYSTEM
-      // line failing to persist must not abort onboarding — the durable membership is already recorded on the
-      // marker above, so the join itself stands. Log it and still wake the room.
-      try {
-        appendThreadMsg(boardId, thread.id, "system", `${sid} joined the thread. members now: ${roster}.`);
-      } catch (e) {
-        console.warn(`[thread] join system line for ${sid} on ${thread.id} not persisted:`, (e as Error)?.message ?? e);
-      }
-      wakeThreadMembers(boardId, thread.id, sid, { broadcast: true }); // a join is a room event — reaches level-`all` seats
-    }
-    const js = liveSessions.get(sid);
-    if (js) {
-      js.read[thread.id] = seedCursor(mode, log);
-      persistSessionState(js);
-    }
-    // Seat (§5): a role-spawned joiner FILLS its role's seat on this thread — created on first join,
-    // re-occupied (same seat, new sid) when a fresh session of the role arrives AFTER the prior occupant
-    // exited (the respawn re-fill). The role rides the session card's `name` ("RoleName.<short-sid>"); a
-    // plain unnamed session takes no seat (it stays a sid-identified participant). 1:1 with roles until
-    // labelled multiplicity ships. LIVE-OCCUPANCY GUARD: if the seat is still held by a LIVE session of the
-    // same role, the joiner must NOT displace it — fillSeat returns `blocked` and we onboard it SEATLESS,
-    // telling it who holds the seat (fixes the two-Coordinator seat-theft; the departed-occupant re-fill
-    // still works because an exited holder fails the liveness predicate).
-    const name = sessionNameForSid(records, sid);
-    if (name) {
-      const role = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
-      if (role && repoPath) {
-        const r = fillSeat(repoPath, thread.id, role, sid, Date.now(), isSidLive);
-        if (r.blocked)
-          sendSessionInput(
-            sid,
-            `[canvas] The ${role} seat on thread ${thread.id} is held by a live session (${r.heldBy}); ` +
-              `you joined SEATLESS (a sid-identified member). @${role} mentions still route to the seated ${role}.`,
-          );
-        else if (role === COORDINATOR_ROLE && r.seat?.fills === 1)
-          // Part 1 — heartbeat DEFAULT-ON: the FIRST staffing of a Coordinator seat auto-enables its sweep.
-          ensureCoordinatorHeartbeat(repoPath, thread.id);
-      }
+    wakeThreadMembers(boardId, threadId, sid, { broadcast: true }); // a join is a room event — reaches level-`all` seats
+  }
+  const js = liveSessions.get(sid);
+  if (js) {
+    js.read[threadId] = seedCursor(mode, log);
+    persistSessionState(js);
+  }
+  // Seat (§5): a role-spawned joiner FILLS its role's seat on this thread — created on first join,
+  // re-occupied (same seat, new sid) when a fresh session of the role arrives AFTER the prior occupant
+  // exited (the respawn re-fill). The role rides the session card's `name` ("RoleName.<short-sid>"); a
+  // plain unnamed session (or a cardless join, whose name isn't on the snapshot) takes no seat. 1:1 with
+  // roles until labelled multiplicity ships. LIVE-OCCUPANCY GUARD: if the seat is still held by a LIVE
+  // session of the same role, the joiner must NOT displace it — fillSeat returns `blocked` and we onboard it
+  // SEATLESS, telling it who holds the seat (fixes the two-Coordinator seat-theft; the departed-occupant
+  // re-fill still works because an exited holder fails the liveness predicate).
+  const name = records ? sessionNameForSid(records, sid) : null;
+  if (name) {
+    const role = name.includes(".") ? name.slice(0, name.indexOf(".")) : name;
+    if (role && repoPath) {
+      const r = fillSeat(repoPath, threadId, role, sid, Date.now(), isSidLive);
+      if (r.blocked)
+        sendSessionInput(
+          sid,
+          `[canvas] The ${role} seat on thread ${threadId} is held by a live session (${r.heldBy}); ` +
+            `you joined SEATLESS (a sid-identified member). @${role} mentions still route to the seated ${role}.`,
+        );
+      else if (role === COORDINATOR_ROLE && r.seat?.fills === 1)
+        // Part 1 — heartbeat DEFAULT-ON: the FIRST staffing of a Coordinator seat auto-enables its sweep.
+        ensureCoordinatorHeartbeat(repoPath, threadId);
     }
   }
 }

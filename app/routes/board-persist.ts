@@ -10,7 +10,8 @@ import {
   readBoardSnapshot,
   writeBoardSnapshot,
 } from "../board-persist.js";
-import { appendTabEvent, dropBoardEngine, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
+import { dropBoardEngine, reconcileBoardEngineOnSnapshot } from "../board-engine.js";
+import { commitTabEvent } from "../server-delivery.js";
 import { isScratchBoard } from "../server-sessions.js";
 
 // ── the durable board store (external-repo boards step 4: records live with the repo) — Phase 1 split ─
@@ -27,6 +28,7 @@ async function handleBoardPersistWrite(
   boardId: string,
   repoPath: string,
   kind: "event" | "snapshot" | "import",
+  originTab: string | undefined,
 ): Promise<void> {
   const ctx = getServerContext();
   let body: Record<string, unknown>;
@@ -42,12 +44,13 @@ async function handleBoardPersistWrite(
       const ev = body.event as Record<string, unknown>;
       // §9 stage 2 / §10 seq handover: the server is the single APPEND POINT. It assigns the board's
       // next authoritative seq (ignoring the tab's provisional one), durably appends the tab-originated
-      // (human gesture) event with it, folds the diff into the live server store (read authority), and
-      // RETURNS the seq for the tab's in-memory mirror to adopt. This retires the old second-writer
-      // tripwire: a bus commit and a human gesture can no longer be handed the same seq, because both
-      // now mint from this one server-side counter. (Bus commands never reach here — they commit via
-      // /api/command; only tab-local human gestures still echo through this route in stages 1–2.)
-      const seq = appendTabEvent(boardId, repoPath, ev);
+      // (human gesture) event with it, and folds the diff into the live server store (read authority).
+      // §9 stage 3 (D2/D6): commitTabEvent then BROADCASTS the folded diff to every OTHER tab on the board
+      // (excluding this origin `?tab=` id) so a human edit in one tab converges live in a second with no
+      // reload — the headline stage-3 deliverable. RETURNS the authoritative seq for the tab's in-memory
+      // mirror to adopt. (Bus commands never reach here — they commit via /api/command; only tab-local human
+      // gestures still echo through this route until the tab-echo retires in stage 4.)
+      const seq = commitTabEvent(boardId, repoPath, ev, originTab);
       return sendJson(res, 200, { ok: true, seq });
     }
     if (kind === "snapshot") {
@@ -85,6 +88,14 @@ async function handleBoardPersistWrite(
         ctx.announceNewMemberships(boardId, before ? (before.records ?? []) : null, snap.records ?? [], ctx.originOf(req));
       } catch (err) {
         console.warn("[threads] membership announce from snapshot diff failed:", err);
+      }
+      // D7 (stage 3): repaint member:open edges for a session card that just (re)appeared on the board —
+      // the edge is a server-derived projection of the ledger, so a reopen/first-appearance rewires it
+      // server-side (idempotent with the retiring client redraw; the only painter for a no-tab reopen).
+      try {
+        ctx.repaintReopenedMemberEdges(boardId, before ? (before.records ?? []) : null, snap.records ?? [], ctx.originOf(req));
+      } catch (err) {
+        console.warn("[threads] member-edge repaint from snapshot diff failed:", err);
       }
       // P2: capture each durable member's offset from its primary thread card off this debounced save (the
       // "persist on drag-end, not per-frame" point). Idempotent — a save that moved nothing writes nothing.
@@ -155,7 +166,9 @@ export const boardPersistRoutes: GlobalRoute[] = [
       if (req.method === "POST") {
         const kind = url.pathname.slice("/api/board/persist/".length);
         if (kind === "event" || kind === "snapshot" || kind === "import")
-          return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind);
+          // The origin `?tab=` id (stage 3, D6) rides the /event POST so its own commit isn't echoed back
+          // to the acting tab — the same stable per-tab id feeds.ts sends on the WS (tabCountFor dedupe).
+          return void handleBoardPersistWrite(req, res, b.boardId, b.repoPath, kind, url.searchParams.get("tab") ?? undefined);
       }
       return sendJson(res, 404, { error: "unknown board-persist endpoint" });
     },

@@ -13,7 +13,7 @@ import { sendJson, openSse, originHostAllowed, type SseClient } from "./server-h
 import type { CanvasFsState, LiveSession, ThreadMsg, WsClient } from "./server-types.js";
 import { boardIdentity, boardRoots, boards, DEFAULT_BOARD, ensureCanvasExcluded, invalidateBoardRoots, readBoardRegistry, recordBoardOpened, reqBoard, rootDir } from "./server-boards.js";
 import { getBusClients, getWsClients, setServerContext } from "./server-context.js";
-import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
+import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, onboardMemberOpen, publishThreadFeed, repaintReopenedMemberEdges, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
 import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startGitLogFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
@@ -482,6 +482,8 @@ setServerContext({
   ensureCanvasExcluded,
   startBoardFeeds,
   announceNewMemberships,
+  onboardMemberOpen,
+  repaintReopenedMemberEdges,
   maybeWakeDocWorker,
   // Threads / inbox / asks (Phase 3) — snapshot/log resolvers + delivery/wake/spawn effects the extracted
   // routes/{threads,inbox,asks}.ts call. Definitions stay here (the delivery/wake engine is Phase-5
