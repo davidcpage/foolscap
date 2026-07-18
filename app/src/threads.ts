@@ -28,6 +28,19 @@ export function isThreadNode(editor: Editor, nodeId: string): boolean {
   return t === "thread" || t === "channel"; // "channel" = the carried-over legacy type
 }
 
+// A thread's OPEN member session cards — the cards that travel with it as a cluster. `member:open`
+// edges run session→thread, so a thread's members are the edge SOURCES whose target is this node.
+// Empty for a non-thread (one-way: a session never pulls in its thread). Shared by the app's
+// right-click group-select and the resize-target expansion so both agree on what "the cluster" is.
+export function threadMembers(editor: Editor, threadId: string): string[] {
+  if (!isThreadNode(editor, threadId)) return [];
+  const members: string[] = [];
+  for (const r of editor.store.getSnapshot().records) {
+    if (r.typeName === "edge" && r.type === MEMBER_OPEN && r.to === threadId) members.push(r.from);
+  }
+  return members;
+}
+
 // The agent attention-edges this UI owns (member:* / watch:*), as opposed to the system wires (type
 // "input") that connect computed cards. Only these get the interactive styling + click-to-act.
 export function isAttentionEdge(type: string): boolean {
