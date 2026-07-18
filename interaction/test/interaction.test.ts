@@ -441,10 +441,12 @@ test("fitSelection frames the selected node, falling back to fitAll when empty",
   assert.ok(Math.hypot(c2.x - 400, c2.y - 300) < 1e-6);
 });
 
-// ── directed-edge selection rule (P3 cluster-selection, replaces the move-with-thread reactor) ──
+// ── directed-edge cluster rule (resize-target seed + group-drag of a pre-selected cluster) ──
 // A thread T with two open member cards A, B and an unrelated card X. The host resolver expands a
-// thread to its members and NOTHING else (one-way): selecting T grabs its cluster, selecting a member
-// never grabs T. Geometry: T 0..100, A 200..300, B 400..500, X 600..700 — all on the x axis, z=1.
+// thread to its members and NOTHING else (one-way). Plain click / marquee NO LONGER auto-expand — a
+// thread selects alone; the cluster is assembled deliberately by a RIGHT-click in the app layer (out of
+// the engine's reach), and the resolver survives only so a PRE-selected cluster resizes from its seed
+// and group-drags as one. Geometry: T 0..100, A 200..300, B 400..500, X 600..700 — x axis, z=1.
 function clusterSetup() {
   const editor = new Editor();
   editor.commit({ type: "addNode", payload: { id: "node:thread:T", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
@@ -459,43 +461,45 @@ function clusterSetup() {
 }
 const sel = (m: InteractionManager) => new Set(m.selection.ids());
 
-test("selecting a thread auto-selects its open member cards (directed expansion)", () => {
+test("plain click on a thread selects only the thread (no auto-expand)", () => {
   const { m } = clusterSetup();
   m.dispatch(down(vec(50, 50))); // press the thread
   m.dispatch(up(vec(50, 50)));
-  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+  assert.deepEqual(sel(m), new Set(["node:thread:T"]), "no members pulled in on a plain click");
 });
 
-test("selecting a member is one-way — it never pulls in the thread", () => {
+test("clicking a member selects just it (one-way, unchanged)", () => {
   const { m } = clusterSetup();
   m.dispatch(down(vec(250, 50))); // press member A
   m.dispatch(up(vec(250, 50)));
   assert.deepEqual(sel(m), new Set(["node:live:A"]), "just the member, no thread, no sibling");
 });
 
-test("plain click on the thread keeps the whole cluster (narrowOnUp carve-out)", () => {
+test("marquee selects only the boxed nodes (a swept-in thread does NOT pull its members)", () => {
   const { m } = clusterSetup();
-  m.dispatch(down(vec(50, 50)));
-  m.dispatch(up(vec(50, 50))); // a plain click must NOT collapse to just the thread
-  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
-  // clicking it again (cluster already selected) still keeps the cluster, not the thread alone
-  m.dispatch(down(vec(50, 50)));
-  m.dispatch(up(vec(50, 50)));
-  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
+  // Rubber-band a box that covers ONLY the thread (0..100), not A/B (>=200).
+  m.dispatch(down(vec(-10, -10)));
+  m.dispatch(move(vec(110, 110)));
+  m.dispatch(up(vec(110, 110)));
+  assert.deepEqual(sel(m), new Set(["node:thread:T"]), "only what the box actually covered");
 });
 
-test("plain click on ONE member of a selected cluster narrows to just that member", () => {
+// The right-click group-select lives in the app layer (App.onContextMenu sets the selection); at the
+// engine level that just means the cluster is ALREADY selected. These two tests cover what the engine
+// still owns once the cluster is assembled: a plain click narrows to one card, a press+drag moves all.
+
+test("plain click on ONE member of a pre-selected cluster narrows to just that member", () => {
   const { m } = clusterSetup();
-  m.dispatch(down(vec(50, 50)));
-  m.dispatch(up(vec(50, 50))); // cluster selected
+  m.selection.set(["node:thread:T", "node:live:A", "node:live:B"]); // as the app's right-click assembles it
   m.dispatch(down(vec(250, 50))); // press member A (already in the multi-selection)
   m.dispatch(up(vec(250, 50))); // plain click → narrow to A (rename / scroll-one)
   assert.deepEqual(sel(m), new Set(["node:live:A"]));
 });
 
-test("group-drag: pressing the thread and dragging moves the whole cluster by one delta", () => {
+test("group-drag: a pre-selected cluster moves by one delta when the thread is press-dragged", () => {
   const { editor, m } = clusterSetup();
-  m.dispatch(down(vec(50, 50))); // press thread → cluster selected + gesture opens
+  m.selection.set(["node:thread:T", "node:live:A", "node:live:B"]); // right-click-assembled cluster
+  m.dispatch(down(vec(50, 50))); // press thread → already selected, keep the group + gesture opens
   m.dispatch(move(vec(90, 50))); // +40 crosses threshold → drag the group
   m.dispatch(up(vec(90, 50)));
   assert.equal(x(editor, "node:thread:T"), 40, "thread moved +40");
@@ -504,16 +508,7 @@ test("group-drag: pressing the thread and dragging moves the whole cluster by on
   assert.equal(x(editor, "node:x"), 600, "the unrelated card did not move");
 });
 
-test("marquee sweeping over a thread pulls in its members even if off-marquee", () => {
-  const { m } = clusterSetup();
-  // Rubber-band a box that covers ONLY the thread (0..100), not A/B (>=200).
-  m.dispatch(down(vec(-10, -10)));
-  m.dispatch(move(vec(110, 110)));
-  m.dispatch(up(vec(110, 110)));
-  assert.deepEqual(sel(m), new Set(["node:thread:T", "node:live:A", "node:live:B"]));
-});
-
-test("no expandSelection resolver → selection behaves exactly as before (thread selects alone)", () => {
+test("no expandSelection resolver → a thread still selects alone (unchanged)", () => {
   const editor = new Editor();
   editor.commit({ type: "addNode", payload: { id: "node:thread:T", x: 0, y: 0, w: 100, h: 100 }, actor: "human" });
   editor.commit({ type: "addNode", payload: { id: "node:live:A", x: 200, y: 0, w: 100, h: 100 }, actor: "human" });

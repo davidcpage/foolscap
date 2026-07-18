@@ -20,7 +20,7 @@ import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
 import { channelListSignal, refreshSessionList, rootsSignal, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
-import { connectToThread, createThread, isThreadNode, isSessionNode, MEMBER_OPEN } from "./threads";
+import { connectToThread, createThread, isThreadNode, isSessionNode, threadMembers } from "./threads";
 import { CanvasView } from "./CanvasView";
 import { useSignal } from "./reactive";
 import { templatesSignal, startRegistry } from "./templates";
@@ -151,20 +151,14 @@ async function createEngine(boardId: string): Promise<Engine> {
     // that session (member:open) — the human drawing it is the consent for their own agent (§8).
     connectable: (nodeId) => isSessionNode(editor, nodeId) || isThreadNode(editor, nodeId),
     connect: (from, to) => connectToThread(editor, from, to),
-    // Directed-edge selection rule (replaces the old move-with-thread reactor): selecting a THREAD card
-    // also selects its OPEN member session cards, so the whole cluster group-drags as one ordinary
-    // selection. `member:open` edges run session→thread, so a thread's members are the edge SOURCES whose
-    // target is this node. ONE-WAY: only threads expand — a session returns nothing, so selecting a member
-    // never pulls in its thread. Closed members have no canvas edge (display-only close removed it), so
-    // they're naturally excluded here and instead follow via the relative-offset reopen (P2).
-    expandSelection: (nodeId) => {
-      if (!isThreadNode(editor, nodeId)) return [];
-      const members: string[] = [];
-      for (const r of editor.store.getSnapshot().records) {
-        if (r.typeName === "edge" && r.type === MEMBER_OPEN && r.to === nodeId) members.push(r.from);
-      }
-      return members;
-    },
+    // Directed-edge cluster resolver: a THREAD card's cluster is its OPEN member session cards; ONE-WAY
+    // (a session returns nothing, so a member never pulls in its thread). This NO LONGER fires on a plain
+    // click or marquee — the engine selects only what's under the pointer/box. It survives so a cluster
+    // that has ALREADY been selected (via right-click, App.onContextMenu) resizes from the thread as its
+    // seed (resizeTargetId, CanvasView + the tool's handle hit-test). Closed members have no canvas edge
+    // (display-only close removed it), so they're naturally excluded and follow via the relative-offset
+    // reopen (P2).
+    expandSelection: (nodeId) => threadMembers(editor, nodeId),
   });
   restoreAndPersistCamera(m.camera, boardId);
   seedHud(m); // the HUD chrome (usage + sessions + clock + threads) isn't menu-spawnable, so ensure it exists on every board
@@ -884,7 +878,21 @@ function Board({ m, undo, persistence }: Engine) {
   // The popover is clamped so it never spills off the right/bottom edge.
   const onContextMenu = useCallback(
     (e: React.MouseEvent) => {
-      if ((e.target as HTMLElement).closest("[data-node-id]")) return;
+      const card = (e.target as HTMLElement).closest("[data-node-id]");
+      if (card) {
+        // A right-click on a THREAD card is the deliberate gesture for group-select: it selects the
+        // whole cluster (thread + its open member session cards) and suppresses the browser menu, so a
+        // following left-drag moves them together. This replaces the old select-expands-on-plain-click
+        // behavior — a plain click now selects the thread alone (less surprise repositioning a new
+        // thread). Any OTHER card is left alone so it keeps its own context (native menu, or the member
+        // pill's own right-click @tag, which stopPropagation's before it reaches here).
+        const nodeId = card.getAttribute("data-node-id");
+        if (nodeId && isThreadNode(m.editor, nodeId)) {
+          e.preventDefault();
+          m.selection.set([nodeId, ...threadMembers(m.editor, nodeId)]);
+        }
+        return;
+      }
       const el = canvasRef.current;
       if (!el) return;
       e.preventDefault();
