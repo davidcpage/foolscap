@@ -132,6 +132,12 @@ export class Persistence implements IntentLog {
   adoptSeq(seq: number): void {
     this.mem.adopt(seq);
   }
+  /** This tab's current log watermark — the highest seq it has adopted (its own committed gestures + every
+   *  peer/agent diff folded via adoptSeq). The reconnect gap-fill (design §9 stage 3, D4) reads it to ask
+   *  the server for `since(watermark)`, and the live gap detector compares an inbound seq against it. */
+  watermark(): number {
+    return this.mem.lastSeq;
+  }
   all(): IntentEvent[] {
     return this.mem.all();
   }

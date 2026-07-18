@@ -156,7 +156,17 @@ export const boardPersistRoutes: GlobalRoute[] = [
         // The full intent log — the provenance mirror / who-touched-this actor badges. Fetched lazily
         // after first paint (not on the boot path), so a blank screen never waits on it. gzip'd (it is
         // large and highly compressible) when the client accepts it.
-        return sendJson(res, 200, { events: readBoardPersist(b.repoPath).events }, req);
+        //
+        // §9 stage 3 (D4): `?since=<seq>` serves the reconnect GAP-FILL — only events with seq > since, the
+        // exact tail a tab missed while its socket was down. The client applies each diff as a "remote"
+        // change in seq order and adopts each seq, so a dropped connection converges with no reload. A
+        // non-numeric/absent `since` falls back to the full log (the provenance use). Bounded implicitly by
+        // the byte cap on the read; a since-window is small by construction.
+        const events = readBoardPersist(b.repoPath).events;
+        const sinceRaw = url.searchParams.get("since");
+        const since = sinceRaw !== null && Number.isFinite(Number(sinceRaw)) ? Number(sinceRaw) : null;
+        const out = since !== null ? events.filter((e) => typeof (e as { seq?: unknown }).seq === "number" && (e as { seq: number }).seq > since) : events;
+        return sendJson(res, 200, { events: out }, req);
       }
       if (url.pathname === "/api/board/persist" && req.method === "DELETE") {
         clearBoardPersist(b.repoPath);

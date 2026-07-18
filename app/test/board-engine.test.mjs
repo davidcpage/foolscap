@@ -245,6 +245,22 @@ test("seq handover (§10): appendTabEvent REASSIGNS the server seq — a bus com
   assert.ok(engine.boardStoreRecords(BOARD, repo).some((r) => r.id === "node:B"), "the tab gesture folded into the live store");
 });
 
+test("§3.3 dedup ring: a RESENT tab event (same id) returns the assigned seq, never a duplicate durable append", () => {
+  const repo = tmpRepo();
+  wire(repo);
+  const ev = { type: "addNode", payload: {}, actor: "human", id: "e-resend", ts: 9, seq: 1, parent: 0, diff: diffAdd(B) };
+  const first = engine.appendTabEvent(BOARD, repo, ev);
+  assert.equal(first, 1, "first sighting → seq 1");
+  // A lost-ack resend (the tab never saw the first ack, re-POSTs the same event id).
+  const second = engine.appendTabEvent(BOARD, repo, ev);
+  assert.equal(second, 1, "the resend returns the ALREADY-assigned seq (idempotent by id)");
+  const seqs = bp.readBoardPersist(repo).events.map((e) => e.seq);
+  assert.deepEqual(seqs, [1], "the durable log holds ONE event — no duplicate append on resend");
+  // A genuinely new event still advances the sequence normally.
+  const third = engine.appendTabEvent(BOARD, repo, { type: "addNode", payload: {}, actor: "human", id: "e-new", ts: 10, parent: 1, diff: diffAdd({ id: "node:C", type: "note", x: 0, y: 0, w: 1, h: 1 }) });
+  assert.equal(third, 2, "a fresh id advances to seq 2");
+});
+
 // ── 4. null contract preserved: a brand-new (unpersisted) board reads null, not [] ───────────────────
 test("boardStoreRecords is null for an unpersisted board, an array once anything is folded", async () => {
   const repo = tmpRepo(); // no .canvas/board files yet

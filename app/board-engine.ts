@@ -43,7 +43,17 @@ export interface BoardEngineEntry {
   watermark: number;
   /** Whether ANY snapshot/event has ever been seen (a brand-new empty board is not "persisted"). */
   hasPersist: boolean;
+  /** §9 stage 3 (§3.3): a bounded ring of recently-committed tab-event ids → the seq they were assigned,
+   *  so a lost-ack RESEND (a tab re-POSTs an event whose ack it never saw) is a NO-OP that returns the
+   *  already-assigned seq instead of a duplicate durable append. Insertion-ordered; oldest evicted past the
+   *  cap (sized to the outbound queue's realistic depth). Pinned on the entry so it rides fsState like the
+   *  store. Client-minted event ids (`evt:…`) are the dedup key. */
+  recentTabEventIds: Map<string, number>;
 }
+
+// The dedup ring's cap — a few hundred covers any realistic outbound-queue depth (an offline tab's backlog),
+// far above which a resend can't still be racing (the tab would have caught up first, §3.3).
+const MAX_RECENT_TAB_EVENT_IDS = 512;
 
 /**
  * The pure fold — a faithful mirror of core's Persistence.hydrate (core/src/persist.ts:139-166): seed
@@ -96,7 +106,7 @@ function hydrateEntry(repoPath: string): BoardEngineEntry {
   const folded = foldSnapshotAndEvents(snapshot, events);
   const store = new Store();
   store.loadSnapshot({ records: folded.records, version: folded.version });
-  return { store, watermark: folded.watermark, hasPersist: !!snapshot || events.length > 0 };
+  return { store, watermark: folded.watermark, hasPersist: !!snapshot || events.length > 0, recentTabEventIds: new Map() };
 }
 
 function engineMap(): Map<string, BoardEngineEntry> {
@@ -247,11 +257,25 @@ export function appendTabEvent(
   ev: StoredEvent & Record<string, unknown>,
 ): number {
   const entry = getBoardEngine(boardId, repoPath);
+  // §3.3 lost-ack dedup: a resent event (same client-minted id) already committed on its first sighting —
+  // return the seq it was assigned, WITHOUT a second durable append or fold. The event is idempotent by id,
+  // so this is exactly-once at the durable log even though the transport delivered it twice.
+  const evId = typeof ev.id === "string" ? ev.id : undefined;
+  if (evId !== undefined) {
+    const prior = entry.recentTabEventIds.get(evId);
+    if (prior !== undefined) return prior;
+  }
   const seq = entry.watermark + 1;
   const stamped = { ...ev, seq };
   appendBoardEvent(repoPath, stamped); // durable first — THROWS on failure (caller 500s, nothing folded)
   entry.watermark = seq;
   entry.hasPersist = true;
+  if (evId !== undefined) {
+    entry.recentTabEventIds.set(evId, seq);
+    // Bound the ring: drop the oldest (Map preserves insertion order) once past the cap.
+    if (entry.recentTabEventIds.size > MAX_RECENT_TAB_EVENT_IDS)
+      entry.recentTabEventIds.delete(entry.recentTabEventIds.keys().next().value as string);
+  }
   try {
     if (ev.diff) entry.store.applyDiffAsChange(ev.diff, "remote");
   } catch (err) {

@@ -75,6 +75,15 @@ export async function fetchBoardLog(boardId: string): Promise<IntentEvent[]> {
   return ((await res.json()) as { events: IntentEvent[] }).events;
 }
 
+/** The reconnect GAP-FILL (design §9 stage 3, D4): only the events with seq > `since` — the tail a tab
+ *  missed while its socket was down. The caller applies each diff as a "remote" change in seq order and
+ *  adopts each seq, so a dropped connection converges with no reload. Small by construction (a since-window,
+ *  not the whole log). Uses requestRetry so a catch-up mid-outage simply waits for the server to return. */
+export async function fetchBoardLogSince(boardId: string, since: number): Promise<IntentEvent[]> {
+  const res = await requestRetry(`${persistUrl(boardId, "/log")}&since=${since}`, { method: "GET" });
+  return ((await res.json()) as { events: IntentEvent[] }).events;
+}
+
 /** One-time adoption of a board's IndexedDB state. `imported:false` = the server already had state
  *  (another tab won the race, or this board predates nothing) — re-fetch and trust the server. */
 export async function importBoardPersist(
