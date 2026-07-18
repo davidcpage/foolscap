@@ -425,7 +425,7 @@ test("ipynb template is EDITABLE with notebookEdit + treeState: per-cell actions
 
   // Every cell gets the edit toolbar (Edit · move · add · delete) and the notebook gets an append row.
   assert.ok(out.includes("ipynb-cell-actions"), "per-cell edit toolbar renders when editable");
-  assert.ok(out.includes("✎ Edit"), "an Edit affordance per cell");
+  assert.ok(out.includes("ipynb-cell-edit") && out.includes("✎"), "an Edit affordance per cell (icon-only)");
   assert.ok(out.includes("＋Code") && out.includes("＋Md"), "add-below affordances");
   assert.ok(out.includes("ipynb-cell-del"), "a delete affordance");
   assert.ok(out.includes("ipynb-append") && out.includes("＋Code cell"), "an append-at-end row");

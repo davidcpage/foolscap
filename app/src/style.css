@@ -458,8 +458,19 @@ textarea.file-source {
   background: #00000022;
   border-radius: 4px;
 }
+/* Each cell is a subtly-bordered block (Jupyter/nteract feel) so cell boundaries read at a glance even
+   with the hover controls hidden. `position: relative` anchors the floating per-cell action chip below. */
 .ipynb-cell {
-  margin: 0 0 12px;
+  position: relative;
+  margin: 0 0 8px;
+  padding: 7px 9px;
+  border: 1px solid #00000012;
+  border-radius: 7px;
+  background: #ffffffcc;
+  transition: border-color 0.12s ease;
+}
+.ipynb-cell:hover {
+  border-color: #0000001f;
 }
 .ipynb-cell:last-child {
   margin-bottom: 0;
@@ -628,6 +639,128 @@ textarea.file-source {
   margin: 3px 0 0 10px;
   color: #b45309;
   font: 10px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* ── P2 edit affordances (card-types/ipynb/render.js makeEditApi) ─────────────────────────────────────
+   The per-cell controls are a compact chip floated top-right of the cell, hidden until you hover the cell
+   (or it is being edited) — unobtrusive, not an always-on button bar. At rest it is BOTH invisible AND
+   click-transparent (`pointer-events: none`), so it can never swallow a click meant for the source/Run. */
+.ipynb-cell-actions {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 2;
+  display: flex;
+  gap: 1px;
+  padding: 1px;
+  border: 1px solid #00000012;
+  border-radius: 6px;
+  background: #ffffff;
+  box-shadow: 0 1px 3px #00000014;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.ipynb-cell:hover > .ipynb-cell-actions,
+.ipynb-cell-actions:focus-within,
+.ipynb-code-editing > .ipynb-cell-actions,
+.ipynb-md-editing > .ipynb-cell-actions,
+.ipynb-raw > .ipynb-cell-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+/* While editing, the chip is PERSISTENT (Done/Cancel must not vanish), so reserve a top band for it — the
+   editor content starts below the chip and it never covers the first source line you're typing. (At rest /
+   on transient hover the chip floats over the top-right, the standard GitHub/nteract pattern.) */
+.ipynb-code-editing,
+.ipynb-md-editing {
+  padding-top: 30px;
+}
+/* Compact, muted icon buttons — borderless at rest, a subtle tinted chip only on hover. */
+.ipynb-cellbtn {
+  cursor: pointer;
+  min-width: 22px;
+  height: 22px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: #71717a;
+  font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.ipynb-cellbtn:hover {
+  background: #f4f4f5;
+  border-color: #0000001a;
+  color: #27272a;
+}
+.ipynb-cell-del:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #b91c1c;
+}
+.ipynb-cell-done {
+  color: #15803d;
+  font-weight: 600;
+}
+.ipynb-cell-done:hover {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  color: #15803d;
+}
+/* The raw-source editor fills the full cell width (never the default ~20-col textarea), matching the
+   look of the read-only `.ipynb-source` box it replaces; autoGrow (render.js) sizes the height. */
+.ipynb-edit {
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 6px 8px;
+  border: 1px solid #0000001f;
+  border-radius: 5px;
+  background: #fbfbfa;
+  color: #27272a;
+  font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+  resize: vertical;
+  overflow: hidden;
+}
+.ipynb-edit:focus {
+  outline: none;
+  border-color: #93c5fd;
+  background: #fff;
+}
+/* Inside a code cell the editor sits in the `.ipynb-in` flex row (prompt · Run · source), so it grows to
+   fill the gutter beside the prompt just like the read-only source box does. */
+.ipynb-in .ipynb-edit {
+  flex: 1 1 auto;
+}
+/* A markdown cell is click-to-edit — hint it (text caret + a faint wash on hover) without a heavy button. */
+.ipynb-md-clickable {
+  cursor: text;
+  border-radius: 4px;
+}
+.ipynb-md-clickable:hover {
+  background: #00000005;
+}
+/* The append-at-end footer: always visible (discoverable), but quiet — a subtle add affordance. */
+.ipynb-append {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.ipynb-append .ipynb-cellbtn {
+  height: 24px;
+  padding: 0 9px;
+  border-color: #00000014;
+  color: #52525b;
+}
+.ipynb-append .ipynb-cellbtn:hover {
+  background: #f4f4f5;
+  border-color: #0000002a;
+  color: #27272a;
 }
 
 /* Frontmatter "properties" strip (card-types/file/render.js): a compact key/value panel above the prose
