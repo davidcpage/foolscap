@@ -32,3 +32,33 @@ export const sidOfNode = (node: string): string | null => {
   const sid = node.replace(/^node:(?:live|session):/, "");
   return sid === node ? null : sid;
 };
+
+// A card's STABLE, copyable reference — the string a user/agent cites elsewhere to point back at this
+// card. Pure and host-side by design: card-type interiors can only import lit-html, so the one place
+// that knows every type's reference rule lives here (see NodeView's copy chip). Returns null for types
+// with no meaningful external reference (they show no chip): the session card (keeps its own in-head
+// button), note/sticky/clock, and the board-global browser cards (sessions/roles/channels), plus the
+// label-titled feed cards (git HEAD / HN). Structural node param so this stays dependency-free.
+//   file family → root-qualified path (the title is the root-relative path; the `repo` root is elided so
+//     an in-repo card cites as its plain filepath, a worktree/external card as `<root>:<path>`).
+//   thread      → the node id itself (already `node:thread:<id>`, the canonical citation).
+//   usage       → the tracked session id (its title when set; untitled = not tracking = null).
+//   weather / git-log → the title, which IS the query/feed key (a city, `data:git-log`).
+export function cardReference(node: { type: string; title: string; id: string }, root: RootId): string | null {
+  switch (node.type) {
+    case "file":
+    case "directory":
+    case "image":
+    case "ipynb":
+    case "notebook":
+      return node.title ? (root === "repo" ? node.title : `${root}:${node.title}`) : null;
+    case "thread":
+      return node.id;
+    case "usage":
+    case "weather":
+    case "git-log":
+      return node.title || null;
+    default:
+      return null;
+  }
+}

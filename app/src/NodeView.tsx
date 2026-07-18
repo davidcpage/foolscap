@@ -11,7 +11,7 @@ import { teardownNotebook } from "./notebook-runtime";
 import { claimWheelGesture, scrollableFromTarget, wheelClaimableByCard } from "./interior";
 import { MEMBER_OPEN, postToThread, setThreadPin, editThreadMsg } from "./threads";
 import { unionPillMembers, type PillMember } from "./pill-members";
-import { consumePendingJump, openCanvasLink, openDocLink, openSession, resolveCanvasLink, resolveDocLink, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
+import { cardReference, consumePendingJump, openCanvasLink, openDocLink, openSession, resolveCanvasLink, resolveDocLink, rootOfId, THREAD_JUMP_EVENT, THREAD_OPEN_EVENT } from "./loader";
 import { HUD_GAP, HUD_SNAP, type HudChrome } from "./hud";
 import { matchTagSpans } from "../thread-tags.js";
 import { makeAnchor, resolveAnchor } from "../anchors.js";
@@ -1064,6 +1064,7 @@ function ThreadView({
             <button className="chan-pinnav-step" title="next pinned message" onClick={() => jumpPinned(1)}>›</button>
           </div>
         )}
+        <CopyRefChip reference={cardReference(node, rootOfId(id)) ?? id} />
         <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
@@ -2202,6 +2203,32 @@ function AnnotationsLayer({
   );
 }
 
+// A small copy-the-reference chip — host chrome shared by every card type that has a stable reference
+// (cardReference, node-id.ts). Reuses the session card's proven pattern: navigator.clipboard.writeText +
+// a transient `.copied` ✓ class. Rendered as a <button> so the host's interior-interaction seam contains
+// its pointerdown (button) and a click copies without dragging the card. `floating` is the TemplateCard
+// overlay variant (absolute, hover/selection-revealed so it never fights a per-card head); omit it for an
+// inline head placement (ThreadView).
+function CopyRefChip({ reference, floating }: { reference: string; floating?: boolean }) {
+  const onCopy = (e: React.MouseEvent<HTMLButtonElement>) => {
+    const btn = e.currentTarget;
+    void Promise.resolve(navigator.clipboard?.writeText(reference)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
+  };
+  return (
+    <button
+      type="button"
+      className={`copy-ref${floating ? " copy-ref--float" : ""}`}
+      title={`Copy reference: ${reference}`}
+      onClick={onCopy}
+    >
+      ⧉
+    </button>
+  );
+}
+
 // The template host: React renders the BOX (position/size off the layout signal, selection ring,
 // type class for folder-level theming) and hands the template one container div for the interior.
 // The split is the disjoint-state invariant at the component level — a drag updates this
@@ -2359,6 +2386,9 @@ function TemplateCard({
   // them direct flex items of the box). The annotations layer is a React SIBLING of the interior
   // (host chrome, like the selection ring): file cards on the canonical root only — annotations are
   // keyed by repo-relative path and deliberately don't fork per worktree (the server refuses ?root=).
+  // The stable, copyable reference for this card (null → no chip). Host-side because a lit interior can't
+  // reach the shared rule; see cardReference in node-id.ts.
+  const reference = node ? cardReference(node, rootOfId(id)) : null;
   return (
     <div
       ref={hostRef}
@@ -2367,6 +2397,7 @@ function TemplateCard({
       style={box}
     >
       <div className="tpl-interior" ref={ref} />
+      {reference && <CopyRefChip reference={reference} floating />}
       {template.type === "file" && node && id.startsWith("node:repo:") && (
         <AnnotationsLayer id={id} path={node.title} hostRef={hostRef} />
       )}

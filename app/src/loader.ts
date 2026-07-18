@@ -19,8 +19,8 @@ import { MEMBER_OPEN, THREAD_CARD_H, THREAD_CARD_W } from "./threads";
 import { detachedMemberCards } from "./reconcile-members";
 // The `node:<root>:<path>` id scheme lives in the dependency-free ./node-id leaf (so hermetic, DOM-free
 // consumers can share it); loader re-exports it as the app-facing home.
-import { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode } from "./node-id";
-export { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode };
+import { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode, cardReference } from "./node-id";
+export { NODE_PREFIX, fileNodeId, rootOfId, liveNodeId, sessionNodeId, sidOfNode, cardReference };
 
 // The bridge between the Node middleware and the canvas. Goes through the public Editor (the one
 // mutation API — "one mutation API, three clients"): the human draws nothing here, the LOADER and the
