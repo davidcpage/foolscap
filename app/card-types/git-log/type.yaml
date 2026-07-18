@@ -1,0 +1,14 @@
+# The git-log card type, as data in the folder (card-types-as-data.md §3). It's a generic DATA-FEED
+# TIMELINE: its TITLE is a `data:*` feed name (the weather card's title-as-query shape), and it renders that
+# feed's byte-bounded event tail newest-first. Created titled `data:git-log` — the board repo's recent
+# commit log, published server-side under the generic `data:*` namespace (server-data-feeds.ts) — so out of
+# the box it's a live commit timeline; retitle it to any other `data:*` feed (e.g. `data:demo`, published by
+# `POST /api/feed/data:demo`) to watch that stream instead. Capabilities:
+#   • `dataFeed` — the generic off-log feed read, keyed by the title. Refuses any non-`data:*` name (the
+#     security boundary), so this card can never reach session/thread/kernel feeds.
+#   • `setTitle` — the one WRITE, so the header input commits the feed name to this card's own record.
+# Commit-shaped events (carrying a `sha`) render as rich commit rows; any other event renders generically,
+# so the same card serves the git-log source and an arbitrary agent/script producer. See render.js.
+name: git-log
+contract: 1
+capabilities: [dataFeed, setTitle]

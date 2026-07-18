@@ -1446,6 +1446,75 @@ test("weather template renders current conditions from the off-log `weather` cap
   assert.equal(titled, "Tokyo", "the location commits through the granted setTitle capability");
 });
 
+test("git-log template renders a data-feed timeline from the off-log `dataFeed` capability, keyed by title", async () => {
+  const mod = await loadTemplate("git-log");
+  assert.equal(mod.contract, 1);
+
+  // `dataFeed` is a CALLABLE keyed by the feed NAME (the card's title), the weather/dirListing shape over the
+  // `data:*` namespace — the value is { name, events:[{ts,data}], truncated, updatedAt }. A commit-shaped
+  // event (data carries a sha) renders a rich commit row; the header is an editable feed name (setTitle).
+  const now = Date.now();
+  const gitValue = {
+    name: "data:git-log",
+    truncated: true,
+    updatedAt: now,
+    // stored oldest→newest; the card renders NEWEST-FIRST
+    events: [
+      { ts: now - 3600_000, data: { sha: "aaaaaaaaaaaa", shortSha: "aaaaaaa", author: "Ada", message: "older commit" } },
+      { ts: now - 60_000, data: { sha: "bbbbbbbbbbbb", shortSha: "bbbbbbb", author: "Grace", message: "newer commit" } },
+    ],
+  };
+  let titled;
+  const card = {
+    fields: { title: "data:git-log", text: "", color: "green" },
+    signals: { dataFeed: (n) => (n === "data:git-log" ? gitValue : undefined), setTitle: (v) => (titled = v) },
+  };
+  const out = flatten(mod.render(card));
+
+  assert.ok(out.includes("gl-name"), "editable feed-name input renders");
+  assert.ok(out.includes("bbbbbbb") && out.includes("newer commit"), "a commit row shows short sha + subject");
+  assert.ok(out.includes("Grace"), "commit author in the meta line");
+  assert.ok(out.includes("older history truncated"), "the truncated flag surfaces a note");
+  assert.ok(!out.includes("?readonly=true"), "editable when setTitle is granted");
+  // Newest-first: the newer commit's subject appears before the older one in the flattened output.
+  assert.ok(out.indexOf("newer commit") < out.indexOf("older commit"), "events render newest-first");
+
+  // A generic (non-commit) producer event — the same card renders any `data:*` feed. A payload with a
+  // `message`/`text` shows that; a bare object shows its JSON.
+  const demoValue = {
+    name: "data:demo",
+    truncated: false,
+    updatedAt: now,
+    events: [
+      { ts: now - 5000, data: { text: "build started" } },
+      { ts: now - 1000, data: { level: "ok", n: 42 } },
+    ],
+  };
+  const demo = flatten(
+    mod.render({ fields: { title: "data:demo", text: "", color: "green" }, signals: { dataFeed: () => demoValue, setTitle: () => {} } }),
+  );
+  assert.ok(demo.includes("build started"), "a string-ish payload renders its message");
+  assert.ok(demo.includes('"level":"ok"') || demo.includes("42"), "an opaque payload renders its JSON");
+
+  // Empty title → the hint (no lookup, no throw); a non-data title → the namespace-only message.
+  const hint = flatten(mod.render({ fields: { title: "", text: "", color: "green" }, signals: { dataFeed: () => undefined, setTitle: () => {} } }));
+  assert.ok(hint.includes("Type a") && hint.includes("data:git-log"), "empty title shows the feed hint");
+  const wrong = flatten(mod.render({ fields: { title: "session:abcd", text: "", color: "green" }, signals: { dataFeed: () => undefined, setTitle: () => {} } }));
+  assert.ok(wrong.includes("isn't a") && wrong.includes("namespace"), "a non-data title is refused with the namespace note");
+
+  // Pre-publish beat (value undefined) → waiting; an empty feed → the no-events line. Neither throws.
+  const waiting = flatten(mod.render({ fields: { title: "data:git-log", text: "", color: "green" }, signals: { dataFeed: () => undefined, setTitle: () => {} } }));
+  assert.ok(waiting.includes("Waiting for data:git-log"), "pending feed shows a waiting line");
+  const empty = flatten(
+    mod.render({ fields: { title: "data:git-log", text: "", color: "green" }, signals: { dataFeed: () => ({ name: "data:git-log", events: [], truncated: false, updatedAt: now }), setTitle: () => {} } }),
+  );
+  assert.ok(empty.includes("No events on data:git-log"), "an empty feed shows the no-events line");
+
+  // setTitle is the per-card write action a feed-name edit commits through.
+  card.signals.setTitle("data:demo");
+  assert.equal(titled, "data:demo", "the feed name commits through the granted setTitle capability");
+});
+
 test("notebook template views a .html file: prose, module cells with wiring/policy + Run + output, feeds the graph", async () => {
   const mod = await loadTemplate("notebook");
   assert.equal(mod.contract, 1);

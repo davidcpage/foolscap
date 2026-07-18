@@ -78,6 +78,7 @@ Current capabilities:
 |---|---|---|
 | `now` | signal | off-log clock tick (`nowSignal`) |
 | `githead`, `hn`, `usage` | signal | off-log feeds (`feeds.ts`) — external data, never on the canvas log |
+| `dataFeed` | callable | generic off-log feed read, keyed by a `data:*` name — `dataFeed("data:git-log")`; refuses any non-`data:*` name (the git-log card) |
 | `session` | per-card signal | this card's live transcript tail, keyed by its title |
 | `sessionInput`, `sessionResume` | per-card action | POST into this card's live session (session-internal, not the canvas log) |
 | `setText`, `setTitle` | per-card **write** action | commit an edit to this card's own record |
@@ -102,6 +103,11 @@ command payload key).
   commit on blur. The reference for any interactive type.
 - **`session/`** — the full duplex: a live feed (`session`) plus actions (`sessionInput`,
   `sessionResume`), with a real jsonl→turns codec. The reference for live + interactive.
+- **`git-log/`** — a generic DATA-FEED timeline: its title is a `data:*` feed name read through the
+  `dataFeed` callable + `setTitle`. Default title `data:git-log` (the board repo's commit log, published
+  server-side under the `data:*` namespace) renders commit rows; retitle it to any other `data:*` feed
+  (e.g. one an agent publishes via `POST /api/feed/data:demo`) to watch that stream. The reference for the
+  generic feed capability.
 
 ## Interacting inside a card
 

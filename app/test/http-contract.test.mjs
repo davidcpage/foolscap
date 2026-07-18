@@ -667,6 +667,46 @@ test("POST /api/file gates a non-text extension with 404 (Slice 2 leaves board u
   assert.equal(fs.existsSync(path.join(scratch, rel)), false, "nothing written for a rejected path");
 });
 
+test("data feed: POST /api/feed/data:* folds a byte-bounded tail + mirrors to .canvas/feeds; non-data name / bad JSON are 400", { skip: !up && "no dev server on 5173" }, async (t) => {
+  const name = `data:contract-${runTag}`;
+  const feedUrl = `${HOST}/api/feed/${encodeURIComponent(name)}?board=${boardId}`;
+  // First publish: the fold returns the tail size + the feed's canonical name. The LIVE contract net lags a
+  // contract change until the running server hot-reloads the merged code (contract-tests-lag-contract-changes):
+  // a server predating this route answers 404 for /api/feed/*, so skip cleanly rather than redden the gate —
+  // exactly the Origin/Host test's stance. Runs for real once reloaded (or via CANVAS_TEST_HOST at a worktree).
+  const r1 = await fetch(feedUrl, j({ msg: "one" }));
+  if (r1.status === 404) {
+    t.skip("running server predates the /api/feed data-feed route (live contract net lags until hot-reload)");
+    return;
+  }
+  assert.equal(r1.status, 200);
+  const b1 = await r1.json();
+  assert.equal(b1.ok, true);
+  assert.equal(b1.name, name);
+  assert.equal(b1.events, 1, "first event lands in the tail");
+  // A second event ACCUMULATES the stream (append semantics, not replace).
+  const r2 = await fetch(feedUrl, j({ msg: "two" }));
+  assert.equal((await r2.json()).events, 2, "the tail accumulates across publishes");
+  // The disk mirror lands under the board's OWN .canvas/feeds (sanitized name), so a notebook cell / file
+  // card consumes it over the file-watch path. board.repoPath is realpath'd (server-boards.boardIdentity),
+  // so read through the realpath'd scratch dir.
+  const real = fs.realpathSync(scratch);
+  const mirror = path.join(real, ".canvas", "feeds", name.replace(/[^A-Za-z0-9._-]/g, "-") + ".json");
+  const mirrored = JSON.parse(fs.readFileSync(mirror, "utf8"));
+  assert.equal(mirrored.name, name);
+  assert.equal(mirrored.events.length, 2, "mirror carries the same tail");
+  assert.equal(mirrored.events[1].data.msg, "two", "mirror preserves the event payload, newest last");
+  // The `data:` prefix is the namespace boundary the read capability also enforces — a non-data name (which
+  // would otherwise let a producer overwrite a session/thread feed) is refused.
+  assert.equal((await fetch(`${HOST}/api/feed/session:sneaky?board=${boardId}`, j({}))).status, 400, "a non-data:* name is 400");
+  // A non-JSON body is the one honest error.
+  assert.equal(
+    (await fetch(feedUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: "not json" })).status,
+    400,
+    "a non-JSON body is 400",
+  );
+});
+
 test("Origin/Host allowlist (pre-push audit): foreign Origin / rebind Host rejected, no-Origin + same-origin allowed", { skip: !up && "no dev server on 5173" }, async (t) => {
   // The reject path, live, via the Origin header (which undici honors; it silently OVERRIDES a custom Host,
   // so the DNS-rebind Host clause is proven by the unit test originHostAllowed(undefined,"rebind…")===false
