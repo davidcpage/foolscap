@@ -60,6 +60,13 @@ export interface ServerContext {
     after: Array<Record<string, unknown>> | null,
     origin: string,
   ) => void; // onboarding from a snapshot's membership-edge diff
+  onboardMemberOpen: (boardId: string, threadId: string, sid: string, origin: string, edgeId?: string) => void; // D7 fact-first join onboarding (no card required)
+  repaintReopenedMemberEdges: (
+    boardId: string,
+    before: Array<Record<string, unknown>> | null,
+    after: Array<Record<string, unknown>> | null,
+    origin: string,
+  ) => void; // D7 server repaint of member:open edges when a session card (re)appears
   // Auto-wake on annotation activity (P2/W5, doc-annotations): a qualifying comment/answer on a watched doc
   // nudges an already-servicing worker or server-spawns a fresh doc worker. A cross-cutting EFFECT (it reads
   // liveSessions and drives the spawn/auto-wake-surface subsystem), so — exactly like publishSession — its

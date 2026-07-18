@@ -56,6 +56,7 @@ function makeCtx(repoPath, records, over = {}) {
   const fsState = { durableMembers: new Map(), threadLogs: new Map() };
   const posted = [];
   const dispatched = [];
+  const sent = []; // sendSessionInput pushes — the onboarding user-text (D7)
   const fake = {
     fsState,
     boards: new Map([[BOARD, { boardId: BOARD, repoPath }]]),
@@ -67,11 +68,19 @@ function makeCtx(repoPath, records, over = {}) {
     sessionNameForSid: snap.sessionNameForSid,
     threadMemberSids: snap.threadMemberSids,
     forgetDurableMember: snap.forgetDurableMember,
+    recordDurableMember: snap.recordDurableMember,
     historyKey: snap.historyKey,
     threadLog: () => [],
     appendThreadMsg: (b, t, from, text) => (posted.push({ from, text }), { seq: posted.length, from, text, ts: 1 }),
     wakeThreadMembers: () => 0,
     dispatchBusCommand: (b, cmd) => (dispatched.push(cmd), 1),
+    // D7 onboarding deps: onboardMemberOpen is the REAL delivery fn (it re-reads this same fake via
+    // getServerContext), so the /join route and the edge funnel exercise the actual code under test.
+    onboardMemberOpen: delivery.onboardMemberOpen,
+    repaintReopenedMemberEdges: delivery.repaintReopenedMemberEdges,
+    sendSessionInput: (sid, text) => sent.push({ sid, text }),
+    seedCursor: () => 0,
+    ensureCoordinatorHeartbeat: () => {},
     persistSessionState: () => {},
     publishSession: () => {},
     publishThreadFeed: () => {},
@@ -80,7 +89,7 @@ function makeCtx(repoPath, records, over = {}) {
     ...over,
   };
   ctx.setServerContext(fake);
-  return { fake, fsState, posted, dispatched };
+  return { fake, fsState, posted, dispatched, sent };
 }
 
 // Drive the POST /api/thread/<id>/<action> route with a JSON body; resolves with the JSON response.
@@ -250,6 +259,99 @@ test("pin: a marker member pins on an off-canvas thread; the pin lands on the ma
   const r = await callThreadRoute("pin", { from: SID, seq: 1 });
   assert.equal(r.status, 200);
   assert.equal(ledger.readThreadMeta(repo, THREAD).pins.length, 1);
+});
+
+// ── 3b. D7: /join is ledger-first + unconditional — no session-card gate ─────────────────────────────
+
+test("D7 /join: a session with NO card on the board joins (records durable membership + onboards, no 400)", async () => {
+  const repo = tmpRepo();
+  // Thread card present, but NO session card for SID (the closed-card / headless case — proof #3).
+  const records = threadCard(THREAD);
+  const { fsState, sent, dispatched } = makeCtx(repo, records);
+  const r = await callThreadRoute("join", { from: SID });
+  assert.equal(r.status, 200, "no session-card gate — the join is not refused");
+  assert.ok(ledger.threadMembersFromMeta(ledger.readThreadMeta(repo, THREAD)).includes(SID), "durable membership recorded");
+  assert.ok(fsState.durableMembers.get(THREAD)?.has(SID), "in-memory tier holds the member");
+  assert.ok(sent.some((s) => s.sid === SID && s.text.includes("You joined thread")), "the joiner is onboarded fact-first");
+  assert.equal(dispatched.filter((c) => c.type === "addEdge").length, 0, "no card ⇒ no member:open edge painted (zero effect on the fact)");
+});
+
+test("D7 /join: a re-join of an existing durable member is a no-op redraw (REOPEN GUARD — no re-onboard)", async () => {
+  const repo = tmpRepo();
+  const records = threadCard(THREAD);
+  ledger.addThreadMember(repo, THREAD, SID, 100); // already a member
+  const { sent } = makeCtx(repo, records);
+  const r = await callThreadRoute("join", { from: SID });
+  assert.equal(r.status, 200);
+  assert.equal(sent.filter((s) => s.text.includes("You joined thread")).length, 0, "an existing member is not re-onboarded");
+});
+
+test("D7 /join: WITH a session card, the member:open edge VIEW is painted (and onboarding runs once)", async () => {
+  const repo = tmpRepo();
+  const records = [...threadCard(THREAD), { typeName: "node", id: `node:live:${SID}`, type: "session", title: SID }];
+  const { sent, dispatched } = makeCtx(repo, records);
+  const r = await callThreadRoute("join", { from: SID });
+  assert.equal(r.status, 200);
+  const edges = dispatched.filter((c) => c.type === "addEdge" && c.payload?.type === "member:open");
+  assert.equal(edges.length, 1, "one member:open edge painted as the view");
+  assert.equal(edges[0].payload.from, `node:live:${SID}`);
+  assert.equal(edges[0].payload.to, THREAD);
+  assert.equal(sent.filter((s) => s.text.includes("You joined thread")).length, 1, "onboarded exactly once (fact-first, not via the edge)");
+});
+
+test("D7 /join: an unknown thread (no marker, no node) still 404s", async () => {
+  const repo = tmpRepo();
+  makeCtx(repo, null);
+  const r = await callThreadRoute("join", { from: SID });
+  assert.equal(r.status, 404);
+});
+
+// ── 3c. D7: the member:open edge is a SERVER repaint-on-(re)appearance projection ───────────────────
+
+test("repaintReopenedMemberEdges: a session card that just APPEARED for a durable member paints its edge", () => {
+  const repo = tmpRepo();
+  ledger.addThreadMember(repo, THREAD, SID, 100);
+  const before = threadCard(THREAD); // no session card yet
+  const after = [...threadCard(THREAD), { typeName: "node", id: `node:live:${SID}`, type: "session", title: SID }];
+  const { fsState, dispatched } = makeCtx(repo, after);
+  fsState.durableMembers.set(THREAD, new Set([SID]));
+  delivery.repaintReopenedMemberEdges(BOARD, before, after, "127.0.0.1:0");
+  const edges = dispatched.filter((c) => c.type === "addEdge" && c.payload?.type === "member:open");
+  assert.equal(edges.length, 1, "the reappeared card's edge is repainted server-side");
+  assert.equal(edges[0].payload.id, `edge:member:${SID}:${THREAD}`, "canonical edge id (converges with client redraw)");
+  assert.equal(edges[0].payload.from, `node:live:${SID}`);
+});
+
+test("repaintReopenedMemberEdges: no repaint when the edge is already present (client redraw won the race)", () => {
+  const repo = tmpRepo();
+  ledger.addThreadMember(repo, THREAD, SID, 100);
+  const before = threadCard(THREAD);
+  const after = [...threadCard(THREAD), ...cardAndEdge(SID, THREAD)]; // card AND edge already present
+  const { fsState, dispatched } = makeCtx(repo, after);
+  fsState.durableMembers.set(THREAD, new Set([SID]));
+  delivery.repaintReopenedMemberEdges(BOARD, before, after, "127.0.0.1:0");
+  assert.equal(dispatched.filter((c) => c.type === "addEdge").length, 0, "idempotent — no duplicate edge");
+});
+
+test("repaintReopenedMemberEdges: a card present in BOTH before and after (not newly-appeared) is not repainted", () => {
+  const repo = tmpRepo();
+  ledger.addThreadMember(repo, THREAD, SID, 100);
+  const card = { typeName: "node", id: `node:live:${SID}`, type: "session", title: SID };
+  const before = [...threadCard(THREAD), card]; // card already on the board last save; only its edge missing
+  const after = [...threadCard(THREAD), card];
+  const { fsState, dispatched } = makeCtx(repo, after);
+  fsState.durableMembers.set(THREAD, new Set([SID]));
+  delivery.repaintReopenedMemberEdges(BOARD, before, after, "127.0.0.1:0");
+  assert.equal(dispatched.filter((c) => c.type === "addEdge").length, 0, "only a (re)appearance repaints, not a standing card");
+});
+
+test("repaintReopenedMemberEdges: a card for a NON-member paints nothing (edge is a projection of the ledger fact)", () => {
+  const repo = tmpRepo();
+  const before = threadCard(THREAD);
+  const after = [...threadCard(THREAD), { typeName: "node", id: `node:live:${SID}`, type: "session", title: SID }];
+  const { dispatched } = makeCtx(repo, after); // SID never recorded as a durable member
+  delivery.repaintReopenedMemberEdges(BOARD, before, after, "127.0.0.1:0");
+  assert.equal(dispatched.filter((c) => c.type === "addEdge").length, 0, "no ledger membership ⇒ no edge");
 });
 
 // ── 4. Display repaint reads the LEDGER alone (pill-click on a Done session mutates nothing) ────────
