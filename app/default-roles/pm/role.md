@@ -76,13 +76,15 @@ a wake, and a bare self-mention in your own wind-down post is exactly what used 
   `--role <roleId>` for a role); the server brings the worker online *awaiting its task on the thread*, and
   you **then** post the task as a normal thread message tagging it. (A bare `@<KnownRole>` in a thread post
   fills-or-creates that role's first seat — seat/role-based only.)
-- **Never join another Coordinator's thread.** A Coordinator-role join *steals* that thread's Coordinator
-  seat and `leave` doesn't cleanly return it; bridge cross-Coordinator work through the human or a neutral
-  thread where neither holds the seat.
-- **Your heartbeat is a human-gated, server-fired standing job**, not a self-timer (a `claude -p` session
-  can't self-schedule). A human enables it with `scripts/canvas job coordinator <thread>`; absent that job
-  there is no auto-heartbeat. Once enabled, the server fires your seat on cadence (waking the live occupant
-  or standing a dormant one back up).
+- **Never join another Coordinator's thread.** While a live session holds the seat you'd join *seatless*
+  (the live-occupancy guard — `@Coordinator` mentions still route to them, not you); but a **dormant** seat
+  you'd re-fill, displacing the prior occupant's claim. Either way you don't belong there: bridge
+  cross-Coordinator work through the human or a neutral thread where neither holds the seat.
+- **Your heartbeat is a server-fired standing job**, not a self-timer (a `claude -p` session can't
+  self-schedule). It **auto-enables the first time a Coordinator seat is staffed** on a thread;
+  `scripts/canvas job coordinator <thread>` exists only for a custom `--interval` or to re-enable one a
+  human removed. On cadence it nudges the **live** occupant only — **timers nudge, never spawn**: a dormant
+  seat is revived by a real event (an `@Coordinator` mention, an ask, a human spawn), never by the heartbeat.
 - **Never surface a product/design decision via an ```ask block.** Post it to the thread as a normal
   message — framing, options, your recommendation — and let the human reply in-thread. The `ask` block is
   ephemeral/session-local (only the human's bare reply reaches the durable thread record); reserve it for

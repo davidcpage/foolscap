@@ -77,9 +77,9 @@ async function handleCommand(req: IncomingMessage, res: ServerResponse, boardId:
 
 // The agents' board read, served from the DURABLE store (unification: the browser used to push a
 // second, near-identical snapshot here just for this read — retired; remote-store.ts's persistence
-// save is the one write path now). `tabs` is the liveness signal: a successful read no longer implies
-// a live tab (that was the old 404's meaning), and a WRITE still needs one — check `tabs`/`delivered`
-// before treating the board as actionable. 404 only for a board with nothing persisted yet.
+// save is the one write path now). `tabs` is a human-presence signal only: a successful read no longer
+// implies a live tab (that was the old 404's meaning), and a WRITE no longer needs one either (§9 stage 2
+// above — /api/command commits server-side). 404 only for a board with nothing persisted yet.
 function handleCanvasGet(res: ServerResponse, boardId: string): void {
   const { boards, tabCountFor } = getServerContext();
   const b = boards.get(boardId);

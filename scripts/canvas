@@ -4,7 +4,7 @@
 # Why this exists: spawning a session is a POST to /api/session/spawn via curl, and the auto-mode
 # permission classifier gates that as "creating an agent". Allowing `Bash(curl:*)` wholesale would be far
 # too broad. Wrapping the gated verbs here lets the spawn path baseline-allow exactly `Bash(scripts/canvas
-# ...)` (see BASELINE_ALLOWED_TOOLS in app/vite-fs-plugin.ts) — auditable, and every session gets legible
+# ...)` (see BASELINE_ALLOWED_TOOLS in app/server-sessions.ts) — auditable, and every session gets legible
 # verbs instead of raw curl. Per the session permission model, this is a UNIFORM baseline capability for
 # every session, not a role permission.
 #
@@ -15,7 +15,7 @@
 #
 # NOTE: a wrapper-spawned (like a curl-spawned) session leaves NO canvas card. To make it a thread
 # member, the spawner must still addNode {id:"node:live:<sid>",type:"session",title:"<sid>"} + a
-# member:open edge over /api/command (see CLAUDE.md "Driving sessions headlessly") — or just pass
+# member:open edge over /api/command (see app/harness/sessions.md) — or just pass
 # --thread and let the server do all of it.
 set -euo pipefail
 
@@ -127,16 +127,18 @@ canvas — session/coordination verbs over the agent bus
         it. Role defaults to Coordinator. anno list shows watchers (👁 role:level) per doc.
 
   scripts/canvas job add <THREAD>|--doc PATH --instruction TEXT [--interval MS] [--role R] [--from ID] [--job-id ID]
-        declare a STANDING JOB (R6/W6) on a thread marker — a periodic server-fired worker. Every --interval
-        (ms; clamped up to a 60s floor) the server spawns a FRESH worker seeded with --instruction; a named
-        --role fires into that role's seat, else a bare worker. Jobs survive their creator AND a restart (they
+        declare a STANDING JOB (R6/W6) on a thread marker — a periodic server-fired nudge. Every --interval
+        (ms; clamped up to a 60s floor) the server fires it — timers nudge, never spawn: a named --role
+        NUDGES that role's live, idle seat occupant with --instruction (a dormant seat waits for a real
+        event), and a bare roleless job is a no-op (no seat to nudge). Jobs survive their creator AND a restart (they
         live on the marker). Pass --job-id to update an existing job in place. Norm: a firing that finds
         nothing posts nothing ("skip days with nothing"). With --doc PATH the job lives on a DOC's marker
         instead (doc-jobs; one worker per doc, fired by the same tick).
   scripts/canvas job coordinator <THREAD> [--interval MS] [--from ID]
-        THE AUTONOMY SWITCH — enable the Coordinator HEARTBEAT as a standing job on <THREAD>, built from the
-        canonical spec (app/coordinator-heartbeat.js). Fires the Coordinator seat on its interval to sweep the
-        board (nudged if live, respawned if dormant). Deliberate + human-gated; turn OFF via job list + job rm.
+        enable the Coordinator HEARTBEAT as a standing job on <THREAD>, built from the canonical spec
+        (app/coordinator-heartbeat.js). AUTO-ENABLED on first staffing of a Coordinator seat — this verb is
+        for a custom --interval or re-enabling one a human removed. Fires the Coordinator seat on its interval
+        to sweep the board (nudge-only; a dormant seat waits for a real event). Turn OFF via job list + job rm.
   scripts/canvas job list <THREAD>|--doc PATH          list a thread's (or doc's) standing jobs (id, role, interval, lastFired)
   scripts/canvas job rm <THREAD> <JOB_ID> | --doc PATH <JOB_ID> [--from ID]  remove a standing job
 
@@ -166,8 +168,9 @@ jstr() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
 # never silently "succeed". So this hard-errors (prints the body, then a clear message to stderr, then
 # returns non-zero → set -e exits the script) on:
 #   • an unreachable server (curl transport error);
-#   • an HTTP 4xx/5xx (e.g. /api/command's 503 {delivered:0} when no live tab applied it, a 409 unread-
-#     mention guard, a 403 non-member) — the request did not do what was asked;
+#   • an HTTP 4xx/5xx (e.g. a 400 unknown board/command, a 409 unread-mention guard, a 403 non-member) —
+#     the request did not do what was asked. (/api/command now COMMITS server-side and returns 200
+#     {ok,seq,id} with no live tab required — its old no-tab 503 {delivered:0} is retired.);
 #   • a body carrying "delivered":0/false (defense-in-depth for a 200 that still reached no tab).
 # NOT an error: a message endpoint's notified:0 — an untagged post legitimately wakes nobody (it's a
 # different field and a deliberate design), so we key ONLY on `delivered`, never `notified`.
@@ -583,11 +586,12 @@ PY
 )
       post "$SERVER/api/thread/$thread/job?board=$BOARD" "$body"; echo ;;
     coordinator|coord)
-      # THE AUTONOMY SWITCH (wakeable-substrate-plan.md — wake-live loop-migration). Enable the Coordinator
-      # heartbeat as a standing job on <THREAD>, built from the canonical spec (coordinator-heartbeat.js) so
-      # the sweep instruction never drifts. This is a deliberate, human-gated act: it starts an auto-firing
-      # Coordinator that wakes on its interval to sweep the board (nudged if live, respawned if dormant).
-      # Remove it (turn autonomy OFF) with `job list <THREAD>` then `job rm <THREAD> <jobId>`.
+      # Enable the Coordinator heartbeat as a standing job on <THREAD>, built from the canonical spec
+      # (coordinator-heartbeat.js) so the sweep instruction never drifts. The heartbeat AUTO-ENABLES on
+      # first staffing of a Coordinator seat (server-delivery.ts), so this verb is for a custom --interval
+      # or re-enabling one a human removed. On fire it NUDGES a live, idle occupant only — timers nudge,
+      # never spawn; a dormant seat waits for a real event (@-mention / ask / human spawn).
+      # Remove it (turn the heartbeat OFF) with `job list <THREAD>` then `job rm <THREAD> <jobId>`.
       local thread="" interval="" from="$DEFAULT_FROM"
       while [ $# -gt 0 ]; do case "$1" in
         --interval|--interval-ms) interval="${2:-}"; shift 2 ;;

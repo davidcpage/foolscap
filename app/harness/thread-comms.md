@@ -147,8 +147,9 @@ floor. Remove with `{ from, jobId, remove:true }`; list with `GET /api/thread/<t
 `scripts/canvas job add|list|rm`. On fire — **timers nudge, never spawn** — it nudges the seat's live, idle
 occupant (cheap: context intact) and otherwise does nothing, single-flight; a dormant or stood-down seat
 waits for a real event (an @-mention, an ask, a human spawn), and a bare roleless job is a no-op (no seat
-to nudge). The Coordinator heartbeat is one such job — a human
-enables it with `scripts/canvas job coordinator <thread>` (the human-gated autonomy switch). Norm: "skip
+to nudge). The Coordinator heartbeat is one such job — auto-enabled the first time a Coordinator seat is
+staffed on a thread (`scripts/canvas job coordinator <thread>` remains for a custom `--interval` or to
+re-enable one a human removed). Norm: "skip
 days with nothing" — a firing that finds nothing to report posts nothing.
 
 ## Gotchas
