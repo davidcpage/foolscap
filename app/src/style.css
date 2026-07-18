@@ -226,6 +226,50 @@ body {
   border-radius: 4px;
   padding: 1px 5px;
 }
+/* The copy-reference chip (host chrome, shared across card types — see cardReference / CopyRefChip). A
+   quiet ⧉ button that copies the card's stable reference and flashes a ✓, mirroring the session card's
+   `.ses-name.copied` pattern. Inline in a head (thread) by default; the --float variant is the
+   TemplateCard overlay. */
+.copy-ref {
+  flex: none;
+  border: none;
+  background: transparent;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-size: 11px;
+  line-height: 1.2;
+  color: #6366f1;
+  cursor: pointer;
+}
+.copy-ref:hover {
+  text-decoration: underline dotted;
+}
+.copy-ref.copied {
+  color: #16a34a;
+  text-decoration: none;
+}
+.copy-ref.copied::after {
+  content: " ✓";
+}
+/* Floating variant: a top-right overlay revealed only on card hover/selection, so it never fights a
+   per-card head (which may already sit top-right). pointer-events gate keeps the invisible chip from
+   swallowing clicks while hidden. */
+.copy-ref--float {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 5;
+  background: #ffffffd9;
+  box-shadow: 0 1px 2px #0000001a;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.node:hover > .copy-ref--float,
+.node.selected > .copy-ref--float {
+  opacity: 1;
+  pointer-events: auto;
+}
 /* The sessions card's running-count badge — a calm green pill (matching the `working` band hue in
    session-status.ts) that reads at a glance as "N agents live". Only rendered when running > 0, so its
    presence alone signals activity; it sits between the card name and the ⟳ refresh in the header. */
