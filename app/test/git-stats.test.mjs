@@ -7,6 +7,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -21,7 +24,9 @@ registerHooks({
   },
 });
 
-const { deriveGitStats, gitStatsRecentTail } = await import("../server-data-feeds.ts");
+const { deriveGitStats, gitStatsRecentTail, writeFeedMirrorObject, feedMirrorRelPath } = await import(
+  "../server-data-feeds.ts"
+);
 
 const RS = "\x1e";
 const US = "\x1f";
@@ -123,6 +128,24 @@ test("deriveGitStats: empty / no-commit dump is inert (no throw, zeroed totals)"
   assert.deepEqual(empty.growth.t, []);
   assert.deepEqual(empty.churn, []);
   assert.equal(empty.downsampled, false);
+});
+
+test("writeFeedMirrorObject: writes the exact on-disk artifact the card reads back (compact, JSON-parseable)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "gitstats-mirror-"));
+  try {
+    const series = deriveGitStats(DUMP, "data:git-stats", 7);
+    // The git-stats producer writes compact (pretty=false) so the full series stays under the /api/file cap.
+    writeFeedMirrorObject(repo, "data:git-stats", series, false);
+    const abs = path.join(repo, feedMirrorRelPath("data:git-stats"));
+    assert.ok(fs.existsSync(abs), "mirror lands at .canvas/feeds/data-git-stats.json");
+    const text = fs.readFileSync(abs, "utf8");
+    assert.ok(!text.includes("\n  "), "compact write: no 2-space pretty indentation");
+    const round = JSON.parse(text); // the card's dataFeedHistory does exactly this
+    assert.deepEqual(round.totals, series.totals, "round-trips the derived totals");
+    assert.deepEqual(round.dirs, series.dirs, "round-trips the dir list");
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
 });
 
 test("gitStatsRecentTail: the bounded recent-commit events for the bus feed", () => {

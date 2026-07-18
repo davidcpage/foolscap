@@ -280,8 +280,9 @@ export function startGitStatsFeed(boardId: string, repo: string): void {
           if (err) return; // empty repo / not a repo / buffer overflow — keep the previous value
           const updatedAt = Date.now();
           const series = deriveGitStats(stdout, name, updatedAt);
-          // Full history → the mirror file (the card's carrier); it self-heals a bad parse to an empty series.
-          writeFeedMirrorObject(repo, name, series);
+          // Full history → the mirror file (the card's carrier); compact (machine-read) to stay under the
+          // /api/file byte cap so the card's read is never head-truncated. Self-heals a bad parse to empty.
+          writeFeedMirrorObject(repo, name, series, false);
           // Recent tail → the bus (byte-bounded via foldDataFeedSnapshot, which also seeds the in-memory buffer).
           const value = foldDataFeedSnapshot(feedKey, name, gitStatsRecentTail(series), series.downsampled, updatedAt);
           publishFeed(feedKey, value);

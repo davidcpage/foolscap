@@ -125,11 +125,14 @@ export function writeFeedMirror(repo: string, name: string, value: DataFeedValue
 // so the `dataFeedHistory` capability, which reads that mirror, hands the card whatever the producer chose
 // to persist there (a bounded tail for the generic feeds, a full series for git-stats). Same best-effort +
 // noisy + never-throw discipline: a lost mirror is cosmetic, a thrown feed once crashed the dev server.
-export function writeFeedMirrorObject(repo: string, name: string, obj: unknown): void {
+export function writeFeedMirrorObject(repo: string, name: string, obj: unknown, pretty: boolean = true): void {
   try {
     const abs = path.join(repo, feedMirrorRelPath(name));
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, JSON.stringify(obj, null, 2) + "\n");
+    // Generic tail mirrors are small + human-inspectable → pretty. A derived FULL-history series (git-stats)
+    // passes pretty=false: it's machine-read, and 2-space indent over arrays-of-numbers ~doubles the bytes —
+    // compact keeps the mirror comfortably under the /api/file byte cap (so the card's read never truncates).
+    fs.writeFileSync(abs, JSON.stringify(obj, null, pretty ? 2 : undefined) + "\n");
   } catch (err) {
     console.warn(`[data-feed] mirror write failed for ${name}: ${String(err)}`);
   }
