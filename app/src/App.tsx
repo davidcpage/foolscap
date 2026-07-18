@@ -28,6 +28,7 @@ import {
   addClock,
   addComputedCard,
   addGitHeadCard,
+  addGitLogCard,
   addHnCard,
   addFileTreeCard,
   addMinimapCard,
@@ -1326,6 +1327,7 @@ function CanvasMenu({
         {/* Clock + Usage live under the HUD section above (true singletons), not here — they're corner chrome,
             not duplicable world widgets. */}
         <button onClick={() => run(() => addGitHeadCard(m, at))}>Git HEAD</button>
+        <button onClick={() => run(() => addGitLogCard(m, at))}>Git log</button>
         <button onClick={() => run(() => addHnCard(m, at))}>Hacker News</button>
         <button onClick={() => run(() => addWeatherCard(m, at))}>Weather</button>
         <button onClick={() => run(() => addComputedCard(m, at))}>Computed</button>

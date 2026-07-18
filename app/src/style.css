@@ -2183,6 +2183,52 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   font-weight: 500;
 }
 
+/* ── git-log / data-feed timeline card (a live `data:*` feed, newest-first) ──────────────────────
+   The interior is inline-styled (the weather/usage additive pattern); the stylesheet owns the box accent,
+   the same "select the card, then touch its input" rule the weather/sticky cards use for the feed-name
+   field, and the small timeline row type. */
+.node.git-log {
+  border-left-width: 4px;
+}
+.node.git-log:not(.selected) .gl-name {
+  pointer-events: none;
+}
+.node.git-log .gl-name {
+  user-select: text;
+}
+.node.git-log .gl-name::placeholder {
+  color: #a1a1aa;
+  font-weight: 500;
+}
+.node.git-log .gl-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  line-height: 1.4;
+}
+.node.git-log .gl-line {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.node.git-log .gl-sha {
+  font: 600 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: #16a34a;
+  flex: none;
+}
+.node.git-log .gl-msg {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.node.git-log .gl-meta {
+  font-size: 10px;
+}
+.node.git-log .gl-trunc {
+  text-align: center;
+}
+
 /* ── session card (a historical agent session, file-backed) ─────────────────────────────────────
    Renders the jsonl transcript as a clipped column of turns. Like the file card it is static and
    clipped (no in-interior scroll/click yet — the interaction layer owns the wheel and hit-tests

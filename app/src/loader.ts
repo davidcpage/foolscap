@@ -837,6 +837,22 @@ export function addWeatherCard(m: InteractionManager, at?: Pos): void {
   m.selection.set([id]);
 }
 
+// The git-log / data-feed timeline card (Github-feed thread): a card-type-as-data whose title is a `data:*`
+// feed name. Created titled `data:git-log` — the board repo's live commit log — but it's the generic
+// data-feed viewer, so retyping the title points it at any other `data:*` feed. Title-as-query, so it's a
+// fresh nodeId per card (not a `node:feed:*` singleton) — you can watch several feeds at once.
+export function addGitLogCard(m: InteractionManager, at?: Pos): void {
+  const w = 300;
+  const h = 320;
+  const id = nodeId();
+  m.editor.commit({
+    type: "addNode",
+    actor: "user",
+    payload: { id, type: "git-log", title: "data:git-log", text: "", color: "green", ...(at ?? spawnAt(m, w, h)), w, h },
+  });
+  m.selection.set([id]);
+}
+
 // Open a HISTORICAL agent session as a card (agent-sessions-on-canvas.md §12). Pure existing
 // architecture — a file-backed card like any other. The server reads a real Claude Code `.jsonl`
 // transcript (`id` omitted → the most recent), and the content rides in `text` exactly as a file card's

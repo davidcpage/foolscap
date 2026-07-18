@@ -16,11 +16,12 @@ import { getBusClients, getWsClients, setServerContext } from "./server-context.
 import { announceNewMemberships, appendThreadMsg, dispatchBusCommand, flushNudge, publishThreadFeed, wakeThreadMembers } from "./server-delivery.js";
 import { attachSessionHost, autoWakeReapTick, endSession, ensureLiveSession, ensureSessionFeed, isScratchBoard, liveSessionCount, MAX_LIVE_SESSIONS, PERMISSION_HOLD_MS, persistSessionState, placeWorkerCard, publishSession, readSessionFile, reconcileSessionBands, republishThreadSeatOccupants, resolveSpawnCwd, sendSessionInput, sendSessionInterrupt, serverSpawnWorker, sessionsDir, sessionSpawnRefusal, sessionStatus, settlePermission } from "./server-sessions.js";
 import { boardSnapshotRecords, captureMemberOffsets, captureReopenSets, forgetDurableMember, historyKey, MAX_THREAD_MSGS, nodeSessionId, recordDurableMember, seedCursor, seedThreadLogs, sessionAnchor, sessionNameForSid, sessionNodeForSid, sessionThreads, sidFromSessionNode, threadLog, threadMemberSids, threadNode, trackEmittedMembership } from "./server-snapshot.js";
-import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
+import { ensureCoordinatorHeartbeat, foldShadowEdits, maybeRespawnDormantSeat, maybeWakeDocWorker, originOf, publishFeed, startCardTypesFeed, startGitHeadFeed, startGitLogFeed, startHnFeed, startLoopHeartbeat, startRolesFeed, startSessionsFeed, startThreadsFeed, startUsageFeed, syncShadowRoots } from "./server-orchestration.js";
 import { foldCodexEvent } from "./codex-projection.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
+import { feedRoutes } from "./routes/feed.js";
 import { cardTypeRoutes, handleCardTypeAsset } from "./routes/card-types.js";
 import { roleRoutes } from "./routes/roles.js";
 import { permissionRoutes } from "./routes/permissions.js";
@@ -358,6 +359,7 @@ function startBoardFeeds(boardId: string, repoPath: string): void {
   if (boardFeedsStarted.has(boardId)) return;
   boardFeedsStarted.add(boardId);
   startGitHeadFeed(boardId, repoPath);
+  startGitLogFeed(boardId, repoPath); // the board repo's recent commit log, under the generic `data:*` namespace
   const markersDir = canvasSessionsDir(repoPath);
   try {
     fs.mkdirSync(markersDir, { recursive: true }); // so chokidar has a dir to watch before the first spawn
@@ -619,6 +621,7 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
 
 // STAGE 2 — BOARD routes (reached only after the shared board gate resolved `board`/`boardId`).
 const BOARD_ROUTES: BoardRoute[] = [
+  ...feedRoutes, // POST /api/feed/<name> (routes/feed.ts) — data:* publish, board-scoped via the shared gate
   ...rootsBoardRoutes, // /api/roots (routes/roots.ts) — same arm, same position
   ...annotationBoardRoutes, // /api/annotations GET+POST (routes/annotations.ts) — same arm, same position
 ];

@@ -124,9 +124,12 @@ export function commitRoot(workTree, opts = {}) {
       // Also exclude `.canvas/worktrees/` — agent worktrees there are nested git checkouts (gitlinks); a
       // force-add would try to stage one as a submodule and fail (`is in submodule`). They reach main via
       // merge-on-green, not this ledger, so the canonical floor must never stage them.
+      // And `.canvas/feeds/` — the data-feed disk mirrors (server-data-feeds.ts) rewrite on every publish; they
+      // are derived/off-log (like the board record store), so shadow-committing them would churn history per
+      // publish. Left OUT of isInternalPath deliberately, so the WS file-watch still serves them live to a card.
       if (fs.existsSync(path.join(workTree, ".canvas"))) {
         const f = await run(
-          [...base, "add", "--force", "--", ".canvas", ":(exclude).canvas/roots", ":(exclude).canvas/worktrees"],
+          [...base, "add", "--force", "--", ".canvas", ":(exclude).canvas/roots", ":(exclude).canvas/worktrees", ":(exclude).canvas/feeds"],
           workTree,
         );
         if (f.code !== 0) throw new Error(`shadow .canvas add failed: ${f.stderr.trim()}`);

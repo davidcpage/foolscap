@@ -413,6 +413,23 @@ export function buildCard(
       signals.weather = (query: string): WeatherData | undefined => tracked(weatherSignal(query));
       continue;
     }
+    // `dataFeed` is the generic off-log FEED read (Github-feed thread, stage 2a) — a CALLABLE keyed by a
+    // feed NAME, the weather/dirListing shape applied to the `data:*` namespace. A card reads
+    // card.signals.dataFeed("data:git-log") (or any `data:*` name typed into its title) and gets that feed's
+    // value: the byte-bounded event tail a producer published via `POST /api/feed/<name>` or the server-side
+    // git-log source (server-data-feeds.ts). The `data:` prefix is the SECURITY BOUNDARY — any other name
+    // resolves to `undefined`, so this one capability can't be pointed at session:/thread:/kernel:/usage
+    // feeds; it's exactly as narrow as a per-source capability but needs no per-source plumbing. Board-scoped
+    // like `githead` (the feed key carries `:<boardId>`); resolved through the cached feedSignal so the
+    // handle identity is STABLE across renders (read reconciliation subscribes/unsubscribes correctly) — the
+    // reason it calls feedSignal(fullName) rather than boardFeedSignal (which mints a fresh wrapper per call).
+    if (name === "dataFeed") {
+      signals.dataFeed = (feedName: string): unknown =>
+        typeof feedName === "string" && feedName.startsWith("data:")
+          ? tracked(feedSignal(feedName + ":" + activeBoardId()))
+          : undefined;
+      continue;
+    }
     // `treeState` is per-card EPHEMERAL view state (the directory card's expand-set): a tiny read-tracked,
     // settable Subscribable so a LOCAL toggle re-renders the card exactly as a signal change would. It is
     // never committed, never logged, gone on reload — browsing a tree is "derived by default"

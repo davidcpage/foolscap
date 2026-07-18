@@ -20,6 +20,13 @@ import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./server-types.js";
 import {
+  foldDataFeedEvent,
+  foldDataFeedSnapshot,
+  writeFeedMirror,
+  type DataFeedEvent,
+  type DataFeedValue,
+} from "./server-data-feeds.js";
+import {
   CLAUDE_USAGE_MAX_BACKOFF_MS,
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
@@ -146,6 +153,86 @@ export function startGitHeadFeed(boardId: string, repo: string): void {
       console.error(
         `[githead] git spawn threw (${String(err)}) — likely fd exhaustion (process holds ${fds} fds); ` +
           `HEAD feed for ${repo} goes stale. This crashed the server once — find the leak.`,
+      );
+    }
+  };
+
+  let t: ReturnType<typeof setTimeout> | null = null;
+  const debounced = () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(read, 150); // a commit touches several .git files; coalesce to one read
+  };
+  chokidar
+    .watch([path.join(repo, ".git/HEAD"), path.join(repo, ".git/logs/HEAD")], { ignoreInitial: true })
+    .on("all", debounced);
+  read();
+}
+
+// ── the generic `data:*` feed namespace (Github-feed thread, stage 2) ───────────────────────────────
+// The server side of the data-feed primitive: publish a byte-bounded value onto the off-log bus AND mirror
+// it to `.canvas/feeds/<name>.json` (so a reactive-notebook cell consumes it over the file-watch), in one
+// place so every producer — the git-log source below, the `POST /api/feed/<name>` route — folds identically.
+// The feed KEY is board-suffixed (`data:<name>:<boardId>`) so two boards' same-named feeds stay disjoint and
+// the `dataFeed` capability (boardFeedSignal-shaped) reads exactly this board's; the mirror FILE is already
+// board-scoped by living under that board's own `.canvas/`, so it keeps the bare `data:*` name.
+function publishDataFeed(boardId: string, repo: string, value: DataFeedValue): void {
+  publishFeed(value.name + ":" + boardId, value);
+  writeFeedMirror(repo, value.name, value);
+}
+
+// APPEND one producer event to a `data:*` feed and publish+mirror the new tail. The route handler's one
+// call; returns the folded value so the route can echo its size/truncation. `data` is the caller's payload.
+export function appendDataFeed(boardId: string, repo: string, name: string, data: unknown): DataFeedValue {
+  const event: DataFeedEvent = { ts: Date.now(), data };
+  const value = foldDataFeedEvent(name + ":" + boardId, name, event);
+  publishDataFeed(boardId, repo, value);
+  return value;
+}
+
+// Feed: the board repo's recent commit log, published under the `data:*` namespace as the stage-1 proof of
+// the generic primitive. Clones startGitHeadFeed's shape — chokidar on .git/HEAD + .git/logs/HEAD (the reflog
+// moves on every commit/amend/pull), debounced, ASYNC execFile with the SAME narrow-and-noisy fd-exhaustion
+// catch (a sync throw here crashed the dev server once, 2026-07-10). Each HEAD change re-reads the window
+// (git log isn't incremental) and publishes a SNAPSHOT: `-n 51` so we can tell "there is older history" (the
+// 51st row) from "that's the whole repo", then keep the newest 50 as the byte-bounded tail. Commits are
+// stored oldest→newest (the tail idiom keeps the recent ones); the card renders newest-first.
+export function startGitLogFeed(boardId: string, repo: string): void {
+  const name = "data:git-log";
+  const feedKey = name + ":" + boardId;
+  const WINDOW = 50;
+  const read = () => {
+    try {
+      execFile(
+        "git",
+        ["log", "-n", String(WINDOW + 1), "--format=%H%x1f%an%x1f%ct%x1f%s"],
+        { cwd: repo },
+        (err, stdout) => {
+          if (err) return; // empty repo / not a repo — keep the previous value
+          const lines = stdout.trim() ? stdout.trim().split("\n") : [];
+          const older = lines.length > WINDOW; // a 51st row ⇒ history extends past the window
+          // newest-first from git → reverse to oldest→newest so the byte-bounded TAIL keeps the recent ones
+          const events: DataFeedEvent[] = lines
+            .slice(0, WINDOW)
+            .map((line) => {
+              const [sha, author, ct, message] = line.split("\x1f");
+              return { ts: Number(ct) * 1000, data: { sha, shortSha: sha.slice(0, 7), author, message } };
+            })
+            .reverse();
+          const value = foldDataFeedSnapshot(feedKey, name, events, older, Date.now());
+          publishDataFeed(boardId, repo, value);
+        },
+      );
+    } catch (err) {
+      // execFile throws SYNCHRONOUSLY when the child can't be forked (EBADF/EMFILE at fd exhaustion) —
+      // the same crash startGitHeadFeed guards. Narrow + noisy: the feed degrades to stale, but a firing
+      // here means the process is leaking fds. Investigate; don't ignore.
+      let fds = "?";
+      try {
+        fds = String(fs.readdirSync("/dev/fd").length);
+      } catch { /* leave "?" */ }
+      console.error(
+        `[git-log] git spawn threw (${String(err)}) — likely fd exhaustion (process holds ${fds} fds); ` +
+          `git-log feed for ${repo} goes stale. This failure mode crashed the server once — find the leak.`,
       );
     }
   };
