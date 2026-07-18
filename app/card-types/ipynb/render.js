@@ -173,9 +173,16 @@ function makeEditApi(card) {
     },
     commitEdit: (cellId, origSrc) => {
       const dm = drafts();
+      // GUARD the removal-blur after a cancel/earlier-commit: if the cell already LEFT edit mode, this blur is
+      // stray — never write (Esc→cancel removes it from the set first, and the removal-blur's @input just
+      // re-stashed the abandoned text). Drop any draft and bail. This is what makes Esc a true cancel.
+      if (!editingSet().has(cellId)) {
+        dm.delete(cellId);
+        return;
+      }
+      // GUARD no-op writes (the sticky card's commitIfChanged): an unchanged draft skips the POST — an
+      // identical write would only churn the file + watcher.
       const draft = dm.get(cellId);
-      // GUARD no-op writes (the sticky card's commitIfChanged) AND cancel-via-blur: a deleted draft (cancel)
-      // or an unchanged one skips the POST — an identical write would only churn the file + watcher.
       if (draft != null && draft !== origSrc) edit({ type: "editSource", cellId, source: draft });
       dm.delete(cellId);
       setEditing((s) => s.delete(cellId));
