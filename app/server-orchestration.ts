@@ -20,9 +20,12 @@ import { readCanvasSession } from "./session-ledger.js";
 import { CARD_TYPES_DIR } from "./server-fs.js";
 import type { LiveSession } from "./server-types.js";
 import {
+  deriveGitStats,
   foldDataFeedEvent,
   foldDataFeedSnapshot,
+  gitStatsRecentTail,
   writeFeedMirror,
+  writeFeedMirrorObject,
   type DataFeedEvent,
   type DataFeedValue,
 } from "./server-data-feeds.js";
@@ -234,6 +237,66 @@ export function startGitLogFeed(boardId: string, repo: string): void {
       console.error(
         `[git-log] git spawn threw (${String(err)}) — likely fd exhaustion (process holds ${fds} fds); ` +
           `git-log feed for ${repo} goes stale. This failure mode crashed the server once — find the leak.`,
+      );
+    }
+  };
+
+  let t: ReturnType<typeof setTimeout> | null = null;
+  const debounced = () => {
+    if (t) clearTimeout(t);
+    t = setTimeout(read, 150); // a commit touches several .git files; coalesce to one read
+  };
+  chokidar
+    .watch([path.join(repo, ".git/HEAD"), path.join(repo, ".git/logs/HEAD")], { ignoreInitial: true })
+    .on("all", debounced);
+  read();
+}
+
+// Feed: per-file / per-commit git STATS — historical code growth + churn (Github-feed thread work item 2).
+// Rides the `data:*` primitive but with a TWIST the generic feed doesn't have: two outputs from one derive.
+//   • the FULL derived series → the `.canvas/feeds/data-git-stats.json` mirror (writeFeedMirrorObject), the
+//     full-history carrier a `git-stats` card reads live via the `dataFeedHistory` capability over the
+//     existing file-watch — kept under the /api/file byte cap so it's never head-truncated;
+//   • a byte-bounded RECENT tail → the bus feed `data:git-stats` (publishFeed), the "recent-events feed" the
+//     primitive expects, also consumable by the git-log card / a notebook cell.
+// It deliberately does NOT go through publishDataFeed (which would write the *tail* to that same mirror path,
+// clobbering the full series). git-stats is a server-DERIVED feed; a stray `POST /api/feed/data:git-stats`
+// would overwrite the full mirror with a tail, but the next reflog change re-derives and heals it — the same
+// self-healing openness the git-log source has. Same reflog watch + async execFile + narrow fd-catch as
+// startGitLogFeed; `git log --numstat` over full history is cheap (this repo: 467 commits, ~68KB raw) but a
+// big monorepo's isn't, so maxBuffer is generous and deriveGitStats degrades (per-dir rollup, top-N, downsample).
+export function startGitStatsFeed(boardId: string, repo: string): void {
+  const name = "data:git-stats";
+  const feedKey = name + ":" + boardId;
+  const read = () => {
+    try {
+      execFile(
+        "git",
+        // RS (\x1e) prefixes each commit header; US (\x1f) separates its fields — so deriveGitStats can split
+        // commits and their numstat rows unambiguously even when a subject contains odd characters.
+        ["log", "--reverse", "--numstat", "--format=%x1e%H%x1f%an%x1f%ct%x1f%s"],
+        { cwd: repo, maxBuffer: 256 * 1024 * 1024 }, // generous: numstat over a large monorepo can be many MB
+        (err, stdout) => {
+          if (err) return; // empty repo / not a repo / buffer overflow — keep the previous value
+          const updatedAt = Date.now();
+          const series = deriveGitStats(stdout, name, updatedAt);
+          // Full history → the mirror file (the card's carrier); it self-heals a bad parse to an empty series.
+          writeFeedMirrorObject(repo, name, series);
+          // Recent tail → the bus (byte-bounded via foldDataFeedSnapshot, which also seeds the in-memory buffer).
+          const value = foldDataFeedSnapshot(feedKey, name, gitStatsRecentTail(series), series.downsampled, updatedAt);
+          publishFeed(feedKey, value);
+        },
+      );
+    } catch (err) {
+      // execFile throws SYNCHRONOUSLY when the child can't be forked (EBADF/EMFILE at fd exhaustion) — the
+      // same crash startGitLogFeed guards. Narrow + noisy: the stats go stale, a firing means an fd leak.
+      let fds = "?";
+      try {
+        fds = String(fs.readdirSync("/dev/fd").length);
+      } catch { /* leave "?" */ }
+      console.error(
+        `[git-stats] git spawn threw (${String(err)}) — likely fd exhaustion (process holds ${fds} fds); ` +
+          `git-stats feed for ${repo} goes stale. This failure mode crashed the server once — find the leak.`,
       );
     }
   };

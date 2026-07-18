@@ -2229,6 +2229,23 @@ input.nb-title::placeholder { color: #c4c4c8; font-weight: 400; }
   text-align: center;
 }
 
+/* ── git-stats / code-growth card (a live `data:*` growth+churn visualization) ────────────────────
+   Same box accent + "select the card, then touch its input" rule as the git-log card for the feed-name
+   field; the charts are inline-styled SVG in the interior (the weather/git-log additive pattern). */
+.node.git-stats {
+  border-left-width: 4px;
+}
+.node.git-stats:not(.selected) .gs-name {
+  pointer-events: none;
+}
+.node.git-stats .gs-name {
+  user-select: text;
+}
+.node.git-stats .gs-name::placeholder {
+  color: #a1a1aa;
+  font-weight: 500;
+}
+
 /* ── session card (a historical agent session, file-backed) ─────────────────────────────────────
    Renders the jsonl transcript as a clipped column of turns. Like the file card it is static and
    clipped (no in-interior scroll/click yet — the interaction layer owns the wheel and hit-tests

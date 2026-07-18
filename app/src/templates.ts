@@ -451,6 +451,30 @@ export function buildCard(
           : undefined;
       continue;
     }
+    // `dataFeedHistory` is the FULL-HISTORY companion to `dataFeed` (Github-feed thread work item 2) — a
+    // callable keyed by a `data:*` name that reads that feed's DISK MIRROR (`.canvas/feeds/<name>.json`) live
+    // via the file-watch, rather than the bus feed's byte-bounded tail. Its contract is honestly "the feed's
+    // persisted mirror": for a generic feed the mirror is the same bounded tail as `dataFeed`, but a derived
+    // producer can write a richer FULL series there (the git-stats source does), and this hands the card
+    // whatever was persisted — parsed from JSON, or `undefined` on a missing/partial file (the card shows a
+    // waiting/empty state). Same `data:` SECURITY BOUNDARY as `dataFeed` (any other name → undefined), and it
+    // rides the ordinary board-scoped file read (fileContentSignal("repo", …)), so a mirror write re-renders
+    // just this card. The sanitize mirrors server-data-feeds.ts `sanitizeFeedName`, inlined to stay
+    // lit-html/browser-safe (no node import). Reading it inside render subscribes the card to the mirror file.
+    if (name === "dataFeedHistory") {
+      signals.dataFeedHistory = (feedName: string): unknown => {
+        if (typeof feedName !== "string" || !feedName.startsWith("data:")) return undefined;
+        const rel = ".canvas/feeds/" + feedName.replace(/[^a-zA-Z0-9._-]/g, "-") + ".json";
+        const text = tracked(fileContentSignal("repo", rel));
+        if (typeof text !== "string" || !text.trim()) return undefined;
+        try {
+          return JSON.parse(text);
+        } catch {
+          return undefined; // a mid-write partial or a head-truncated (trailing "…") file — treat as pending
+        }
+      };
+      continue;
+    }
     // `treeState` is per-card EPHEMERAL view state (the directory card's expand-set): a tiny read-tracked,
     // settable Subscribable so a LOCAL toggle re-renders the card exactly as a signal change would. It is
     // never committed, never logged, gone on reload — browsing a tree is "derived by default"
