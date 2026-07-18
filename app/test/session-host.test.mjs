@@ -7,7 +7,7 @@ import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { createHost } from "../session-host.js";
+import { createHost, codexSpawnBlocked } from "../session-host.js";
 import { makeLineSplitter, isResultLine, isUserWrite, PROTOCOL_VERSION } from "../session-host-protocol.js";
 
 const FAKE = new URL("./fixtures/fake-claude.mjs", import.meta.url).pathname;
@@ -138,6 +138,66 @@ test("busy bit: a user write sets it, a hung turn holds it, an interrupt-style w
     await sleep(100);
     const byId = Object.fromEntries((await c.request({ op: "list" })).sessions.map((s) => [s.id, s.busy]));
     assert.deepEqual(byId, { s1: true, s2: false });
+    await c.close();
+  } finally {
+    await host.shutdown();
+  }
+});
+
+test("codexSpawnBlocked: a cached failure blocks within its cooldown, lapses at the deadline", () => {
+  assert.equal(codexSpawnBlocked(null, 1_000), false, "no failure → never blocked");
+  const failure = { error: new Error("no chatgpt"), until: 5_000 };
+  assert.equal(codexSpawnBlocked(failure, 1_000), true, "before deadline → fail fast");
+  assert.equal(codexSpawnBlocked(failure, 5_000), false, "at deadline → allow a fresh attempt");
+  assert.equal(codexSpawnBlocked(failure, 9_000), false, "past deadline → allow");
+});
+
+test("a failed codex app-server spawn is memoized: repeated ops don't re-spawn until the cooldown lapses", async () => {
+  const { socketPath, logPath } = tmpSock();
+  let factoryCalls = 0;
+  let mode = "fail"; // flip to a healthy runtime once the user "logs into ChatGPT"
+  const codexRuntimeFactory = async () => {
+    factoryCalls++;
+    if (mode === "fail")
+      throw new Error("Codex app-server requires ChatGPT login; refusing account type apiKey");
+    return {
+      pid: 99,
+      account: { type: "chatgpt", planType: "team" },
+      usage: () => ({ provider: "codex", billing: "chatgpt-plan", error: null, fetchedAt: 1 }),
+      close() {},
+    };
+  };
+  // A tiny cooldown so the expiry path is exercised without a slow test.
+  const host = await createHost({ socketPath, logPath, codexRuntimeFactory, codexSpawnFailureCooldownMs: 200 });
+  try {
+    const c = await connect(socketPath);
+    await c.request({ op: "hello", ver: PROTOCOL_VERSION });
+
+    // A non-probe usage op boots the runtime → the spawn fails and is memoized.
+    const r1 = await c.request({ op: "usage" });
+    assert.equal(r1.ok, false);
+    assert.match(r1.error, /ChatGPT login/);
+    // Further ops inside the cooldown fail fast WITHOUT re-spawning the app-server.
+    const r2 = await c.request({ op: "usage" });
+    const r3 = await c.request({ op: "usage" });
+    assert.equal(r2.ok, false);
+    assert.equal(r3.ok, false);
+    assert.equal(factoryCalls, 1, "repeated codex ops within the cooldown spawn app-server at most once");
+
+    // A probe (the 60s usage poller) still short-circuits to null without spawning — unchanged behaviour.
+    const probe = await c.request({ op: "usage", probe: true });
+    assert.deepEqual([probe.ok, probe.usage], [true, null]);
+    assert.equal(factoryCalls, 1, "a probe never boots the runtime");
+
+    await sleep(260); // let the cooldown lapse
+    mode = "ok"; // the user has since logged into ChatGPT
+    const r4 = await c.request({ op: "usage" });
+    assert.equal(r4.ok, true, "one fresh attempt is allowed after the cooldown lapses");
+    assert.equal(factoryCalls, 2, "exactly one re-spawn after the window");
+
+    const r5 = await c.request({ op: "usage" });
+    assert.equal(r5.ok, true);
+    assert.equal(factoryCalls, 2, "the live runtime is reused; the negative cache cleared on success");
     await c.close();
   } finally {
     await host.shutdown();

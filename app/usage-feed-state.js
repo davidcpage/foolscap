@@ -2,8 +2,20 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-export const CLAUDE_USAGE_POLL_MS = 180_000;
+export const CLAUDE_USAGE_POLL_MS = 180_000; // idle/base cadence — also the exponential-backoff base
+export const CLAUDE_USAGE_POLL_ACTIVE_MS = 60_000; // faster cadence while any session is live
 export const CLAUDE_USAGE_MAX_BACKOFF_MS = 15 * 60_000;
+
+/**
+ * Pick the next Claude usage-poll delay by board activity: poll every 60s while any live session
+ * exists (fresher plan-usage during multi-agent work), every 180s when the board is quiet (the
+ * endpoint is free but rate-limited, so a flat 1-min poll 24/7 is wasteful). This is only the BASE
+ * cadence — the 429/401 backoff gates in pollClaude() compute their own delays and take precedence.
+ * @param {number} liveSessionCount  number of live (status !== "exited") sessions across all boards
+ */
+export function claudeUsagePollDelay(liveSessionCount) {
+  return liveSessionCount > 0 ? CLAUDE_USAGE_POLL_ACTIVE_MS : CLAUDE_USAGE_POLL_MS;
+}
 
 /**
  * A stable, non-reversible fingerprint of the OAuth token — so the poller can tell "same failing

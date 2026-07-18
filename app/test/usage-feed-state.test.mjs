@@ -5,8 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import {
   CLAUDE_USAGE_MAX_BACKOFF_MS,
+  CLAUDE_USAGE_POLL_ACTIVE_MS,
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
+  claudeUsagePollDelay,
   mergeUsageProvider,
   purgeCachedEmail,
   readUsageCache,
@@ -28,6 +30,14 @@ test("Claude usage honors Retry-After while retaining exponential backoff", () =
   const second = claudeRateLimitDelay(first.backoff, null);
   assert.equal(second.backoff, 360_000);
   assert.equal(second.delay, 540_000);
+});
+
+test("claudeUsagePollDelay is adaptive: 60s while any session is live, 180s when the board is quiet", () => {
+  assert.equal(claudeUsagePollDelay(0), CLAUDE_USAGE_POLL_MS, "idle board → base 180s cadence");
+  assert.equal(claudeUsagePollDelay(1), CLAUDE_USAGE_POLL_ACTIVE_MS, "one live session → 60s cadence");
+  assert.equal(claudeUsagePollDelay(9), CLAUDE_USAGE_POLL_ACTIVE_MS, "many live sessions → still 60s");
+  assert.equal(CLAUDE_USAGE_POLL_ACTIVE_MS, 60_000);
+  assert.equal(CLAUDE_USAGE_POLL_MS, 180_000);
 });
 
 test("an abusive Retry-After is capped at the 15-min max backoff (no hour-long freeze)", () => {
