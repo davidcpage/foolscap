@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Editor } from "../src/editor.js";
 import { UndoManager } from "../src/undo.js";
+import { invertDiff, type RecordsDiff } from "../src/diff.js";
 import type { LayoutRecord, NodeRecord } from "../src/records.js";
 
 test("commit(addNode) writes node+layout, appends ONE intent event carrying the diff", () => {
@@ -153,6 +154,33 @@ test("UndoManager: one gesture = one undo step; undo/redo round-trips", () => {
   assert.equal((e.store.get<"node">("node:a") as NodeRecord).typeName, "node");
   undo.redo(); // re-drag
   assert.equal((e.store.get<"layout">("layout:node:a") as LayoutRecord).x, 10);
+});
+
+test("UndoManager.forget: a rolled-back edit drops its undo entry — a later ⌘Z reverts the SURVIVING edit, no double-revert", () => {
+  const e = new Editor();
+  const undo = new UndoManager(e.store);
+  const userDiffs: RecordsDiff[] = [];
+  const off = e.store.listen((d, src) => { if (src === "user") userDiffs.push(d); });
+  e.commit({ type: "addNode", payload: { id: "node:a", x: 0, y: 0 }, actor: "human" });
+  e.commit({ type: "addNode", payload: { id: "node:b", x: 0, y: 0 }, actor: "human" });
+  off();
+  assert.equal(userDiffs.length, 2);
+  // Simulate a server 4xx reject of the SECOND edit (stage 3, §4): roll it back by applying its inverse as a
+  // "remote" change (not itself undoable), then forget the now-void undo entry.
+  e.store.applyDiffAsChange(invertDiff(userDiffs[1]!), "remote");
+  assert.equal(e.store.get("node:b"), undefined, "the rejected edit is rolled back out of the store");
+  assert.equal(undo.forget(userDiffs[1]!), true, "the void undo entry was found and dropped");
+  // A later ⌘Z must revert the FIRST (surviving) edit — not double-revert the already-gone second one.
+  undo.undo();
+  assert.equal(e.store.get("node:a"), undefined, "⌘Z reverts the surviving edit");
+  assert.equal(undo.canUndo, false, "the forgotten entry never ran — the stack is empty");
+});
+
+test("UndoManager.forget: no matching entry is a no-op returning false", () => {
+  const e = new Editor();
+  const undo = new UndoManager(e.store);
+  const orphan: RecordsDiff = { added: { "node:ghost": { typeName: "node", id: "node:ghost", type: "note", x: 0, y: 0, w: 1, h: 1 } as unknown as NodeRecord }, updated: {}, removed: {} };
+  assert.equal(undo.forget(orphan), false, "forgetting an edit never on the stack is a harmless no-op");
 });
 
 test("UndoManager is selective: undo pops MY last act, not the agent's or a remote ingest's", () => {

@@ -105,6 +105,11 @@ export class RemoteEventStore implements EventStore {
   // §10), so this tab bumps its mirror's watermark to what the server actually assigned — keeping its next
   // locally-minted seq above the server's and its snapshot watermark honest.
   onServerSeq?: (seq: number) => void;
+  // Set after construction (stage 3, §4): a durable-write REJECT (server 4xx = the event is malformed, a
+  // code bug — retrying re-sends the same mistake) hands the rejected event back so the tab can roll the
+  // optimistic edit back (apply its inverse as "remote" + forget the void undo entry + toast). Distinct from
+  // onError (which still fires via Persistence for logging) because rollback needs the EVENT, not just the error.
+  onReject?: (event: IntentEvent, status: number) => void;
   // loadAll serves the boot payload rather than re-fetching: hydrate() runs once, right after the
   // boot fetch, and every later event is one this tab itself appended (already in the mem mirror).
   constructor(
@@ -119,12 +124,20 @@ export class RemoteEventStore implements EventStore {
     // tab finish against the 64KB keepalive budget — the snapshot save is too big to get the same.
     // `&tab=` (stage 3, D6): the server excludes this originating tab from the diff rebroadcast it now
     // does on every human commit — this tab already applied the edit optimistically.
-    const res = await requestRetry(`${persistUrl(this.boardId, "/event")}&tab=${encodeURIComponent(tabId())}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ event: e }),
-      keepalive: true,
-    });
+    let res: Response;
+    try {
+      res = await requestRetry(`${persistUrl(this.boardId, "/event")}&tab=${encodeURIComponent(tabId())}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event: e }),
+        keepalive: true,
+      });
+    } catch (err) {
+      // A 4xx reject (PersistClientError) will never heal — roll the optimistic edit back, then rethrow so
+      // Persistence.onError still records it (and the pending count still decrements in its finally).
+      if (err instanceof PersistClientError) this.onReject?.(e, err.status);
+      throw err;
+    }
     // Adopt the server-assigned seq (§10). Best-effort: a body without a numeric seq (an older server, or
     // a keepalive response the tab is shutting down through) simply skips the adopt — never fatal.
     try {

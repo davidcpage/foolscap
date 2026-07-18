@@ -20,6 +20,21 @@ function makeApp(events = new MemoryEventStore(), snapshots = new MemorySnapshot
   return { editor, persistence, events, snapshots };
 }
 
+test("onPending (§3.1 inspectable outbound queue): count rises per queued edit, drains to 0 as writes settle", async () => {
+  const pendings: number[] = [];
+  const persistence = new Persistence({ events: new MemoryEventStore(), snapshots: new MemorySnapshotStore(), debounceMs: 1e9, onPending: (n) => pendings.push(n) });
+  const editor = new Editor({ log: persistence });
+  persistence.attach(editor.store);
+  editor.commit({ type: "addNode", actor: "human", payload: { id: "node:a" } });
+  editor.commit({ type: "addNode", actor: "human", payload: { id: "node:b" } });
+  // The count rises SYNCHRONOUSLY at commit time (the write is enqueued before it awaits the backend), so
+  // the queue depth is honest the instant an edit is made — the pill never lags the backlog.
+  assert.deepEqual(pendings, [1, 2], "two edits queued → pending rose 1 then 2");
+  await persistence.whenIdle();
+  assert.equal(pendings.at(-1), 0, "both durable writes settled → drained to 0");
+  assert.ok(pendings.includes(2), "peaked at the queue depth (2)");
+});
+
 test("a fresh store reloads identically through the durable backends", async () => {
   const events = new MemoryEventStore();
   const snapshots = new MemorySnapshotStore();
