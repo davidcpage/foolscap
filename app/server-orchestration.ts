@@ -23,6 +23,7 @@ import {
   CLAUDE_USAGE_MAX_BACKOFF_MS,
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
+  claudeUsagePollDelay,
   mergeUsageProvider,
   purgeCachedEmail,
   readUsageCache,
@@ -329,7 +330,13 @@ export function startUsageFeed(): void {
         error: "offline", fetchedAt: Date.now(),
       });
     }
-    setTimeout(pollClaude, nextDelay); // recursive (not setInterval) so backoff can stretch the gap
+    // Base cadence is adaptive — 60s while any session is live, 180s when the board is quiet — but a
+    // still-set gate (401 hold) keeps precedence: recheck the local token at base cadence, matching the
+    // shouldSkipUsagePoll wake above. (The 429 branch returns early with its own backoff delay.)
+    setTimeout(
+      pollClaude,
+      gate ? CLAUDE_USAGE_POLL_MS : claudeUsagePollDelay(getServerContext().liveSessionCount()),
+    ); // recursive (not setInterval) so backoff can stretch the gap
   };
 
   const CODEX_USAGE_POLL_MS = 60_000;

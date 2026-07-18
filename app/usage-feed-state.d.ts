@@ -1,5 +1,8 @@
 export const CLAUDE_USAGE_POLL_MS: number;
+export const CLAUDE_USAGE_POLL_ACTIVE_MS: number;
 export const CLAUDE_USAGE_MAX_BACKOFF_MS: number;
+
+export function claudeUsagePollDelay(liveSessionCount: number): number;
 
 export function retryAfterMs(value: string | null | undefined, now?: number): number | null;
 export function claudeRateLimitDelay(

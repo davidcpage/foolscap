@@ -46,6 +46,21 @@ import {
 
 const MAX_EXIT_BACKLOG = 200;
 
+// How long a FAILED codex app-server spawn/handshake (missing CLI, non-ChatGPT account) is remembered so
+// subsequent codex ops fail fast with the cached error instead of re-spawning `codex app-server` only to
+// re-fail. A codex-less / API-key box otherwise re-boots + re-fails the app-server on every request.
+export const CODEX_SPAWN_FAILURE_COOLDOWN_MS = 15 * 60_000;
+
+/**
+ * Is a cached codex spawn failure still inside its cooldown window? true ⇒ fail fast with the cached error
+ * and do NOT re-spawn; false ⇒ the window elapsed (or there was no failure), so one fresh attempt is
+ * allowed. A successful spawn or an auth-state change clears the cache at the call site, not here.
+ * @param {{error: Error, until: number}|null} failure
+ */
+export function codexSpawnBlocked(failure, now = Date.now()) {
+  return !!failure && now < failure.until;
+}
+
 /** Probe a socket path: resolves "live" (a host answered), "dead" (stale file), or "absent". */
 function probeSocket(socketPath) {
   return new Promise((resolve) => {
@@ -63,7 +78,12 @@ function probeSocket(socketPath) {
  * Start the host. Resolves once listening; rejects if another host already owns the socket. The returned
  * handle is for tests and the CLI — the protocol is the real interface.
  */
-export async function createHost({ socketPath, logPath, codexRuntimeFactory = createCodexHostRuntime }) {
+export async function createHost({
+  socketPath,
+  logPath,
+  codexRuntimeFactory = createCodexHostRuntime,
+  codexSpawnFailureCooldownMs = CODEX_SPAWN_FAILURE_COOLDOWN_MS,
+}) {
   const log = (msg) => {
     const line = `${new Date().toISOString()} ${msg}\n`;
     try {
@@ -92,6 +112,10 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
   let attachedPid = null;
   let shuttingDown = false;
   let codexRuntimePromise = null;
+  // Negative cache for a failed app-server spawn/handshake — { error, until } — so repeated codex ops
+  // while unauthenticated fail fast with the cached error instead of re-spawning once per request. A
+  // subsequent spawn that SUCCEEDS clears it (auth got fixed); otherwise it lapses on cooldown expiry.
+  let codexSpawnFailure = null;
 
   const sendTo = (conn, msg) => {
     if (!conn || conn.destroyed) return;
@@ -157,6 +181,9 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
 
   const getCodexRuntime = () => {
     if (codexRuntimePromise) return codexRuntimePromise;
+    // Fail fast on a still-cooling failed spawn: don't re-boot `codex app-server` just to re-fail on the
+    // same missing-CLI / non-ChatGPT account. Cooldown expiry allows the next attempt through to re-probe.
+    if (codexSpawnBlocked(codexSpawnFailure)) return Promise.reject(codexSpawnFailure.error);
     const starting = codexRuntimeFactory({
       cwd: new URL(".", import.meta.url).pathname,
       onEvent: onCodexEvent,
@@ -173,9 +200,17 @@ export async function createHost({ socketPath, logPath, codexRuntimeFactory = cr
       },
     });
     codexRuntimePromise = starting;
-    void starting.catch(() => {
-      if (codexRuntimePromise === starting) codexRuntimePromise = null;
-    });
+    void starting.then(
+      () => {
+        codexSpawnFailure = null; // a live runtime clears any prior negative cache
+      },
+      (err) => {
+        if (codexRuntimePromise === starting) codexRuntimePromise = null;
+        const error = err instanceof Error ? err : new Error(String(err));
+        codexSpawnFailure = { error, until: Date.now() + codexSpawnFailureCooldownMs };
+        log(`codex app-server spawn failed; failing fast for ${Math.round(codexSpawnFailureCooldownMs / 1000)}s: ${error.message}`);
+      },
+    );
     return starting;
   };
 

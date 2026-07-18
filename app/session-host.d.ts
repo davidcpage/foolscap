@@ -10,4 +10,11 @@ export function createHost(opts: {
   socketPath: string;
   logPath: string;
   codexRuntimeFactory?: (...args: any[]) => Promise<import("./codex-host-runtime.js").CodexHostRuntime>;
+  codexSpawnFailureCooldownMs?: number;
 }): Promise<SessionHost>;
+
+export const CODEX_SPAWN_FAILURE_COOLDOWN_MS: number;
+export function codexSpawnBlocked(
+  failure: { error: Error; until: number } | null,
+  now?: number,
+): boolean;
