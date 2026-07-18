@@ -377,6 +377,27 @@ export function buildCard(
       else signals.kernelRestart = (): Promise<boolean> => post("restart");
       continue;
     }
+    // `notebookEdit` — the ipynb card's STRUCTURAL-EDIT action (P2, docs/ipynb-card.md): edit cell source /
+    // add / delete / move a cell. Unlike the reactive notebook card's whole-file `writeFile`, an ipynb edit
+    // is applied SERVER-side BY CELL ID to the freshly-read full-fidelity on-disk notebook under CAS
+    // (routes/notebook.ts → server-notebook.ts) — the card holds only the lossy RENDER projection, so it must
+    // never ship the notebook body. Keyed by THIS card's node id (percent-encoded — it carries colons/slashes).
+    // Returns the applied result (ok + writeback outcome), so the card can react to a `stale-cell` conflict
+    // (the target cell was deleted since it read). Not read-tracked — editing is an act; the durable result
+    // arrives via `fileContent` (the file watch re-renders the card), exactly like the kernel output merge.
+    if (name === "notebookEdit") {
+      const id = host?.id ?? nodeSub.get()?.title ?? "";
+      signals.notebookEdit = (op: unknown): Promise<{ ok: boolean; writeback?: string; cellId?: string }> =>
+        fetch(`/api/notebook/${encodeURIComponent(id)}/edit?board=${activeBoardId()}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ op }),
+        }).then(
+          (r) => r.json().then((j) => ({ ok: r.ok, ...(j as object) }), () => ({ ok: r.ok })),
+          () => ({ ok: false }),
+        );
+      continue;
+    }
     // `gone` (slice D): true once this card's (root, path) backing is deleted on disk (the watch's unlink
     // or a 404). The file/dir card reads it to render a TOMBSTONE instead of content / a stuck "loading…".
     // Per-card (keyed by this card's root + path). Worktree-removal isn't tracked here — the card derives

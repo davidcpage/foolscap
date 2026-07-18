@@ -18,9 +18,17 @@
 #       - `kernelStatus`    — the live status/streaming feed (kernel:<node>:<board>): running/idle/errored
 #     Outputs are NOT written from the card: the broker merges them into the file by cell id, and the file
 #     watch re-renders this card through `fileContent` — the file is the durable, agent-legible record.
+#   • the STRUCTURAL-EDIT capabilities (P2, docs/ipynb-card.md) — edit cell SOURCE + add/delete/move cells:
+#       - `notebookEdit` — (action) apply ONE structural edit by cell id (editSource / addCell / deleteCell /
+#         moveCell) → POST /api/notebook/<node>/edit. Applied SERVER-side to the full-fidelity ON-DISK
+#         notebook by cell id under CAS (server-notebook.ts), so a kernel run and a card edit never clobber;
+#         the card never ships the notebook body (its `fileContent` read is the lossy RENDER projection). The
+#         durable result arrives via `fileContent` (the file watch re-renders), like the kernel output merge.
+#       - `treeState` — (ephemeral view state) which cells are in RAW-EDIT mode. Off-log, gone on reload,
+#         never committed — the directory card's expand-set shape. The in-progress edit DRAFT text lives in a
+#         module-level map in render.js (not here), so it survives a watch re-render (kernel write-back).
 #
-# The card SOURCE stays read-only for P1 (no `writeFile`; no add/delete/move cells — that is P2/P3). html
-# outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
+# html outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
 name: ipynb
 contract: 1
-capabilities: [fileContent, kernelRun, kernelRunAll, kernelInterrupt, kernelRestart, kernelStatus]
+capabilities: [fileContent, kernelRun, kernelRunAll, kernelInterrupt, kernelRestart, kernelStatus, notebookEdit, treeState]
