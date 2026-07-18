@@ -37,7 +37,7 @@ import { kernelRoutes } from "./routes/kernel.js";
 import { notebookRoutes } from "./routes/notebook.js";
 import { canvasRoutes } from "./routes/canvas.js";
 import { shutdownKernel } from "./server-kernel.js";
-import { CARD_TYPES_DIR, isInternalPath, openRootWatcher } from "./server-fs.js";
+import { CARD_TYPES_DIR, isInternalPath, openDirWatcher, safeResolve } from "./server-fs.js";
 
 // The Node backbone of the spike — a dev-server middleware (no separate process) that exposes a real
 // folder's text files to the browser and pushes live change events. This is the seam the design note
@@ -186,6 +186,54 @@ export function installWsHeartbeat(ws: HeartbeatWs, intervalMs = 25000): ReturnT
   }, intervalMs);
 }
 
+// The (root, dir) watch key — one string, so client.watches keys on the PAIR (a directory watch belongs to
+// its root). NUL can't occur in a path or a root slug, so it's an unambiguous separator.
+export function watchKey(root: string, dir: string): string {
+  return root + "\0" + dir;
+}
+
+// Open ONE depth-0 directory watcher for this socket, keyed (root, dir) and idempotent per pair (the client
+// refcounts multiple card subscribers of a (root, dir) down to a single sub message, so a repeat sub is a
+// no-op guard, never a leaked watcher). Confinement mirrors GET /api/watch: `root` must be one of this
+// BOARD's known roots (resolveRoot), and `dir` must resolve WITHIN that root (safeResolve) — a caller can't
+// watch an arbitrary path. `resolveRoot`/`open` are injected so the keying + confinement is unit-testable
+// without a live server (attachWs passes the real rootDir + openDirWatcher). Events are streamed back tagged
+// with (root, dir) so the client routes each to the right subscription.
+export function openClientWatch(
+  client: WsClient,
+  root: string,
+  dir: string,
+  resolveRoot: (boardId: string, root: string) => string | null,
+  open: (absDir: string, relBase: string, send: (ev: { type: string; path: string }) => void) => () => void,
+): void {
+  const key = watchKey(root, dir);
+  if (client.watches.has(key)) return; // already watching this (root, dir) on this socket
+  const rootAbs = resolveRoot(client.boardId, root);
+  if (!rootAbs) return; // unknown root for this board — refuse (same confinement as /api/watch)
+  const absDir = safeResolve(rootAbs, dir);
+  if (!absDir) return; // `dir` escapes the root — refuse
+  client.watches.set(
+    key,
+    open(absDir, rootAbs, (ev) => {
+      client.send({ ch: "watch", root, dir, ev });
+      // BUG-3: a deleted `.ipynb` can't be re-run, so reap its kernel rather than leaving a stray Python
+      // process bound to a file that no longer exists. Node id is `node:<root>:<relPath>` (routes/kernel.ts
+      // parseNodeId); shutdownKernel is a no-op when no kernel is live for it. ev.path is ROOT-relative
+      // (relBase = rootAbs), so the id is right regardless of which directory watcher delivered the unlink.
+      if (ev.type === "unlink" && ev.path.toLowerCase().endsWith(".ipynb")) {
+        void shutdownKernel(client.boardId, `node:${root}:${ev.path}`);
+      }
+    }),
+  );
+}
+
+// Close this socket's watcher for one (root, dir), if present — the {unsub:"watch"} twin.
+export function closeClientWatch(client: WsClient, root: string, dir: string): void {
+  const key = watchKey(root, dir);
+  client.watches.get(key)?.();
+  client.watches.delete(key);
+}
+
 function attachWs(server: ViteDevServer): void {
   const http = server.httpServer;
   if (!http || wsAttachedServers.has(http)) return;
@@ -240,33 +288,21 @@ function attachWs(server: ViteDevServer): void {
       // the reaper terminates a socket that missed its ping, which fires ws.on("close") to remove the client.
       const ping = installWsHeartbeat(ws);
       ws.on("message", (data) => {
-        let msg: { sub?: unknown; unsub?: unknown; root?: unknown };
+        let msg: { sub?: unknown; unsub?: unknown; root?: unknown; dir?: unknown };
         try {
           msg = JSON.parse(String(data));
         } catch {
           return;
         }
+        // The watch protocol keys on (root, dir): the client subscribes the specific DIRECTORIES that hold a
+        // live dependency, not the whole root (docs/root-watcher-fd-scaling.md). Both fields are required;
+        // `dir` may be "" (the root's own top level, for a file card at the root). rootDir + safeResolve
+        // confinement, the (root, dir) keying, and the .ipynb kernel-reap all live in openClientWatch.
         const root = typeof msg.root === "string" ? msg.root : null;
-        if (msg.sub === "watch" && root && !client.watches.has(root)) {
-          // Same confinement as GET /api/watch: the root must be one of this BOARD's known roots.
-          const dir = rootDir(client.boardId, root);
-          if (!dir) return;
-          client.watches.set(
-            root,
-            openRootWatcher(dir, (ev) => {
-              client.send({ ch: "watch", root, ev });
-              // BUG-3: a deleted `.ipynb` can't be re-run, so reap its kernel rather than leaving a stray
-              // Python process bound to a file that no longer exists. Node id is `node:<root>:<relPath>`
-              // (routes/kernel.ts parseNodeId); shutdownKernel is a no-op when no kernel is live for it.
-              if (ev.type === "unlink" && ev.path.toLowerCase().endsWith(".ipynb")) {
-                void shutdownKernel(client.boardId, `node:${root}:${ev.path}`);
-              }
-            }),
-          );
-        } else if (msg.unsub === "watch" && root) {
-          client.watches.get(root)?.();
-          client.watches.delete(root);
-        }
+        const dir = typeof msg.dir === "string" ? msg.dir : null;
+        if (root == null || dir == null) return;
+        if (msg.sub === "watch") openClientWatch(client, root, dir, rootDir, openDirWatcher);
+        else if (msg.unsub === "watch") closeClientWatch(client, root, dir);
       });
       ws.on("error", () => {
         /* close follows; the close handler is the one teardown */

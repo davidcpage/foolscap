@@ -18,7 +18,7 @@ import { activeBoard, activeBoardId, boardHref, listBoards, removeBoard, resolve
 import { ViewStore } from "./views";
 import { restoreAndPersistCamera } from "./session";
 import { onFeedsReconnect } from "./feeds";
-import { channelListSignal, refreshSessionList, rootsSignal, sessionListSignal } from "./content";
+import { channelListSignal, refreshSessionList, sessionListSignal } from "./content";
 import { connectAgentBus } from "./agentBus";
 import { connectToThread, createThread, isThreadNode, isSessionNode, MEMBER_OPEN } from "./threads";
 import { CanvasView } from "./CanvasView";
@@ -54,7 +54,7 @@ import {
   reprojectContent,
   createUnstartedSession,
   addRolesCard,
-  watchDataset,
+  watchBoardDependencies,
   type Pos,
   type WatchEvent,
 } from "./loader";
@@ -543,25 +543,14 @@ function Board({ m, undo, persistence }: Engine) {
     [nodes, m, navigate, flash],
   );
 
-  // A file watch PER ROOT (the canonical checkout + each git worktree) for the component's life. Each
-  // only touches cards already on the board (loader gates it), so it's safe to run before any folder is
-  // added. The root set can GROW mid-session (a worktree created by an agent or the CLI), so the watches
-  // are (re)synced whenever rootsSignal changes; "repo" is always watched, even before /api/roots returns.
-  useEffect(() => {
-    const watches = new Map<string, () => void>();
-    const sync = (): void => {
-      const ids = new Set((rootsSignal.get() ?? []).map((r) => r.id));
-      ids.add("repo");
-      for (const id of ids) if (!watches.has(id)) watches.set(id, watchDataset(m, id, pushEvent));
-      for (const [id, off] of watches) if (!ids.has(id)) (off(), watches.delete(id));
-    };
-    sync();
-    const off = rootsSignal.subscribe(sync);
-    return () => {
-      off();
-      for (const o of watches.values()) o();
-    };
-  }, [m]);
+  // The board's file watch, SCOPED TO ITS CONTENT (docs/root-watcher-fd-scaling.md): instead of one
+  // whole-tree watcher per root — which, on a large mounted checkout, exhausted the process fd table
+  // (chokidar v4 holds one kqueue fd per watched file) — watchBoardDependencies derives the set of
+  // directories that back live cards / loaded listings / loaded annotations and opens one depth-0 watch
+  // per directory, reconciling as cards mount, unmount, rename, or their folders load/collapse. It handles
+  // worktree roots appearing mid-session (rootsSignal) and only touches cards already on the board (the
+  // loader gates every event), so it is safe to run before any folder is added.
+  useEffect(() => watchBoardDependencies(m, pushEvent), [m]);
 
   // Refresh hydrated file/session content from disk once on boot (and re-arm session live-tails). Also
   // re-run it whenever the feed stream RECONNECTS: a cold server restart drops the per-session file-tails

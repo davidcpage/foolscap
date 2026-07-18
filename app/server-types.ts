@@ -114,7 +114,10 @@ export interface WsClient {
   boardId: string; // fixed at connect (?board=) — bus commands fan out per board
   tab?: string; // stable per-tab id (?tab=, sessionStorage-scoped) so tabCountFor dedupes a board-switch
   // overlap (old page's socket not yet reaped) into ONE tab; absent = legacy/untagged, counts individually
-  watches: Map<string, () => void>; // rootId → watcher close ({sub:"watch"} subscriptions)
+  watches: Map<string, () => void>; // (root, dir) → depth-0 watcher close ({sub:"watch", root, dir} subs).
+  // Keyed `root + "\0" + dir` (watchKey) — the board scopes its watch to the DIRECTORIES that hold a live
+  // dependency (docs/root-watcher-fd-scaling.md), not the whole tree, so this map's size tracks board
+  // content, not repo size. One depth-0 watcher per distinct (root, dir) this socket has subscribed.
   send(msg: unknown): void;
 }
 

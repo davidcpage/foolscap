@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import chokidar from "chokidar";
+import chokidar, { type FSWatcher } from "chokidar";
 import { contentVersion } from "./cas-guard.js";
 import { MAX_BYTES } from "./server-http.js";
 
@@ -135,19 +135,19 @@ export function readFileWithVersion(
   };
 }
 
-// The chokidar watcher one watch subscription rides — shared by the SSE endpoint (handleWatch, the /api/watch
-// compat path) and the WS file-watch (one per open root). Forward file add/change/unlink plus DIR add/remove
-// (mapped to the generic add/unlink), so a directory card whose folder is deleted on disk gets tombstoned
-// rather than hanging on "loading…" (worktree-activity slice D). The client gates every event to a card that
-// actually exists, so forwarding dir events is harmless noise otherwise. Returns the close handle.
-export function openRootWatcher(root: string, send: (ev: { type: string; path: string }) => void): () => void {
-  const emit = (type: string) => (abs: string) => send({ type, path: path.relative(root, abs) });
-  const watcher = chokidar.watch(root, {
-    ignoreInitial: true,
-    // Rule B (docs/canvas-home.md §5): watch `.canvas/` CONTENT (so a dropped image / file-backed body
-    // refreshes its card) but never the shadow git-dirs under `.canvas/roots/` (the feedback loop).
-    ignored: (p: string) => isInternalPath(p),
-  });
+// Map chokidar's file+dir event set onto the generic {add,change,unlink} the client consumes, with paths
+// reported relative to `relBase` (the ROOT dir, so a card addresses the same (root, path) regardless of
+// which directory watcher delivered the event). Forwarding DIR add/remove as add/unlink means a directory
+// card whose folder vanishes on disk gets tombstoned rather than hanging on "loading…" (worktree-activity
+// slice D); the client gates every event to a card that actually exists, so a dir event is harmless
+// otherwise. `ignored: isInternalPath` keeps the shadow git-dirs / board record store off the stream (the
+// feedback loop) — a cheap event filter now that fd safety comes from *scoping* the watch, not this predicate.
+function wireWatcher(
+  watcher: FSWatcher,
+  relBase: string,
+  send: (ev: { type: string; path: string }) => void,
+): () => void {
+  const emit = (type: string) => (abs: string) => send({ type, path: path.relative(relBase, abs) });
   watcher
     .on("add", emit("add"))
     .on("addDir", emit("add"))
@@ -155,4 +155,33 @@ export function openRootWatcher(root: string, send: (ev: { type: string; path: s
     .on("unlink", emit("unlink"))
     .on("unlinkDir", emit("unlink"));
   return () => void watcher.close();
+}
+
+// The DEPTH-0 directory watcher — the primitive the WS file-watch scopes the board to (docs/root-watcher-
+// fd-scaling.md). A depth-0 chokidar watch of one directory reports `change` for the files IN it (a card's
+// content) AND add/unlink of its immediate entries (a directory card's listing, a file card's create/
+// delete), holding fds proportional to that ONE directory's size — never the whole tree. The client derives
+// the set of directories containing a live dependency (file-card parent dirs, loaded listings, loaded
+// annotations) and subscribes one of these per dir, so total fds scale with BOARD CONTENT, not repo size —
+// no mounted checkout, however large, can exhaust the process fd table. Paths are reported relative to
+// `relBase` (the root dir), so `dir` may be any directory under the root. Returns the close handle.
+export function openDirWatcher(
+  dir: string,
+  relBase: string,
+  send: (ev: { type: string; path: string }) => void,
+): () => void {
+  return wireWatcher(
+    chokidar.watch(dir, { depth: 0, ignoreInitial: true, ignored: (p: string) => isInternalPath(p) }),
+    relBase,
+    send,
+  );
+}
+
+// The whole-tree RECURSIVE watcher — the COMPAT path for the /api/watch SSE endpoint (routes/files.ts) and
+// external consumers only. The app no longer uses it: it rides the scoped depth-0 openDirWatcher over the WS
+// instead (the fd-scaling fix). Left whole-tree deliberately — /api/watch's "mirror the entire root" contract
+// is out of scope for the scoping work; a caller that opens it on a huge checkout still pays the fd cost, but
+// no in-app path does. Same event mapping / `ignored` filter as the depth-0 primitive, via wireWatcher.
+export function openRootWatcher(root: string, send: (ev: { type: string; path: string }) => void): () => void {
+  return wireWatcher(chokidar.watch(root, { ignoreInitial: true, ignored: (p: string) => isInternalPath(p) }), root, send);
 }

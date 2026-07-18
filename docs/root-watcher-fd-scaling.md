@@ -1,6 +1,9 @@
 # Root watcher: scope the watch to board content
 
-**Status:** planned — not yet implemented. A name-based stopgap is in place (see the end).
+**Status:** implemented (node:thread:9ed8a09a). The whole-tree WS watcher is replaced by a dynamic,
+refcounted set of depth-0 directory watches derived from live board dependencies. `/api/watch` (the SSE
+compat endpoint) stays whole-tree; the app no longer uses it. `EXCLUDE_DIRS` / `isInternalPath` remains as a
+cheap event filter but is no longer load-bearing for fd safety.
 
 ## The problem is *what* we watch, not *how*
 
@@ -67,14 +70,35 @@ This works on **stock chokidar v4, cross-platform**: watching a small set of kno
 cheap on every backend (kqueue, inotify, FSEvents), with no recursive-watch portability cliff. It keeps all
 of chokidar's value — clean add/change/unlink/dir classification, `awaitWriteFinish`, `ready` — that a raw
 `fs.watch` rewrite would have to re-implement. `EXCLUDE_DIRS` / `isInternalPath` stays as a cheap event
-filter (still skip `.canvas/roots`, etc.) but stops being load-bearing for fd safety, and the `data` stopgap
-(below) can be removed.
+filter (still skip `.canvas/roots`, etc.) but stops being load-bearing for fd safety.
 
-Touchpoints: `openRootWatcher` (server-fs.ts) becomes per-directory rather than per-root; `subscribeWatch` /
-`watchSubs` (feeds.ts) and the WS `sub/unsub:"watch"` protocol (vite-fs-plugin.ts) key on `(root, dir)` and
-maintain refcounts; the client derives the dependency-directory set from live cards + loaded listings +
-loaded annotations and drives subscriptions from it. Worth a test that mounts a scratch tree, opens/moves/
-deletes cards, and asserts the watched-directory set (and fd count) tracks board content, not tree size.
+## As built
+
+The design above shipped as-is. The concrete pieces:
+
+- **`app/server-fs.ts`** — `openDirWatcher(dir, relBase, send)` is the depth-0 primitive (chokidar
+  `depth: 0`, `ignoreInitial`, `ignored: isInternalPath`), reporting paths relative to `relBase` (the root
+  dir) so a card addresses the same `(root, path)` regardless of which directory watcher delivered the event.
+  `openRootWatcher` is retained, whole-tree, **only** for the `/api/watch` SSE compat endpoint.
+- **`app/vite-fs-plugin.ts`** — the WS protocol is `{sub|unsub:"watch", root, dir}`; `client.watches` is
+  keyed `(root, dir)` (`watchKey`). `openClientWatch` / `closeClientWatch` hold the keying + `rootDir` /
+  `safeResolve` confinement + the `.ipynb` kernel-reap on unlink, extracted so they unit-test without a live
+  upgrade.
+- **`app/src/feeds.ts`** — `subscribeWatch(root, dir, fn)` refcounts per `(root, dir)`: first-in sends the
+  sub, last-out sends the unsub; `onopen` re-sends every live pair after a reconnect.
+- **`app/src/watch-deps.ts`** — the **pure** `desiredWatchDirs(nodes, listingDirs, annotationPaths)`
+  derivation: (a) each file-backed card's parent dir, (b) each live directory listing, (c) annotated files'
+  parent dirs + the ledger dir. The `Set` collapses shared directories to one entry — that dedup *is* the
+  refcount at the derivation layer.
+- **`app/src/loader.ts`** — `watchBoardDependencies(m, onEvent)` wires the live signals (the store's
+  file-backed nodes, `content.loadedListingDirs()`, `annotations.loadedAnnotationPaths()`, `rootsSignal`)
+  into `desiredWatchDirs`, diffs the result against live subscriptions, subscribes newcomers, and closes
+  departures after a short settle (so rename/move and expand/collapse don't thrash the server watcher). The
+  set is gated to roots the server currently knows (`rootsSignal ∪ "repo"`) so a card hydrated before its
+  worktree root is reported doesn't send a dead sub. It replaces the per-root watch effect in `App.tsx`.
+- **Tests** — `app/test/middleware-hermetic.test.mjs`: `openDirWatcher` depth-0 scoping (fires for a dir's
+  own children, never its subtree), `openClientWatch` `(root, dir)` keying / open-once / confinement /
+  close, and the pure `desiredWatchDirs` derivation + dedup.
 
 ## Why not just change the watch backend
 
