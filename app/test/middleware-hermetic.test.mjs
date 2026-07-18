@@ -45,6 +45,7 @@ const filesRoute = await import("../routes/files.ts");
 const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatch-seam error boundary (BUG-4b)
 const inbox = await import("../routes/inbox.ts"); // computeInbox — the inbox read as a pure computation
 const casGuard = await import("../cas-guard.js"); // senderCursorAfterPost — the post-cursor invariant
+const watchDeps = await import("../src/watch-deps.ts"); // desiredWatchDirs — the pure watch-set derivation
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -125,6 +126,155 @@ test("server-fs openRootWatcher never descends into a venv (behavioral: no fd, n
     close();
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("server-fs openDirWatcher is DEPTH-0: fires for a dir's own children, never its subtree", async () => {
+  // The fd-scaling fix (docs/root-watcher-fd-scaling.md): the WS file-watch is a set of depth-0 directory
+  // watches, so watching a directory costs fds for THAT directory's entries — never the whole tree beneath
+  // it. Mount a scratch root with a deep, populated subtree, watch ONE mid-tree directory at depth 0, and
+  // assert an add to that directory's own child arrives (root-relative) while an add deep under it never does.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-dirwatch-"));
+  fs.mkdirSync(path.join(root, "sub/deep/deeper"), { recursive: true });
+  // A large subtree under sub/deep — the "huge mounted checkout" the old whole-tree watcher would have paid
+  // one fd per file for. A depth-0 watch of `sub` must not touch any of it.
+  for (let i = 0; i < 200; i++) fs.writeFileSync(path.join(root, "sub/deep", `f-${i}.txt`), "x\n");
+  const events = [];
+  const close = fsMod.openDirWatcher(path.join(root, "sub"), root, (ev) => events.push(ev));
+  try {
+    const deadline = Date.now() + 8000;
+    let round = 0;
+    while (!events.some((e) => e.type === "add" && e.path === `sub/ok-${round}.txt`)) {
+      round++;
+      // A file DEEP under the watched dir (would ride along if the watch descended) …
+      fs.writeFileSync(path.join(root, "sub/deep/deeper", `x-${round}.txt`), "deep\n");
+      fs.writeFileSync(path.join(root, "sub/deep", `y-${round}.txt`), "mid\n");
+      // … and a DIRECT child of the watched dir (the sentinel a depth-0 watch must deliver).
+      fs.writeFileSync(path.join(root, "sub", `ok-${round}.txt`), "ok\n");
+      const until = Date.now() + 400;
+      while (Date.now() < until && !events.some((e) => e.type === "add" && e.path === `sub/ok-${round}.txt`))
+        await new Promise((r) => setTimeout(r, 25));
+      assert.ok(Date.now() < deadline, "depth-0 watcher never delivered the direct-child sentinel");
+    }
+    await new Promise((r) => setTimeout(r, 300)); // settle: catch any straggler from the subtree
+    // Every event is a DIRECT child of `sub` (path "sub/<name>"), root-relative; nothing from sub/deep/….
+    const leaked = events.filter((e) => /^sub\/deep\//.test(e.path));
+    assert.deepEqual(leaked, [], "a depth-0 watch of sub/ must never fire for anything under sub/deep/");
+    assert.ok(
+      events.every((e) => /^sub\/[^/]+$/.test(e.path)),
+      `every event is a direct child of sub/ (paths: ${events.map((e) => e.path).join(",")})`,
+    );
+  } finally {
+    close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("vite-fs-plugin openClientWatch: (root,dir)-keyed, opens once per pair, confined, closes on unsub", () => {
+  // The WS watch bookkeeping (extracted so it's testable without a live upgrade): the board opens one
+  // depth-0 watcher per distinct (root, dir) it subscribes, so the watcher COUNT tracks dependency count —
+  // NOT tree size (the `open` here is a counting fake; real fd cost per watch is proven depth-0 above). The
+  // resolver + opener are injected. A resolveRoot that only knows "repo", plus a scratch abs dir it maps to.
+  const rootAbs = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-clientwatch-"));
+  const resolveRoot = (_boardId, root) => (root === "repo" ? rootAbs : null);
+  let opened = 0;
+  let closed = 0;
+  const open = () => {
+    opened++;
+    return () => void closed++;
+  };
+  const client = { boardId: "b", watches: new Map(), send() {} };
+
+  // N distinct dirs → N watchers, regardless of how large the underlying tree is (count == dependency count).
+  for (let i = 0; i < 40; i++) plugin.openClientWatch(client, "repo", `dir-${i}`, resolveRoot, open);
+  assert.equal(opened, 40, "one watcher per distinct (root, dir)");
+  assert.equal(client.watches.size, 40);
+
+  // A REPEAT sub of an already-watched (root, dir) opens nothing new (the client refcounts subscribers down
+  // to one sub per dir; the server guards anyway) — "two cards one dir → one watch".
+  plugin.openClientWatch(client, "repo", "dir-0", resolveRoot, open);
+  assert.equal(opened, 40, "re-subscribing the same (root, dir) opens no second watcher");
+
+  // The SAME dir under a DIFFERENT root is a different key → its own watcher (were "repo" the only known
+  // root this would be refused; assert keying, not resolution, by teaching the resolver a second root).
+  const resolve2 = (_b, r) => (r === "repo" || r === "wt" ? rootAbs : null);
+  plugin.openClientWatch(client, "wt", "dir-0", resolve2, open);
+  assert.equal(opened, 41, "(wt, dir-0) is a distinct key from (repo, dir-0)");
+
+  // Confinement: an unknown root and a dir escaping the root both open nothing (same guarantee as /api/watch).
+  plugin.openClientWatch(client, "ghost", "dir-0", resolveRoot, open);
+  plugin.openClientWatch(client, "repo", "../evil", resolveRoot, open);
+  assert.equal(opened, 41, "an unknown root or an escaping dir opens no watcher");
+
+  // Unsub closes exactly that (root, dir)'s watcher and drops the key; a single unsub suffices (the last
+  // subscriber leaving) — "close both → closes".
+  plugin.closeClientWatch(client, "repo", "dir-0");
+  assert.equal(closed, 1, "unsub closes the watcher");
+  assert.equal(client.watches.has(plugin.watchKey("repo", "dir-0")), false, "the (root, dir) key is gone");
+  assert.equal(client.watches.has(plugin.watchKey("wt", "dir-0")), true, "the other-root watch is untouched");
+
+  fs.rmSync(rootAbs, { recursive: true, force: true });
+});
+
+test("vite-fs-plugin openClientWatch: real fs change → a (root,dir)-tagged frame with a root-relative path", async () => {
+  // The full server chain end-to-end: openClientWatch wires the REAL openDirWatcher onto a scratch dir, and
+  // an out-of-band write there must reach the socket as {ch:"watch", root, dir, ev} with a ROOT-relative
+  // path (so the client routes it to the right (root, dir) subscription and addresses the right card).
+  const rootAbs = fs.mkdtempSync(path.join(os.tmpdir(), "canvas-clientwatch-live-"));
+  fs.mkdirSync(path.join(rootAbs, "docs"), { recursive: true });
+  const frames = [];
+  const client = { boardId: "b", watches: new Map(), send: (m) => frames.push(m) };
+  plugin.openClientWatch(client, "repo", "docs", (_b, r) => (r === "repo" ? rootAbs : null), fsMod.openDirWatcher);
+  try {
+    const deadline = Date.now() + 8000;
+    let round = 0;
+    while (!frames.some((f) => f.ev?.path === `docs/note-${round}.md`)) {
+      round++;
+      fs.writeFileSync(path.join(rootAbs, "docs", `note-${round}.md`), "hi\n");
+      const until = Date.now() + 400;
+      while (Date.now() < until && !frames.some((f) => f.ev?.path === `docs/note-${round}.md`))
+        await new Promise((r) => setTimeout(r, 25));
+      assert.ok(Date.now() < deadline, "no watch frame ever arrived for the scratch write");
+    }
+    const hit = frames.find((f) => f.ev?.path === `docs/note-${round}.md`);
+    assert.equal(hit.ch, "watch");
+    assert.equal(hit.root, "repo");
+    assert.equal(hit.dir, "docs", "the frame carries the (root, dir) so the client routes it");
+    assert.equal(hit.ev.type, "add");
+  } finally {
+    for (const close of client.watches.values()) close();
+    fs.rmSync(rootAbs, { recursive: true, force: true });
+  }
+});
+
+test("watch-deps desiredWatchDirs derives (root,dir) from cards + listings + annotations, deduped", () => {
+  const { desiredWatchDirs, watchDirKey, ANNOTATION_LEDGER_DIR } = watchDeps;
+  const nodes = [
+    { id: "node:repo:docs/a.md", type: "file" }, // → repo/docs
+    { id: "node:repo:docs/b.md", type: "file" }, // → repo/docs (SAME dir → deduped to one)
+    { id: "node:repo:src", type: "directory" }, // a dir card → its PARENT (repo/"") for own-delete
+    { id: "node:wt:pkg/x.ts", type: "notebook" }, // a worktree root → wt/pkg
+    { id: "node:repo:.canvas/images/p.png", type: "image" }, // → repo/.canvas/images
+    { id: "node:clock", type: "clock" }, // NOT file-backed → ignored
+    { id: "node:live:abc123", type: "session" }, // NOT file-backed → ignored
+    { id: "node:thread:9ed8a09a", type: "thread" }, // NOT file-backed → ignored
+  ];
+  const listingDirs = [{ root: "repo", path: "src" }]; // a directory card's loaded folder → repo/src
+  const annotationPaths = ["docs/a.md"]; // → repo/docs (dedup with the file card) + the ledger dir
+
+  const got = desiredWatchDirs(nodes, listingDirs, annotationPaths);
+  const expected = new Set([
+    watchDirKey("repo", "docs"), // file cards + annotated file (all deduped to ONE)
+    watchDirKey("repo", ""), // the src directory card's parent (root top level)
+    watchDirKey("wt", "pkg"), // worktree-root notebook card
+    watchDirKey("repo", ".canvas/images"), // image card
+    watchDirKey("repo", "src"), // the loaded listing itself (its children)
+    watchDirKey("repo", ANNOTATION_LEDGER_DIR), // the annotation ledger dir
+  ]);
+  assert.deepEqual(got, expected);
+
+  // Non-file-backed nodes alone → no watches; no annotations → no ledger dir.
+  assert.equal(desiredWatchDirs([{ id: "node:clock", type: "clock" }], [], []).size, 0);
+  assert.equal(desiredWatchDirs([{ id: "node:repo:a.md", type: "file" }], [], []).has(watchDirKey("repo", ".canvas/annotations")), false);
 });
 
 test("server-fs extension gates classify text vs image vs blocked", () => {

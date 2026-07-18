@@ -10,10 +10,11 @@ import {
   type AnyRecord,
 } from "./lib";
 import { fileKind } from "./fileTypes";
-import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce, fileApiUrl, type ChannelMeta } from "./content";
-import { annotationsWatchEvent } from "./annotations";
+import { filePreview, setFileContent, setGone, refreshListing, writeFileContent, writeAsset, readFileOnce, listDirOnce, fileApiUrl, loadedListingDirs, subscribeListingSet, rootsSignal, type ChannelMeta } from "./content";
+import { annotationsWatchEvent, loadedAnnotationPaths, subscribeAnnotationSet } from "./annotations";
 import { activeBoardId } from "./board";
 import { subscribeWatch } from "./feeds";
+import { desiredWatchDirs, splitWatchKey, type WatchNode } from "./watch-deps";
 import { MEMBER_OPEN, THREAD_CARD_H, THREAD_CARD_W } from "./threads";
 import { detachedMemberCards } from "./reconcile-members";
 // The `node:<root>:<path>` id scheme lives in the dependency-free ./node-id leaf (so hermetic, DOM-free
@@ -1519,15 +1520,92 @@ export async function importBoard(m: InteractionManager, file: File): Promise<bo
 // LIVE: an add/unlink re-pulls its parent folder's off-log listing (refreshListing), so a file created or
 // removed on disk appears in / disappears from the tree at once — only PROMOTING a path to its own card
 // stays a deliberate drag-out. Returns an unsubscribe fn.
-export function watchDataset(
-  m: InteractionManager,
-  root: RootId,
-  onEvent?: (e: WatchEvent) => void,
-): () => void {
-  // Rides the tab's shared WebSocket (feeds.subscribeWatch) rather than its own EventSource — a standing
-  // SSE stream per root was one of the three per-tab streams that starved the browser's six-per-host
-  // connection pool. Reconnect + re-subscribe live in feeds.ts; the server closes its watcher with the sub.
-  return subscribeWatch(root, (ev) => void onWatchEvent(m, root, ev as WatchEvent, onEvent));
+// The old design watched each ROOT's WHOLE tree; on chokidar v4 (one kqueue fd per watched file) a large
+// mounted checkout exhausted the process fd table and crashed the server (docs/root-watcher-fd-scaling.md).
+// Instead we derive the set of DIRECTORIES that hold a live dependency — file-card parent dirs, loaded
+// directory listings, loaded annotations — and open one depth-0 watch per directory (feeds.subscribeWatch →
+// the server's per-(root, dir) watcher), reconciling as cards mount/unmount/rename and folders load/collapse.
+// fd count then tracks BOARD CONTENT (dozens of dirs), never repo size, so no checkout can exhaust fds.
+//
+// The desired set is a PURE function (watch-deps.desiredWatchDirs) of three reactive inputs — the store's
+// file-backed nodes, content.loadedListingDirs(), annotations.loadedAnnotationPaths(). We recompute on any
+// of them (coalesced into a microtask), diff against the live subscriptions, subscribe newcomers, and CLOSE
+// departures only after a short settle so a rename/move or an expand/collapse (an unsub-then-resub in the
+// same tick) doesn't thrash the server watcher. The set is GATED to roots the server currently knows
+// (rootsSignal ∪ "repo") so a card hydrated before its worktree root is reported doesn't send a dead sub —
+// rootsSignal growing re-runs the reconcile and the watch attaches then. Returns an unsubscribe.
+const WATCH_CLOSE_SETTLE_MS = 2000;
+export function watchBoardDependencies(m: InteractionManager, onEvent?: (e: WatchEvent) => void): () => void {
+  const active = new Map<string, () => void>(); // watchDirKey → subscribeWatch unsubscribe
+  const pendingClose = new Map<string, ReturnType<typeof setTimeout>>();
+
+  const fileNodes = (): WatchNode[] => {
+    const out: WatchNode[] = [];
+    for (const r of m.editor.store.getSnapshot().records) {
+      if (r.typeName === "node") out.push({ id: r.id, type: (r as NodeRecord).type });
+    }
+    return out;
+  };
+
+  const reconcile = (): void => {
+    const known = new Set<string>(["repo"]); // the canonical root is always served; worktrees appear async
+    for (const r of rootsSignal.get() ?? []) known.add(r.id);
+    const want = new Set<string>();
+    for (const k of desiredWatchDirs(fileNodes(), loadedListingDirs(), loadedAnnotationPaths())) {
+      if (known.has(splitWatchKey(k).root)) want.add(k);
+    }
+    // Subscribe newcomers; cancel any pending close for a key wanted again (the rename/expand-collapse case).
+    for (const k of want) {
+      const pc = pendingClose.get(k);
+      if (pc !== undefined) {
+        clearTimeout(pc);
+        pendingClose.delete(k);
+      }
+      if (!active.has(k)) {
+        const { root, dir } = splitWatchKey(k);
+        active.set(k, subscribeWatch(root, dir, (ev) => void onWatchEvent(m, root, ev as WatchEvent, onEvent)));
+      }
+    }
+    // Schedule a settled close for anything no longer wanted (and not already scheduled).
+    for (const k of active.keys()) {
+      if (want.has(k) || pendingClose.has(k)) continue;
+      pendingClose.set(
+        k,
+        setTimeout(() => {
+          active.get(k)?.();
+          active.delete(k);
+          pendingClose.delete(k);
+        }, WATCH_CLOSE_SETTLE_MS),
+      );
+    }
+  };
+
+  // Coalesce bursts — hydrating N cards on boot, or a drag emitting many layout diffs — into one reconcile.
+  let scheduled = false;
+  const schedule = (): void => {
+    if (scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      reconcile();
+    });
+  };
+
+  reconcile(); // seed from whatever is already hydrated
+  const offStore = m.editor.store.listen(schedule);
+  const offListings = subscribeListingSet(schedule);
+  const offAnnotations = subscribeAnnotationSet(schedule);
+  const offRoots = rootsSignal.subscribe(schedule);
+  return () => {
+    offStore();
+    offListings();
+    offAnnotations();
+    offRoots();
+    for (const pc of pendingClose.values()) clearTimeout(pc);
+    pendingClose.clear();
+    for (const off of active.values()) off();
+    active.clear();
+  };
 }
 
 async function onWatchEvent(

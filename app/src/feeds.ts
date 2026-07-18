@@ -39,6 +39,7 @@ interface ServerFrame {
   diff?: RecordsDiff;
   seq?: number;
   root?: string;
+  dir?: string; // a watch frame's directory — the board scopes its watch to (root, dir) pairs, not roots
   ev?: { type: string; path: string };
 }
 /** A committed diff pushed over the bus: the record changes to apply as a "remote" change + the server's
@@ -58,7 +59,13 @@ const busSubs = new Set<(diff: RecordsDiff, seq: number) => void>();
 // Bounded (generous) against an unbounded no-consumer run.
 const pendingBus: BusDiff[] = [];
 const MAX_PENDING_BUS = 1000;
+// Per-(root, dir) file-watch subscribers, keyed by watchKey below. The board watches DIRECTORIES that hold a
+// live dependency, not whole roots (docs/root-watcher-fd-scaling.md), so this map is keyed on the pair and
+// refcounts the (usually one) subscriber per directory — first-in sends {sub}, last-out sends {unsub}.
 const watchSubs = new Map<string, Set<(ev: { type: string; path: string }) => void>>();
+// (root, dir) → one key. NUL can't occur in a path or a root slug (same convention as content.ts / the
+// server's watchKey), so it's an unambiguous separator; split() recovers the pair for the reconnect re-send.
+const watchKey = (root: string, dir: string): string => root + "\0" + dir;
 let ws: WebSocket | null = null;
 let connectedOnce = false;
 
@@ -121,14 +128,18 @@ function ensureConnected(): void {
         pendingBus.push(busDiff); // no consumer yet — hold it (see pendingBus above)
         if (pendingBus.length > MAX_PENDING_BUS) pendingBus.shift();
       } else for (const fn of busSubs) fn(busDiff.diff, busDiff.seq);
-    } else if (frame.ch === "watch" && frame.root != null && frame.ev) {
-      for (const fn of watchSubs.get(frame.root) ?? []) fn(frame.ev);
+    } else if (frame.ch === "watch" && frame.root != null && frame.dir != null && frame.ev) {
+      for (const fn of watchSubs.get(watchKey(frame.root, frame.dir)) ?? []) fn(frame.ev);
     }
   };
   // onopen fires on every successful (re)connection; skip the first so only a genuine reconnect — where
   // the server may have restarted with empty feed state — triggers the re-arm.
   sock.onopen = () => {
-    for (const root of watchSubs.keys()) sock.send(JSON.stringify({ sub: "watch", root }));
+    // Re-arm every live (root, dir) watch — the server lost its per-socket watchers on the drop.
+    for (const k of watchSubs.keys()) {
+      const sep = k.indexOf("\0");
+      sock.send(JSON.stringify({ sub: "watch", root: k.slice(0, sep), dir: k.slice(sep + 1) }));
+    }
     if (connectedOnce) for (const fn of reconnectListeners) fn();
     connectedOnce = true;
   };
@@ -156,22 +167,26 @@ export function onBusDiff(fn: (diff: RecordsDiff, seq: number) => void): () => v
   return () => busSubs.delete(fn);
 }
 
-// Per-root file-watch events (loader.watchDataset is the one consumer): {sub:"watch", root} rides the
-// shared socket, the server runs one chokidar watcher per (socket, root) and streams {type, path}
-// events back. Unsubscribing the last listener of a root closes the server-side watcher.
-export function subscribeWatch(root: string, fn: (ev: { type: string; path: string }) => void): () => void {
-  let set = watchSubs.get(root);
-  const firstForRoot = !set;
-  if (!set) watchSubs.set(root, (set = new Set()));
+// Per-(root, dir) file-watch events (the loader's dependency reconciler is the one consumer): the board
+// subscribes the DIRECTORIES that back live cards / loaded listings / annotations, so a giant mounted
+// checkout never opens a watcher for a file nobody carded (docs/root-watcher-fd-scaling.md). {sub:"watch",
+// root, dir} rides the shared socket; the server runs one depth-0 chokidar watcher per (socket, root, dir)
+// and streams {type, path} events (path root-relative) back tagged with (root, dir). Refcounted: the FIRST
+// subscriber of a (root, dir) sends the sub, the LAST to leave sends the unsub (closing the server watcher).
+export function subscribeWatch(root: string, dir: string, fn: (ev: { type: string; path: string }) => void): () => void {
+  const k = watchKey(root, dir);
+  let set = watchSubs.get(k);
+  const firstForDir = !set;
+  if (!set) watchSubs.set(k, (set = new Set()));
   set.add(fn);
   ensureConnected();
   // A CONNECTING socket is covered by onopen's re-send loop; an OPEN one needs the sub sent now.
-  if (firstForRoot && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ sub: "watch", root }));
+  if (firstForDir && ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ sub: "watch", root, dir }));
   return () => {
     set.delete(fn);
     if (set.size === 0) {
-      watchSubs.delete(root);
-      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ unsub: "watch", root }));
+      watchSubs.delete(k);
+      if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ unsub: "watch", root, dir }));
     }
   };
 }

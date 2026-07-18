@@ -117,6 +117,29 @@ export function docWatchersSignal(path: string): Subscribable<WatchRecord[] | un
   return s;
 }
 
+// The set of files with LIVE annotation subscribers — the dependency the watch reconciler derives from
+// (docs/root-watcher-fd-scaling.md, part (c)): a card showing a doc's annotations needs a re-pull when the
+// annotated file changes (anchors shift, orphans appear/heal) OR when its ledger appends. Keyed on the live
+// subscriber (a closed card drops out), same as content.ts's listing set. Notified on sub/unsub.
+const annotationSetSubs = new Set<() => void>();
+function notifyAnnotationSet(): void {
+  for (const fn of annotationSetSubs) fn();
+}
+
+// The distinct annotated-file paths with ≥1 live annotation subscriber right now (canonical-root relative —
+// annotations are repo-root only). The reconciler watches each path's PARENT directory plus the ledger dir.
+export function loadedAnnotationPaths(): string[] {
+  const out: string[] = [];
+  for (const [p, set] of subs) if (set.size > 0) out.push(p);
+  return out;
+}
+
+// Subscribe to changes in the live-annotation set (a doc card mounting/unmounting its annotations layer).
+export function subscribeAnnotationSet(fn: () => void): () => void {
+  annotationSetSubs.add(fn);
+  return () => annotationSetSubs.delete(fn);
+}
+
 /** Channel-1 handle for one file's annotations. First subscribe lazily fetches. */
 export function annotationsSignal(path: string): Subscribable<AnnotationInfo[] | undefined> {
   let s = sigs.get(path);
@@ -125,10 +148,15 @@ export function annotationsSignal(path: string): Subscribable<AnnotationInfo[] |
       get: () => values.get(path),
       subscribe(onChange) {
         let set = subs.get(path);
+        const firstForPath = !set || set.size === 0;
         if (!set) subs.set(path, (set = new Set()));
         set.add(onChange);
         if (!values.has(path)) void fetchAnnotations(path);
-        return () => set!.delete(onChange);
+        if (firstForPath) notifyAnnotationSet(); // this doc just became a live watch dependency
+        return () => {
+          set!.delete(onChange);
+          if (set!.size === 0) notifyAnnotationSet(); // last viewer left → the reconciler may drop its watch
+        };
       },
     };
     sigs.set(path, s);

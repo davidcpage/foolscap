@@ -222,6 +222,35 @@ async function fetchListing(root: string, path: string): Promise<void> {
   }
 }
 
+// The set of directories with a LIVE listing subscriber — the dependency the watch reconciler derives a
+// depth-0 dir watch from (docs/root-watcher-fd-scaling.md): a directory card showing (root, path) needs
+// add/unlink of that folder's children, so the folder itself must be watched. Keyed on the SUBSCRIBER, not
+// the cached `listings` map (a fetched-once-then-collapsed folder shouldn't pin a watch forever) and NOT the
+// localStorage expand state (that's UI memory, not a live dependency). Notified on every sub/unsub so the
+// reconciler re-derives; a debounced close on its side keeps expand/collapse from thrashing the server.
+const listingSetSubs = new Set<() => void>();
+function notifyListingSet(): void {
+  for (const fn of listingSetSubs) fn();
+}
+
+// The distinct (root, path) directories with ≥1 live listing subscriber right now.
+export function loadedListingDirs(): Array<{ root: string; path: string }> {
+  const out: Array<{ root: string; path: string }> = [];
+  for (const [k, set] of listingSubs) {
+    if (set.size === 0) continue;
+    const sep = k.indexOf("\0");
+    out.push({ root: k.slice(0, sep), path: k.slice(sep + 1) });
+  }
+  return out;
+}
+
+// Subscribe to changes in the live-listing set (a card mounting/unmounting a directory view). Returns an
+// unsubscribe. The reconciler wires this alongside the store + annotation-set + roots signals.
+export function subscribeListingSet(fn: () => void): () => void {
+  listingSetSubs.add(fn);
+  return () => listingSetSubs.delete(fn);
+}
+
 // Channel-1 handle for one directory's immediate children, keyed by (root, path) — the directory card's
 // `dirListing` capability resolves through this, exactly as a file card's body resolves through
 // fileContentSignal. First subscribe with no cached value lazily fetches /api/ls.
@@ -233,10 +262,15 @@ export function dirListingSignal(root: string, path: string): Subscribable<DirLi
       get: () => listings.get(k),
       subscribe(onChange) {
         let set = listingSubs.get(k);
+        const firstForDir = !set || set.size === 0;
         if (!set) listingSubs.set(k, (set = new Set()));
         set.add(onChange);
         if (!listings.has(k)) void fetchListing(root, path);
-        return () => set!.delete(onChange);
+        if (firstForDir) notifyListingSet(); // this dir just became a live dependency
+        return () => {
+          set!.delete(onChange);
+          if (set!.size === 0) notifyListingSet(); // last viewer left → the reconciler may drop its watch
+        };
       },
     };
     listingSignals.set(k, s);
