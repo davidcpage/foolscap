@@ -10,7 +10,7 @@
 // files}, dirs:[topLevelDir…("other")], growth:{ t:[ms…], cum:[[netLOC per dir]…] }, commits:[{s,a,d,t}…],
 // churn:[{p,a,d,c}…], downsampled, truncated }. Charts are hand-rolled SVG (no chart lib vendored). Every
 // draw guards a missing/partial series (headless + the pre-publish beat both pass `undefined`).
-import { html } from "/vendor/lit-html.js";
+import { html, svg } from "/vendor/lit-html.js";
 
 const INK = "#27272a";
 const MUTE = "#52525b";
@@ -79,7 +79,12 @@ function growthChart(series) {
       lower[i] = top;
     }
     downPts.reverse();
-    bands.push(html`<polygon
+    // Each band is a SEPARATELY-tagged fragment placed inside the outer <svg> via a child part, so it MUST
+    // use the `svg` tag: lit-html parses a bare `html` fragment through innerHTML in the HTML namespace,
+    // making the <polygon> an HTMLUnknownElement that SVG never paints. `svg` wraps it in <svg> first, so
+    // the node is born SVG-namespaced. (The outer template's LITERAL <svg> is fine — the HTML parser enters
+    // foreign-content mode for it; only nested separately-tagged fragments need the explicit svg tag.)
+    bands.push(svg`<polygon
       points=${[...upPts, ...downPts].join(" ")}
       fill=${colorFor(d)}
       fill-opacity="0.85"

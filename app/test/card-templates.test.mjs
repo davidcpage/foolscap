@@ -1580,6 +1580,71 @@ test("git-stats template renders code-growth + churn from the `dataFeedHistory` 
   assert.equal(titled, "data:demo", "the feed name commits through the granted setTitle capability");
 });
 
+// Github-feed work item 3 REGRESSION: the growth chart rendered a blank plot because each stacked-area
+// band was tagged html`` (an HTMLUnknownElement <polygon> that SVG never paints) instead of svg``. The
+// flatten() harness above CANNOT catch this — it string-concatenates template.strings, so the literal
+// "<polygon" is present whichever tag is used. Catching a namespace bug needs REAL DOM: instantiate the
+// template in jsdom and assert every rendered <polygon> is SVG-namespaced. Flip the band tag back to
+// html`` in render.js and this test fails (the polygons come back HTML-namespaced) — verified during the fix.
+test("git-stats growth polygons are SVG-namespaced in real DOM (catches the empty-plot bug flatten cannot)", async () => {
+  const { JSDOM } = await import("jsdom");
+  const dom = new JSDOM("<!DOCTYPE html><body></body>");
+
+  // A FRESH lit-html instance bound to jsdom's document: lit-html captures `document` (const l=document) at
+  // import, and the shared harness at the top of this file already bound the file-URL copy to the headless
+  // `globalThis.document` mock. Rewriting the template's /vendor/lit-html.js to a data: URL of the same
+  // source imports a clean copy that binds to whatever `globalThis.document` is at import time (jsdom's).
+  const litSrc = fs.readFileSync(new URL("vendor/lit-html.js", root), "utf8");
+  const jsdomLitUrl = "data:text/javascript," + encodeURIComponent(litSrc);
+  const gsSrc = fs
+    .readFileSync(new URL("card-types/git-stats/render.js", root), "utf8")
+    .replaceAll('"/vendor/lit-html.js"', `"${jsdomLitUrl}"`);
+  const gsUrl = "data:text/javascript," + encodeURIComponent(gsSrc);
+
+  const savedDoc = globalThis.document;
+  globalThis.document = dom.window.document; // lit-html's fresh copy binds `l` to this on first import below
+  try {
+    const { render } = await import(jsdomLitUrl);
+    const mod = (await import(gsUrl)).default;
+
+    // A minimal-but-valid series: ≥2 growth samples + ≥2 dirs so growthChart() actually draws its bands
+    // (n < 2 or no dirs short-circuits to the "not enough history" note — no polygons at all).
+    const now = 1_700_000_000_000;
+    const series = {
+      name: "data:git-stats",
+      totals: { commits: 3, adds: 100, dels: 20, net: 80, files: 5 },
+      dirs: ["app", "docs"],
+      growth: { t: [now - 86400_000, now], cum: [[10, 5], [400, 120]] },
+      commits: [],
+      churn: [{ p: "app/x.ts", a: 10, d: 2, c: 12 }],
+      downsampled: false,
+      truncated: false,
+    };
+    const card = {
+      fields: { title: "data:git-stats", text: "", color: "green" },
+      signals: { dataFeedHistory: (n) => (n === "data:git-stats" ? series : undefined), setTitle: () => {} },
+    };
+
+    const container = dom.window.document.createElement("div");
+    render(mod.render(card), container);
+
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    const polys = container.querySelectorAll("polygon");
+    assert.equal(polys.length, series.dirs.length, "one growth band <polygon> per directory renders in real DOM");
+    for (const p of polys)
+      assert.equal(
+        p.namespaceURI,
+        SVG_NS,
+        "each growth <polygon> is SVG-namespaced (svg`` tag) — an HTML-namespaced one is the unpainted empty-plot bug",
+      );
+    // Sanity: the outer chart <svg> is SVG-namespaced too (the container really entered foreign content),
+    // so the polygons' namespace is the meaningful signal, not an all-HTML parse.
+    assert.equal(container.querySelector("svg").namespaceURI, SVG_NS, "the chart <svg> is SVG-namespaced");
+  } finally {
+    globalThis.document = savedDoc; // restore the headless mock for any following test
+  }
+});
+
 test("notebook template views a .html file: prose, module cells with wiring/policy + Run + output, feeds the graph", async () => {
   const mod = await loadTemplate("notebook");
   assert.equal(mod.contract, 1);
