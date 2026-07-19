@@ -13,6 +13,13 @@ import type { ChangeSource, Store } from "./store.js";
 // interleaved foreign changes — unless they removed the record, in which case the inverse update is
 // a no-op rather than a resurrection. `source` keeps its second job: undo/redo writes are emitted
 // back onto channel 2 attributed to the same source they undo.
+// A diff's record-id signature — the sorted ids it adds / removes / updates. A good discriminator for
+// matching a stack entry to a rolled-back edit (two unrelated edits rarely touch the exact same id set)
+// without a deep value compare. Used by UndoManager.forget.
+function keyOf(d: RecordsDiff): string {
+  return JSON.stringify([Object.keys(d.added).sort(), Object.keys(d.removed).sort(), Object.keys(d.updated).sort()]);
+}
+
 export class UndoManager {
   private undos: RecordsDiff[] = [];
   private redos: RecordsDiff[] = [];
@@ -50,6 +57,23 @@ export class UndoManager {
     if (!diff) return;
     this.apply(diff);
     this.undos.push(invertDiff(diff));
+  }
+
+  /** Drop the undo entry for a committed diff that was ROLLED BACK out-of-band (design §9 stage 3, §4): a
+   *  server 4xx reject re-applies the edit's inverse as a "remote" change (not itself undoable) — but the
+   *  original "user" commit already pushed its inverse onto this stack, and a later Ctrl-Z would then revert
+   *  something already gone (double-apply). So forget that void entry. Matches by the record-id keysets of
+   *  the inverse (the stack holds invertDiff(committed)); removes the TOPMOST match (the rejected edit is the
+   *  most recent), or no-ops if it was already undone/superseded. Returns whether an entry was removed. */
+  forget(committed: RecordsDiff): boolean {
+    const target = keyOf(invertDiff(committed));
+    for (let i = this.undos.length - 1; i >= 0; i--) {
+      if (keyOf(this.undos[i]!) === target) {
+        this.undos.splice(i, 1);
+        return true;
+      }
+    }
+    return false;
   }
 
   dispose(): void {

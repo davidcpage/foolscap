@@ -134,6 +134,35 @@ test("POST /api/command with no tab commits server-side: ok + authoritative seq 
 // Stage 2 is merged and live, so the command test above now carries the id-echo contract end-to-end;
 // the minting LOGIC remains covered hermetically in middleware-hermetic.
 
+test("§9 stage 3 (D4): GET /api/board/persist/log?since=<seq> serves ONLY the tail past the watermark (reconnect gap-fill)", { skip: !up && "no dev server on 5173" }, async () => {
+  // The inbound catch-up asks the server for exactly the events it missed while offline. Commit two events,
+  // read the log, and assert since=<mid> returns only the tail — the gap-fill window a reconnecting tab folds.
+  const a = await (await fetch(`${HOST}/api/command?board=${boardId}`, j({ type: "addNode", actor: "user", payload: { type: "note", title: "gapfill-A" } }))).json();
+  const b = await (await fetch(`${HOST}/api/command?board=${boardId}`, j({ type: "addNode", actor: "user", payload: { type: "note", title: "gapfill-B" } }))).json();
+  assert.ok(b.seq > a.seq, "two commits mint ascending seqs");
+  const since = await (await fetch(`${HOST}/api/board/persist/log?board=${boardId}&since=${a.seq}`)).json();
+  const seqs = since.events.map((e) => e.seq);
+  assert.ok(seqs.every((s) => s > a.seq), "every returned event is strictly past the since watermark");
+  assert.ok(seqs.includes(b.seq), "the event committed after the watermark is in the gap-fill");
+  assert.ok(!seqs.includes(a.seq), "the event at/below the watermark is NOT re-sent");
+  // since=0 (or absent) is the full-log provenance read — a superset that includes the earlier event.
+  const full = await (await fetch(`${HOST}/api/board/persist/log?board=${boardId}&since=0`)).json();
+  assert.ok(full.events.map((e) => e.seq).includes(a.seq), "since=0 replays everything (the provenance read)");
+});
+
+test("§9 stage 3 (§3.3): the server dedup ring no-ops a RESENT tab event id — same seq, no duplicate durable append", { skip: !up && "no dev server on 5173" }, async () => {
+  // A lost-ack resend: the tab re-POSTs an event whose ack it never saw. The server must return the seq it
+  // already assigned and NOT append a second copy (exactly-once at the durable log).
+  const evId = `evt:resend-${runTag}`;
+  const nodeId = `node:resend-${runTag}`;
+  const event = { id: evId, ts: 1, parent: 0, seq: 1, type: "addNode", actor: "user", payload: { id: nodeId }, diff: { added: { [nodeId]: { typeName: "node", id: nodeId, type: "note", x: 0, y: 0, w: 1, h: 1 } }, updated: {}, removed: {} } };
+  const first = await (await fetch(`${HOST}/api/board/persist/event?board=${boardId}`, j({ event }))).json();
+  const second = await (await fetch(`${HOST}/api/board/persist/event?board=${boardId}`, j({ event }))).json();
+  assert.equal(first.seq, second.seq, "the resend returns the ALREADY-assigned seq");
+  const log = await (await fetch(`${HOST}/api/board/persist/log?board=${boardId}&since=0`)).json();
+  assert.equal(log.events.filter((e) => e.id === evId).length, 1, "the durable log holds ONE copy — the resend was a no-op");
+});
+
 test("thread append lazy-seeds from the on-disk ledger — never mints seq 1 onto a real tail", { skip: !up && "no dev server on 5173" }, async () => {
   // Per-run id: the server's in-memory thread log is pinned for the process, so re-using one id
   // across runs would serve the previous run's in-memory tail instead of exercising the lazy seed.

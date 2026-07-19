@@ -1,5 +1,6 @@
 import type { RecordsDiff, Subscribable } from "./lib";
 import { activeBoardId } from "./board";
+import { setConnected } from "./sync-status";
 
 // Off-log FEED signals — the clock's pattern generalized (demo §10: each feed is "the clock with a
 // fetch in it"). ONE shared WebSocket (/api/ws) carries every named feed — plus the agent-bus command
@@ -137,6 +138,7 @@ function ensureConnected(): void {
   // onopen fires on every successful (re)connection; skip the first so only a genuine reconnect — where
   // the server may have restarted with empty feed state — triggers the re-arm.
   sock.onopen = () => {
+    setConnected(true); // the sync pill: the feed socket is up (a drop set it false in onclose)
     // Re-arm every live (root, dir) watch — the server lost its per-socket watchers on the drop.
     for (const k of watchSubs.keys()) {
       const sep = k.indexOf("\0");
@@ -147,6 +149,7 @@ function ensureConnected(): void {
   };
   sock.onclose = () => {
     if (ws === sock) ws = null;
+    setConnected(false); // the sync pill: dropped — "reconnecting…" (or "offline — N pending" if edits queue)
     setTimeout(() => {
       if (!ws && (subs.size || busSubs.size || watchSubs.size)) ensureConnected();
     }, 2000);

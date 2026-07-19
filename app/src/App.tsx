@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   Editor,
   InteractionManager,
   Persistence,
   UndoManager,
   bindDom,
+  invertDiff,
   layoutId,
   vec,
   type Id,
@@ -13,6 +14,7 @@ import {
 } from "./lib";
 import { IdbEventStore, IdbSnapshotStore, boardDbName } from "./idb";
 import { RemoteEventStore, RemoteSnapshotStore, fetchBoardPersist, fetchBoardLog, importBoardPersist } from "./remote-store";
+import { setPending, subscribeSyncStatus, syncStatus, syncPillLabel } from "./sync-status";
 import { seedProvenanceHistory } from "./provenance";
 import { activeBoard, activeBoardId, boardHref, listBoards, removeBoard, resolveBoard, type BoardListing } from "./board";
 import { ViewStore } from "./views";
@@ -85,6 +87,7 @@ interface Engine {
   m: InteractionManager;
   undo: UndoManager;
   persistence: Persistence;
+  eventStore: RemoteEventStore; // exposed so the board can wire the 4xx reject-rollback (stage 3, §4)
 }
 
 // Build the engine, hydrating from durable storage first (mirrors app/'s persistence order):
@@ -124,6 +127,9 @@ async function createEngine(boardId: string): Promise<Engine> {
     events: eventStore,
     snapshots: new RemoteSnapshotStore(boardId, boot.snapshot),
     onError: (e) => console.error("[persistence]", e),
+    // §3.1 inspectable outbound queue → the sync pill: the count of edits not yet durable, rising while
+    // offline and draining FIFO on reconnect. A module-level signal (no component dependency here).
+    onPending: setPending,
   });
   // §10 seq handover: adopt the seq the server assigns to each tab-echoed (human gesture) event, so this
   // tab's mirror watermark tracks the single server-side sequencer (bus commits advance it invisibly here).
@@ -179,7 +185,7 @@ async function createEngine(boardId: string): Promise<Engine> {
   };
   if (typeof requestIdleCallback === "function") requestIdleCallback(backfillProvenance);
   else setTimeout(backfillProvenance, 0);
-  return { m, undo, persistence };
+  return { m, undo, persistence, eventStore };
 }
 
 // How long Alt must be held before it means "edit the HUD" rather than "tap to toggle visibility". Short
@@ -309,7 +315,21 @@ export function App() {
   return <Board {...engine} />;
 }
 
-function Board({ m, undo, persistence }: Engine) {
+// The sync-status pill (stage 3, §3.4). Subscribes to the module-level sync signal (connection state from
+// feeds.ts + the outbound-queue count from Persistence.onPending) and renders the honest label, or nothing
+// when the board is online and fully synced. Its own tiny component so only it re-renders on a status tick.
+function SyncPill() {
+  const status = useSyncExternalStore(subscribeSyncStatus, syncStatus);
+  const label = syncPillLabel(status);
+  if (!label) return null;
+  return (
+    <div className="sync-pill" data-offline={!status.connected}>
+      {label}
+    </div>
+  );
+}
+
+function Board({ m, undo, persistence, eventStore }: Engine) {
   // The fs-watch corner chip. Each event carries a monotonic `seq` so the render can `key` off it
   // (restarting the fade animation on a repeat event) and a timer can re-arm cleanly. It self-dismisses
   // (see the timeout effect below) — the chip is a glance, not standing chrome.
@@ -437,6 +457,21 @@ function Board({ m, undo, persistence }: Engine) {
     const t = setTimeout(() => setToast(null), 1400);
     return () => clearTimeout(t);
   }, [toast]);
+
+  // §4 / OQ-R reject rollback: a server 4xx means the event is malformed (a code bug — retrying re-sends the
+  // same mistake), so the optimistic edit must come back OUT. Apply its inverse as a "remote" change (not
+  // itself undoable), forget the now-void undo entry (so a later ⌘Z doesn't double-revert), and show a
+  // minimal, non-destructive toast. On a solo board 4xx is an edge/safety path, not a routine event.
+  useEffect(() => {
+    eventStore.onReject = (event) => {
+      m.editor.store.applyDiffAsChange(invertDiff(event.diff), "remote");
+      undo.forget(event.diff);
+      flash("this change couldn't be saved");
+    };
+    return () => {
+      eventStore.onReject = undefined;
+    };
+  }, [eventStore, m, undo, flash]);
 
   // Persistent "your turn" stack: one chip per session currently WAITING (idle, blocked on you), derived
   // straight from live status. A chip appears when a session stops for you and CLEARS ITSELF the moment
@@ -942,6 +977,11 @@ function Board({ m, undo, persistence }: Engine) {
           {toast.text}
         </div>
       )}
+
+      {/* The SYNC pill (stage 3, §3.4): unobtrusive-but-honest — hidden when online + synced, else a small
+          top-centre chip: "reconnecting…" / "offline — N edits pending" / "syncing N…". Derived from the
+          feed socket state + the inspectable outbound queue; never silently drops a queued edit. */}
+      <SyncPill />
 
       {/* Persistent "your turn" stack, bottom-centre: a chip per session waiting on you, each a light glassy
           pill with the amber waiting dot. Clears itself as sessions resolve; click a chip to fly to its

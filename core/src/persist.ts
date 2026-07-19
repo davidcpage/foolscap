@@ -90,6 +90,11 @@ export interface PersistenceOptions {
   debounceMs?: number;
   /** Surface a durable-write failure (otherwise rejections are swallowed). */
   onError?: (err: unknown) => void;
+  /** Report the count of EVENT writes queued-but-not-yet-durable (design §9 stage 3, §3.1): the outbound
+   *  offline queue made inspectable for the pending-sync UI. Fired on every enqueue and every settle, so it
+   *  rises as edits back up behind an outage and drains head-first (FIFO chain) as each POST acks. Snapshot
+   *  saves are not counted — this is "edits not yet landed". */
+  onPending?: (pending: number) => void;
 }
 
 // Implements IntentLog so it drops straight into `new Editor({ log: persistence })` — the durable log
@@ -101,6 +106,8 @@ export class Persistence implements IntentLog {
   private readonly snapshots: SnapshotStore | null;
   private readonly debounceMs: number;
   private readonly onError: (err: unknown) => void;
+  private readonly onPending: (pending: number) => void;
+  private pending = 0; // EVENT writes queued-but-not-durable — the inspectable outbound queue (§3.1)
 
   // Durable writes (events + snapshots) are serialized onto one promise chain so they land in order and
   // flush() can await the lot. A timer coalesces snapshot saves; `store` is captured in attach().
@@ -114,12 +121,24 @@ export class Persistence implements IntentLog {
     this.snapshots = opts.snapshots ?? null;
     this.debounceMs = opts.debounceMs ?? 400;
     this.onError = opts.onError ?? (() => {});
+    this.onPending = opts.onPending ?? (() => {});
   }
 
   // ── IntentLog (channel 3) ───────────────────────────────────────────────────────────────────────
   append(e: UnsequencedIntentEvent): IntentEvent {
     const event = this.mem.append(e); // sync mirror assigns the seq + keeps since()/all()/describe() instant
-    this.enqueue(() => this.events.append(event)); // and durably persist the SEQUENCED event
+    // §3.1 inspectable outbound queue: count this event as pending until its durable write settles (acks or
+    // rejects). The count rises while offline (writes back up behind the retry) and drains FIFO on reconnect.
+    this.pending++;
+    this.onPending(this.pending);
+    this.enqueue(async () => {
+      try {
+        await this.events.append(event); // durably persist the SEQUENCED event
+      } finally {
+        this.pending--;
+        this.onPending(this.pending);
+      }
+    });
     return event;
   }
   since(seq: number): IntentEvent[] {
@@ -131,6 +150,12 @@ export class Persistence implements IntentLog {
    *  next locally-minted seq above the server's and the debounced snapshot stamping an honest watermark. */
   adoptSeq(seq: number): void {
     this.mem.adopt(seq);
+  }
+  /** This tab's current log watermark — the highest seq it has adopted (its own committed gestures + every
+   *  peer/agent diff folded via adoptSeq). The reconnect gap-fill (design §9 stage 3, D4) reads it to ask
+   *  the server for `since(watermark)`, and the live gap detector compares an inbound seq against it. */
+  watermark(): number {
+    return this.mem.lastSeq;
   }
   all(): IntentEvent[] {
     return this.mem.all();

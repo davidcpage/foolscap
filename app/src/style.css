@@ -4749,6 +4749,33 @@ textarea.chan-description { max-height: none; overflow: hidden; resize: none; }
   100% { opacity: 0; transform: translate(-50%, 3px); }
 }
 
+/* The SYNC pill (stage 3, §3.4): quiet top-centre chip, shown only when NOT online-and-synced. Same glassy
+   idiom as the fs-watch chip; the offline variant warms to amber so an unsynced backlog reads as "attention,
+   not alarm" without being a loud banner. Non-interactive (a status glance). */
+.sync-pill {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 30;
+  padding: 3px 11px;
+  pointer-events: none;
+  background: #1e1b4bcc;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffffff22;
+  border-radius: 999px;
+  color: #c7d2fe;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sync-pill[data-offline="true"] {
+  background: #4a2f1bcc;
+  border-color: #f59e0b55;
+  color: #fde68a;
+}
+
 /* Persistent "your turn" stack — sessions waiting on you, bottom-centre (bottom-centre is empty; the
    board strip and event chip live at bottom-LEFT, so nothing collides here, unlike the clock HUD it used
    to sit on at top-centre). A vertical column of light glassy chips (the fs-watch chip idiom: translucent

@@ -10,6 +10,22 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { registerHooks } from "node:module";
+
+// Resolve the core engine's `./x.js` specifiers to their `.ts` sources (node strips types), same shim the
+// hermetic tests use — needed for the proof-#2 import of core's Store below.
+registerHooks({
+  resolve(spec, ctx, next) {
+    if ((spec.startsWith("./") || spec.startsWith("../")) && spec.endsWith(".js")) {
+      try {
+        return next(spec, ctx);
+      } catch {
+        return next(spec.slice(0, -3) + ".ts", ctx);
+      }
+    }
+    return next(spec, ctx);
+  },
+});
 
 const HOST = process.env.HOST || "http://127.0.0.1:5199";
 const WS = HOST.replace(/^http/, "ws");
@@ -72,8 +88,40 @@ assert.equal(joinRes.status, 200, "PROOF #3: a cardless session /joins — the s
 const msgRes = await fetch(`${HOST}/api/thread/${encodeURIComponent(threadId)}/message?board=${boardId}`, j({ from: sid, text: "cardless member speaking" }));
 assert.equal(msgRes.status, 200, "PROOF #3: the cardless member posts as a real ledger member");
 
+// ── (2) reconnect GAP-FILL convergence — S3-b/D4 ────────────────────────────────────────────────────
+// A tab is up and caught up, its socket DROPS, peers commit while it's down, it RECONNECTS and gap-fills.
+// This drives the REAL server /log?since + the REAL client foldCatchUp against a local core Store, and
+// asserts convergence — proof #2 end to end.
+const { Store } = await import("../../core/src/store.ts");
+const { foldCatchUp } = await import("../src/bus-convergence.ts");
+
+// A tiny watermark holder standing in for Persistence's watermark()/adoptSeq (the client mirror).
+const mirror = { seq: 0, watermark() { return this.seq; }, adoptSeq(s) { this.seq = Math.max(this.seq, s); } };
+const tabStore = new Store();
+
+// The tab is caught up to the board's current head (as after a boot).
+const head = (await (await fetch(`${HOST}/api/canvas?board=${boardId}`)).json()).snapshot.seq ?? 0;
+mirror.adoptSeq(head);
+
+// Socket is DOWN. Three peer commits land while the tab can't see them.
+const missedIds = [];
+for (let i = 0; i < 3; i++) {
+  const out = await (await fetch(`${HOST}/api/command?board=${boardId}`, j({ type: "addNode", actor: "user", payload: { type: "note", title: `gap-${i}` } }))).json();
+  missedIds.push(out.id);
+}
+// Before catch-up the tab's store is empty of those records (it never received the diffs).
+assert.ok(missedIds.every((id) => !tabStore.get(id)), "pre-reconnect: the tab missed every peer commit");
+
+// RECONNECT → gap-fill: fetch since(watermark) and fold in seq order (the catchUp loop, one pass suffices).
+const gap = (await (await fetch(`${HOST}/api/board/persist/log?board=${boardId}&since=${mirror.watermark()}`)).json()).events;
+const applied = foldCatchUp(gap, tabStore, mirror);
+assert.ok(applied >= 3, "PROOF #2: the gap-fill applied the missed events");
+for (const id of missedIds) assert.ok(tabStore.get(id), `PROOF #2: the reconnected tab converged — ${id} is present`);
+assert.equal(mirror.watermark(), head + 3, "the watermark advanced to the board head with no reload");
+
 tabA.close();
 tabB.close();
-console.log("S3-a BEHAVIORAL PROOF PASSED:");
+console.log("S3-a+b BEHAVIORAL PROOF PASSED:");
 console.log(`  #1 human edit reached tab B (seq ${bGotIt.seq}), origin tab A excluded, durable in server store`);
+console.log(`  #2 dropped connection → 3 peer commits missed → since(${head}) gap-fill → store converged (watermark ${mirror.watermark()})`);
 console.log(`  #3 cardless /join → 200 (was 400 pre-D7), member posts a message → 200`);
