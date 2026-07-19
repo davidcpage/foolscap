@@ -9,6 +9,7 @@ import {
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
   claudeUsagePollDelay,
+  makeReschedulingPoller,
   mergeUsageProvider,
   purgeCachedEmail,
   readUsageCache,
@@ -77,6 +78,107 @@ test("shouldSkipUsagePoll: hold a failing token, retry on rotation or deadline",
   assert.equal(shouldSkipUsagePoll(gate429, dead, 10_000), false, "at deadline → fetch");
   assert.equal(shouldSkipUsagePoll(gate429, dead, 20_000), false, "past deadline → fetch");
   assert.equal(shouldSkipUsagePoll(gate429, fresh, 5_000), false, "rotation before deadline → fetch");
+});
+
+// ── makeReschedulingPoller — the single-chain force/reschedule mechanics behind /api/usage/refresh ──
+// A deterministic fake-timer harness so the poller's timer bookkeeping is testable with no real clock:
+// records armed timers by id, lets us count them and fire them by hand.
+function fakeTimers() {
+  let nextId = 1;
+  const timers = new Map();
+  return {
+    set: (fn, delay) => {
+      const id = nextId++;
+      timers.set(id, { fn, delay });
+      return id;
+    },
+    clear: (id) => void timers.delete(id),
+    pending: () => timers.size,
+    delays: () => [...timers.values()].map((t) => t.delay),
+    fireAll: () => {
+      for (const [id, t] of [...timers.entries()]) {
+        timers.delete(id);
+        t.fn();
+      }
+    },
+  };
+}
+// Drain the microtask queue (the poller's cycle is async — one `await runOnce()` per tick). A real
+// macrotask hop flushes pending microtasks regardless of the INJECTED fake timers above.
+const flush = () => new Promise((r) => setImmediate(r));
+
+test("makeReschedulingPoller runs one cycle on start and arms exactly one timer with the returned delay", async () => {
+  const ft = fakeTimers();
+  let runs = 0;
+  const p = makeReschedulingPoller(async () => (runs++, 180_000), { setTimeoutFn: ft.set, clearTimeoutFn: ft.clear });
+  p.start();
+  await flush();
+  assert.equal(runs, 1, "start fires one cycle immediately (mirrors the old `void poll()`)");
+  assert.equal(ft.pending(), 1, "one timer armed for the next tick");
+  assert.deepEqual(ft.delays(), [180_000], "the cycle's returned delay drives the next tick");
+  ft.fireAll();
+  await flush();
+  assert.equal(runs, 2, "the scheduled tick ran the next cycle");
+  assert.equal(ft.pending(), 1, "still exactly one timer — the chain never doubles");
+});
+
+test("a forced poll runs now and does NOT fork a second self-perpetuating chain (the central race)", async () => {
+  const ft = fakeTimers();
+  let runs = 0;
+  const p = makeReschedulingPoller(async () => (runs++, 60_000), { setTimeoutFn: ft.set, clearTimeoutFn: ft.clear });
+  p.start();
+  await flush();
+  assert.equal(runs, 1);
+  assert.equal(ft.pending(), 1);
+  p.force(); // the /api/usage/refresh path
+  await flush();
+  assert.equal(runs, 2, "force runs a cycle now");
+  assert.equal(ft.pending(), 1, "the prior timer was CLEARED before rescheduling — not stacked into a second chain");
+  // Fire the one armed timer a few rounds: a forked chain would show pending() > 1 or runs jumping by >1.
+  ft.fireAll();
+  await flush();
+  ft.fireAll();
+  await flush();
+  assert.equal(runs, 4, "one cycle per tick — no double-polling");
+  assert.equal(ft.pending(), 1, "invariant across ticks: exactly one armed timer");
+});
+
+test("a force during an in-flight cycle is COALESCED into a single re-run, never a concurrent run", async () => {
+  const ft = fakeTimers();
+  let runs = 0;
+  let release = null;
+  const p = makeReschedulingPoller(
+    async () => {
+      runs++;
+      await new Promise((r) => (release = r)); // hold the cycle open until we let it finish
+      return 90_000;
+    },
+    { setTimeoutFn: ft.set, clearTimeoutFn: ft.clear },
+  );
+  p.start();
+  await flush();
+  assert.equal(runs, 1, "first cycle started and is awaiting");
+  const finishFirst = release;
+  p.force();
+  p.force(); // two forces mid-flight — both must coalesce onto ONE re-run
+  await flush();
+  assert.equal(runs, 1, "no concurrent cycle starts while one is in flight");
+  finishFirst();
+  await flush();
+  assert.equal(runs, 2, "exactly ONE re-run after the in-flight cycle completes (the two forces coalesced)");
+  release(); // let the coalesced re-run finish
+  await flush();
+  assert.equal(ft.pending(), 1, "settles to a single armed timer");
+});
+
+test("cancel drops the pending timer (hot re-eval / teardown leaves no orphan chain)", async () => {
+  const ft = fakeTimers();
+  const p = makeReschedulingPoller(async () => 180_000, { setTimeoutFn: ft.set, clearTimeoutFn: ft.clear });
+  p.start();
+  await flush();
+  assert.equal(ft.pending(), 1);
+  p.cancel();
+  assert.equal(ft.pending(), 0, "no armed timer after cancel");
 });
 
 test("provider-explicit last-good usage survives a dev-server process restart cache", () => {

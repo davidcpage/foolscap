@@ -714,6 +714,16 @@ export function buildCard(
       signals.rolesRefresh = (): void => refreshRolesList();
       continue;
     }
+    // `usageRefresh` is the usage card's force-poll ACTION (the roles/kernel action shape): POST the global
+    // /api/usage/refresh so the server pulls plan usage NOW instead of waiting out the adaptive cadence
+    // (handy on first canvas open). Global, not board-scoped — the usage feed is one server-side poller —
+    // so no ?board=. Nothing to read-track: the fresh reading arrives on the `usage` feed as usual; this
+    // just triggers the pull. Returns a bool so the card can debounce/ignore-while-in-flight if it wants.
+    if (name === "usageRefresh") {
+      signals.usageRefresh = (): Promise<boolean> =>
+        fetch("/api/usage/refresh", { method: "POST" }).then((r) => r.ok, () => false);
+      continue;
+    }
     // `roleLaunch` is the roles browser's explicit LAUNCH action (agent-roles.md): spawn a live session UNDER
     // a role and drop its card (loader.spawnLiveSession, which stamps the RoleName.<sid> name), placed by
     // cascadeFrom off THIS browser card. A BUTTON, not a double-click — spawning a real process eats a session

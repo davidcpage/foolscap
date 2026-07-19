@@ -65,6 +65,64 @@ export function claudeRateLimitDelay(previousBackoff, retryAfter, base = CLAUDE_
   return { backoff, delay: Math.max(base + backoff, honoredRetry) };
 }
 
+/**
+ * A single-chain rescheduling poller — the piece that makes a FORCED usage poll safe. The usage feed's
+ * pollers (pollClaude/pollCodex) are recursive one-shots: each cycle schedules the next. Left as raw,
+ * UNSTORED `setTimeout(poll, …)` calls, a forced re-invoke would fork a SECOND self-perpetuating chain
+ * and the feed would double-poll forever. This wraps that pattern so there is only ever ONE live timer:
+ *
+ *   • `runOnce()` does one poll cycle and RETURNS the ms delay until its next scheduled tick (the caller
+ *     no longer calls setTimeout itself — every reschedule flows through here).
+ *   • scheduling always CLEARS the pending timer first, so neither a normal reschedule nor a force() can
+ *     leave two timers armed.
+ *   • `force()` runs a cycle NOW (routed through the same runOnce, so any in-cycle gate/backoff check keeps
+ *     precedence). While a cycle is IN FLIGHT a force is COALESCED — it never starts a concurrent run;
+ *     instead the in-flight cycle re-runs immediately on completion (its own reschedule is dropped).
+ *
+ * setTimeoutFn/clearTimeoutFn are injectable so the mechanics unit-test with fake timers, no network.
+ * @param {() => (number | Promise<number>)} runOnce  one poll cycle → next-tick delay in ms
+ */
+export function makeReschedulingPoller(runOnce, { setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+  let timer = null;
+  let running = false;
+  let rerun = false; // a force arrived mid-cycle — run again the instant the in-flight cycle finishes
+
+  const clear = () => {
+    if (timer !== null) {
+      clearTimeoutFn(timer);
+      timer = null;
+    }
+  };
+
+  const tick = async () => {
+    clear(); // we're firing now — drop the armed handle so nothing else can also fire it
+    if (running) {
+      rerun = true; // don't start a second chain; the in-flight cycle will pick this up
+      return;
+    }
+    running = true;
+    let delay;
+    try {
+      delay = await runOnce();
+    } finally {
+      running = false;
+    }
+    if (rerun) {
+      rerun = false;
+      void tick(); // a force landed during the cycle — re-run now, skipping the just-computed delay
+    } else {
+      clear();
+      timer = setTimeoutFn(tick, delay);
+    }
+  };
+
+  return {
+    start: () => void tick(), // fire the first cycle immediately (mirrors the old `void poll()`)
+    force: () => void tick(), // run now, or coalesce onto an in-flight cycle
+    cancel: clear, // drop the pending timer (hot re-eval / teardown)
+  };
+}
+
 export function mergeUsageProvider(envelope, provider, value) {
   return {
     schema: 2,

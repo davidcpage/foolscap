@@ -4,6 +4,19 @@ export const CLAUDE_USAGE_MAX_BACKOFF_MS: number;
 
 export function claudeUsagePollDelay(liveSessionCount: number): number;
 
+export interface ReschedulingPoller {
+  start(): void;
+  force(): void;
+  cancel(): void;
+}
+export function makeReschedulingPoller(
+  runOnce: () => number | Promise<number>,
+  opts?: {
+    setTimeoutFn?: (fn: () => void, delayMs: number) => unknown;
+    clearTimeoutFn?: (handle: unknown) => void;
+  },
+): ReschedulingPoller;
+
 export function retryAfterMs(value: string | null | undefined, now?: number): number | null;
 export function claudeRateLimitDelay(
   previousBackoff: number,

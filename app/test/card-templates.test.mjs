@@ -1330,6 +1330,26 @@ test("usage template renders the account plan bars from the `usage` feed", async
   assert.ok(!out.includes("Extra usage"), "no extra-usage row when the field is absent");
 });
 
+test("usage template shows the force-refresh button only when the usageRefresh capability is granted", async () => {
+  const mod = await loadTemplate("usage");
+  const usage = { five_hour: { utilization: 14, resets_at: "2026-06-20T19:29:00+00:00" }, error: null };
+
+  // No grant (headless mount before capabilities resolve, or a type that omits it) → no button, no throw.
+  const noGrant = flatten(mod.render({ fields: { title: "", text: "", color: "green" }, signals: { usage } }));
+  assert.ok(!noGrant.includes("refresh usage now"), "no refresh button without the capability");
+
+  // Granted → the ⟳ button renders, carrying data-interactive so the host card-drag seam ignores the click.
+  const granted = flatten(
+    mod.render({ fields: { title: "", text: "", color: "green" }, signals: { usage, usageRefresh: () => Promise.resolve(true) } }),
+  );
+  assert.ok(granted.includes("refresh usage now"), "refresh button shown when granted");
+  assert.ok(granted.includes("data-interactive"), "button opts out of the drag seam");
+
+  // The static footnote is honest about the adaptive cadence — no stale fixed-interval claim.
+  assert.ok(granted.includes("adaptive"), "footnote names the adaptive cadence");
+  assert.ok(!granted.includes("every 3 min"), "the stale fixed-3-min copy is gone");
+});
+
 test("usage template keeps provider and billing identity explicit for Claude and Codex", async () => {
   const mod = await loadTemplate("usage");
   const out = flatten(mod.render({

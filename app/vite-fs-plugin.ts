@@ -21,6 +21,7 @@ import { foldCodexEvent } from "./codex-projection.js";
 import type { GlobalRoute, BoardRoute, RootRoute } from "./routes/router.js";
 import { exact, oneOf, prefix, re } from "./routes/router.js";
 import { weatherRoutes } from "./routes/weather.js";
+import { usageRoutes } from "./routes/usage.js";
 import { feedRoutes } from "./routes/feed.js";
 import { cardTypeRoutes, handleCardTypeAsset } from "./routes/card-types.js";
 import { roleRoutes } from "./routes/roles.js";
@@ -620,6 +621,7 @@ const GLOBAL_ROUTES: GlobalRoute[] = [
   ...canvasRoutes,
   ...notebookRoutes, // /api/notebook/<id>/outputs GET+POST (routes/notebook.ts) — same arm, same position
   ...weatherRoutes, // /api/weather (routes/weather.ts) — self-contained, same position
+  ...usageRoutes, // POST /api/usage/refresh (routes/usage.ts) — global force-poll, self-contained
 ];
 
 // STAGE 2 — BOARD routes (reached only after the shared board gate resolved `board`/`boardId`).

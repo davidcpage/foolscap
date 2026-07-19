@@ -10,4 +10,4 @@
 # session's token gauge. See render.js for the two codecs and the not-authed / rate-limited states.
 name: usage
 contract: 1
-capabilities: [usage, session]
+capabilities: [usage, session, usageRefresh]
