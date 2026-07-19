@@ -12,6 +12,8 @@ import {
   canvasThreadsDir,
   migrateChannelLedger,
   appendThreadLine,
+  appendThreadLineAsync,
+  withThreadLock,
   readThreadLog,
   readThreadMeta,
   upsertThreadMeta,
@@ -87,6 +89,62 @@ test("BUG-6: a durable append that CANNOT be persisted THROWS — it is no longe
     () => appendThreadLine(filePath, "node:thread:x", msg(1, "boom")),
     "a durable append that can't be made durable surfaces the error instead of swallowing it",
   );
+});
+
+test("appendThreadLineAsync is durable-before-resolve — the same fsync'd guarantee, off the event loop (r2 item 3)", async () => {
+  // The async twin of appendThreadLine: a line that RESOLVES from here is fsync'd to disk (BUG-6), so the
+  // server can await it and return its 200 knowing the post survives a restart. Modelled the same way the sync
+  // durability test is — a marker-independent fresh re-read once the promise resolves.
+  const repo = tmpRepo();
+  const id = "node:thread:async-durable";
+  await appendThreadLineAsync(repo, id, msg(1, "durable via the async path"));
+  await appendThreadLineAsync(repo, id, msg(2, "and this too"));
+  assert.deepEqual(
+    readThreadLog(repo, id),
+    [msg(1, "durable via the async path"), msg(2, "and this too")],
+    "both async appends are on disk the instant their promise resolves (fsync-before-resolve)",
+  );
+});
+
+test("appendThreadLineAsync REJECTS when it can't be made durable — no silent swallow (r2 item 3)", async () => {
+  // Mirror the sync BUG-6 throw test: a repoPath that is a FILE makes the `.canvas/threads` mkdir fail, and the
+  // failure must reject the promise so the accept path can return 500 rather than a dishonest 200.
+  const filePath = fs.mkdtempSync(path.join(os.tmpdir(), "thread-ledger-async-notdir-")) + "/afile";
+  fs.writeFileSync(filePath, "i am a file, not a directory");
+  await assert.rejects(
+    appendThreadLineAsync(filePath, "node:thread:x", msg(1, "boom")),
+    "an un-persistable async append rejects instead of swallowing the error",
+  );
+});
+
+test("withThreadLock serializes same-thread work so concurrent appends never interleave (r2 item 3)", async () => {
+  // The seq-atomicity guard: without the lock, two appends that both read the tail before either wrote would
+  // mint a DUPLICATE seq across the fsync await. Model the exact hazard — each locked unit reads the current
+  // length, yields (await), then appends length+1 — and assert the lock forces a clean 1..N with no gaps/dupes.
+  const repo = tmpRepo();
+  const id = "node:thread:locked";
+  const runs = await Promise.all(
+    [0, 1, 2, 3, 4].map((i) =>
+      withThreadLock(id, async () => {
+        const n = readThreadLog(repo, id).length; // read-modify-write around an await — the race the lock closes
+        await new Promise((r) => setTimeout(r, i % 2 ? 0 : 1)); // interleave-inducing yield
+        await appendThreadLineAsync(repo, id, msg(n + 1, `m${n + 1}`));
+        return n + 1;
+      }),
+    ),
+  );
+  assert.deepEqual(runs, [1, 2, 3, 4, 5], "each locked unit saw the prior one's write — serialized, not raced");
+  assert.deepEqual(readThreadLog(repo, id).map((m) => m.seq), [1, 2, 3, 4, 5], "contiguous seqs, no duplicate");
+});
+
+test("withThreadLock keeps DIFFERENT threads independent, and a rejection doesn't wedge the queue (r2 item 3)", async () => {
+  // Different thread ids use different chains (concurrency preserved); and a unit that throws must not poison
+  // the thread's queue — the next unit on the same thread still runs.
+  const a = withThreadLock("node:thread:A", async () => "a-done");
+  const b = withThreadLock("node:thread:B", async () => "b-done");
+  assert.deepEqual(await Promise.all([a, b]), ["a-done", "b-done"], "independent threads both resolve");
+  await assert.rejects(withThreadLock("node:thread:A", async () => { throw new Error("boom"); }), /boom/);
+  assert.equal(await withThreadLock("node:thread:A", async () => "recovered"), "recovered", "the queue survives a prior rejection");
 });
 
 test("readThreadLog tolerates a ragged first line (a tail-cut / torn mid-write append)", () => {

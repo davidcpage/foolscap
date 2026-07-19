@@ -111,13 +111,12 @@ export async function handleThreadReply(
 
   settleAsk(ask.askId, { askId: ask.askId, reply: { from: body.from, text: body.text, ts: Date.now() } });
   // Legibility echo: a single card-only entry; inbox/nudge skip kind:"ask", so no member is woken.
-  // Best-effort: appendThreadMsg throws on a durable failure (BUG-6), but the ask is ALREADY settled (the
-  // answer reached the asker) — the reply succeeded; only the card echo failed. Log it, don't 500 the reply.
-  try {
-    appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" });
-  } catch (e) {
-    console.warn(`[thread] ask echo for ${ask.askId} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
-  }
+  // Best-effort: appendThreadMsg rejects (async) on a durable failure (BUG-6), but the ask is ALREADY settled
+  // (the answer reached the asker) — the reply succeeded; only the card echo failed. Fire-and-forget; a rejection
+  // is logged, never thrown into the reply path, and withThreadLock keeps the echo ordered.
+  void appendThreadMsg(boardId, threadId, body.from, `Q (${ask.from}): ${ask.text}\nA: ${body.text}`, { kind: "ask" }).catch((e) =>
+    console.warn(`[thread] ask echo for ${ask.askId} on ${threadId} not persisted:`, (e as Error)?.message ?? e),
+  );
   sendJson(res, 200, { ok: true, askId: ask.askId, channel: threadId, delivered: true });
 }
 

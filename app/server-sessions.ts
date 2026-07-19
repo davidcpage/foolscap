@@ -590,21 +590,20 @@ function clearBlockedIntents(repoPath: string, sid: string): void {
     // block sat in — the exact keys, not a re-derived seat key, so a sid-keyed block can't be stranded —
     // so the rail state / deriveThreadState (which reads the marker) agrees. Both surfaces freshen
     // uniformly, with a provenance note. Converges: the next resume finds nothing left to clear.
-    // Best-effort (as this whole freshen is): appendThreadMsg throws on a durable failure (BUG-6), but a
-    // failed auto-freshen line must not break the per-thread loop or the resume — part 1's live pill still
-    // covers the view. Log it and move on to the next thread.
-    let msg;
-    try {
-      msg = appendThreadMsg(boardId, threadId, sid, intentLine("working", "auto: resumed — block answered"), {
-        kind: "intent",
-        intent: "working",
-      });
-    } catch (e) {
-      console.warn(`[thread] auto-resume intent for ${sid} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
-      continue;
-    }
+    // Best-effort (as this whole freshen is): appendThreadMsg rejects (async) on a durable failure (BUG-6), but
+    // a failed auto-freshen line must not break the per-thread loop or the resume — part 1's live pill still
+    // covers the view. Fire-and-forget the card line (a rejection is logged, ordering safe via withThreadLock);
+    // the marker overwrite below — the rail-state source — runs synchronously and reliably regardless. Its `ts`
+    // is a local clock, not the appended msg's, so the marker never waits on the (now-async) durable write; the
+    // two are the same moment for the human's purposes, and appendThreadMsg's own lastSeq/lastTs upsert
+    // shallow-merges around this `intents` write.
+    const ts = Date.now();
+    void appendThreadMsg(boardId, threadId, sid, intentLine("working", "auto: resumed — block answered"), {
+      kind: "intent",
+      intent: "working",
+    }).catch((e) => console.warn(`[thread] auto-resume intent for ${sid} on ${threadId} not persisted:`, (e as Error)?.message ?? e));
     const next = { ...(readThreadMeta(repoPath, threadId)?.intents ?? {}) };
-    for (const key of keys) next[key] = { intent: "working", ts: msg.ts, sid };
+    for (const key of keys) next[key] = { intent: "working", ts, sid };
     upsertThreadMeta(repoPath, threadId, { intents: next });
   }
 }

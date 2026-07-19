@@ -46,6 +46,7 @@ const plugin = await import("../vite-fs-plugin.ts"); // runRoute — the dispatc
 const inbox = await import("../routes/inbox.ts"); // computeInbox — the inbox read as a pure computation
 const casGuard = await import("../cas-guard.js"); // senderCursorAfterPost — the post-cursor invariant
 const watchDeps = await import("../src/watch-deps.ts"); // desiredWatchDirs — the pure watch-set derivation
+const routesThreads = await import("../routes/threads.ts"); // threadRoutes — the /posted record-check endpoint (r2)
 
 // ── Group A: server-fs pure confinement / gates (no context, no server) ─────────────────────────────
 test("server-fs safeResolve confines a path to its root and refuses every escape", () => {
@@ -1247,4 +1248,82 @@ test("tabCountFor dedupes WS clients by stable tab id; untagged legacy sockets c
 
   wsSet.clear();
   busMap.clear();
+});
+
+// ── Group K: thread-post reliability r2 (BUG-6 recurrence) — idempotent post, durable-before-ack, /posted ──
+// The "Sending → Timed Out → never appears" failure and its retry-duplicate. appendThreadMsg is now async
+// (an off-event-loop fsync serialized per thread via withThreadLock); these prove (item 3) durability holds
+// BEFORE the promise resolves — so the route's 200 still means on-disk — (item 2) a same-postId retry can't
+// duplicate, and (item 1) GET /posted confirms a post from the RECORD so a lost response is no false failure.
+const r2Repo = () => fs.mkdtempSync(path.join(os.tmpdir(), "r2-post-"));
+// A minimal ServerContext for delivery.appendThreadMsg + its publishThreadFeed, over a REAL tmp repo (so the
+// fsync'd ledger write actually lands and can be re-read from disk). threadLog hands back a stable per-thread
+// array, exactly like the real pinned in-memory tail the dedupe scan + seq-alloc read.
+function r2Fake(repo) {
+  const logs = new Map();
+  const feeds = [];
+  ctx.setServerContext({
+    fsState: {},
+    boards: new Map([["b1", { repoPath: repo }]]),
+    threadLog: (_b, t) => { if (!logs.has(t)) logs.set(t, []); return logs.get(t); },
+    boardSnapshotRecords: () => [],
+    threadNode: () => null,
+    sessionStatus: () => null,
+    publishFeed: (chan, payload) => feeds.push({ chan, payload }),
+    reqBoard: () => ({ boardId: "b1", repoPath: repo }),
+    MAX_THREAD_MSGS: 500,
+  });
+  return { logs, feeds };
+}
+
+test("r2 item 3: appendThreadMsg is durable BEFORE it resolves (fsync-before-ack holds through the async path)", async () => {
+  const repo = r2Repo();
+  r2Fake(repo);
+  const tid = "node:thread:ack";
+  const msg = await delivery.appendThreadMsg("b1", tid, "human", "on disk before the 200");
+  assert.equal(msg.seq, 1);
+  // A marker-INDEPENDENT fresh disk re-read the instant the promise resolved: the route awaits this before its
+  // 200, so a resolved append == an on-disk post. This is the BUG-6 guarantee the brief requires a test for.
+  assert.deepEqual(ledger.readThreadLog(repo, tid).map((m) => m.text), ["on disk before the 200"]);
+});
+
+test("r2 item 2: a retry with the SAME postId never appends a duplicate durable line", async () => {
+  const repo = r2Repo();
+  r2Fake(repo);
+  const tid = "node:thread:idem";
+  const first = await delivery.appendThreadMsg("b1", tid, "human", "hello", { postId: "p-1" });
+  // The exact timeout→retry the client does: same postId + text. The server dedupes rather than appending again.
+  const retry = await delivery.appendThreadMsg("b1", tid, "human", "hello", { postId: "p-1" });
+  assert.equal(retry.seq, first.seq, "the retry returns the ALREADY-appended message's seq");
+  const disk = ledger.readThreadLog(repo, tid);
+  assert.equal(disk.length, 1, "exactly one durable line — the retry made no duplicate");
+  assert.equal(disk[0].postId, "p-1");
+  await delivery.appendThreadMsg("b1", tid, "human", "hello", { postId: "p-2" }); // a genuinely new send
+  assert.equal(ledger.readThreadLog(repo, tid).length, 2, "a distinct postId appends a new line");
+  await delivery.appendThreadMsg("b1", tid, "human", "hello"); // the CLI / old client — no postId
+  await delivery.appendThreadMsg("b1", tid, "human", "hello");
+  assert.equal(ledger.readThreadLog(repo, tid).length, 4, "postId-less posts are never deduped (backward-compatible)");
+});
+
+test("r2 item 1: GET /posted confirms a post from the RECORD by postId (the timeout→re-fetch path)", async () => {
+  const repo = r2Repo();
+  r2Fake(repo);
+  const tid = "node:thread:posted";
+  await delivery.appendThreadMsg("b1", tid, "human", "did it land?", { postId: "p-abc" });
+  const route = routesThreads.threadRoutes.find((r) => r.method === "GET" && r.match("/api/thread/x/posted"));
+  assert.ok(route, "the /posted GET route is registered");
+  const call = (postId) => {
+    const res = fakeRes();
+    const qs = postId == null ? "" : `&postId=${encodeURIComponent(postId)}`;
+    const url = fakeUrl(`/api/thread/${encodeURIComponent(tid)}/posted?board=b1${qs}`);
+    route.run(fakeReq("GET"), res, url, [encodeURIComponent(tid)]);
+    return { status: res.statusCode, body: JSON.parse(res._body) };
+  };
+  const hit = call("p-abc");
+  assert.equal(hit.status, 200);
+  assert.equal(hit.body.landed, true, "the record confirms it landed — the client declares success, not a false timeout");
+  assert.equal(hit.body.seq, 1);
+  const miss = call("p-never");
+  assert.equal(miss.body.landed, false, "an unknown postId did NOT land — the client falls through to a dedup-safe retry");
+  assert.equal(call(null).status, 400, "a missing postId is a 400");
 });

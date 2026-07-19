@@ -17,6 +17,7 @@ export interface ThreadLogMsg {
   intent?: WorkIntent;
   target?: number;
   deleted?: boolean;
+  postId?: string; // idempotency key — appendThreadMsg dedupes on it so a client retry can't duplicate a post
 }
 
 // The latest work-intent a participant declared (threads-as-cards §6), on the marker's `intents` — keyed by
@@ -84,6 +85,8 @@ export interface PinnedMsg {
 export function canvasThreadsDir(repoPath: string): string;
 export function migrateChannelLedger(repoPath: string): boolean;
 export function appendThreadLine(repoPath: string, threadId: string, msg: ThreadLogMsg): void;
+export function appendThreadLineAsync(repoPath: string, threadId: string, msg: ThreadLogMsg): Promise<void>;
+export function withThreadLock<T>(threadId: string, fn: () => T | Promise<T>): Promise<T>;
 export function readThreadLog(repoPath: string, threadId: string): ThreadLogMsg[];
 export function readThreadMeta(repoPath: string, threadId: string): ThreadMetaMarker | null;
 export function upsertThreadMeta(repoPath: string, threadId: string, data: Record<string, unknown>): void;

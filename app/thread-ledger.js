@@ -80,6 +80,45 @@ export function appendThreadLine(repoPath, threadId, msg) {
 }
 
 /**
+ * The ASYNC twin of appendThreadLine (thread-post reliability r2, item 3): same write+fsync-under-one-fd
+ * DURABILITY guarantee (BUG-6), but every step runs on fs.promises so the fsync — the expensive disk flush —
+ * executes on the libuv threadpool INSTEAD OF blocking the single JS event loop. Under a burst (many posts, a
+ * board-persist snapshot writing synchronously beside it) the sync fsyncSync head-of-line blocked every other
+ * request and could approach the client's 8s post timeout on its own; awaiting an off-loop fsync frees the loop
+ * to serve them meanwhile. The DURABILITY contract is identical: a line that RESOLVES from here is fsync'd to
+ * stable storage, so the caller can return its HTTP 200 knowing the post survives a crash/restart. Ordering +
+ * seq-atomicity across the await are the CALLER's job (appendThreadMsg wraps the whole append in withThreadLock,
+ * so two appends to one thread never interleave across this await). THROWS on failure — no silent swallow.
+ */
+export async function appendThreadLineAsync(repoPath, threadId, msg) {
+  await fs.promises.mkdir(canvasThreadsDir(repoPath), { recursive: true });
+  const fh = await fs.promises.open(logPath(repoPath, threadId), "a");
+  try {
+    await fh.write(JSON.stringify(msg) + "\n");
+    await fh.sync(); // fsync on the threadpool — durable BEFORE we resolve, off the event loop
+  } finally {
+    await fh.close();
+  }
+}
+
+// ── per-thread serialization lock (thread-post reliability r2, item 3) ───────────────────────────────
+// A promise-chain queue keyed by threadId: withThreadLock(id, fn) runs `fn` only after every prior lock on
+// the SAME thread has settled, so a whole append (read the tail → allocate the next seq → durable write →
+// publish) stays ATOMIC per thread even though it now awaits an off-loop fsync. Without it, two concurrent
+// posts to one thread would both read the same tail before either pushed and mint a DUPLICATE seq across the
+// await. Different threads use different chains → they still run concurrently (the loop-freeing win is kept).
+// The stored tail swallows rejections (a failed append must not wedge the thread's queue), but the value
+// RETURNED to the caller is fn's real result/rejection.
+const threadLocks = new Map();
+export function withThreadLock(threadId, fn) {
+  const prev = threadLocks.get(threadId) ?? Promise.resolve();
+  const run = prev.then(fn, fn); // run fn once the prior lock settles, whatever its outcome
+  threadLocks.set(threadId, run.then(noop, noop)); // the chain tail never carries a rejection
+  return run; // the caller sees fn's actual result/rejection
+}
+function noop() {}
+
+/**
  * Read a thread's durable log back (newest tail, byte-bounded), parsed to a ThreadMsg[]. A tail read can
  * chop the first line mid-record; we skip any line that won't parse (the same ragged-first-line tolerance
  * the session codec has). Returns [] for a missing/unreadable file — never throws.

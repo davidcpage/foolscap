@@ -5,7 +5,8 @@ import { defaultCommands } from "../core/src/commands.js";
 import { getAnnouncedMemberships, getBusClients, getPendingAsks, getPendingHistoryMode, getServerContext, getWsClients } from "./server-context.js";
 import { appendTabEvent, commitBoardCommand } from "./board-engine.js";
 import {
-  appendThreadLine,
+  appendThreadLineAsync,
+  withThreadLock,
   fillSeat,
   readPins,
   readSeenMentions,
@@ -142,38 +143,60 @@ export function appendThreadMsg(
   threadId: string,
   from: string,
   text: string,
-  extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent } | { kind: "edit"; target: number; deleted?: boolean },
-): ThreadMsg {
-  const { boards, threadLog, boardSnapshotRecords, threadNode, MAX_THREAD_MSGS } = getServerContext();
-  const log = threadLog(boardId, threadId); // lazy-seeds from the ledger — never mint seq 1 onto a real tail
-  const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
-  const msg: ThreadMsg = { seq, ts: Date.now(), from, text, ...extra };
-  // DURABLE-BEFORE-LIVE (BUG-6). Persist to the fsync'd .jsonl ledger BEFORE we mutate the in-memory log or
-  // publish the live feed — the honest ordering. appendThreadLine now THROWS on failure (it no longer
-  // swallows), so a post that can't be made durable propagates out of here to the caller (→ HTTP 500) rather
-  // than returning a dishonest 200 with the message alive only in the bounded in-memory tail (the vanishing
-  // 2026-07-12 posts). And because the feed publish is AFTER a successful append, the card/live feed never
-  // shows a message that isn't on disk — the former publish-then-append inversion. The marker upsert stays
-  // best-effort: it is the rail's INDEX, not the conversation, and the message is already durable in the
-  // .jsonl (lazy threadLog re-reads that marker-independently on the next touch after a restart).
-  const repoPath = boards.get(boardId)?.repoPath;
-  if (repoPath) {
-    appendThreadLine(repoPath, threadId, msg); // fsync'd; throws if it can't be made durable
-    // Refresh the marker. Title/brief ride along only when the snapshot can resolve the thread node
-    // (so a momentary no-snapshot post bumps activity without clobbering a good title with a blank one).
-    const records = boardSnapshotRecords(boardId);
-    const thread = records ? threadNode(records, threadId) : null;
-    const meta: Record<string, unknown> = { lastSeq: msg.seq, lastTs: msg.ts };
-    if (thread) { meta.title = thread.title ?? ""; meta.text = typeof thread.text === "string" ? thread.text : ""; }
-    upsertThreadMeta(repoPath, threadId, meta);
-  }
-  // Only now is the message live: it is durably on disk (or the board has no repo tier at all). Push it to the
-  // bounded in-memory tail and publish the feed.
-  log.push(msg);
-  let truncated = false;
-  if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
-  publishThreadFeed(boardId, threadId, log, truncated);
-  return msg;
+  extra?:
+    | { kind: "ask" }
+    | { kind: "intent"; intent: WorkIntent }
+    | { kind: "edit"; target: number; deleted?: boolean }
+    | { postId?: string },
+): Promise<ThreadMsg> {
+  // PER-THREAD SERIALIZATION (thread-post reliability r2, item 3). The whole append — read the tail, allocate
+  // the next seq, durably write, publish — runs under withThreadLock so it stays ATOMIC per thread even though
+  // the durable write is now an awaited, off-event-loop fsync. Two concurrent posts to one thread thus can't
+  // both read the same tail and mint a DUPLICATE seq across the await; posts to DIFFERENT threads still run
+  // concurrently (the event-loop-freeing win). All callers append through here, so the lock covers them all.
+  return withThreadLock(threadId, async () => {
+    const { boards, threadLog, boardSnapshotRecords, threadNode, MAX_THREAD_MSGS } = getServerContext();
+    const log = threadLog(boardId, threadId); // lazy-seeds from the ledger — never mint seq 1 onto a real tail
+    // IDEMPOTENT POST (item 2). A client mints one postId per logical send and reuses it across its retries; if
+    // a message with this postId is ALREADY in the log (a retry of a post whose first attempt landed durably but
+    // whose response was lost to a mid-request dev-server bounce), return that SAME message — never append a
+    // second durable line. The scan is over the lazy-seeded tail, which re-reads the ledger after a cold restart,
+    // so a retry that crosses a restart still dedupes. Card-only/CLI posts carry no postId and skip this.
+    const postId = (extra as { postId?: string } | undefined)?.postId;
+    if (postId) {
+      const dup = log.find((m) => m.postId === postId);
+      if (dup) return dup;
+    }
+    const seq = (log.length ? log[log.length - 1]!.seq : 0) + 1;
+    const msg: ThreadMsg = { seq, ts: Date.now(), from, text, ...extra };
+    // DURABLE-BEFORE-LIVE (BUG-6). Persist to the fsync'd .jsonl ledger BEFORE we mutate the in-memory log or
+    // publish the live feed — the honest ordering. appendThreadLineAsync fsyncs (off the event loop) and THROWS
+    // on failure, so a post that can't be made durable propagates out of here to the caller (→ HTTP 500) rather
+    // than returning a dishonest 200 with the message alive only in the bounded in-memory tail (the vanishing
+    // 2026-07-12 posts). Because the feed publish is AFTER a successful await, the card/live feed never shows a
+    // message that isn't on disk, and because the ROUTE awaits this whole call before its 200, the fsync-before-
+    // ACK guarantee holds — the async fsync moved off the loop, it did not move after the ack. The marker upsert
+    // stays best-effort: it is the rail's INDEX, not the conversation, and the message is already durable in the
+    // .jsonl (lazy threadLog re-reads that marker-independently on the next touch after a restart).
+    const repoPath = boards.get(boardId)?.repoPath;
+    if (repoPath) {
+      await appendThreadLineAsync(repoPath, threadId, msg); // fsync'd off-loop; throws if it can't be made durable
+      // Refresh the marker. Title/brief ride along only when the snapshot can resolve the thread node
+      // (so a momentary no-snapshot post bumps activity without clobbering a good title with a blank one).
+      const records = boardSnapshotRecords(boardId);
+      const thread = records ? threadNode(records, threadId) : null;
+      const meta: Record<string, unknown> = { lastSeq: msg.seq, lastTs: msg.ts };
+      if (thread) { meta.title = thread.title ?? ""; meta.text = typeof thread.text === "string" ? thread.text : ""; }
+      upsertThreadMeta(repoPath, threadId, meta);
+    }
+    // Only now is the message live: it is durably on disk (or the board has no repo tier at all). Push it to the
+    // bounded in-memory tail and publish the feed.
+    log.push(msg);
+    let truncated = false;
+    if (log.length > MAX_THREAD_MSGS) { log.splice(0, log.length - MAX_THREAD_MSGS); truncated = true; } // keep recent
+    publishThreadFeed(boardId, threadId, log, truncated);
+    return msg;
+  });
 }
 
 // A message arrived in a thread: mark every OTHER live member as owing a nudge and wake the idle ones now
@@ -669,14 +692,13 @@ export function onboardMemberOpen(boardId: string, threadId: string, sid: string
       `you'll be NUDGED only when a peer @-tags or /asks you; read messages with GET ${base}/api/inbox?session=${sid}, pending asks with GET ${base}/api/asks?session=${sid}${backlog}`,
   );
   if (others.length) {
-    // Best-effort: appendThreadMsg now throws if the durable append fails (BUG-6), but a "joined" SYSTEM
+    // Best-effort: appendThreadMsg throws (async) if the durable append fails (BUG-6), but a "joined" SYSTEM
     // line failing to persist must not abort onboarding — the durable membership is already recorded on the
-    // marker above, so the join itself stands. Log it and still wake the room.
-    try {
-      appendThreadMsg(boardId, threadId, "system", `${sid} joined the thread. members now: ${roster}.`);
-    } catch (e) {
-      console.warn(`[thread] join system line for ${sid} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
-    }
+    // marker above, so the join itself stands. Fire-and-forget (appendThreadMsg is async now); a rejection is
+    // logged, never thrown into this sync onboarding path. Ordering is safe — withThreadLock serializes it.
+    void appendThreadMsg(boardId, threadId, "system", `${sid} joined the thread. members now: ${roster}.`).catch((e) =>
+      console.warn(`[thread] join system line for ${sid} on ${threadId} not persisted:`, (e as Error)?.message ?? e),
+    );
     wakeThreadMembers(boardId, threadId, sid, { broadcast: true }); // a join is a room event — reaches level-`all` seats
   }
   const js = liveSessions.get(sid);
