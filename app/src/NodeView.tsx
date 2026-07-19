@@ -681,6 +681,11 @@ function ThreadView({
   const descViewRef = useRef<HTMLDivElement>(null);
   const [descOverflows, setDescOverflows] = useState(false);
   const [title, setTitle] = useState(node.title);
+  // The title reads as the click-to-copy id link by default (single click copies node:thread:<id>, ✓ flash —
+  // uniform with the session/file cards); a DOUBLE click swaps it for the rename <input> below. `editingTitle`
+  // is that swap; the title must stay renameable, so it can't be a plain static copy button.
+  const [editingTitle, setEditingTitle] = useState(false);
+  const titleInputRef = useRef<HTMLInputElement>(null);
   const [post, setPost] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   // Human edit/delete affordance (thread node:8f661d03): the browser viewer IS the human, so amendments go
@@ -842,9 +847,26 @@ function ThreadView({
     el.setSelectionRange(el.value.length, el.value.length);
     autosizeDesc(el);
   }, [editingDesc]);
+  useEffect(() => {
+    if (!editingTitle) return;
+    const el = titleInputRef.current;
+    if (!el) return;
+    el.focus();
+    el.select();
+  }, [editingTitle]);
   const commitTitle = () => {
     const t = title.trim() || "thread";
     if (t !== node.title) m.editor.commit({ type: "setTitle", actor: "user", payload: { id, title: t } });
+  };
+  // Single click on the title copies the thread's reference (node:thread:<id>) with the transient ✓ flash —
+  // the session card's `.ses-name` interaction, reused here on the title text. A double click renames instead.
+  const threadRef = cardReference(node, rootOfId(id)) ?? id;
+  const copyTitleRef = (e: React.MouseEvent<HTMLButtonElement>) => {
+    const btn = e.currentTarget;
+    void Promise.resolve(navigator.clipboard?.writeText(threadRef)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
   };
   const send = async () => {
     const t = post.trim();
@@ -1054,13 +1076,31 @@ function ThreadView({
   return (
     <div ref={ref} data-node-id={id} className={`node thread c-${node.color}${selected ? " selected" : ""}`} style={box}>
       <div className="file-head">
-        <input
-          className="chan-title"
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          onBlur={commitTitle}
-          onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); }}
-        />
+        {editingTitle ? (
+          <input
+            ref={titleInputRef}
+            className="chan-title"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            onBlur={() => { commitTitle(); setEditingTitle(false); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+              else if (e.key === "Escape") { setTitle(node.title); setEditingTitle(false); }
+            }}
+          />
+        ) : (
+          // Title text IS the click-to-copy link (uniform with session/file cards); double-click to rename.
+          <button
+            type="button"
+            className="chan-title copy-ref-name"
+            title={`Copy reference: ${threadRef}  ·  double-click to rename`}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={copyTitleRef}
+            onDoubleClick={() => setEditingTitle(true)}
+          >
+            {title || "thread"}
+          </button>
+        )}
         {pins.length > 0 && (
           // Minimal pinned-nav: a muted "📌 N" count with ‹/› to step through the pinned messages in the log
           // (scroll-into-view, cycling). The functional successor to the header chip removed in batch 1.
@@ -1070,9 +1110,9 @@ function ThreadView({
             <button className="chan-pinnav-step" title="next pinned message" onClick={() => jumpPinned(1)}>›</button>
           </div>
         )}
-        <CopyRefText reference={cardReference(node, rootOfId(id)) ?? id} className="file-ext">
-          thread
-        </CopyRefText>
+        {/* The "thread" type label is now purely cosmetic — the copy affordance moved to the title text above
+            (Option A). Kept as a plain pill for parity with the file/session type badges. */}
+        <span className="file-ext">thread</span>
       </div>
       {editingDesc ? (
         <textarea
@@ -2232,39 +2272,6 @@ function CopyRefChip({ reference, floating }: { reference: string; floating?: bo
       onClick={onCopy}
     >
       ⧉
-    </button>
-  );
-}
-
-// The click-to-copy reference as the card's own LABEL TEXT — the same writeText + transient `.copied` ✓ as
-// CopyRefChip, but the text itself IS the affordance (the session card's `.ses-name` pattern), not a
-// separate ⧉ chip. The thread card uses this on its "thread" type label so clicking it copies the thread's
-// node id. `className` carries the label's own styling (e.g. `file-ext`); the button chrome is reset in CSS.
-function CopyRefText({
-  reference,
-  className,
-  children,
-}: {
-  reference: string;
-  className?: string;
-  children: React.ReactNode;
-}) {
-  const onCopy = (e: React.MouseEvent<HTMLButtonElement>) => {
-    const btn = e.currentTarget;
-    void Promise.resolve(navigator.clipboard?.writeText(reference)).then(() => {
-      btn.classList.add("copied");
-      setTimeout(() => btn.classList.remove("copied"), 1200);
-    });
-  };
-  return (
-    <button
-      type="button"
-      className={className}
-      title={`Copy reference: ${reference}`}
-      onMouseDown={(e) => e.preventDefault()}
-      onClick={onCopy}
-    >
-      {children}
     </button>
   );
 }
