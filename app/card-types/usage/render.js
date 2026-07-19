@@ -6,9 +6,11 @@
 //      session window plus the weekly all-models / Sonnet / Opus windows. These have no local mirror,
 //      so the dev-server middleware (vite-fs-plugin.ts) polls Anthropic's OAuth usage endpoint
 //      server-side with the locally-stored token and republishes it on the `usage` feed. Reading
-//      card.signals.usage subscribes this card; a new poll (every ~3 min) re-renders it. The poll is a
-//      metering call — it reports utilization and runs no inference, so it spends none of the budget it
-//      measures; the only cost is the endpoint's own per-token rate limit, which the server respects.
+//      card.signals.usage subscribes this card; each server poll re-renders it. The cadence is adaptive
+//      (faster while sessions are live, slower when the board is quiet), and the top-right ⟳ button forces
+//      an immediate pull. The poll is a metering call — it reports utilization and runs no inference, so it
+//      spends none of the budget it measures; the only cost is the endpoint's own per-token rate limit,
+//      which the server respects.
 //
 //   2. SESSION TOKEN GAUGE (secondary, optional) — when this card is titled with a session id that also
 //      has a live session card on the canvas, it piggybacks the same `session` feed the session card
@@ -173,7 +175,7 @@ function claudePlanSection(usage) {
       ${planBar("Current week (all models)", usage.seven_day)}
       ${planBar("Current week (Opus)", usage.seven_day_opus)}
       ${extraUsageSection(usage.extra_usage, usage.spend)}
-      <div style="font-size:9px;color:${FAINT};">billing: Anthropic plan · polled server-side every 3 min</div>
+      <div style="font-size:9px;color:${FAINT};">billing: Anthropic plan · polled server-side (adaptive)</div>
     </div>
   `;
 }
@@ -338,14 +340,41 @@ function sessionSection(card) {
   `;
 }
 
+// A small top-right ⟳ that forces an immediate server-side poll (POST /api/usage/refresh via the
+// usageRefresh capability) — useful on first canvas open, when the last reading may predate this tab.
+// Absolutely positioned so it floats over the scrolling content; data-interactive + stopPropagation keep
+// the click off the host's card-drag seam (precedent: card-types/roles/render.js). Absent (nothing drawn)
+// when the capability isn't wired — e.g. the headless template mock. Inline styles only, like the rest of
+// this card. `refreshing` is set on the card for the in-flight beat so a double-tap is ignored.
+function refreshButton(card) {
+  const refresh = card.signals.usageRefresh;
+  if (!refresh) return "";
+  const onClick = (e) => {
+    e.stopPropagation();
+    if (card.refreshing) return; // ignore-while-in-flight
+    card.refreshing = true;
+    Promise.resolve(refresh()).finally(() => {
+      card.refreshing = false;
+    });
+  };
+  return html`<button
+    type="button"
+    data-interactive="1"
+    title="refresh usage now"
+    @click=${onClick}
+    style="position:absolute;top:8px;right:8px;z-index:1;width:20px;height:20px;padding:0;line-height:18px;
+      border:1px solid ${BORDER};border-radius:4px;background:#fff;color:${MUTE};font-size:12px;cursor:pointer;"
+  >⟳</button>`;
+}
+
 export default {
   contract: 1,
   render(card) {
     return html`
       <div
-        style="padding:12px;font:12px/1.45 ui-sans-serif,system-ui;color:${INK};overflow:auto;height:100%;box-sizing:border-box;"
+        style="position:relative;padding:12px;font:12px/1.45 ui-sans-serif,system-ui;color:${INK};overflow:auto;height:100%;box-sizing:border-box;"
       >
-        ${planSection(card.signals.usage)} ${sessionSection(card)}
+        ${refreshButton(card)} ${planSection(card.signals.usage)} ${sessionSection(card)}
       </div>
     `;
   },

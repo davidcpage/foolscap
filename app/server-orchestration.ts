@@ -34,6 +34,7 @@ import {
   CLAUDE_USAGE_POLL_MS,
   claudeRateLimitDelay,
   claudeUsagePollDelay,
+  makeReschedulingPoller,
   mergeUsageProvider,
   purgeCachedEmail,
   readUsageCache,
@@ -407,7 +408,11 @@ export function startUsageFeed(): void {
   // wake at BASE cadence but skip the upstream fetch — so we stop hammering a dead token / an abusive
   // Retry-After, yet a token refresh mid-hold fires a prompt retry instead of waiting the sleep out.
   let gate: { hash: string | null; until: number } | null = null;
-  const pollClaude = async () => {
+  // One poll CYCLE → the ms delay until its next scheduled tick. The pollers below turn this into a
+  // single self-clearing timer chain, so a forced poll (forceUsagePoll) re-runs this without forking a
+  // second chain. The 401/429 gate is re-checked INSIDE here (shouldSkipUsagePoll), so a force during a
+  // hold re-checks locally and skips the upstream fetch — gate/backoff precedence is preserved.
+  const pollClaude = async (): Promise<number> => {
     let nextDelay = CLAUDE_USAGE_POLL_MS;
     try {
       const token = await readClaudeOAuthToken();
@@ -423,8 +428,7 @@ export function startUsageFeed(): void {
         if (shouldSkipUsagePoll(gate, hash)) {
           // Same failing token, still inside the hold window — keep the last published state (its
           // retryAt still shows the scheduled retry) and just re-check the local token at base cadence.
-          setTimeout(pollClaude, CLAUDE_USAGE_POLL_MS);
-          return;
+          return CLAUDE_USAGE_POLL_MS;
         }
         const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
           headers: {
@@ -446,8 +450,7 @@ export function startUsageFeed(): void {
             ...provider("claude"), provider: "claude", billing: "anthropic-plan",
             error: "rate-limited", retryAt, fetchedAt: Date.now(),
           });
-          setTimeout(pollClaude, Math.min(CLAUDE_USAGE_POLL_MS, nextDelay));
-          return;
+          return Math.min(CLAUDE_USAGE_POLL_MS, nextDelay);
         } else if (res.status === 401) {
           // Dead token — stop hammering (that hammering is what earns the abuse-429). Hold until the
           // keychain token changes; a Claude Code re-login then triggers an immediate retry.
@@ -484,15 +487,13 @@ export function startUsageFeed(): void {
     // Base cadence is adaptive — 60s while any session is live, 180s when the board is quiet — but a
     // still-set gate (401 hold) keeps precedence: recheck the local token at base cadence, matching the
     // shouldSkipUsagePoll wake above. (The 429 branch returns early with its own backoff delay.)
-    setTimeout(
-      pollClaude,
-      gate ? CLAUDE_USAGE_POLL_MS : claudeUsagePollDelay(getServerContext().liveSessionCount()),
-    ); // recursive (not setInterval) so backoff can stretch the gap
+    // Returned (not setTimeout'd) so the poller owns the single timer chain — see makeReschedulingPoller.
+    return gate ? CLAUDE_USAGE_POLL_MS : claudeUsagePollDelay(getServerContext().liveSessionCount());
   };
 
   const CODEX_USAGE_POLL_MS = 60_000;
   let codexBackoff = 0; // exponential backoff after a live-runtime usage failure, cleared on success
-  const pollCodex = async () => {
+  const pollCodex = async (): Promise<number> => {
     let nextDelay = CODEX_USAGE_POLL_MS;
     const client = getServerContext().fsState.hostClient;
     if (!client) {
@@ -520,10 +521,35 @@ export function startUsageFeed(): void {
         });
       }
     }
-    setTimeout(pollCodex, nextDelay);
+    return nextDelay;
   };
-  void pollClaude();
-  void pollCodex();
+
+  // Wrap each cycle in a single-chain rescheduling poller (usage-feed-state.js): the sole timer per
+  // provider, so forceUsagePoll can re-run a cycle NOW without forking a second self-perpetuating chain
+  // (the central double-poll race). Cancel any prior pollers first so a hot re-eval of startUsageFeed
+  // (should the feedsStarted guard ever be bypassed) replaces the chain instead of stacking a second.
+  usagePollers?.claude.cancel();
+  usagePollers?.codex.cancel();
+  usagePollers = {
+    claude: makeReschedulingPoller(pollClaude),
+    codex: makeReschedulingPoller(pollCodex),
+  };
+  usagePollers.claude.start();
+  usagePollers.codex.start();
+}
+
+// The live usage pollers, module-scoped so the global forceUsagePoll() route handler can reach the
+// closures startUsageFeed created. Set once startUsageFeed runs (feeds start at server boot).
+let usagePollers: { claude: ReturnType<typeof makeReschedulingPoller>; codex: ReturnType<typeof makeReschedulingPoller> } | null = null;
+
+// Force an IMMEDIATE usage poll cycle for both providers — the server side of the usage card's refresh
+// button (POST /api/usage/refresh → routes/usage.ts). Routes THROUGH the pollers' force(), which re-runs
+// pollClaude/pollCodex: the 401/429 gate (shouldSkipUsagePoll) and 429 backoff are re-checked inside, so a
+// forced poll during a hold re-checks locally and does NOT hit the upstream endpoint. A no-op before the
+// feeds have started (nothing to force yet). Coalesced onto an in-flight cycle — never a second chain.
+export function forceUsagePoll(): void {
+  usagePollers?.claude.force();
+  usagePollers?.codex.force();
 }
 
 // ── card types WATCH feed (a template edit on disk pings the client, whose registry re-imports) ──────
