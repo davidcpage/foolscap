@@ -415,7 +415,13 @@ third thread"), sequenced internally:
   (moving `board-persist.js`'s schedule server-side). *Gate:* no tab writes `events.jsonl`/
   `snapshot.json`; a headless-only board still compacts. *Risk:* the snapshot-writer clock move — keep
   the watermark-409 stale-guard until the tab writer is fully gone.
-- **Stage 4 (separate work item, after soak):** delete the §6 scaffolding per that table.
+  > **RULED 2026-07-19 (human, arch-review-meta seq 98): S3-d is RE-SCOPED INTO STAGE 4.** This sketch
+  > item contradicted D2 (§2, §7.1 — "`/event` retires in stage 4") and §6's overlap-then-retire
+  > sequencing; the ruling resolves the contradiction in D2/§6's favour. Stage 3 shipped as S3-a/b/c
+  > (merged 272b9f8 + 8495eed); the retirements above land with the stage-4 scaffolding deletion, after
+  > soak.
+- **Stage 4 (separate work item, after soak):** delete the §6 scaffolding per that table, plus S3-d
+  above (per the 2026-07-19 ruling).
 
 **Cross-cutting risks:** (1) Vite plugin-graph reloads — the queue + dedupe ring live on the pinned
 `globalThis` `fsState` like every other cross-request map, rehydrate-from-files on drift (§10 of the
