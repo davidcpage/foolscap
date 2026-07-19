@@ -18,6 +18,8 @@
 #     as processed prose by default and flips to a raw <textarea> on click (once the card is selected — the
 #     sticky card's gesture); that flip is per-card view state (off-log, gone on reload, never committed),
 #     exactly the directory card's expand-set shape.
+#   • cardRef — this card's stable copyable reference string (the host's cardReference rule), so the
+#     filename TEXT in the head is the click-to-copy link (the session-card pattern), not a separate ⧉ chip.
 name: notebook
 contract: 1
-capabilities: [fileContent, writeFile, syncCells, runCell, cellOutputs, treeState]
+capabilities: [fileContent, writeFile, syncCells, runCell, cellOutputs, treeState, cardRef]

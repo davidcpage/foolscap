@@ -34,6 +34,12 @@ import { memberPillState, intentPillState, type PillState } from "../thread-stat
 // declared-intent vocabulary where a state can be declared (blocked:human/blocked:peer), the plain band word
 // otherwise (scheduled/crashed) — so a server-inferred blue reads "blocked:peer" without an agent having to
 // declare it, and a card-only band still gets a word on the pill.
+// Card types that render their reference as their OWN filename/id TEXT (the `cardRef` capability — the
+// session-card click-to-copy pattern) rather than the host's floating ⧉ chip. The host suppresses the float
+// chip for exactly these; every other referenceable type (image/directory/feed/…) keeps it. Kept in sync
+// with the `cardRef` grant in each type's type.yaml.
+const INLINE_REF_TYPES = new Set(["file", "notebook", "ipynb"]);
+
 const PILL_LABEL: Record<PillState, string> = {
   working: "working",
   "blocked-human": "blocked:human",
@@ -1064,8 +1070,9 @@ function ThreadView({
             <button className="chan-pinnav-step" title="next pinned message" onClick={() => jumpPinned(1)}>›</button>
           </div>
         )}
-        <CopyRefChip reference={cardReference(node, rootOfId(id)) ?? id} />
-        <span className="file-ext">thread</span>
+        <CopyRefText reference={cardReference(node, rootOfId(id)) ?? id} className="file-ext">
+          thread
+        </CopyRefText>
       </div>
       {editingDesc ? (
         <textarea
@@ -2229,6 +2236,39 @@ function CopyRefChip({ reference, floating }: { reference: string; floating?: bo
   );
 }
 
+// The click-to-copy reference as the card's own LABEL TEXT — the same writeText + transient `.copied` ✓ as
+// CopyRefChip, but the text itself IS the affordance (the session card's `.ses-name` pattern), not a
+// separate ⧉ chip. The thread card uses this on its "thread" type label so clicking it copies the thread's
+// node id. `className` carries the label's own styling (e.g. `file-ext`); the button chrome is reset in CSS.
+function CopyRefText({
+  reference,
+  className,
+  children,
+}: {
+  reference: string;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const onCopy = (e: React.MouseEvent<HTMLButtonElement>) => {
+    const btn = e.currentTarget;
+    void Promise.resolve(navigator.clipboard?.writeText(reference)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
+  };
+  return (
+    <button
+      type="button"
+      className={className}
+      title={`Copy reference: ${reference}`}
+      onMouseDown={(e) => e.preventDefault()}
+      onClick={onCopy}
+    >
+      {children}
+    </button>
+  );
+}
+
 // The template host: React renders the BOX (position/size off the layout signal, selection ring,
 // type class for folder-level theming) and hands the template one container div for the interior.
 // The split is the disjoint-state invariant at the component level — a drag updates this
@@ -2389,6 +2429,11 @@ function TemplateCard({
   // The stable, copyable reference for this card (null → no chip). Host-side because a lit interior can't
   // reach the shared rule; see cardReference in node-id.ts.
   const reference = node ? cardReference(node, rootOfId(id)) : null;
+  // The focus card types render the reference as their OWN filename/id TEXT (the `cardRef` capability, the
+  // session-card pattern) — so the host must NOT also float its ⧉ chip on them. image/directory/feed and
+  // every other referenceable type keep the float chip. Kept in sync with the `cardRef` grants in the
+  // matching type.yaml files.
+  const inlineRef = INLINE_REF_TYPES.has(template.type);
   return (
     <div
       ref={hostRef}
@@ -2397,7 +2442,7 @@ function TemplateCard({
       style={box}
     >
       <div className="tpl-interior" ref={ref} />
-      {reference && <CopyRefChip reference={reference} floating />}
+      {reference && !inlineRef && <CopyRefChip reference={reference} floating />}
       {template.type === "file" && node && id.startsWith("node:repo:") && (
         <AnnotationsLayer id={id} path={node.title} hostRef={hostRef} />
       )}

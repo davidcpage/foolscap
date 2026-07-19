@@ -25,6 +25,29 @@ function splitPath(p) {
   return { base, dir, kind: ext ? (KIND_ALIAS[ext] ?? ext) : "file" };
 }
 
+// The filename head slot, as the card's OWN click-to-copy reference link — the session card's `.ses-name`
+// pattern (writeText + a transient `.copied` ✓), so the TITLE TEXT itself is the copyable reference
+// (uniform across the focus cards), not a separate host ⧉ chip. `ref` is the host-computed reference string
+// (card.signals.cardRef); absent (headless mock / pre-grant / untitled) → a plain <span>, so the card never
+// depends on the grant. The host's interior seam contains a <button> press (no card drag) so the click fires.
+function fileNameRef(base, ref) {
+  if (!ref) return html`<span class="file-name">${base}</span>`;
+  const copy = (e) => {
+    const btn = e.currentTarget;
+    Promise.resolve(navigator.clipboard?.writeText(ref)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
+  };
+  return html`<button
+    class="file-name copy-ref-name"
+    type="button"
+    title=${`Copy reference: ${ref}`}
+    @mousedown=${(e) => e.preventDefault()}
+    @click=${copy}
+  >${base}</button>`;
+}
+
 // YAML frontmatter (memory files, role.md, …): a leading `---` fence, key/value lines, a closing `---`
 // fence, then the body. Split it off so the body renders as prose and the frontmatter renders as a
 // structured "properties" strip (below) — NOT dumped into the prose, where the raw YAML rendered as an
@@ -170,7 +193,7 @@ export default {
       return html`
         <div class="file-head">
           ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
-          <span class="file-name">${base}</span>
+          ${fileNameRef(base, card.signals.cardRef)}
           <span class="file-ext">${kind}</span>
         </div>
         ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}
@@ -240,7 +263,7 @@ export default {
     return html`
       <div class="file-head">
         ${hue ? html`<span class="dir-root-swatch" style="background:${hue}"></span>` : ""}
-        <span class="file-name">${base}</span>
+        ${fileNameRef(base, card.signals.cardRef)}
         <span class="file-ext">${kind}</span>
         ${granted
           ? canEdit

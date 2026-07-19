@@ -3,7 +3,7 @@ import type { Editor, Id, InteractionManager, Subscribable } from "./lib";
 import { nowSignal } from "./clock";
 import { feedSignal, onFeedsReconnect } from "./feeds";
 import { fileContentSignal, writeFileContent, dirListingSignal, sessionListSignal, refreshSessionList, hideSession, channelListSignal, refreshChannelList, rolesListSignal, refreshRolesList, rootsSignal, goneSignal, type DirListing, type RootInfo } from "./content";
-import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, rootOfId, sessionSpawnBody, newSessionStub, parseSessionStub, type SessionStub, type RootId } from "./loader";
+import { openSession, openChannel, openRole, requestThreadJump, spawnLiveSession, materializeAt, cascadeFrom, renameFileNodes, rootOfId, cardReference, sessionSpawnBody, newSessionStub, parseSessionStub, type SessionStub, type RootId } from "./loader";
 // The role.md codec — the ONE source for `role.md text <-> {name,colour,charter}`, shared with the server
 // ledger (role-ledger.js). The host parses/serialises here so the role CARD stays a pure view (it can only
 // import /vendor/, never this) — exactly how the host hands cards parsed sessionList/dirListing data.
@@ -818,6 +818,23 @@ export function buildCard(
           for (const fn of watchers) fn();
         },
       };
+      continue;
+    }
+    // `cardRef` is THIS card's STABLE, copyable reference string (cardReference, node-id.ts) — the SAME
+    // value the host's float ⧉ chip uses, handed to the interior so a focus card (file/notebook/ipynb) can
+    // render its own filename/id TEXT as the click-to-copy link (the session card's pattern), instead of a
+    // separate chip. Host-side because the interior can only import /vendor/ — it can't reach the reference
+    // rule. Read-tracked through the node signal, so a rename re-renders the link; `null` when this type has
+    // no meaningful reference (an untitled card) → the interior falls back to plain text.
+    if (name === "cardRef") {
+      Object.defineProperty(signals, "cardRef", {
+        enumerable: true,
+        get: () => {
+          const n = tracked(nodeSub) as { type?: string; title?: string; id?: string } | undefined;
+          if (!n) return null;
+          return cardReference({ type: n.type ?? "", title: n.title ?? "", id: n.id ?? host?.id ?? "" }, root);
+        },
+      });
       continue;
     }
     const s = CAPABILITY_SIGNALS[name];

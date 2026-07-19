@@ -270,6 +270,59 @@ body {
   opacity: 1;
   pointer-events: auto;
 }
+/* Click-to-copy TITLE link — the card's own filename/id TEXT as the reference affordance (the session
+   card's `.ses-name` pattern), replacing the separate ⧉ chip on the focus cards. Used by the file/notebook/
+   ipynb interiors on `.file-name` and, as a button reset, wherever the label itself is the copy link. A
+   button reset so the text reads as its plain self; a dotted-underline hover hint + a green ✓ flashed on
+   copy. `.file-name.copy-ref-name` re-asserts the filename weight/size/left-push that `font: inherit` drops. */
+.copy-ref-name {
+  font: inherit;
+  color: inherit;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: inherit;
+}
+.copy-ref-name:hover {
+  color: #6366f1;
+  text-decoration: underline dotted;
+}
+.copy-ref-name.copied {
+  color: #16a34a;
+  text-decoration: none;
+}
+.copy-ref-name.copied::after {
+  content: " ✓";
+}
+.file-name.copy-ref-name {
+  font-weight: 600;
+  font-size: 12px;
+  margin-right: auto;
+}
+/* The thread card's "thread" type label as a click-to-copy id link: a <button> carrying the `.file-ext`
+   pill look, so it reads as the same badge it replaced — just interactive (copies node:thread:<id>). Reset
+   only the button chrome (border/font-family); the pill's bg/padding/size come from `.file-ext`. */
+button.file-ext {
+  font-family: inherit;
+  border: none;
+  cursor: pointer;
+}
+button.file-ext:hover {
+  color: #6366f1;
+}
+button.file-ext.copied {
+  color: #16a34a;
+  background: #16a34a14;
+}
+button.file-ext.copied::after {
+  content: " ✓";
+}
 /* The sessions card's running-count badge — a calm green pill (matching the `working` band hue in
    session-status.ts) that reads at a glance as "N agents live". Only rendered when running > 0, so its
    presence alone signals activity; it sits between the card name and the ⟳ refresh in the header. */
