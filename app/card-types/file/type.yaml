@@ -21,6 +21,8 @@
 #   • `treeState` — (ephemeral view state) whether this card is in raw-source EDIT mode. The rendered view
 #     is the default; a click on Edit flips to the textarea. Per-card, off-log, gone on reload, never
 #     committed — the directory card's expand-set shape, the role/notebook edit-mode idiom.
+#   • `cardRef` — this card's stable copyable reference string (the host's cardReference rule), so the
+#     filename TEXT itself is the click-to-copy link (the session-card pattern), not a separate ⧉ chip.
 name: file
 contract: 1
-capabilities: [fileContent, roots, gone, writeFile, treeState]
+capabilities: [fileContent, roots, gone, writeFile, treeState, cardRef]

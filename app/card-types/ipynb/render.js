@@ -46,6 +46,29 @@ function splitPath(p) {
   return { base: slash >= 0 ? p.slice(slash + 1) : p, dir: slash >= 0 ? p.slice(0, slash) : "" };
 }
 
+// The filename head slot, as the card's OWN click-to-copy reference link — the session card's `.ses-name`
+// pattern (writeText + a transient `.copied` ✓), so the filename TEXT itself is the copyable reference
+// (uniform across the focus cards), not a separate host ⧉ chip. `ref` is the host-computed reference string
+// (card.signals.cardRef); absent (headless mock / pre-grant / untitled) → a plain <span>, so the card never
+// depends on the grant. The host's interior seam contains a <button> press (no card drag) so the click fires.
+function fileNameRef(base, ref) {
+  if (!ref) return html`<span class="file-name">${base}</span>`;
+  const copy = (e) => {
+    const btn = e.currentTarget;
+    Promise.resolve(navigator.clipboard?.writeText(ref)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
+  };
+  return html`<button
+    class="file-name copy-ref-name"
+    type="button"
+    title=${`Copy reference: ${ref}`}
+    @mousedown=${(e) => e.preventDefault()}
+    @click=${copy}
+  >${base}</button>`;
+}
+
 // langForKind (vendor/highlight-lit.js) keys off FILE-EXTENSION kinds (`py`, `js`, …), but a notebook names
 // its language in full (`python`, `javascript`). Bridge the common kernel language names to the kind the
 // highlighter understands; an unmapped name is passed through (many already match, e.g. `bash`/`sql`/`go`),
@@ -425,7 +448,7 @@ export default {
 
     const head = html`
       <div class="file-head">
-        <span class="file-name">${base}</span>
+        ${fileNameRef(base, card.signals.cardRef)}
         <span class="file-ext">ipynb</span>
       </div>
       ${dir ? html`<div class="file-dir">${dir}/</div>` : ""}

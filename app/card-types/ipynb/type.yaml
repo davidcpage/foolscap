@@ -27,8 +27,10 @@
 #       - `treeState` — (ephemeral view state) which cells are in RAW-EDIT mode. Off-log, gone on reload,
 #         never committed — the directory card's expand-set shape. The in-progress edit DRAFT text lives in a
 #         module-level map in render.js (not here), so it survives a watch re-render (kernel write-back).
+#   • `cardRef` — this card's stable copyable reference string (the host's cardReference rule), so the
+#     filename TEXT in the head is the click-to-copy link (the session-card pattern), not a separate ⧉ chip.
 #
 # html outputs are rendered RAW (trusted-notebook assumption, unsanitised) — see render.js.
 name: ipynb
 contract: 1
-capabilities: [fileContent, kernelRun, kernelRunAll, kernelInterrupt, kernelRestart, kernelStatus, notebookEdit, treeState]
+capabilities: [fileContent, kernelRun, kernelRunAll, kernelInterrupt, kernelRestart, kernelStatus, notebookEdit, treeState, cardRef]

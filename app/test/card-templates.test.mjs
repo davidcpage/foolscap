@@ -350,6 +350,30 @@ test("ipynb template renders a notebook read-only: header, markdown + code cells
   assert.ok(!out.includes("["), "no raw ANSI escape codes leak through");
 });
 
+test("focus cards render the filename TEXT as a click-to-copy reference link when granted cardRef", async () => {
+  // The `cardRef` capability (buildCard) hands each focus card its host-computed reference string, so the
+  // filename TEXT itself is the copy affordance (the session card's `.ses-name` pattern) — the host no
+  // longer floats a ⧉ chip on these types. WITHOUT the grant (a headless mock / the pre-grant beat) the
+  // head degrades to a plain <span>, so the card never depends on the capability being present.
+  const cases = [
+    ["file", "core/src/store.ts", { fileContent: "export const x = 1;" }],
+    ["notebook", "notebooks/hello.html", { fileContent: "<notebook><title>t</title></notebook>", writeFile: () => {} }],
+    ["ipynb", "notebooks/explore.ipynb", { fileContent: '{"cells": [], "metadata": {}}' }],
+  ];
+  for (const [type, title, extra] of cases) {
+    const mod = await loadTemplate(type);
+    const ref = title; // a repo-root card's reference IS its plain path (cardReference)
+
+    const granted = flatten(mod.render({ fields: { title, text: "", color: "blue" }, signals: { ...extra, cardRef: ref } }));
+    assert.ok(granted.includes("copy-ref-name"), `${type}: filename becomes the copy-link button`);
+    assert.ok(granted.includes(`Copy reference: ${ref}`), `${type}: the link copies this card's reference`);
+
+    const plain = flatten(mod.render({ fields: { title, text: "", color: "blue" }, signals: { ...extra } }));
+    assert.ok(!plain.includes("copy-ref-name"), `${type}: plain filename span without the cardRef grant`);
+    assert.ok(plain.includes("file-name"), `${type}: the filename still renders without the grant`);
+  }
+});
+
 test("ipynb template honors truncation + parse failure, and the empty/pre-signal beat, without throwing", async () => {
   const mod = await loadTemplate("ipynb");
 

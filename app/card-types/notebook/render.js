@@ -82,6 +82,29 @@ function basename(p) {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
+// The filename head slot, as the card's OWN click-to-copy reference link — the session card's `.ses-name`
+// pattern (writeText + a transient `.copied` ✓), so the filename TEXT itself is the copyable reference
+// (uniform across the focus cards), not a separate host ⧉ chip. `ref` is the host-computed reference string
+// (card.signals.cardRef); absent (headless mock / pre-grant / untitled) → a plain <span>, so the card never
+// depends on the grant. The host's interior seam contains a <button> press (no card drag) so the click fires.
+function fileNameRef(base, ref) {
+  if (!ref) return html`<span class="file-name">${base}</span>`;
+  const copy = (e) => {
+    const btn = e.currentTarget;
+    Promise.resolve(navigator.clipboard?.writeText(ref)).then(() => {
+      btn.classList.add("copied");
+      setTimeout(() => btn.classList.remove("copied"), 1200);
+    });
+  };
+  return html`<button
+    class="file-name copy-ref-name"
+    type="button"
+    title=${`Copy reference: ${ref}`}
+    @mousedown=${(e) => e.preventDefault()}
+    @click=${copy}
+  >${base}</button>`;
+}
+
 // One cell's output for display — the TEXT/JSON path. The worker (or the main-thread realm) made the value
 // clone-safe: strings show verbatim, everything else as JSON. A DOM/SVG node is NOT handled here — a `view`
 // output is mounted as a live node by the branch in renderCell (Phase-2 B2). No completed run yet → empty.
@@ -455,7 +478,7 @@ export default {
 
     return html`
       <div class="file-head">
-        <span class="file-name">${basename(card.fields.title)}</span>
+        ${fileNameRef(basename(card.fields.title), card.signals.cardRef)}
         <span class="file-ext">notebook</span>
       </div>
       <div class="nb-body" data-nbkey=${cardKey}>
