@@ -1083,7 +1083,10 @@ function ThreadView({
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             onBlur={() => { commitTitle(); setEditingTitle(false); }}
-            onKeyDown={(e) => {
+            // Capture, not bubble: the host's onKD keydown listener stopPropagation()s input-target keys (so
+            // typing doesn't leak Space→pan / Backspace→delete to the canvas), which also kills a bubble-phase
+            // React onKeyDown. Capture fires first (root→target), before onKD's bubble stop — so Enter/Escape land.
+            onKeyDownCapture={(e) => {
               if (e.key === "Enter") (e.target as HTMLInputElement).blur();
               else if (e.key === "Escape") { setTitle(node.title); setEditingTitle(false); }
             }}
