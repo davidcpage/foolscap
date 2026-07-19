@@ -74,6 +74,11 @@ export interface ThreadMsg {
   intent?: WorkIntent;
   target?: number; // kind:"edit" — the seq this event amends
   deleted?: boolean; // kind:"edit" — this amendment is a tombstone (a delete, not a text edit)
+  // IDEMPOTENCY KEY (thread-post reliability r2): the client mints one postId per logical send and reuses it
+  // across its 8s-timeout retries; appendThreadMsg dedupes on it BEFORE appending, so a retry whose first
+  // attempt landed durably (but whose response was lost to a mid-request dev-server bounce) can never create a
+  // DUPLICATE durable line. Absent on card-only entries and on posts from clients that don't mint one (the CLI).
+  postId?: string;
 }
 
 // §16 ask/reply: a synchronous consultation held in memory, keyed by askId (NOT a persisted recipient —

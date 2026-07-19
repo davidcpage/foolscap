@@ -93,7 +93,7 @@ async function handleThreadMessage(
     originOf,
   } = getServerContext();
   const threadLogs = getServerContext().fsState.threadLogs;
-  let body: { from?: unknown; text?: unknown; force?: unknown };
+  let body: { from?: unknown; text?: unknown; force?: unknown; postId?: unknown };
   try {
     body = JSON.parse(await readBody(req));
   } catch {
@@ -101,6 +101,10 @@ async function handleThreadMessage(
   }
   if (typeof body.text !== "string" || !body.text) return sendJson(res, 400, { error: "missing text" });
   if (typeof body.from !== "string" || !body.from) return sendJson(res, 400, { error: "missing from" });
+  // The client's per-send idempotency key (thread-post reliability r2): reused across its timeout retries so a
+  // retry whose earlier attempt landed durably but lost its response can't create a DUPLICATE line — the server
+  // dedupes on it in appendThreadMsg. Optional (the CLI and old clients omit it → a plain append, unchanged).
+  const postId = typeof body.postId === "string" && body.postId ? body.postId : undefined;
   const records = boardSnapshotRecords(boardId);
   // Existence gate is the LEDGER marker, falling back to the canvas node (the seen pattern, 6100261): a
   // thread persists in `.canvas/threads/` with no card on the board, and a card-only brand-new thread has a
@@ -153,7 +157,7 @@ async function handleThreadMessage(
   // loses the message; the caller can retry.
   let msg: ThreadMsg;
   try {
-    msg = appendThreadMsg(boardId, threadId, from, body.text);
+    msg = await appendThreadMsg(boardId, threadId, from, body.text, { postId });
   } catch (e) {
     return sendJson(res, 500, { error: "message could not be persisted — not accepted, retry", detail: String((e as Error)?.message ?? e) });
   }
@@ -377,14 +381,12 @@ async function handleThreadMembership(
     if (repoPath) releaseSeat(repoPath, threadId, body.from);
     forgetDurableMember(repoPath, threadId, body.from);
     // Membership changes are never silent (the 2026-07-12 drops were): log the departure for the record.
-    // Best-effort: appendThreadMsg throws on a durable failure (BUG-6), but the durable LEAVE already landed
-    // above (releaseSeat/forgetDurableMember) — a failed system line must not un-leave the member or 500 the
-    // leave. Log it and continue.
-    try {
-      appendThreadMsg(boardId, threadId, "system", `${body.from} left the thread.`);
-    } catch (e) {
-      console.warn(`[thread] leave system line for ${body.from} on ${threadId} not persisted:`, (e as Error)?.message ?? e);
-    }
+    // Best-effort: appendThreadMsg rejects (async) on a durable failure (BUG-6), but the durable LEAVE already
+    // landed above (releaseSeat/forgetDurableMember) — a failed system line must not un-leave the member or 500
+    // the leave. Fire-and-forget; a rejection is logged, ordering stays safe via withThreadLock.
+    void appendThreadMsg(boardId, threadId, "system", `${body.from} left the thread.`).catch((e) =>
+      console.warn(`[thread] leave system line for ${body.from} on ${threadId} not persisted:`, (e as Error)?.message ?? e),
+    );
     publishFeed("threads:" + boardId, { ts: Date.now() }); // rail roster refresh
     const sessionNode = records ? sessionNodeForSid(records, body.from) : null;
     const edgeId = sessionNode && records ? memberEdge(records, sessionNode, threadId) : null;
@@ -520,7 +522,7 @@ async function handleThreadIntent(
   // so an un-persistable declaration returns 500 rather than a dishonest 200 that loses the work-intent.
   let declared: { msg: ThreadMsg; seat: string | null };
   try {
-    declared = recordThreadIntent(boardId, threadId, body.from, body.intent, note);
+    declared = await recordThreadIntent(boardId, threadId, body.from, body.intent, note);
   } catch (e) {
     return sendJson(res, 500, { error: "intent could not be persisted — not recorded, retry", detail: String((e as Error)?.message ?? e) });
   }
@@ -536,15 +538,15 @@ async function handleThreadIntent(
 // Keyed by the declarer's SEAT when it holds one (§5: the declared state must survive an occupant respawn —
 // a fresh session re-fills the seat and inherits/overwrites the same slot), else by sid; the record's own
 // `sid` field says which occupant actually spoke.
-function recordThreadIntent(
+async function recordThreadIntent(
   boardId: string,
   threadId: string,
   from: string,
   intent: WorkIntent,
   note?: string,
-): { msg: ThreadMsg; seat: string | null } {
+): Promise<{ msg: ThreadMsg; seat: string | null }> {
   const { appendThreadMsg, boards, publishSession, liveSessions } = getServerContext();
-  const msg = appendThreadMsg(boardId, threadId, from, intentLine(intent, note), { kind: "intent", intent });
+  const msg = await appendThreadMsg(boardId, threadId, from, intentLine(intent, note), { kind: "intent", intent });
   const repoPath = boards.get(boardId)?.repoPath;
   let seat: string | null = null;
   if (repoPath) {
@@ -738,7 +740,7 @@ async function handleThreadEdit(
   // Append the amendment event durably (BUG-6: honest accept — appendThreadMsg throws on a durable failure).
   let editMsg: ThreadMsg;
   try {
-    editMsg = appendThreadMsg(boardId, threadId, body.from, isDelete ? "" : (newText as string), {
+    editMsg = await appendThreadMsg(boardId, threadId, body.from, isDelete ? "" : (newText as string), {
       kind: "edit",
       target: body.seq,
       ...(isDelete ? { deleted: true } : {}),
@@ -1012,6 +1014,26 @@ export const threadRoutes: GlobalRoute[] = [
       for (const s of Object.values(meta?.seats ?? {})) if (s?.sid) members.add(s.sid); // seat-only members count too
       const sids = readReopenSet(meta).filter((sid) => members.has(sid));
       return sendJson(res, 200, { thread: threadId, sids });
+    },
+  },
+  // GET /api/thread/<id>/posted?postId=<uuid> — CONFIRM A POST FROM THE RECORD (thread-post reliability r2,
+  // item 1). The client's post has an 8s timeout; a mid-request dev-server bounce can drop the RESPONSE of a
+  // request whose durable append already landed, so a "timed out" in the composer is a lie. Rather than trust
+  // the dead socket, the client re-fetches this: it answers "is a message carrying THIS postId on disk?" by
+  // scanning the durable ledger tail (readThreadLog — the record, not the in-memory tail, so it survives the
+  // very restart that dropped the response). `landed:true` lets the client declare success instead of a false
+  // failure, and — paired with the server's postId dedupe — makes a retry that DID land a harmless no-op.
+  {
+    method: "GET",
+    match: re(/^\/api\/(?:thread|channel)\/([^/]+)\/posted$/),
+    run: (_req, res, url, g) => {
+      const b = getServerContext().reqBoard(url);
+      if (!b) return sendJson(res, 400, { error: "unknown board" });
+      const threadId = decodeURIComponent(g[0]!);
+      const postId = url.searchParams.get("postId");
+      if (!postId) return sendJson(res, 400, { error: "missing postId" });
+      const hit = readThreadLog(b.repoPath, threadId).find((m) => m.postId === postId);
+      return sendJson(res, 200, { thread: threadId, postId, landed: !!hit, seq: hit ? hit.seq : null });
     },
   },
 ];

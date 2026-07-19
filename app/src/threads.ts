@@ -150,19 +150,43 @@ export function leaveThread(editor: Editor, edgeId: string): void {
 // so the post box can surface a 403 (not a member) / 404 honestly.
 //
 // A server-file merge restarts the Vite dev server mid-request, so a POST can hang against a dead socket
-// until the OS gives up (~tens of seconds). We bound each attempt with an AbortController timeout and retry
-// ONCE on a timeout / network drop / 5xx (the restart-shaped failures), so a bounce that lands between the
-// two attempts still gets the message through instead of stranding the composer on "sending…". A 4xx
-// (403/409 membership-sync races) is deterministic per attempt — surfaced immediately, not retried.
+// until the OS gives up (~tens of seconds). We bound each attempt with an AbortController timeout. On an
+// UNCERTAIN outcome — a timeout / network drop / 5xx (the restart-shaped failures) — we do NOT trust the dead
+// socket: the durable append is fsync'd BEFORE the server's 200, so a request whose connection was accepted
+// but whose response was lost may have landed durably anyway (the old "timed out" was a lie, and its blind
+// retry appended a DUPLICATE line). So we (1) mint ONE idempotency `postId` per logical send, reused across
+// every attempt, which the server dedupes on before appending — a retry can therefore never duplicate — and
+// (2) confirm from the RECORD (GET /posted) before retrying or declaring failure: if our postId is on disk the
+// post succeeded, full stop. A 4xx (403/409 membership-sync races) is deterministic per attempt — surfaced
+// immediately, not retried. See thread-post reliability r2 (BUG-6 recurrence).
 const POST_TIMEOUT_MS = 8000;
+
+// Has a post carrying `postId` actually landed on the server's durable record? A cheap, cursor-free read of
+// the thread's ledger (GET /posted) — the honest source when a POST's response was lost. Any failure here
+// (the server still down, a network error) answers "not confirmed" so the caller falls through to a retry.
+async function postLanded(threadId: string, postId: string): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/thread/${encodeURIComponent(threadId)}/posted?board=${activeBoardId()}&postId=${encodeURIComponent(postId)}`,
+      { signal: AbortSignal.timeout(4000) },
+    );
+    if (!res.ok) return false;
+    const body = (await res.json().catch(() => ({}))) as { landed?: boolean };
+    return body.landed === true;
+  } catch {
+    return false;
+  }
+}
+
 export async function postToThread(
   threadId: string,
   from: string,
   text: string,
-  opts: { timeoutMs?: number; retries?: number } = {},
+  opts: { timeoutMs?: number; retries?: number; postId?: string } = {},
 ): Promise<{ ok: boolean; error?: string }> {
   const timeoutMs = opts.timeoutMs ?? POST_TIMEOUT_MS;
   const retries = opts.retries ?? 1;
+  const postId = opts.postId ?? crypto.randomUUID(); // one key per logical send, reused across retries
   let lastError = "failed";
   for (let attempt = 0; attempt <= retries; attempt++) {
     const ctrl = new AbortController();
@@ -171,7 +195,7 @@ export async function postToThread(
       const res = await fetch(`/api/thread/${encodeURIComponent(threadId)}/message?board=${activeBoardId()}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from, text }),
+        body: JSON.stringify({ from, text, postId }),
         signal: ctrl.signal,
       });
       const body = (await res.json().catch(() => ({}))) as { error?: string };
@@ -184,14 +208,19 @@ export async function postToThread(
       if (res.status === 403) return { ok: false, error: body.error ?? "not a member (or membership still syncing)" };
       lastError = body.error ?? `HTTP ${res.status}`;
       if (res.status < 500) return { ok: false, error: lastError }; // other 4xx: deterministic, don't retry
-      // 5xx (e.g. a durable-append hiccup during a restart) → fall through to the retry.
+      // 5xx (e.g. a durable-append hiccup during a restart) → fall through to the record check + retry.
     } catch (e) {
-      // AbortError (our timeout) or a network drop — the restart-shaped failures worth one retry.
+      // AbortError (our timeout) or a network drop — the restart-shaped failures.
       lastError = ctrl.signal.aborted ? "timed out" : String(e);
     } finally {
       clearTimeout(timer);
     }
+    // Uncertain outcome: confirm from the record before retrying. If it landed, we're done — no false
+    // "timed out", and no need to re-POST. If not, loop: the retry is dedup-safe by postId.
+    if (await postLanded(threadId, postId)) return { ok: true };
   }
+  // Retries exhausted — a final record check catches a last attempt that landed but whose response was lost too.
+  if (await postLanded(threadId, postId)) return { ok: true };
   return { ok: false, error: lastError };
 }
 

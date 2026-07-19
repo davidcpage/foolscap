@@ -71,7 +71,7 @@ function makeCtx(repoPath, records, over = {}) {
     recordDurableMember: snap.recordDurableMember,
     historyKey: snap.historyKey,
     threadLog: () => [],
-    appendThreadMsg: (b, t, from, text) => (posted.push({ from, text }), { seq: posted.length, from, text, ts: 1 }),
+    appendThreadMsg: (b, t, from, text) => (posted.push({ from, text }), Promise.resolve({ seq: posted.length, from, text, ts: 1 })),
     wakeThreadMembers: () => 0,
     dispatchBusCommand: (b, cmd) => (dispatched.push(cmd), 1),
     // D7 onboarding deps: onboardMemberOpen is the REAL delivery fn (it re-reads this same fake via

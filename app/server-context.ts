@@ -110,8 +110,12 @@ export interface ServerContext {
     threadId: string,
     from: string,
     text: string,
-    extra?: { kind: "ask" } | { kind: "intent"; intent: WorkIntent } | { kind: "edit"; target: number; deleted?: boolean },
-  ) => ThreadMsg;
+    extra?:
+      | { kind: "ask" }
+      | { kind: "intent"; intent: WorkIntent }
+      | { kind: "edit"; target: number; deleted?: boolean }
+      | { postId?: string },
+  ) => Promise<ThreadMsg>;
   wakeThreadMembers: (
     boardId: string,
     threadId: string,
